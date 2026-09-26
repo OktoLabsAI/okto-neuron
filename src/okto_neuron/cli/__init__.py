@@ -77,6 +77,15 @@ _SERVER_STARTUP_TIMEOUT_SECONDS = 60.0
 _VERSION_MESSAGE = "%(prog)s %(version)s\n" + BRAND_LINE
 
 
+def _warn_if_telemetry_unavailable() -> None:
+    """One stderr line when MLflow export is requested but cannot happen."""
+    from okto_neuron.llm._telemetry import missing_mlflow_warning
+
+    message = missing_mlflow_warning()
+    if message:
+        click.echo(f"warning: {message}", err=True)
+
+
 class OktoNeuronGroup(click.Group):
     """Top-level Click group with the RFC failure taxonomy dispatcher."""
 
@@ -123,6 +132,8 @@ def app(ctx: click.Context, debug: bool) -> None:
     """Okto Neuron by Okto Labs - local-first knowledge graph memory for agents."""
     install_cli_warning_format()
     load_user_env_file()
+    if ctx.invoked_subcommand != "serve":  # serve reports it itself, once per stream
+        _warn_if_telemetry_unavailable()
     ctx.ensure_object(dict)
     ctx.obj["debug"] = debug
 
@@ -138,6 +149,8 @@ def kg_cli(ctx: click.Context, debug: bool) -> None:
     """Compatibility CLI with graph commands flattened at the top level."""
     install_cli_warning_format()
     load_user_env_file()
+    if ctx.invoked_subcommand != "serve":  # serve reports it itself, once per stream
+        _warn_if_telemetry_unavailable()
     ctx.ensure_object(dict)
     ctx.obj["debug"] = debug
 
@@ -2946,6 +2959,7 @@ def serve(
                 err=True,
             )
             raise click.exceptions.Exit(1) from exc
+        _warn_if_telemetry_unavailable()  # the re-exec'd child logs it to the file
         # Raw stdout/stderr go to the same file so uncaught tracebacks and
         # third-party prints survive; structured logs use the rotating handler.
         spawned_pid = daemonize(stdout=log_file, stderr=log_file)
@@ -2985,6 +2999,15 @@ def serve(
         return
 
     logger = configure_logging(resolved, log_file=log_file)
+    from okto_neuron.llm._telemetry import missing_mlflow_warning
+
+    telemetry_warning = missing_mlflow_warning()
+    if telemetry_warning:
+        logger.warning(
+            "%s",
+            telemetry_warning,
+            extra={"component": "server", "event": "telemetry.unavailable"},
+        )
     try:
         with PidFile(lock_root) as pid_file:
             logger.info(

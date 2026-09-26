@@ -554,3 +554,75 @@ def test_a_genuine_client_failure_still_disables_export(monkeypatch):
 
     assert _telemetry._client() is None
     assert _telemetry._CLIENT_FAILED is True
+
+
+# ── Tracking URI set, mlflow missing: a degraded state must never look like success ──
+
+
+def test_missing_mlflow_warning_is_none_when_off(monkeypatch):
+    monkeypatch.delenv(_telemetry.ENV_TRACKING_URI, raising=False)
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    assert _telemetry.missing_mlflow_warning() is None
+
+
+def test_missing_mlflow_warning_names_the_fix(monkeypatch):
+    monkeypatch.setenv(_telemetry.ENV_TRACKING_URI, "http://mlflow.example:5000")
+    monkeypatch.setitem(sys.modules, "mlflow", None)  # find_spec -> None, import -> ImportError
+    message = _telemetry.missing_mlflow_warning()
+    assert message is not None
+    assert "OKTO_NEURON_MLFLOW_TRACKING_URI is set (http://mlflow.example:5000)" in message
+    assert "mlflow is not installed" in message
+    assert "OKTO_NEURON_TELEMETRY=1" in message
+
+
+def test_lazy_path_does_not_repeat_a_reported_missing_mlflow(monkeypatch, caplog):
+    monkeypatch.setenv(_telemetry.ENV_TRACKING_URI, "http://mlflow.example:5000")
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    assert _telemetry.missing_mlflow_warning() is not None
+    caplog.set_level("DEBUG", logger="okto_neuron.llm.telemetry")
+    assert _telemetry._client() is None
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+def test_lazy_path_names_the_missing_package_not_the_server(monkeypatch, caplog):
+    """Without the startup check, the first call used to say "... talking to <uri>
+    (... check the server)" with a traceback: it pointed at the wrong thing."""
+    monkeypatch.setenv(_telemetry.ENV_TRACKING_URI, "http://mlflow.example:5000")
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    caplog.set_level("WARNING", logger="okto_neuron.llm.telemetry")
+    assert _telemetry._client() is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "mlflow is not installed" in warnings[0].getMessage()
+    assert "talking to" not in warnings[0].getMessage()
+
+
+def test_cli_warns_once_on_stderr_when_mlflow_is_missing(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from okto_neuron.cli import app
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(_telemetry.ENV_TRACKING_URI, "http://mlflow.example:5000")
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    result = CliRunner().invoke(
+        app, ["status", "--endpoint", "http://127.0.0.1:1", "--timeout", "0.2"]
+    )
+    assert result.stderr.count("mlflow is not installed") == 1, result.stderr
+    assert "warning: OKTO_NEURON_MLFLOW_TRACKING_URI is set" in result.stderr
+    assert "mlflow is not installed" not in result.stdout
+
+
+def test_cli_is_quiet_when_telemetry_is_off(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from okto_neuron.cli import app
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(_telemetry.ENV_TRACKING_URI, raising=False)
+    monkeypatch.delenv("MARGINALIA_MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    result = CliRunner().invoke(
+        app, ["status", "--endpoint", "http://127.0.0.1:1", "--timeout", "0.2"]
+    )
+    assert "mlflow" not in result.stderr

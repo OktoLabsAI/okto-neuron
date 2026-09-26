@@ -18836,6 +18836,7 @@ nothing — not even an import — until you turn it on.</p>
 <h2 id="docs__observability--turning-it-on">Turning it on</h2>
 <p>Install the optional extra and point Okto Neuron at a tracking server:</p>
 <pre><code class="language-bash">uv sync --group telemetry                    # or: pip install &quot;okto-neuron[telemetry]&quot;
+# installed tool: re-run the installer with OKTO_NEURON_TELEMETRY=1
 
 export OKTO_NEURON_MLFLOW_TRACKING_URI=http://my-mlflow-host:5000
 export OKTO_NEURON_MLFLOW_EXPERIMENT=my-experiment      # optional
@@ -18907,6 +18908,10 @@ daemon was started before the variable was exported, <code>mlflow</code> is not 
 in the environment that runs the daemon (the optional <code>telemetry</code> extra), or the
 server is unreachable — the last one warns once and then stays quiet by design,
 since telemetry must never take a request down with it.</p>
+<p>A missing <code>mlflow</code> is reported at startup, not at the first call: every CLI
+command prints one <code>warning: OKTO_NEURON_MLFLOW_TRACKING_URI is set (...) but mlflow is not installed ...</code> line on stderr, and <code>okto-neuron serve</code> writes the
+same text to the daemon log as a <code>telemetry.unavailable</code> event. The installer
+adds the extra when <code>OKTO_NEURON_TELEMETRY=1</code> or the tracking URI is set.</p>
 <h2 id="docs__observability--the-shape-of-an-operation-nested-spans">The shape of an operation: nested spans</h2>
 <p>A completion is a call, not an operation. One <code>ask</code> is a retrieval and a
 synthesis — two on the subgraph path, one per tier — and exporting each call as

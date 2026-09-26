@@ -39,6 +39,7 @@ wall-clock window of a call that has already finished.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import queue
@@ -201,6 +202,45 @@ def enabled() -> bool:
     return tracking_uri() is not None
 
 
+#: What an operator runs to get the missing dependency. The installer adds the
+#: ``telemetry`` extra when this is set (or when the tracking URI is).
+_MISSING_MLFLOW_FIX = "re-run the Okto Neuron installer with OKTO_NEURON_TELEMETRY=1"
+_MISSING_MLFLOW_REPORTED = False
+
+
+def _missing_mlflow_message(uri: str) -> str:
+    return (
+        f"{ENV_TRACKING_URI} is set ({uri}) but mlflow is not installed, so no "
+        f"LLM call will be traced. Fix: {_MISSING_MLFLOW_FIX} (adds the "
+        "'telemetry' extra), then restart the daemon."
+    )
+
+
+def missing_mlflow_warning() -> str | None:
+    """The startup warning for "export requested, but mlflow is not installed".
+
+    Without it that state looked like success: nothing was said until the first
+    LLM call, and then as "... talking to <uri> (... check the server)" with a
+    traceback, which points at the server rather than the missing package.
+    Uses ``find_spec`` so the check stays free of mlflow's import cost; a
+    broken-but-present install is still caught (and warned about) lazily.
+    Returns ``None`` when telemetry is off or mlflow is present. Marks the
+    condition reported, so the lazy path does not warn a second time.
+    """
+    global _MISSING_MLFLOW_REPORTED
+    uri = tracking_uri()
+    if uri is None:
+        return None
+    try:
+        missing = importlib.util.find_spec("mlflow") is None
+    except (ImportError, ValueError):
+        missing = True
+    if not missing:
+        return None
+    _MISSING_MLFLOW_REPORTED = True
+    return _missing_mlflow_message(uri)
+
+
 def _warn_once(message: str, *args: object, **kwargs: Any) -> None:
     """First failure warns; every later one drops to DEBUG.
 
@@ -354,6 +394,12 @@ def _resolve_client_locked() -> tuple[Any, str] | None:
         if generation != _CLIENT_GENERATION:
             return None  # reset while we were in flight: not ours to publish
         _CLIENT_FAILED = True
+        if isinstance(exc, ImportError) and (exc.name or "").split(".", 1)[0] == "mlflow":
+            if _MISSING_MLFLOW_REPORTED:
+                logger.debug("MLflow telemetry disabled: mlflow is not installed")
+            else:
+                _warn_once("%s", _missing_mlflow_message(uri))
+            return None
         _warn_once(
             "MLflow telemetry disabled for this process: %s talking to %s "
             "(install the 'telemetry' extra and check the server)",
@@ -643,7 +689,7 @@ def _reset_for_tests() -> None:
     holds only the old queue and dies with the process.
     """
     global _CLIENT, _EXPERIMENT_ID, _CLIENT_FAILED, _WARNED, _QUEUE, _WORKER
-    global _CLIENT_LOCK, _CLIENT_GENERATION
+    global _CLIENT_LOCK, _CLIENT_GENERATION, _MISSING_MLFLOW_REPORTED
     # A detached drain thread may still be inside a slow resolution, holding the
     # old lock and about to publish. A fresh lock means the next test never
     # queues behind it; the generation bump means its result is discarded.
@@ -653,6 +699,7 @@ def _reset_for_tests() -> None:
     _EXPERIMENT_ID = None
     _CLIENT_FAILED = False
     _WARNED = False
+    _MISSING_MLFLOW_REPORTED = False
     _QUEUE = None
     _WORKER = None
 

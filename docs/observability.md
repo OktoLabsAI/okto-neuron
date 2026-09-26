@@ -12,6 +12,7 @@ Install the optional extra and point Okto Neuron at a tracking server:
 
 ```bash
 uv sync --group telemetry                    # or: pip install "okto-neuron[telemetry]"
+# installed tool: re-run the installer with OKTO_NEURON_TELEMETRY=1
 
 export OKTO_NEURON_MLFLOW_TRACKING_URI=http://my-mlflow-host:5000
 export OKTO_NEURON_MLFLOW_EXPERIMENT=my-experiment      # optional
@@ -82,6 +83,12 @@ daemon was started before the variable was exported, `mlflow` is not installed
 in the environment that runs the daemon (the optional `telemetry` extra), or the
 server is unreachable — the last one warns once and then stays quiet by design,
 since telemetry must never take a request down with it.
+
+A missing `mlflow` is reported at startup, not at the first call: every CLI
+command prints one `warning: OKTO_NEURON_MLFLOW_TRACKING_URI is set (...) but
+mlflow is not installed ...` line on stderr, and `okto-neuron serve` writes the
+same text to the daemon log as a `telemetry.unavailable` event. The installer
+adds the extra when `OKTO_NEURON_TELEMETRY=1` or the tracking URI is set.
 
 ## The shape of an operation: nested spans
 
