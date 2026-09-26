@@ -1044,8 +1044,9 @@ jobs:
         run: |
           # Runs the real install.ps1 (both documented shapes) so the refusal is
           # proven through the script-wide trap, not just the isolated function.
-          # The child writes to stderr; exit codes are checked explicitly.
-          $ErrorActionPreference = "Continue"
+          # The child's streams go straight to files: captured with `&`, Windows
+          # PowerShell 5.1 splits each stderr line into its own NativeCommandError
+          # record, which breaks the message apart.
           $install = Join-Path $PWD "install.ps1"
           $iexRunner = Join-Path $env:RUNNER_TEMP "run-install-iex.ps1"
           Set-Content -LiteralPath $iexRunner -Value "Get-Content -Raw -LiteralPath '$install' | Invoke-Expression"
@@ -1058,15 +1059,18 @@ jobs:
             @{ Name = "MARGINALIA_LLM_PROVIDER"; Script = $install }
           )) {
             Set-Item -Path "Env:$($case.Name)" -Value "skip"
-            $out = Join-Path $env:RUNNER_TEMP "preseed-refusal.out"
-            & powershell -NoProfile -ExecutionPolicy Bypass -File $case.Script *> $out
-            $code = $LASTEXITCODE
+            $stdout = Join-Path $env:RUNNER_TEMP "preseed-refusal.stdout"
+            $stderr = Join-Path $env:RUNNER_TEMP "preseed-refusal.stderr"
+            $child = Start-Process -FilePath powershell -Wait -PassThru -NoNewWindow `
+              -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($case.Script)`"") `
+              -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+            $code = $child.ExitCode
             Remove-Item -Path "Env:$($case.Name)"
-            $text = Get-Content -Raw -LiteralPath $out
+            $text = (Get-Content -Raw -LiteralPath $stdout) + (Get-Content -Raw -LiteralPath $stderr)
             $text | Out-Host
             if ($code -eq 0) { throw "$($case.Name) preseed without a vault was accepted ($($case.Script))" }
-            # Compare without line wrapping (and pwsh 7's "|" error gutter).
-            $flat = ($text -replace '\r?\n[ \t]*\|', '') -replace '\s', ''
+            # Compare without colour codes, line wrapping and pwsh 7's "|" error gutter.
+            $flat = (($text -replace '\x1b\[[0-9;?]*[A-Za-z]', '') -replace '\r?\n[ \t]*\|', '') -replace '\s', ''
             if (-not $flat.Contains(($expected -replace '\s', ''))) {
               throw "refusal message missing ($($case.Name), $($case.Script))"
             }
