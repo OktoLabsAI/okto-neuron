@@ -537,6 +537,24 @@ def test_ignored_override_echo_is_canonical_for_case_and_whitespace(
     Vault.init(registry_home / "beta", packs=["core"]).close()
     state = _state(None, None)
     ignored: list[str] = []
+    # A differently-cased name only resolves where the filesystem folds case
+    # (macOS, Windows). On a case-sensitive filesystem (Linux) it names no vault,
+    # and the override must error rather than be echoed as a benign "ignored".
+    if not (registry_home / supplied.strip()).exists():
+        try:
+            with pytest.raises(VaultResolutionError) as excinfo:
+                resolve_runtime_selector(
+                    "alpha",
+                    is_loopback=True,
+                    state=state,
+                    vault=supplied,
+                    override_ignored=ignored,
+                )
+            assert excinfo.value.code == "unknown_vault"
+            assert ignored == []
+        finally:
+            state.close()
+        return
     try:
         runtime = resolve_runtime_selector(
             "alpha", is_loopback=True, state=state, vault=supplied, override_ignored=ignored
