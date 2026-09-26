@@ -20,6 +20,10 @@ tests/golden/datasets/synthetic-ci/frozen-vault/.marginalia/*
 !tests/golden/datasets/synthetic-ci/frozen-vault/*.lbug
 docs/private-corpus-pilot-log.*.json
 
+# Private raw Windows transcripts from bin/test-install.ps1; only the
+# sanitized evidence-*.public.log may be committed.
+*.private.raw.log
+
 # OS / editor cruft
 .DS_Store
 

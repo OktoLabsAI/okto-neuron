@@ -9,7 +9,8 @@ name: distribution-gate
 #   parity            shell syntax/shellcheck, preseed refusal, tester contract
 #                     and marker order, installer/manifest/docs parity, and, once
 #                     release-manifest.json exists, the published GitHub Release
-#                     (tag, prerelease, asset digest) and the public wheel's
+#                     (tag, prerelease or committed Windows lifecycle
+#                     evidence, asset digest) and the public wheel's
 #                     checksum and metadata.
 #   bash-transaction  installer helper failure paths, predecessor pre-status
 #                     cleanup, and a real clean install, live-PID refusal,
@@ -344,10 +345,68 @@ jobs:
               raise AssertionError(f"could not read release v{version} (HTTP {error.code})") from error
           assert release["tag_name"] == f"v{version}"
           assert release["draft"] is False, "the release must not be a draft"
-          assert release["prerelease"] is True, (
-              "the release must remain a prerelease while the real interactive "
-              "Windows PowerShell 5.1 lifecycle evidence is outstanding"
-          )
+          # A promoted (non-prerelease) release needs the sanitized public log
+          # of a real interactive Windows PowerShell 5.1 run of
+          # `bin/test-install.ps1 -Profile release-lifecycle`, committed under
+          # evidence/v<version>/. Its lines must carry, in this order, the
+          # profile, the exact public driver commit, INPUT_REDIRECTED=False and
+          # every Windows lifecycle marker ending in WINDOWS_RELEASE_LIFECYCLE_OK.
+          # The private raw transcript never belongs in git.
+          assert not subprocess.run(
+              ["git", "ls-files", "*.private.raw.log"], check=True, capture_output=True, text=True
+          ).stdout.strip(), "a private raw Windows transcript is tracked in git"
+
+          def windows_lifecycle_evidence(version):
+              windows_markers = [
+                  "WINDOWS_RELEASE_LIFECYCLE_PREDECESSOR_STOPPED_UPDATE_OK",
+                  "WINDOWS_RELEASE_LIFECYCLE_APP_FIRST_OK",
+                  "RELEASE_LIFECYCLE_FRESH_INSTALL_OK",
+                  "RELEASE_LIFECYCLE_STATUS_UI_OK",
+                  "RELEASE_LIFECYCLE_STOPPED_UPDATE_OK",
+                  "RELEASE_LIFECYCLE_RUNNING_UPDATE_OK",
+                  "RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK",
+                  "RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK",
+                  "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK",
+                  "RELEASE_LIFECYCLE_ACTIVATION_ROLLBACK_OK",
+                  "RELEASE_LIFECYCLE_FINAL_STOP_OK",
+                  "WINDOWS_RELEASE_LIFECYCLE_OK",
+              ]
+              name = re.compile(r"evidence-\d{8}-\d{6}\.public\.log")
+              directory = Path(f"evidence/v{version}")
+              logs = sorted(p for p in directory.glob("*.public.log") if name.fullmatch(p.name))
+              for log in logs:
+                  lines = [line.strip() for line in log.read_text(encoding="utf-8-sig").splitlines()]
+                  expected = [
+                      lambda line: line == "PROFILE=release-lifecycle",
+                      lambda line: re.fullmatch(r"DRIVER_COMMIT=[0-9a-f]{40}", line) is not None,
+                      lambda line: line == "INPUT_REDIRECTED=False",
+                  ] + [lambda line, marker=marker: line == marker for marker in windows_markers]
+                  commit = None
+                  step = 0
+                  for line in lines:
+                      if step < len(expected) and expected[step](line):
+                          if line.startswith("DRIVER_COMMIT="):
+                              commit = line.split("=", 1)[1]
+                          step += 1
+                  if step < len(expected):
+                      continue
+                  try:
+                      github_api(f"repos/OktoLabsAI/okto-neuron/commits/{commit}")
+                  except urllib.error.HTTPError:
+                      continue
+                  return log
+              return None
+
+          if release["prerelease"] is not True:
+              evidence_log = windows_lifecycle_evidence(version)
+              assert evidence_log is not None, (
+                  "the release must remain a prerelease while the real interactive "
+                  "Windows PowerShell 5.1 lifecycle evidence is outstanding "
+                  f"(no evidence/v{version}/evidence-<timestamp>.public.log with "
+                  "PROFILE=release-lifecycle, a public DRIVER_COMMIT, INPUT_REDIRECTED=False "
+                  "and every Windows lifecycle marker through WINDOWS_RELEASE_LIFECYCLE_OK)"
+              )
+              print(f"promoted release backed by Windows lifecycle evidence {evidence_log}")
           assets = {asset["name"]: asset for asset in release["assets"]}
           assert set(assets) == {wheel, "SHA256SUMS", "release-manifest.json"}, sorted(assets)
           asset = assets[wheel]
