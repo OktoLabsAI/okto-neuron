@@ -88,3 +88,42 @@ def test_preseed_without_vault_is_refused_with_the_real_message(
         assert helper not in output, output
     # Refused before touching anything: no installer state under the sandbox home.
     assert not (tmp_path / ".okto-neuron").exists()
+
+
+_MATCHER_SCRIPT = r"""
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$null, [ref]$null)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq "Test-ClaudeMcpRegistrationMatches" }, $true)
+. ([scriptblock]::Create($fn.Extent.Text))
+$url = "http://127.0.0.1:8201/mcp"
+# U+2714 is what Claude Code 2.1.283 printed (bytes E2 9C 94), 2026-09-26.
+$glyphBytes = [System.Text.Encoding]::UTF8.GetBytes([string][char]0x2714)
+foreach ($codePage in @(65001, 437, 850, 1252)) {
+    $glyph = [System.Text.Encoding]::GetEncoding($codePage).GetString($glyphBytes)
+    foreach ($status in @("$glyph Connected", "$glyph Not Connected", "Not Connected")) {
+        $output = @(
+            "okto-neuron:",
+            "  Scope: User config (available in all your projects)",
+            "  Status: $status",
+            "  Type: http",
+            "  URL: $url"
+        ) -join "`n"
+        "{0}|{1}|{2}" -f $codePage, $status.EndsWith("Not Connected"), (Test-ClaudeMcpRegistrationMatches $output $url)
+    }
+}
+"""
+
+
+def test_mcp_status_glyph_matches_under_any_console_code_page(tmp_path: Path) -> None:
+    """Windows PowerShell 5.1 decodes native output with the OEM code page, so
+    the check mark's three UTF-8 bytes arrive as three characters, some of them
+    letters (cp437: U+0393 U+00A3 U+00F6). A connected registration must still
+    verify, and "Not Connected" must still fail, whatever the code page."""
+    script = tmp_path / "matcher.ps1"
+    script.write_text(_MATCHER_SCRIPT, encoding="utf-8")
+    result = _run(tmp_path, ["-File", str(script), str(INSTALL_PS1)], {})
+    assert result.returncode == 0, result.stdout + result.stderr
+    rows = [line.split("|") for line in result.stdout.split() if "|" in line]
+    assert len(rows) == 12, result.stdout + result.stderr
+    for code_page, negated, matched in rows:
+        assert matched == str(negated != "True"), (code_page, negated, matched, result.stdout)

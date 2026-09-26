@@ -315,7 +315,12 @@ function Test-ClaudeMcpRegistrationMatches([string]$Output, [string]$ExpectedUrl
     $type = $typeMatches[0].Groups[1].Value
     $url = $urlMatches[0].Groups[1].Value
     $hasUserScope = $scope -cmatch ('^' + $ScopeLabel + ' config(?:[ \t]+\([^()]*\))?$')
-    $isConnected = $status -cmatch '^(?:[^\p{L}\p{N}\s]\s*)?Connected$'
+    # Claude prints a glyph before "Connected" (U+2713). When the console
+    # output encoding is not UTF-8 (Windows PowerShell 5.1 defaults to the OEM
+    # code page) its three UTF-8 bytes decode as three non-ASCII characters,
+    # some of them letters (e.g. cp437 "Γ£ô"). Accept one symbol or a run of
+    # non-ASCII characters as the glyph; "Not Connected" still fails.
+    $isConnected = $status -cmatch '^(?:[^\p{L}\p{N}\s]|[^\x00-\x7F]+)?\s*Connected$'
     return ($hasUserScope -and $isConnected -and $type -ceq "http" -and
         $url -ceq $ExpectedUrl)
 }

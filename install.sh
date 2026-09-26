@@ -316,8 +316,13 @@ claude_mcp_registration_matches() {
   printf '%s\n' "${output}" | grep -Eq \
     "^[[:space:]]*Scope:[[:space:]]*${scope_label} config([[:space:]]+\\([^()]*\\))?[[:space:]]*\$" \
     || return 1
-  printf '%s\n' "${output}" | grep -Eq \
-    '^[[:space:]]*Status:[[:space:]]*([^[:alnum:]][[:space:]]*)?Connected[[:space:]]*$' \
+  # Claude prints a glyph before "Connected" (e.g. U+2713, three UTF-8 bytes).
+  # Match bytes, not characters: under LANG unset / C the glyph is three
+  # "characters", and under a UTF-8 locale it is one. LC_ALL=C makes the
+  # result identical in both; a run of non-alphanumeric, non-space bytes is
+  # the glyph, so "Not Connected" still fails.
+  printf '%s\n' "${output}" | LC_ALL=C grep -Eq \
+    '^[[:space:]]*Status:[[:space:]]*([^[:alnum:][:space:]]+[[:space:]]*)?Connected[[:space:]]*$' \
     || return 1
   printf '%s\n' "${output}" | grep -Eq \
     '^[[:space:]]*Type:[[:space:]]*http[[:space:]]*$' || return 1

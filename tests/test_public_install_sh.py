@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = REPO_ROOT / "install.sh"
 RELEASE_ARTIFACT_GATE = REPO_ROOT / ".github" / "workflows" / "release-artifact-gate.yml"
@@ -424,6 +426,54 @@ def test_public_installer_accepts_only_connected_matching_user_mcp_get(
             check=False,
         )
         assert (result.returncode == 0) is should_match, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("locale", ["C", "C.UTF-8", None])
+def test_public_installer_verifies_connected_mcp_get_in_any_locale(
+    tmp_path: Path, locale: str | None
+) -> None:
+    """The check-mark glyph is 3 bytes: under LANG unset / C it was 3 chars.
+
+    `claude mcp get` output as Claude Code 2.1.283 printed it in a clean
+    ubuntu:24.04 container with no LANG set (2026-09-26, token redacted). Its
+    Status bytes were E2 9C 94 (U+2714). Before the fix the installer died
+    with "did not verify as a connected user-scope endpoint" although Claude
+    said Connected.
+    """
+    helpers = _script().split("trap installer_exit EXIT", 1)[0]
+    helper_path = tmp_path / "installer-helpers.sh"
+    helper_path.write_text(helpers, encoding="utf-8")
+    url = "http://127.0.0.1:8201/mcp"
+    connected = (
+        "okto-neuron:\n"
+        "  Scope: User config (available in all your projects)\n"
+        "  Status: \u2714 Connected\n"
+        "  Type: http\n"
+        f"  URL: {url}\n"
+        "  Headers:\n"
+        "    Authorization: Bearer <redacted>\n"
+        "\n"
+        "To remove this server, run: claude mcp remove okto-neuron -s user\n"
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LC_") and k != "LANG"}
+    if locale is not None:
+        env["LANG"] = locale
+        env["LC_ALL"] = locale
+    for output, should_match in (
+        (connected, True),
+        (connected.replace("\u2714", "\u2713"), True),
+        (connected.replace("\u2714 Connected", "\u2718 Failed to connect"), False),
+        (connected.replace("\u2714 Connected", "Not Connected"), False),
+        (connected.replace("\u2714 Connected", "\u2714 Not Connected"), False),
+    ):
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; claude_mcp_registration_matches "$2" "$3"',
+             "bash", str(helper_path), output, url],
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        assert (result.returncode == 0) is should_match, (locale, output, result.stderr)
 
 
 # -- Marginalia -> Okto Neuron upgrade path (0.3.0) ---------------------------

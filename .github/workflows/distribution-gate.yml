@@ -1127,6 +1127,18 @@ jobs:
           if (-not (Test-ClaudeMcpRegistrationMatches $decoratedConnectedUser $expectedUrl)) {
             throw "decorated connected user-scope registration was rejected"
           }
+          # The glyph's UTF-8 bytes as a non-UTF-8 console decodes them.
+          $glyphBytes = [System.Text.Encoding]::UTF8.GetBytes([string][char]0x2713)
+          foreach ($codePage in @(437, 850, 1252)) {
+            $mojibake = [System.Text.Encoding]::GetEncoding($codePage).GetString($glyphBytes)
+            $mojibakeConnected = $decoratedConnectedUser.Replace([string][char]0x2713, $mojibake)
+            if (-not (Test-ClaudeMcpRegistrationMatches $mojibakeConnected $expectedUrl)) {
+              throw "connected registration decoded as code page $codePage was rejected"
+            }
+            if (Test-ClaudeMcpRegistrationMatches $mojibakeConnected.Replace("Connected", "Not Connected") $expectedUrl) {
+              throw "Not Connected decoded as code page $codePage was accepted"
+            }
+          }
 
           $invalidRegistrations = @(
             (@(
