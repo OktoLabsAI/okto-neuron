@@ -1405,6 +1405,9 @@ jobs:
           if ([regex]::Matches($tester, 'function Invoke-TestNative\(').Count -ne 2) {
             throw "Invoke-TestNative must be defined in both the driver and its child runner"
           }
+          # The runner's powershell shell exits with the last native exit code,
+          # which here is the deliberate `exit /b 3` above.
+          $global:LASTEXITCODE = 0
           "WINDOWS_NATIVE_STDERR_OK"
 
       - name: Verify fail-closed PID record guard
