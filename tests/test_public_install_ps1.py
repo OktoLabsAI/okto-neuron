@@ -127,3 +127,138 @@ def test_mcp_status_glyph_matches_under_any_console_code_page(tmp_path: Path) ->
     assert len(rows) == 12, result.stdout + result.stderr
     for code_page, negated, matched in rows:
         assert matched == str(negated != "True"), (code_page, negated, matched, result.stdout)
+
+
+FAKE_CLAUDE = REPO_ROOT / "tests" / "fixtures" / "fake-claude-mcp.sh"
+_MCP_URL = "http://127.0.0.1:8201/mcp"
+_TOKEN = "daemon-credential-0123456789"
+
+# Loads the installer's real helper functions (by AST, so nothing else in the
+# script runs) and then its real Claude Code wiring block, with the daemon
+# either verified running or intentionally left stopped.
+_WIRING_SCRIPT = r"""
+param([string]$Installer, [string]$Started)
+$ErrorActionPreference = "Stop"
+$text = Get-Content -Raw -LiteralPath $Installer
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$null)
+$names = @("Step", "Info", "Warn", "Die", "Test-ClaudeMcpRegistrationMatches",
+    "Test-ClaudeMcpRegistrationWritten", "Get-ClaudeMcpRegistrationScope", "Get-ScopeLabel",
+    "Test-McpRegistrationVerified", "Register-Mcp", "Remove-LegacyMcp")
+foreach ($fn in $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $names }, $true)) {
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$CliName = "okto-neuron"
+$LegacyCliName = "marginalia"
+$globalUrl = $env:TEST_MCP_URL
+$authToken = $env:TEST_TOKEN
+$serverStarted = ($Started -eq "1")
+$mcpWired = $false
+$mcpScopeWired = ""
+$script:LegacyMcpRemovedScope = ""
+$start = $text.IndexOf('if ($env:OKTO_NEURON_NO_MCP -eq "1") {')
+$end = $text.IndexOf("# The daemon itself stays headless")
+. ([scriptblock]::Create($text.Substring($start, $end - $start)))
+"LEGACY_REMOVED_SCOPE=$($script:LegacyMcpRemovedScope)"
+"""
+
+
+def _seed_mcp_entry(state: Path, name: str, token: str, scope: str = "user") -> None:
+    (state / name).write_text(
+        f"{scope}\n{_MCP_URL}\nAuthorization: Bearer {token}\n", encoding="utf-8"
+    )
+
+
+def _run_wiring(
+    tmp_path: Path, *, server_started: bool, status: str
+) -> subprocess.CompletedProcess[str]:
+    script = tmp_path / "wiring.ps1"
+    script.write_text(_WIRING_SCRIPT, encoding="utf-8")
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir(exist_ok=True)
+    if not (fake_bin / "claude").exists():
+        (fake_bin / "claude").symlink_to(FAKE_CLAUDE)
+    return _run(
+        tmp_path,
+        ["-File", str(script), str(INSTALL_PS1), "1" if server_started else "0"],
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_CLAUDE_STATE": str(tmp_path / "state"),
+            "FAKE_CLAUDE_STATUS": status,
+            "TEST_MCP_URL": _MCP_URL,
+            "TEST_TOKEN": _TOKEN,
+        },
+    )
+
+
+def test_stopped_daemon_update_registers_okto_neuron_and_removes_marginalia(
+    tmp_path: Path,
+) -> None:
+    """The install.ps1 twin of the install.sh fix: with the daemon left stopped
+    the new entry is verified as written, and the old `marginalia` entry is
+    still replaced (before, the update died with "did not verify as a
+    connected user-scope endpoint")."""
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+
+    result = _run_wiring(tmp_path, server_started=False, status="failed")
+
+    output = _flat(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in state.iterdir()) == ["okto-neuron"], output
+    assert (state / "okto-neuron").read_text(encoding="utf-8").splitlines() == [
+        "user",
+        _MCP_URL,
+        f"Authorization: Bearer {_TOKEN}",
+    ]
+    assert _flat("removed the old 'marginalia' user-scope entry") in output
+    assert _flat("it connects on the next 'okto-neuron serve'") in output
+    assert _flat("LEGACY_REMOVED_SCOPE=user") in output
+    assert _TOKEN not in result.stdout + result.stderr
+
+
+def test_stopped_daemon_rerun_preserves_the_written_entry(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+    _seed_mcp_entry(state, "okto-neuron", _TOKEN)
+
+    result = _run_wiring(tmp_path, server_started=False, status="failed")
+
+    output = _flat(result.stdout + result.stderr)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(p.name for p in state.iterdir()) == ["okto-neuron"], output
+    assert _flat("preserved configured 'okto-neuron' user-scope registration") in output
+
+
+def test_stopped_daemon_refuses_an_entry_with_another_credential(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+    _seed_mcp_entry(state, "okto-neuron", "some-other-credential")
+
+    result = _run_wiring(tmp_path, server_started=False, status="failed")
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert _flat("Claude MCP registration conflict") in _flat(result.stdout + result.stderr)
+    assert sorted(p.name for p in state.iterdir()) == ["marginalia", "okto-neuron"]
+
+
+def test_running_daemon_still_requires_a_connected_entry(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+
+    failed = _run_wiring(tmp_path, server_started=True, status="failed")
+    assert failed.returncode != 0, failed.stdout + failed.stderr
+    assert _flat("did not verify as a connected user-scope endpoint") in _flat(
+        failed.stdout + failed.stderr
+    )
+    assert (state / "marginalia").exists()
+
+    (state / "okto-neuron").unlink()
+    connected = _run_wiring(tmp_path, server_started=True, status="connected")
+    assert connected.returncode == 0, connected.stdout + connected.stderr
+    assert sorted(p.name for p in state.iterdir()) == ["okto-neuron"]
+    assert "connects on the next" not in connected.stdout

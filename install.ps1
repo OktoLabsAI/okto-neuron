@@ -331,6 +331,29 @@ function Test-ClaudeMcpRegistrationMatches([string]$Output, [string]$ExpectedUrl
         $url -ceq $ExpectedUrl)
 }
 
+# The same entry checked without a running daemon, which Claude can only report
+# as "Failed to connect". Everything the installer wrote is verified instead:
+# one entry, the scope, http type, the URL, and one Authorization header
+# carrying exactly this daemon's credential.
+function Test-ClaudeMcpRegistrationWritten([string]$Output, [string]$ExpectedUrl, [string]$ScopeLabel, [string]$Token) {
+    if (-not $Output -or -not $ExpectedUrl -or -not $Token) { return $false }
+
+    $fieldPattern = '(?m)^[ \t]*{0}:[ \t]*([^\r\n]*?)[ \t]*\r?$'
+    $scopeMatches = [regex]::Matches($Output, ($fieldPattern -f "Scope"))
+    $typeMatches = [regex]::Matches($Output, ($fieldPattern -f "Type"))
+    $urlMatches = [regex]::Matches($Output, ($fieldPattern -f "URL"))
+    $authMatches = [regex]::Matches($Output, ($fieldPattern -f "Authorization"))
+    if ($scopeMatches.Count -ne 1 -or $typeMatches.Count -ne 1 -or
+        $urlMatches.Count -ne 1 -or $authMatches.Count -ne 1) {
+        return $false
+    }
+
+    $hasScope = $scopeMatches[0].Groups[1].Value -cmatch ('^' + $ScopeLabel + ' config(?:[ \t]+\([^()]*\))?$')
+    return ($hasScope -and $typeMatches[0].Groups[1].Value -ceq "http" -and
+        $urlMatches[0].Groups[1].Value -ceq $ExpectedUrl -and
+        $authMatches[0].Groups[1].Value -ceq "Bearer $Token")
+}
+
 function Get-ClaudeMcpRegistrationScope([string]$Output) {
     if ($Output -cmatch '(?m)^\s*Scope:\s*Local config(?:\s+\([^()]*\))?\s*$') {
         return "local"
@@ -1154,7 +1177,9 @@ $script:BackupRoot = $null
 # Upgrading from Marginalia: the daemon keeps its port and adopts the old
 # credential, so an existing `marginalia` entry keeps working until it is
 # replaced. `okto-neuron` is registered in the scope the old entry had (user or
-# local) and verified as connected (Claude Code's own health check). Only then is
+# local) and verified as connected (Claude Code's own health check), or, when
+# the daemon was intentionally left stopped, verified as written (scope, URL,
+# credential), since nothing can connect yet. Only then is
 # the old `marginalia` entry in that same scope removed, and only when it pointed
 # at this same endpoint. If the installer fails after that removal, the trap adds
 # the old entry back exactly as it was. A project entry (a shared .mcp.json file)
@@ -1175,17 +1200,29 @@ function Get-ScopeLabel([string]$Scope) {
     }
 }
 
+# With the daemon running, Claude's own health check must report the entry as
+# Connected. With the daemon intentionally stopped (an update of a stopped
+# install, or OKTO_NEURON_NO_SERVE=1) nothing can connect, so the entry is
+# verified as written instead: scope, URL and this daemon's credential.
+function Test-McpRegistrationVerified([string]$Output, [string]$Scope) {
+    if ($serverStarted) {
+        return (Test-ClaudeMcpRegistrationMatches $Output $globalUrl (Get-ScopeLabel $Scope))
+    }
+    return (Test-ClaudeMcpRegistrationWritten $Output $globalUrl (Get-ScopeLabel $Scope) $authToken)
+}
+
 function Register-Mcp([string]$Scope) {
+    $kind = if ($serverStarted) { "connected" } else { "configured" }
     $output = (& claude mcp get $CliName 2>&1 | Out-String)
     if ($LASTEXITCODE -eq 0) {
-        if (Test-ClaudeMcpRegistrationMatches $output $globalUrl (Get-ScopeLabel $Scope)) {
+        if (Test-McpRegistrationVerified $output $Scope) {
             $script:mcpWired = $true
             $script:mcpScopeWired = $Scope
-            Info "preserved connected '$CliName' $Scope-scope registration"
+            Info "preserved $kind '$CliName' $Scope-scope registration"
             return $true
         }
         $existingScope = Get-ClaudeMcpRegistrationScope $output
-        Warn "an existing '$CliName' Claude MCP entry is not the connected $Scope-scope endpoint $globalUrl"
+        Warn "an existing '$CliName' Claude MCP entry is not the $kind $Scope-scope endpoint $globalUrl"
         if ($existingScope -in @("local", "project", "user")) {
             Info "resolve it with: claude mcp remove $CliName --scope $existingScope"
         } else {
@@ -1196,9 +1233,8 @@ function Register-Mcp([string]$Scope) {
     & claude mcp add --scope $Scope --transport http $CliName $globalUrl --header "Authorization: Bearer $authToken" 2>$null | Out-Null
     if ($LASTEXITCODE -eq 0) {
         $output = (& claude mcp get $CliName 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0 -or
-            -not (Test-ClaudeMcpRegistrationMatches $output $globalUrl (Get-ScopeLabel $Scope))) {
-            Die "Claude MCP registration was added but did not verify as a connected $Scope-scope endpoint"
+        if ($LASTEXITCODE -ne 0 -or -not (Test-McpRegistrationVerified $output $Scope)) {
+            Die "Claude MCP registration was added but did not verify as a $kind $Scope-scope endpoint"
         }
         $script:mcpWired = $true
         $script:mcpScopeWired = $Scope
@@ -1209,7 +1245,8 @@ function Register-Mcp([string]$Scope) {
     return $false
 }
 
-# Called only after Register-Mcp verified the new entry as connected.
+# Called only after Register-Mcp verified the new entry (connected, or as
+# written while the daemon is stopped).
 function Remove-LegacyMcp([string]$Scope, [string]$LegacyOutput) {
     $pointsHere = $false
     foreach ($line in ($LegacyOutput -split "`r?`n")) {
@@ -1253,6 +1290,9 @@ if ($env:OKTO_NEURON_NO_MCP -eq "1") {
         if ($legacyMcpScope -eq "project") {
             Warn "a project-scope '$LegacyCliName' entry (.mcp.json) was left unchanged; it still works, and you can rename it to '$CliName' in that file"
         }
+    }
+    if ($mcpWired -and -not $serverStarted) {
+        Info "the daemon is not running, so Claude Code lists '$CliName' as failed to connect; it connects on the next '$CliName serve'"
     }
 } else {
     Step "Claude Code CLI not found"

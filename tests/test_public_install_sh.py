@@ -633,3 +633,182 @@ def test_public_installer_shell_scripts_pass_bash_syntax_check() -> None:
     for path in (REPO_ROOT / "install.sh", REPO_ROOT / "bin" / "test-install.sh"):
         result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
+
+
+FAKE_CLAUDE = REPO_ROOT / "tests" / "fixtures" / "fake-claude-mcp.sh"
+_MCP_URL = "http://127.0.0.1:8201/mcp"
+_TOKEN = "daemon-credential-0123456789"
+
+
+def _seed_mcp_entry(state: Path, name: str, token: str, scope: str = "user") -> None:
+    (state / name).write_text(
+        f"{scope}\n{_MCP_URL}\nAuthorization: Bearer {token}\n", encoding="utf-8"
+    )
+
+
+def _run_mcp_wiring(
+    tmp_path: Path, *, server_started: bool, status: str
+) -> subprocess.CompletedProcess[str]:
+    """Run the installer's real Claude Code wiring section (step 7) against the
+    fake `claude`, with the daemon either verified running or left stopped."""
+    text = _script()
+    helpers = tmp_path / "helpers.sh"
+    helpers.write_text(text[: text.index("trap installer_exit EXIT")], encoding="utf-8")
+    wiring = tmp_path / "wiring.sh"
+    wiring.write_text(
+        text[text.index("# ── 7. wire Claude Code") : text.index("# The daemon itself stays headless")],
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir(exist_ok=True)
+    if not (fake_bin / "claude").exists():
+        (fake_bin / "claude").symlink_to(FAKE_CLAUDE)
+    home = tmp_path / "home"
+    (home / ".okto-neuron").mkdir(parents=True, exist_ok=True)
+    (home / ".okto-neuron" / "daemon-7777.token").write_text(f"{_TOKEN}\n", encoding="utf-8")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("OKTO_NEURON_", "MARGINALIA_"))
+    }
+    env.update(
+        HOME=str(home),
+        PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        FAKE_CLAUDE_STATE=str(tmp_path / "state"),
+        FAKE_CLAUDE_STATUS=status,
+        NO_COLOR="1",
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; SERVER_STARTED="$3"; source "$2"',
+            "bash",
+            str(helpers),
+            str(wiring),
+            "1" if server_started else "",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_stopped_daemon_update_registers_okto_neuron_and_removes_marginalia(
+    tmp_path: Path,
+) -> None:
+    """Updating a stopped Marginalia install: nothing can connect, so the new
+    entry is verified as written and the old one is still replaced.
+
+    Before the fix this died with "Claude MCP registration was added but did
+    not verify as a connected user-scope endpoint" and left `marginalia` in
+    place (seen upgrading a real Mac from 0.2.0, 2026-09-26)."""
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+
+    result = _run_mcp_wiring(tmp_path, server_started=False, status="failed")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert sorted(p.name for p in state.iterdir()) == ["okto-neuron"], output
+    assert (state / "okto-neuron").read_text(encoding="utf-8").splitlines() == [
+        "user",
+        _MCP_URL,
+        f"Authorization: Bearer {_TOKEN}",
+    ]
+    assert "registered and verified the app-scoped 'okto-neuron' MCP endpoint (user scope)" in output
+    assert "removed the old 'marginalia' user-scope entry" in output
+    assert "it connects on the next 'okto-neuron serve'" in output
+    assert _TOKEN not in output
+
+
+def test_stopped_daemon_rerun_preserves_the_written_entry(tmp_path: Path) -> None:
+    """A re-run after the failed update above finds both entries."""
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+    _seed_mcp_entry(state, "okto-neuron", _TOKEN)
+
+    result = _run_mcp_wiring(tmp_path, server_started=False, status="failed")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert sorted(p.name for p in state.iterdir()) == ["okto-neuron"], output
+    assert "preserved configured 'okto-neuron' user-scope registration" in output
+
+
+def test_stopped_daemon_refuses_an_entry_with_another_credential(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+    _seed_mcp_entry(state, "okto-neuron", "some-other-credential")
+
+    result = _run_mcp_wiring(tmp_path, server_started=False, status="failed")
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "Claude MCP registration conflict" in output
+    assert sorted(p.name for p in state.iterdir()) == ["marginalia", "okto-neuron"]
+
+
+def test_running_daemon_still_requires_a_connected_entry(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    _seed_mcp_entry(state, "marginalia", _TOKEN)
+
+    failed = _run_mcp_wiring(tmp_path, server_started=True, status="failed")
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert "did not verify as a connected user-scope endpoint" in failed.stderr
+    assert (state / "marginalia").exists()
+
+    (state / "okto-neuron").unlink()
+    connected = _run_mcp_wiring(tmp_path, server_started=True, status="connected")
+    assert connected.returncode == 0, connected.stdout + connected.stderr
+    assert sorted(p.name for p in state.iterdir()) == ["okto-neuron"]
+    assert "connects on the next" not in connected.stdout
+
+
+def test_written_registration_check_verifies_every_field(tmp_path: Path) -> None:
+    helpers = tmp_path / "helpers.sh"
+    text = _script()
+    helpers.write_text(text[: text.index("trap installer_exit EXIT")], encoding="utf-8")
+    written = (
+        "okto-neuron:\n"
+        "  Scope: User config (available in all your projects)\n"
+        "  Status: ✘ Failed to connect\n"
+        "  Issue: ECONNREFUSED: Unable to connect.\n"
+        "  Type: http\n"
+        f"  URL: {_MCP_URL}\n"
+        "  Headers:\n"
+        f"    Authorization: Bearer {_TOKEN}\n"
+    )
+    cases = (
+        (written, _TOKEN, True),
+        (written, "", False),
+        (written, "other", False),
+        (written.replace(f"Bearer {_TOKEN}", f"Bearer {_TOKEN}x"), _TOKEN, False),
+        (written.replace(f"    Authorization: Bearer {_TOKEN}\n", ""), _TOKEN, False),
+        (f"{written}    Authorization: Bearer other\n", _TOKEN, False),
+        (written.replace("User config", "Local config"), _TOKEN, False),
+        (written.replace("Type: http", "Type: stdio"), _TOKEN, False),
+        (written.replace(_MCP_URL, "http://127.0.0.1:9999/mcp"), _TOKEN, False),
+    )
+    for output, token, should_match in cases:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; claude_mcp_registration_written "$2" "$3" User "$4"',
+                "bash",
+                str(helpers),
+                output,
+                _MCP_URL,
+                token,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (result.returncode == 0) is should_match, (output, token, result.stderr)

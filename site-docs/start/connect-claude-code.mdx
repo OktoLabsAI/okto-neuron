@@ -103,7 +103,10 @@ Code and then either re-run the installer or register the endpoint yourself.
 Releases up to 0.2.0 registered the server as `marginalia`. On an upgrade the installer
 registers `okto-neuron` in the scope the old entry had (user or local) and checks that it
 connects. Only then does it remove the old `marginalia` entry from that same scope, and only if
-that entry pointed at `http://127.0.0.1:8201/mcp`. If the installer fails after the removal, it
+that entry pointed at `http://127.0.0.1:8201/mcp`. If the daemon was stopped before the upgrade,
+it stays stopped and nothing can connect yet, so the installer checks the entry it wrote instead
+(scope, URL, and the daemon's own credential in the `Authorization` header) and says it connects
+on the next `okto-neuron serve`. If the installer fails after the removal, it
 adds the `marginalia` entry back as it was. A `marginalia` entry in project scope (a shared
 `.mcp.json`) is left alone; rename it to `okto-neuron` in that file yourself. Tools then appear
 as `mcp__okto-neuron__*` instead of `mcp__marginalia__*`.

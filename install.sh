@@ -341,6 +341,37 @@ claude_mcp_registration_matches() {
   '
 }
 
+# The same entry checked without a running daemon, which Claude can only
+# report as "Failed to connect". Everything the installer wrote is verified
+# instead: one entry, the scope, http type, the URL, and one Authorization
+# header carrying exactly this daemon's credential.
+claude_mcp_registration_written() {
+  local output="$1" expected_url="$2" scope_label="$3" token="$4"
+  [ -n "${token}" ] || return 1
+  printf '%s\n' "${output}" | awk '
+    $1 == "Scope:" { scope += 1 }
+    $1 == "Type:" { type += 1 }
+    $1 == "URL:" { url += 1 }
+    $1 == "Authorization:" { auth += 1 }
+    END { exit(scope == 1 && type == 1 && url == 1 && auth == 1 ? 0 : 1) }
+  ' || return 1
+  printf '%s\n' "${output}" | grep -Eq \
+    "^[[:space:]]*Scope:[[:space:]]*${scope_label} config([[:space:]]+\\([^()]*\\))?[[:space:]]*\$" \
+    || return 1
+  printf '%s\n' "${output}" | grep -Eq \
+    '^[[:space:]]*Type:[[:space:]]*http[[:space:]]*$' || return 1
+  printf '%s\n' "${output}" | awk -v expected="${expected_url}" '
+    $1 == "URL:" && $2 == expected && NF == 2 { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' || return 1
+  # The credential goes through the environment, not awk -v (no escape
+  # processing, not on a command line).
+  printf '%s\n' "${output}" | MCP_EXPECTED_BEARER="${token}" awk '
+    $1 == "Authorization:" && $2 == "Bearer" && $3 == ENVIRON["MCP_EXPECTED_BEARER"] && NF == 3 { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 claude_mcp_registration_scope() {
   local output="$1"
   if printf '%s\n' "${output}" | grep -Eq \
@@ -1194,7 +1225,9 @@ migrate_launch_agent
 # Upgrading from Marginalia: the daemon keeps its port and adopts the old
 # credential, so an existing `marginalia` entry keeps working until it is
 # replaced. `okto-neuron` is registered in the scope the old entry had (user or
-# local) and verified as connected (Claude Code's own health check). Only then is
+# local) and verified as connected (Claude Code's own health check), or, when
+# the daemon was intentionally left stopped, verified as written (scope, URL,
+# credential), since nothing can connect yet. Only then is
 # the old `marginalia` entry in that same scope removed, and only when it pointed
 # at this same endpoint. If the installer fails after that removal, the EXIT trap
 # adds the old entry back exactly as it was (same scope, URL and credential). A
@@ -1219,18 +1252,31 @@ scope_label() {
   esac
 }
 
+# With the daemon running, Claude's own health check must report the entry as
+# Connected. With the daemon intentionally stopped (an update of a stopped
+# install, or OKTO_NEURON_NO_SERVE=1) nothing can connect, so the entry is
+# verified as written instead: scope, URL and this daemon's credential.
+mcp_registration_verified() {
+  if [ -n "${SERVER_STARTED}" ]; then
+    claude_mcp_registration_matches "$1" "${GLOBAL_URL}" "$(scope_label "$2")"
+  else
+    claude_mcp_registration_written "$1" "${GLOBAL_URL}" "$(scope_label "$2")" "${AUTH_TOKEN}"
+  fi
+}
+
 register_mcp() {
-  local scope="$1" output=""
+  local scope="$1" output="" kind="connected"
+  [ -n "${SERVER_STARTED}" ] || kind="configured"
   if output="$(claude mcp get "${CLI}" 2>&1)"; then
-    if claude_mcp_registration_matches "${output}" "${GLOBAL_URL}" "$(scope_label "${scope}")"; then
+    if mcp_registration_verified "${output}" "${scope}"; then
       MCP_WIRED="1"
       MCP_SCOPE_WIRED="${scope}"
-      info "preserved connected '${CLI}' ${scope}-scope registration"
+      info "preserved ${kind} '${CLI}' ${scope}-scope registration"
       return 0
     fi
     local existing_scope=""
     existing_scope="$(claude_mcp_registration_scope "${output}")"
-    warn "an existing '${CLI}' Claude MCP entry is not the connected ${scope}-scope endpoint ${GLOBAL_URL}"
+    warn "an existing '${CLI}' Claude MCP entry is not the ${kind} ${scope}-scope endpoint ${GLOBAL_URL}"
     if [ "${existing_scope}" = "local" ] || [ "${existing_scope}" = "project" ] || [ "${existing_scope}" = "user" ]; then
       info "resolve it with: claude mcp remove ${CLI} --scope ${existing_scope}"
     else
@@ -1242,8 +1288,8 @@ register_mcp() {
        "${CLI}" "${GLOBAL_URL}" \
        --header "Authorization: Bearer ${AUTH_TOKEN}" >/dev/null 2>&1; then
     output="$(claude mcp get "${CLI}" 2>&1 || true)"
-    if ! claude_mcp_registration_matches "${output}" "${GLOBAL_URL}" "$(scope_label "${scope}")"; then
-      die "Claude MCP registration was added but did not verify as a connected ${scope}-scope endpoint"
+    if ! mcp_registration_verified "${output}" "${scope}"; then
+      die "Claude MCP registration was added but did not verify as a ${kind} ${scope}-scope endpoint"
     fi
     MCP_WIRED="1"
     MCP_SCOPE_WIRED="${scope}"
@@ -1255,8 +1301,9 @@ register_mcp() {
 }
 
 # Remove the pre-0.3.0 `marginalia` entry from the scope `okto-neuron` now
-# answers in. Called only after register_mcp verified the new entry as
-# connected, and only for an old entry that pointed at this same endpoint.
+# answers in. Called only after register_mcp verified the new entry (connected,
+# or as written while the daemon is stopped), and only for an old entry that
+# pointed at this same endpoint.
 remove_legacy_mcp() {
   local scope="$1" legacy_output="$2" after=""
   if ! claude_mcp_registration_matches "${legacy_output}" "${GLOBAL_URL}" "$(scope_label "${scope}")" \
@@ -1303,6 +1350,9 @@ elif command -v claude >/dev/null 2>&1; then
     if [ "${LEGACY_MCP_SCOPE}" = "project" ]; then
       warn "a project-scope '${LEGACY_CLI}' entry (.mcp.json) was left unchanged; it still works, and you can rename it to '${CLI}' in that file"
     fi
+  fi
+  if [ -n "${MCP_WIRED}" ] && [ -z "${SERVER_STARTED}" ]; then
+    info "the daemon is not running, so Claude Code lists '${CLI}' as failed to connect; it connects on the next '${CLI} serve'"
   fi
 else
   step "Claude Code CLI not found"

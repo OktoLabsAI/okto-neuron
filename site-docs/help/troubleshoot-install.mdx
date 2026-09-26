@@ -166,6 +166,8 @@ claude mcp get okto-neuron
 
 Resolve the entry by hand, then re-run the installer. A registration that does match the connected endpoint is preserved as-is and reported with `preserved connected 'okto-neuron' user-scope registration`.
 
+When the daemon is intentionally stopped (an update of an install whose daemon was not running, or `OKTO_NEURON_NO_SERVE=1`), no entry can show `Connected`. The installer then checks what it wrote: user scope, `Type: http`, the URL, and an `Authorization: Bearer` header with the daemon's own credential. The messages say `configured` instead of `connected` (for example `preserved configured 'okto-neuron' user-scope registration`), and a last line says the entry connects on the next `okto-neuron serve`.
+
 ### Wiring deferred or failed
 
 `Claude Code wiring deferred` means the installer found no daemon credential file to register. Start the daemon, then re-run the installer. `automatic Claude Code registration failed` is a warning: the install stands, the registration does not. You can set `OKTO_NEURON_NO_MCP=1` to have the installer skip this step entirely.
