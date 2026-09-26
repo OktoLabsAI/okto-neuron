@@ -1,0 +1,31 @@
+# Golden dataset manifest — _smoke
+# Throwaway engine-validation dataset: the FIXED synthetic-vault fixture wrapped
+# as a golden dataset. Proves the harness is correct (ingest → drain → recall/ask
+# → provenance byte-hash) on known content before we trust it on real corpora.
+name: _smoke
+description: "Engine smoke test over the fabricated synthetic-vault fixture (known golden cases)."
+
+source:
+  origin: "tests/fixtures/synthetic-vault (in-repo, fabricated, offline)"
+  selected_on: "2026-05-31"
+  rationale: "Reuses the exact fixture + golden queries from tests/eval/golden.py so a
+    green run means the black-box engine reproduces the known-good in-process eval."
+
+settings:
+  embedder: fastembed
+
+files:
+  - authority/agent-alice.md
+  - authority/agent-bob.md
+  - concepts/concept-data-quality.md
+  - concepts/concept-provenance.md
+  - decisions/decision-2025-12-01.md
+  - decisions/decision-2026-02-15.md
+  - decisions/ladybug-kuzu.md
+  - drift_alias.md
+  - drift_commitment.md
+  - drift_supersedence.md
+  - handoff.md
+  - proposals/proposal-acme-2026.md
+  - sows/sow-2026-q1.md
+  - transcripts/transcript-kickoff-2026-01-22.md

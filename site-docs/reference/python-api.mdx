@@ -1,0 +1,386 @@
+---
+title: Vault API (Python)
+description: "Opening a vault in-process: the methods, their parameters, return shapes and errors."
+---
+
+`marginalia.Vault` opens a vault's store directly inside your own Python
+process. The `okto-neuron` CLI's `add`, `query` and `detect-drift` commands do not
+do this: they are HTTP clients over a running daemon
+(`src/okto_neuron/cli/_client.py`). The daemon holds the vault lock while it runs,
+so an in-process `Vault.open` against the same vault fails while it is up. This
+page lists the constructors, the instance methods, the value models they return
+and the exceptions they raise.
+
+<Note>
+Okto Neuron is at version 0.3.0 and is marked `2 - Pre-Alpha` in its packaging
+metadata. Treat every signature here as subject to change.
+</Note>
+
+```python
+from okto_neuron import Vault, ExportScope
+
+with Vault.open("~/vault") as vault:
+    hits = vault.query("retention policy", k=3)
+```
+
+`Vault`, `QueryHit`, `Provenance`, `IngestResult`, `ExportScope`, `Node` and
+`Document` are all re-exported from the `okto-neuron` package root, alongside the
+error classes.
+
+## Opening and creating
+
+### `Vault.open(path)`
+
+Resolves and expands `path`, then opens the store. If the path does not exist it
+raises `VaultNotFoundError`. It reads `okto-neuron.yaml` when one is present and
+carries `compat_allow_external_sources` into the instance, which controls whether
+`add` accepts sources outside the vault root.
+
+<Warning>
+`Vault.open` opens the store through the same locked path the rest of Okto Neuron
+uses. If the vault lock is already held, it raises `VaultLockedError`.
+</Warning>
+
+### `Vault.init(path, ...)`
+
+Creates the vault directory tree, writes the config, opens the store and returns
+a `Vault`. It also sets mode `0o700` on the vault root.
+
+<ParamField path="path" type="str | PathLike[str]" required>
+Vault root. Expanded and resolved.
+</ParamField>
+<ParamField path="packs" type="tuple[str, ...] | list[str]" default='("core",)'>
+Schema packs written into the config.
+</ParamField>
+<ParamField path="embedder" type="str" default='"default"'>
+Embedder name written into the config.
+</ParamField>
+<ParamField path="embedding_provider" type="str | None" default="None">
+Legacy alias. When set, it overwrites `embedder` and turns on
+`allow_external_sources`, and it changes the behaviour on an existing vault (see
+below).
+</ParamField>
+<ParamField path="backend" type="str" default='"ladybug"'>
+Storage backend pinned into `okto-neuron.yaml`.
+</ParamField>
+<ParamField path="storage_uri" type="str | None" default="None" />
+<ParamField path="storage_credential_env" type="str | None" default="None" />
+<ParamField path="storage_database" type="str | None" default="None" />
+<ParamField path="storage_allow_remote" type="bool" default="False" />
+
+<Warning>
+The library default and the CLI default differ. `Vault.init` and
+`Vault.scaffold` default `backend` to `"ladybug"`, while the CLI vault-creation
+entry points pass `DEFAULT_NEW_VAULT_BACKEND`, which is `"grafx"`. A vault you
+create from Python without naming `backend` is pinned to a different engine than
+one created by the CLI. Pass `backend` explicitly if you care which engine you
+get.
+</Warning>
+
+Behaviour when `okto-neuron.yaml` already exists:
+
+<Steps>
+<Step title="Backend pin is checked first">
+The config is loaded and its pinned backend compared. If the pinned backend differs from the
+requested one it raises `VaultBackendMismatch`. A config with no `storage` key
+counts as pinned to `"ladybug"`. A config that fails to load is left alone and
+falls through to the branches below.
+</Step>
+<Step title="With embedding_provider set, it reopens">
+`Vault.init` returns `cls.open(root)` instead of raising.
+</Step>
+<Step title="Otherwise it refuses">
+`VaultAlreadyExistsError`.
+</Step>
+</Steps>
+
+### `Vault.scaffold(path, ...)`
+
+Creates `root`, `notes/`, `refs/` and `.marginalia/`, each with mode `0o700`,
+writes the config, and returns the resolved root `Path`. It does not open the
+graph. It takes the same keyword arguments as `Vault.init` except
+`embedding_provider`; it takes `allow_external_sources: bool = False` directly.
+It applies the same backend-pin check and raises `VaultAlreadyExistsError` when
+`okto-neuron.yaml` already exists.
+
+See [/reference/vault-layout](/reference/vault-layout) for what those
+directories hold.
+
+## Instance methods
+
+### `add(source) -> Document`
+
+Ingests one source and returns a `Document`.
+
+`source` may be a `PathLike`, a plain path string, or a `file:`, `http:` or
+`https:` URL. Any other scheme raises `IngestError`. A single-letter scheme that
+matches a drive-letter path shape is treated as a path rather than a URL.
+
+Local paths (including `file:` URLs) are resolved and checked against the vault
+root: outside it, `add` raises `FileNotUnderVaultError`, unless the vault was
+opened with `compat_allow_external_sources`, which skips the check. `http:` and
+`https:` sources are passed through without that check.
+
+If the ingest module cannot be imported, or if ingestion raises anything that is
+not already an Okto Neuron error, `add` raises `IngestError`.
+
+### `query(text, *, k=5, type=None, with_drift=False, expand_context=True, seed_diversity=False, seed_subject_cap=None, seed_entity_min=None, seed_rel_min=None, seed_scalar_max=None) -> list[QueryHit]`
+
+<ParamField path="text" type="str" required>
+Query text.
+</ParamField>
+<ParamField path="k" type="int" default="5">
+Number of hits requested.
+</ParamField>
+<ParamField path="type" type="str | None" default="None">
+Node type filter.
+</ParamField>
+<ParamField path="with_drift" type="bool" default="False">
+When set, hits may carry a value in `QueryHit.drift`.
+</ParamField>
+<ParamField path="expand_context" type="bool" default="True">
+When false, the neighbour count is forced to zero and every hit comes back with
+an empty `context_spans`.
+</ParamField>
+<ParamField path="seed_diversity" type="bool" default="False">
+Internal tuning knob. The subgraph ask path passes it; it is not a surface you
+are expected to drive.
+</ParamField>
+<ParamField path="seed_subject_cap" type="int | None" default="None">
+Internal tuning knob, as above.
+</ParamField>
+<ParamField path="seed_entity_min" type="int | None" default="None">
+Internal tuning knob, as above.
+</ParamField>
+<ParamField path="seed_rel_min" type="int | None" default="None">
+Internal tuning knob, as above.
+</ParamField>
+<ParamField path="seed_scalar_max" type="int | None" default="None">
+Internal tuning knob, as above.
+</ParamField>
+
+Scores are normalized: each raw score is divided by the largest raw score in the
+result set, then clamped to `0.0`-`1.0`.
+
+`query_with_metrics` takes the same arguments and returns
+`tuple[list[QueryHit], dict[str, object]]`: the same hits, plus a mapping whose
+`schema_version` key is `"recall_cost.v1"`.
+
+### `get(node_id) -> Node | None`
+
+Returns the node coerced to the public `Node` model, or `None` when the store has
+no such id.
+
+### `get_provenance(claim_id) -> dict[str, object] | None`
+
+Returns `None` when the id is missing or the node's `type` is not `"Claim"`.
+Otherwise returns a dict with three keys:
+
+<ResponseField name="claim" type="dict">
+The claim node, dumped in JSON mode.
+</ResponseField>
+<ResponseField name="block" type="dict | None">
+The node whose id is the claim's `facets["block_id"]`, dumped in JSON mode, or
+`None` when the facet is absent or the node is missing.
+</ResponseField>
+<ResponseField name="edges" type="list[dict]">
+Edges with the claim as source, kept only when `edge.type` starts with `prov:`.
+</ResponseField>
+
+Background on what those edges mean is in
+[/concepts/provenance](/concepts/provenance), and the node and edge types are
+listed in [/reference/graph-schema](/reference/graph-schema).
+
+### `export(*, format="jsonld", stream=None, scope=None) -> str | None`
+
+Builds a JSON-LD document by hand and returns it as a string, or writes it to
+`stream` and returns `None`.
+
+<ParamField path="format" type='"jsonld" | "jsonld-star"' default='"jsonld"'>
+Membership-checked. Any other value raises `ExportError`. The value is not read
+again after that check.
+</ParamField>
+<ParamField path="stream" type="file-like | None" default="None">
+When given, the serialized string is written with a single `stream.write` call
+and `export` returns `None`.
+</ParamField>
+<ParamField path="scope" type="ExportScope | None" default="None">
+Defaults to `ExportScope()`.
+</ParamField>
+
+`export` first tries `import rdflib`. If the import fails it raises `ExportError`
+with the message `rdflib is required for JSON-LD export; install
+okto-neuron[jsonld]`. The `jsonld` extra is `rdflib>=7,<8`, and `install.sh`
+installs the extras `serve,litellm`, so a vault installed that way cannot export
+until you add the extra. The import is an availability check; the payload is
+assembled with `json.dumps(..., sort_keys=True, separators=(",", ":"))`, so
+object keys are sorted and the output carries no whitespace. The ladybug and grafx
+backends both return `list_nodes()` ordered by node id (`ORDER BY n.id`), so
+`@graph` follows that order.
+
+The payload has two top-level keys. `@context` is fixed: `@vocab` and
+`marginalia` both map to `https://oktolabs.ai/marginalia#` (the vocabulary IRI and prefix keep their pre-0.3.0 names so exported documents stay comparable), and `prov` maps to
+`http://www.w3.org/ns/prov#`. `@graph` is a list built from `store.list_nodes()`
+after scope filtering. Each entry has:
+
+<ResponseField name="@id" type="str">
+The node id.
+</ResponseField>
+<ResponseField name="@type" type="str">
+The node type.
+</ResponseField>
+<ResponseField name="name" type="str">
+`node.title`, falling back to `facets["name"]`, falling back to `""`.
+</ResponseField>
+<ResponseField name="facets" type="dict">
+A copy of the node's facets.
+</ResponseField>
+<ResponseField name="created_at" type="str">
+Present only when `node.created_at` is a `datetime`, emitted as `isoformat()`.
+</ResponseField>
+<ResponseField name="provenance" type="dict">
+Present only when `scope.include_provenance` is true and the node has a
+provenance object with `model_dump`.
+</ResponseField>
+<ResponseField name="embedding" type="list">
+Present only when `scope.include_embeddings` is true and the node has a
+non-`None` embedding.
+</ResponseField>
+
+The walk covers nodes. Edges are not part of the payload.
+
+### `close()`, `__enter__`, `__exit__`
+
+`close` is idempotent: it sets the closed flag and calls `store.close()` when the
+store has one. Every method above calls an open check first and raises
+`VaultClosedError` once the vault is closed. `Vault` is a context manager;
+`__enter__` runs the open check and returns the vault, and `__exit__` calls
+`close`.
+
+```python
+from okto_neuron import Vault
+
+with Vault.open("~/vault") as vault:
+    doc = vault.add("~/vault/notes/meeting.md")
+    print(doc.id)
+```
+
+## Value models
+
+All models are Pydantic models frozen with `extra="forbid"` and `strict=True`,
+so unknown keys are rejected and no type coercion happens.
+
+<AccordionGroup>
+<Accordion title="Node">
+`id: str`, `type: str`, `name: str | None = None`. The `title` property returns
+`name` or `""`.
+</Accordion>
+<Accordion title="Document">
+A `Node` with `type: str = "Document"`, `path: str | None`, `tags: tuple[str, ...] = ()`,
+`media_type: str | None`, and `content_hash: str | None` constrained to the
+pattern `^sha256:[0-9a-f]{64}$`.
+</Accordion>
+<Accordion title="Provenance">
+`path: str`, `byte_start: int`, `byte_end: int`, `content_hash: str` matching
+`^sha256:[0-9a-f]{64}$`, `extraction_activity_id: str`, `agent_id: str`,
+`document_id: str`, `block_id: str`.
+</Accordion>
+<Accordion title="ContextSpan">
+`path: str`, `byte_start: int`, `byte_end: int`, `content_hash: str` matching
+`^sha256:[0-9a-f]{64}$`, `block_id: str`, `block_index: int`. Context spans are
+rebuilt at read time by expanding a retrieved block to adjacent siblings with the
+same `source_path` and neighbouring `block_index`.
+</Accordion>
+<Accordion title="QueryHit">
+`node: Node`, `score: float` constrained to `0.0 <= score <= 1.0`,
+`provenance: Provenance`, `context_spans: tuple[ContextSpan, ...] = ()`, and
+`drift: Any | None = None`. `drift` is typed `Any`; its shape is not defined by
+the model.
+
+Derived properties: `path`, `byte_start` and `byte_end` forward to `provenance`;
+`content_hash` returns the provenance hash with the `sha256:` prefix removed; and
+`claim_id` returns `node.id` when `node.type == "Claim"`, otherwise `None`.
+</Accordion>
+<Accordion title="IngestResult">
+`document_id: str`, `blocks_added: int`, `claims_added: int`,
+`annotations_added: int`, `references_added: int`, `skipped_existing: bool`.
+`add` does not return this model: it converts whatever ingestion produced into a
+`Document`, and when that value is an `IngestResult` it keeps only
+`document_id`.
+</Accordion>
+<Accordion title="ExportScope">
+`node_types: tuple[str, ...] | None = None`, `document_ids: tuple[str, ...] | None = None`,
+`since: datetime | None = None`, `include_provenance: bool = True`,
+`include_embeddings: bool = False`.
+
+`node_types` keeps nodes whose `type` is in the set. `document_ids` keeps nodes whose
+export document id is in the set: a `Document` node contributes its own id, and
+any other node contributes `facets["document_id"]`, falling back to
+`facets["S_id"]`, falling back to `""`. `since` keeps nodes whose `created_at` is
+a `datetime` and is greater than or equal to `since`, so a node whose
+`created_at` is anything else is dropped from a scoped export.
+</Accordion>
+</AccordionGroup>
+
+## Errors
+
+<ResponseField name="VaultNotFoundError" type="VaultError">
+`Vault.open` on a path that does not exist.
+</ResponseField>
+<ResponseField name="VaultAlreadyExistsError" type="VaultError">
+`Vault.init` or `Vault.scaffold` on a root that already has `okto-neuron.yaml`,
+except for `init`'s `embedding_provider` reopen.
+</ResponseField>
+<ResponseField name="VaultBackendMismatch" type="VaultError">
+The requested `backend` differs from the one pinned in the existing config.
+Defined in `okto_neuron.vault`, not in `okto_neuron.errors`.
+</ResponseField>
+<ResponseField name="VaultLockedError" type="VaultError">
+The store could not be opened because the vault lock is held.
+</ResponseField>
+<ResponseField name="VaultClosedError" type="VaultError">
+Any method called after `close`.
+</ResponseField>
+<ResponseField name="InvalidVaultConfigError" type="VaultError">
+`okto-neuron.yaml` is unreadable, is not valid YAML, or does not parse to a
+mapping.
+</ResponseField>
+<ResponseField name="IngestError" type="OktoNeuronError">
+Unsupported source scheme, missing ingest module, or any non-Okto Neuron
+exception raised during ingestion.
+</ResponseField>
+<ResponseField name="FileNotUnderVaultError" type="IngestError">
+A local source path that is not relative to the vault root.
+</ResponseField>
+<ResponseField name="ExportError" type="OktoNeuronError">
+An unsupported `format` value, or `rdflib` not importable.
+</ResponseField>
+<ResponseField name="VaultError" type="OktoNeuronError">
+Raised directly by the store opener when the ladybug storage module cannot be
+imported (`src/okto_neuron/vault.py`). ladybug is a base dependency, so this
+indicates a broken install rather than a missing extra.
+</ResponseField>
+
+## `okto_neuron.api`
+
+`okto_neuron.api` is an eight-line compatibility wrapper. It imports `QueryHit`
+from `okto_neuron.models` and `Vault` from `okto_neuron.vault`, and its `__all__`
+is exactly those two names. Nothing else lives there. Import from the
+`okto-neuron` package root instead.
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Provenance" href="/concepts/provenance">
+What the `prov:` edges and the `Provenance` fields record.
+</Card>
+<Card title="Graph schema" href="/reference/graph-schema">
+Node and edge types you will see in `@type` and in `get`.
+</Card>
+<Card title="Thin client" href="/concepts/thin-client">
+Why the process boundary is drawn where it is.
+</Card>
+<Card title="Vault layout" href="/reference/vault-layout">
+The directories `scaffold` creates and what lands in them.
+</Card>
+</CardGroup>

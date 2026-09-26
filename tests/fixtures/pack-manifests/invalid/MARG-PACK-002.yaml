@@ -1,0 +1,4 @@
+id: schema-validation
+version: "0.1.0"
+compatRange: ">=0.0.1"
+unexpected: true

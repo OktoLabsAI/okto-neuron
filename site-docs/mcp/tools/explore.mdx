@@ -1,0 +1,245 @@
+---
+title: "MCP tool: explore"
+description: "A structured ego graph around a topic or a node, with no LLM call at all."
+---
+
+<Note>
+Okto Neuron is 0.3.0 and prerelease. Tool signatures and return shapes can change between releases.
+</Note>
+
+`explore` returns a structured ego graph around a seed set. It hands you `nodes`, `relationships` and `claims` so your agent can navigate by id, and it makes no LLM call, so there is no prose and no `synthesis_status` in the result.
+
+## Signature
+
+```python
+explore(
+    topic: str = "",
+    node_id: str | None = None,
+    hops: int = 1,
+    k: int = 12,
+    vault: str | None = None,
+    relationship_types: list[str] | None = None,
+    min_claim_confidence: float | None = None,
+    max_degree_per_seed: int | None = None,
+) -> dict
+```
+
+<ParamField path="topic" type="string" default='""'>
+Free text. Seeds the graph by semantic search over the vault. Ignored when `node_id` is given.
+</ParamField>
+
+<ParamField path="node_id" type="string | null" default="null">
+A node id taken from an earlier `explore` or `ask` result. Expands directly from that node and skips the semantic search.
+</ParamField>
+
+<ParamField path="hops" type="integer" default="1">
+How far the neighbourhood expands from each seed. The value is clamped into the range 1 to 5 before use.
+</ParamField>
+
+<ParamField path="k" type="integer" default="12">
+Number of seed notes for a topic search. Capped at `MAX_QUERY_K`, which is 100. Unused in `node_id` mode.
+</ParamField>
+
+<ParamField path="vault" type="string | null" default="null">
+The registered NAME of the vault to read, never a path. Omit it to use the vault this connection already selected.
+</ParamField>
+
+<ParamField path="relationship_types" type="array of string | null" default="null">
+Restricts edges to these predicate names. `null` means no restriction; there is no vault config fallback for this argument, and the applied value is reported as `[]`.
+</ParamField>
+
+<ParamField path="min_claim_confidence" type="number | null" default="null">
+Floors claim confidence, 0.0 to 1.0. `null` inherits the vault's `llm.ask` configuration.
+</ParamField>
+
+<ParamField path="max_degree_per_seed" type="integer | null" default="null">
+Caps how many neighbours are expanded per seed. `null` inherits the vault's `llm.ask` configuration.
+</ParamField>
+
+## Two entry modes
+
+`explore` needs one of `topic` or `node_id`.
+
+<Tabs>
+<Tab title="topic mode">
+```json
+{ "topic": "retention policy", "k": 12, "hops": 1 }
+```
+The topic string seeds by semantic search, and the ego graph is built around those hits.
+</Tab>
+<Tab title="node mode">
+```json
+{ "node_id": "node:contract-2024", "hops": 2 }
+```
+The node id becomes the single seed, with weight 1.0. `topic` is ignored and `k` is unused.
+</Tab>
+</Tabs>
+
+Call it with neither, and the call fails with:
+
+```text
+explore requires either a topic or a node_id
+```
+
+While the server is shutting down, any `explore` call raises `shutting_down: server is shutting down` before it reaches the vault.
+
+## Seed count
+
+`k` defaults to 12. `ask` defaults to 20. See [ask](/mcp/tools/ask) for the one-shot prose path, and [subgraph answers](/concepts/subgraph-answers) for the iterative walk pattern.
+
+## Return shape
+
+Six top-level keys: `seeds`, `hops`, `retrieval`, `nodes`, `relationships`, `claims`.
+
+<ResponseField name="seeds" type="array of string">
+The seed ids the graph was built from. In node mode this is the single `node_id` you passed.
+</ResponseField>
+
+<ResponseField name="hops" type="integer">
+The effective hop count after clamping. Duplicated in `retrieval.hops` on purpose; the top-level key is an existing contract.
+</ResponseField>
+
+<ResponseField name="retrieval" type="object">
+How the call actually retrieved. See below.
+</ResponseField>
+
+<ResponseField name="nodes" type="array of object">
+One entry per node in the ego graph, with `id`, `type`, `name`, `is_seed`, `score`, `block_id` and `span`.
+</ResponseField>
+
+<ResponseField name="relationships" type="array of object">
+Topology assertions, subject to object. Fields: `claim_id`, `subject_id`, `predicate`, `object_id`, `confidence`, `block_id`.
+</ResponseField>
+
+<ResponseField name="claims" type="array of object">
+Propositional assertions with a literal value. Fields: `claim_id`, `subject_id`, `subject_name`, `predicate`, `literal`, `confidence`, `block_id`.
+</ResponseField>
+
+`score` on a node comes straight from the ego graph builder's record. Treat it as a relative ordering signal within one response; the page does not define a formula for it.
+
+Every relationship and every claim carries the source `block_id`, so each row is anchorable back to the block it came from. Node entries carry `block_id` and `span`. See [the data model](/concepts/data-model) for what a node, a relationship and a claim are.
+
+### The retrieval block
+
+Every value here is the effective one after caller override, then vault config, then code default. It reports what was applied, not what you asked for.
+
+<ResponseField name="mode" type="string">
+`"node"` when `node_id` was given, otherwise `"topic"`.
+</ResponseField>
+
+<ResponseField name="seed_k" type="integer | null">
+The seed count used by the topic search. `null` in node mode, where `k` plays no part, so reporting it would misrepresent the call.
+</ResponseField>
+
+<ResponseField name="hops" type="integer">
+The clamped hop count.
+</ResponseField>
+
+<ResponseField name="max_degree_per_seed" type="integer">
+The applied degree cap.
+</ResponseField>
+
+<ResponseField name="min_claim_confidence" type="number">
+The applied confidence floor.
+</ResponseField>
+
+<ResponseField name="relationship_types" type="array of string">
+The applied predicate restriction. This field has no config fallback, so an empty list means no restriction.
+</ResponseField>
+
+<ResponseField name="vault" type="string | null">
+The registered NAME of the vault that served the call. Injected by the MCP layer.
+</ResponseField>
+
+<ResponseField name="vault_override_ignored" type="string">
+Present only when your `vault` argument lost to the connection's `?vault=` selector. It carries the canonical registered name of the discarded vault, not the literal string you passed.
+</ResponseField>
+
+There is no `synthesis_status` and no `source_block_policy` in this block. Both would be a lie here, because `explore` calls no model.
+
+### Example response
+
+```json
+{
+  "seeds": ["node:retention-policy"],
+  "hops": 1,
+  "retrieval": {
+    "mode": "topic",
+    "seed_k": 12,
+    "hops": 1,
+    "max_degree_per_seed": 8,
+    "min_claim_confidence": 0.0,
+    "relationship_types": [],
+    "vault": "work"
+  },
+  "nodes": [
+    {
+      "id": "node:retention-policy",
+      "type": "Concept",
+      "name": "Retention policy",
+      "is_seed": true,
+      "score": 0.83,
+      "block_id": "block:handbook#12",
+      "span": "1200-1460"
+    }
+  ],
+  "relationships": [
+    {
+      "claim_id": "claim:0a1",
+      "subject_id": "node:retention-policy",
+      "predicate": "owned_by",
+      "object_id": "node:legal-team",
+      "confidence": 0.7,
+      "block_id": "block:handbook#12"
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim:0a2",
+      "subject_id": "node:retention-policy",
+      "subject_name": "Retention policy",
+      "predicate": "review_cadence",
+      "literal": "annual",
+      "confidence": 0.6,
+      "block_id": "block:handbook#12"
+    }
+  ]
+}
+```
+
+The `retrieval` values above are the code defaults you get when the vault sets nothing: degree cap 8, confidence floor 0.0.
+
+## Filters
+
+`min_claim_confidence` and `max_degree_per_seed` are per-call overrides of the matching `llm.ask` vault config values; a caller-supplied value wins and `None` inherits the config exactly. `relationship_types` has no config fallback.
+
+| Argument | Effect | When `null` |
+| --- | --- | --- |
+| `relationship_types` | Keeps only edges whose predicate is in the list | No restriction, reported as `[]` |
+| `min_claim_confidence` | Drops claims below the floor | Vault config, else 0.0 |
+| `max_degree_per_seed` | Caps neighbours expanded per seed | Vault config, else 8 |
+
+An explicit `0` or `0.0` from the caller is honoured rather than falling through to config.
+
+## Vault selection
+
+`vault` takes a registered name from `list_vaults`, never a path. It is always validated, so an unknown or path-shaped name fails the call even when the connection's `?vault=` selector takes precedence over it. When the selector wins, the result tells you through `retrieval.vault_override_ignored` instead of letting you believe your argument routed the call.
+
+Before choosing, check the project directory for a `.marginalia-vault` file containing `{"vault": "<name>"}` and pass the name it pins.
+
+## Errors
+
+`explore` resolves and leases its vault through the same seam `ask` does, so it raises the same vault errors. Most carry a stable machine-readable `code` prefix; branch on the code, not on the wording.
+
+| Message | Cause |
+| --- | --- |
+| `explore requires either a topic or a node_id` | You passed neither entry argument. This one is an unprefixed `CompanionError`, so there is no `code` to branch on. |
+| `shutting_down: server is shutting down` | The server is draining. Raised before any vault is leased, and again if a fenced pool is hit while shutting down. |
+| `maintenance: vault maintenance is in progress; try again shortly` | The vault pool is fenced for routine maintenance, for example a reembed. Retry once maintenance finishes. |
+| `<code>: <sanitised message>` | Vault resolution or a pool failure. The message is sanitised before it leaves the server, because raw resolver and pool messages embed the resolved absolute vault path. The `code` prefix is stable. |
+
+A vault name that is path-shaped or unknown fails during resolution, before any retrieval runs. The resolution codes are listed once in [vault selection](/mcp/vault-selection).
+
+`explore` builds no retrieval policy object, so it has no `invalid retrieval policy:` failure the way `ask` does.
+
+`explore` and the subgraph `ask` path share `build_ego_graph`. See [subgraph answers](/concepts/subgraph-answers).

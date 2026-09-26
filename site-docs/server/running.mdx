@@ -1,0 +1,172 @@
+---
+title: "Start and stop the server"
+description: "Run the daemon in the foreground or the background, and understand its two ports and its lock."
+---
+
+Okto Neuron runs as one server process. `okto-neuron serve` opens the REST/UI surface and the FastMCP surface in the same Python process, and everything else (the CLI client, the MCP host, the browser) talks to it over loopback.
+
+<Note>
+Okto Neuron is prerelease software. Command names, defaults and output can change between versions.
+</Note>
+
+## Install the server extra
+
+The base wheel does not include the server dependencies. If they are missing, `okto-neuron serve` fails with a message naming the extra to install instead of an import traceback:
+
+```text
+server dependencies are not installed; install okto-neuron[serve] to run `okto-neuron serve`
+```
+
+The message names the extra you are missing. Install the application with the `serve` extra the same way you installed Okto Neuron; see [install](/start/install).
+
+## Run it in the foreground
+
+```bash
+okto-neuron serve
+```
+
+This binds REST and the web UI on `127.0.0.1:7777` and FastMCP on `127.0.0.1:8201`. Both listeners live in one process, sharing one handle pool. With no `--log-file`, foreground logs go to stdout, so you watch them in the terminal you started from. The process stays attached to that terminal; stopping it is Ctrl-C, or `okto-neuron stop` from another shell.
+
+By default the server opens the local UI in your browser once it is ready. Pass `--no-open` if you do not want that.
+
+The bind host defaults to `127.0.0.1` and only loopback hosts are accepted. See [remote access](/server/remote-access) for what happens when you try anything else.
+
+## Run it in the background
+
+`--daemon` is the only way to background the server. Nothing else in the CLI detaches it.
+
+```bash
+okto-neuron serve --daemon
+```
+
+<Steps>
+  <Step title="The parent pre-flights the lock">
+    Before spawning anything, the parent process takes and immediately releases the PID lock. If another server already holds it, you get the "already running" error and exit code 1 without a half-started child.
+  </Step>
+  <Step title="The child is spawned detached">
+    The parent spawns a detached child that re-runs `okto-neuron serve` in the foreground, in a new session, with stdin on `/dev/null` and stdout and stderr redirected to the log file.
+  </Step>
+  <Step title="The parent waits for readiness">
+    The parent polls the endpoint's `/health` and then `/api/v1/status`, and only accepts the start once `/health` returns `{"status": "ok"}` and the status endpoint reports the pid of the child it spawned. It waits up to 60 seconds.
+  </Step>
+  <Step title="It prints the summary, or kills the child">
+    On success the parent prints the pid, the UI url, the status command, the stop command and the log path, then exits. On timeout it sends SIGTERM to the spawned child and fails with `daemon spawned from pid <pid> did not become ready; inspect <log file>`.
+  </Step>
+</Steps>
+
+A successful start looks like this:
+
+```text
+Okto Neuron is running in the background (pid=41207)
+  UI: http://127.0.0.1:7777/
+  Status: okto-neuron status --endpoint http://127.0.0.1:7777
+  Stop: okto-neuron stop
+  Logs: /Users/you/.marginalia/logs/okto-neuron-serve.log
+```
+
+## Logs
+
+With `--daemon` and no explicit `--log-file`, the server picks a default log path. Raw stdout and stderr are pointed at the same file, so uncaught tracebacks and third-party prints land there too, alongside the structured JSON log lines.
+
+A regular log file is size-rotated. The default path and the rotation values are on [/reference/cli/server-commands](/reference/cli/server-commands).
+
+To silence the log entirely, point it at a character device:
+
+```bash
+okto-neuron serve --daemon --log-file /dev/null
+```
+
+`/dev/null` cannot be size-rotated, so the server uses a plain file handler for it rather than the rotating one.
+
+Without `--daemon`, logs go to stdout unless you pass `--log-file` yourself.
+
+For reading what ends up in there, see [status and logs](/server/status-and-logs).
+
+## The lock, and "already running"
+
+The server lifecycle is application-scoped, never vault-scoped. The lock root is `~/.okto-neuron/runtime`, and the PID file sits at `~/.okto-neuron/runtime/.marginalia/server.pid`. Passing `--vault` to `serve` does not move it.
+
+Starting a second server while one already holds the lock is refused rather than allowed to clobber the first. With `--daemon`, the parent writes the refusal to stderr and exits 1:
+
+```text
+Okto Neuron server already running (pid=41207, pid_file=/Users/you/.okto-neuron/runtime/.marginalia/server.pid)
+UI: http://127.0.0.1:7777/
+```
+
+and, still on stderr, the stop command:
+
+```text
+Stop: okto-neuron stop
+```
+
+In the foreground the same refusal is written as a structured log record with `event: server.start_refused` (to stdout, or to `--log-file` if you set one); only the `UI:` line goes to stderr. The exit code is 1 either way.
+
+If `--open` is in effect (the default), the CLI probes `/health` for up to 2 seconds first and opens the already-running UI in your browser before it exits. The start is refused; the running server is untouched.
+
+## Stop it
+
+```bash
+okto-neuron stop
+```
+
+`stop` finds the application lock root itself. If the application root has no PID file, it falls back to the older vault-scoped lock layout, either the `--vault` you gave it or the single verified live owner it can discover.
+
+When it finds a running pid it tells you what it is about to do:
+
+```text
+stopping okto-neuron server (pid=41207); waiting up to 30.0s for drain, then escalating automatically
+stopped okto-neuron server (pid=41207)
+```
+
+The drain window is `--timeout` ([/reference/cli/server-commands](/reference/cli/server-commands) carries its default). Halfway through the drain window, capped at ten seconds, a server that has not stopped receives the same signal a second time, which the runtime treats as an explicit force request, so you never have to look up the pid and signal it yourself. If the stop fails, the lifecycle error goes to stderr and the command exits 1.
+
+The server's own drain after SIGTERM is capped at 30 seconds: both Uvicorn servers and every per-vault worker drain before pooled handles close. A second signal during that drain exits immediately.
+
+## No login or reboot persistence
+
+Nothing Okto Neuron installs registers a login item or a reboot service. The supported background path is `okto-neuron serve --daemon`, stopped with `okto-neuron stop`. The package never touches `~/Library/LaunchAgents` or the Homebrew services registry on your behalf.
+
+<Warning>
+The `packaging/` directory in the repository is not an install path. It holds three files and no code: a README, a launchd LaunchAgent template, and a Homebrew formula stub. The README documents both templates as unsupported and opt-in.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="The launchd template">
+    `packaging/macos/com.oktolabs.okto-neuron.plist` is a template, not a working job. It carries unresolved `{{OKTO_NEURON_BIN}}` and `{{LOG_DIR}}` placeholders that you would have to replace with real absolute paths before `launchctl` could load it. Its `ProgramArguments` invoke `serve --foreground --no-open`; the job stays in the foreground because it omits `--daemon`, and `--foreground` itself changes nothing.
+  </Accordion>
+  <Accordion title="The Homebrew stub">
+    `packaging/brew/okto-neuron.rb` is a stub. It is not published to any tap, and its `url`, `sha256` and `version` fields are placeholders the README describes as deliberately invalid. It documents the intended shape of a `service` block; it is not an install you can run.
+  </Accordion>
+  <Accordion title="Linux">
+    There is no `packaging/linux/` directory and no systemd unit. The README puts systemd explicitly out of scope.
+  </Accordion>
+</AccordionGroup>
+
+## Running without a built web UI
+
+The daemon boots the same way whether or not a web UI build is present. The server looks for the UI in the installed package data at `okto_neuron/_webui`, then falls back to a repo-root `frontend_dist/` for an editable checkout. When it finds one it mounts it, last in the route list, so it cannot shadow the API and bare-CLI routes.
+
+When it finds none it logs:
+
+```text
+no web UI build found (frontend_dist/ absent); serving API only
+```
+
+and keeps going. REST, the bare-CLI routes and MCP are unaffected; only the UI route 404s. An editable install (`pip install -e`) does not materialize the force-included UI, so this is the normal state in a dev checkout. See [the web UI](/server/web-ui).
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Status and logs" href="/server/status-and-logs">
+    Check whether the server is up and read what it wrote.
+  </Card>
+  <Card title="Remote access" href="/server/remote-access">
+    Why the listener is loopback-only, and the tunnel.
+  </Card>
+  <Card title="Server commands reference" href="/reference/cli/server-commands">
+    Every flag on `serve`, `stop` and the rest, exhaustively.
+  </Card>
+  <Card title="Troubleshoot the runtime" href="/help/troubleshoot-runtime">
+    Startup failures, stuck locks and ports in use.
+  </Card>
+</CardGroup>

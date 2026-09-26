@@ -1,0 +1,260 @@
+---
+title: HTTP endpoints the CLI uses
+description: The daemon routes exercised by the shipped CLI, with the exact request bodies it sends, plus the loopback-only administrative routes.
+---
+
+<Warning>
+This is not an API reference. It documents the routes the shipped CLI calls and the request shapes it sends, plus a handful of destructive and read-only routes that were surveyed directly in the server source. There is no OpenAPI spec and no API contract. Any route not listed here was not surveyed, and nothing on this page is a stability promise.
+</Warning>
+
+<Note>
+Okto Neuron is 0.3.0 and prerelease. Route paths, request fields and response fields can change without notice.
+</Note>
+
+## Base URL resolution
+
+The CLI resolves the server base URL through the shared client precedence documented on [/reference/cli/overview](/reference/cli/overview).
+
+```bash
+okto-neuron query "release process" --endpoint http://127.0.0.1:7777
+OKTO_NEURON_ENDPOINT=http://127.0.0.1:7777 okto-neuron status
+```
+
+See [/concepts/thin-client](/concepts/thin-client) for why these commands have no local fallback.
+
+## Authentication
+
+REST and the web UI are deliberately credential-free and protected by a loopback host guard, so the CLI sends no `Authorization` header on these calls. The bearer token applies to MCP only. The versioned routes are not authenticated differently from the unversioned ones: there is one host guard wrapping every route, and per-handler loopback checks on the sensitive writes. See [/mcp/security](/mcp/security).
+
+`okto-neuron add`, `query`, `ask`, `detect-drift` and `status` add `X-Okto-Neuron-Vault` only when you pass `--vault`. The `watch-folder` commands resolve a vault first and always send the header, carrying the resolved path, with or without `--vault`. The server accepts a registered vault id, name, or resolved path. It selects the vault for that one request and does not change the daemon's selection.
+
+### Which routes are vault-scoped
+
+`X-Okto-Neuron-Vault` is not limited to the routes the CLI sends it on. The server treats every path
+under `/api/` as vault-scoped except the vault, credential and provider management paths and a short
+list of application-wide paths such as `/health` and `/version` (`src/okto_neuron/server/http.py:683-694`,
+`:654-671`). Nine bare paths are scoped as well: `/add`, `/query`, `/detect-drift`, `/remember`,
+`/recall`, `/ask`, `/review-queue`, `/review-queue/batch` and `/resolve-review`
+(`src/okto_neuron/server/http.py:640-652`). So the curation, reconcile, upkeep, quality, ledger and
+authority routes in the table below all read the header, whether or not any shipped command sends it.
+
+When a vault-scoped request arrives with no header, the server does not fail. It resolves the request to
+the runtime for the vault the daemon was started with (`src/okto_neuron/server/state.py:557-561`),
+otherwise to the configured or default vault, otherwise to the sole registered vault if there is exactly
+one (`src/okto_neuron/server/http.py:704-723`). Only when none of those resolve does it return
+`409 no_active_vault`. The middleware binds the resolved runtime to the request context
+(`src/okto_neuron/server/http.py:808`, `:820`), and the handlers' `get_state()` returns that bound runtime rather
+than process-wide state (`src/okto_neuron/server/state.py:788-791`), so the handler operates on that
+vault's graph.
+
+<Warning>
+One daemon can hold several vaults. If you run more than one, send `X-Okto-Neuron-Vault` on every
+write you issue by hand. A header-less `POST /api/v1/curation/rollback`, `rebuild`, `heal` or `reembed`
+acts on the fallback vault, which may not be the one you meant. Rebuild and heal end by swapping that
+vault's live graph (`src/okto_neuron/server/http.py:6685-6688`, `:6727-6733`), and rollback reads the live
+generation of whichever runtime it resolved to (`src/okto_neuron/server/http.py:6703-6704`) and restores
+that vault's checkpoint over its live graph.
+</Warning>
+
+Every response carries `x-okto-neuron-vault`, and the pre-0.3.0 `x-marginalia-vault`, set to the resolved vault path
+(`src/okto_neuron/server/http.py:801-804`), so you can check after the fact which vault answered.
+
+## Routes the shipped CLI calls
+
+| Route | Method | Request body the CLI sends | Called by |
+| --- | --- | --- | --- |
+| `/health` | GET | none | `serve` readiness wait, `okto-neuron ui` |
+| `/version` | GET | none | `okto-neuron status` |
+| `/api/v1/status` | GET | none | `okto-neuron status`, `serve` readiness wait |
+| `/add` | POST | `{"path": "<abs path>", "content": "<file text>"}` | `okto-neuron add` |
+| `/query` | POST | `{"query": "<text>", "k": <int>}` | `okto-neuron query` |
+| `/api/v1/ask` | POST | `{"question": "<text>", "k": <int>}`, plus `"retrieval_policy": {"hops": <int>}` only when `--hops` is not 1 | `okto-neuron ask` |
+| `/detect-drift` | POST | `{"corpus_root": "<abs path>", "dry_run": <bool>}` | `okto-neuron detect-drift` |
+| `/api/v1/config` | GET | none | `okto-neuron watch-folder list` |
+| `/api/v1/folder-watch/roots` | POST | `{"path": "<abs path>"}` | `okto-neuron watch-folder add` |
+| `/api/v1/ingest-folder` | POST | `{"path": "<abs path>", "recursive": <bool>}` | `okto-neuron watch-folder add` |
+| `/api/v1/folder-watch/roots` | DELETE | `{"path": "<abs path>"}` | `okto-neuron watch-folder remove` |
+
+`okto-neuron ask` calls the versioned path. `okto-neuron query`, `add` and `detect-drift` call bare paths.
+
+`okto-neuron detect-drift` accepts `--algos`, but the command deletes the value before building the request. The body carries only `corpus_root` and `dry_run`.
+
+The `/health` poll is not a preflight on every request. It appears in the readiness loop that `serve` uses to wait for the daemon, paired with `/api/v1/status` when a specific pid must be confirmed, and `okto-neuron ui` runs the same loop before opening the browser. Ordinary CLI requests go straight to their route.
+
+`/api/v1/ingest-folder` requires the folder under the key `path`.
+
+Flag details for each of these commands live in [/reference/cli/client-commands](/reference/cli/client-commands).
+
+## Routes the shipped web UI calls
+
+`_routes()` returns 97 `Route()` registrations (`src/okto_neuron/server/http.py:6834-7038`): 86 of them are `/api/v1` registrations over 76 distinct versioned paths, and the remaining 11 are the bare paths. The table above covers the ones a shipped CLI command sends. Most of the rest are called only by the bundled web UI, which resolves every request against one constant, `export const API_BASE = '/api/v1'` (`frontend/src/services/http.ts:6`), and issues them from the modules under `frontend/src/services/`.
+
+<Note>
+This table records which UI service module calls which route. It is not a contract, and it does not describe any screen, button or click path. Request and response shapes for these routes were not surveyed, so they are not given here, with one exception: `POST /api/v1/curation/rollback` was surveyed directly in the server source and its shapes are in [its own section below](#post-apiv1curationrollback). Everything on this page can change without notice while Okto Neuron is prerelease (0.3.0).
+</Note>
+
+| Route | Method | Caller in the frontend source |
+| --- | --- | --- |
+| `/api/v1/curation/jobs` | GET | `services/curation-api.ts:268` |
+| `/api/v1/curation/scheduler` | GET | `services/curation-api.ts:296` |
+| `/api/v1/curation/companion-triage` | POST | `services/curation-api.ts:306` |
+| `/api/v1/curation/rebuild` | POST | `services/curation-api.ts:498` |
+| `/api/v1/curation/rollback` | POST | `services/curation-api.ts:501` |
+| `/api/v1/curation/heal` | POST | `services/curation-api.ts:504` |
+| `/api/v1/curation/reembed` | POST | `services/curation-api.ts:507` |
+| `/api/v1/curation/rebuild/status` | GET | `services/curation-api.ts:512` |
+| `/api/v1/reconcile/status` | GET | `services/curation-api.ts:399` |
+| `/api/v1/ledger/runs` | GET | `services/ledger-api.ts:8` |
+| `/api/v1/ledger/runs/{run_id}` | GET | `services/ledger-api.ts:13` |
+| `/api/v1/ledger/summary` | GET | `services/ledger-api.ts:19` |
+| `/api/v1/authority` | GET | `services/curation-api.ts:446` |
+| `/api/v1/authority/unmerge` | POST | `services/curation-api.ts:449` |
+| `/api/v1/reconcile/propose` | POST | `services/curation-api.ts:379` |
+| `/api/v1/reconcile/apply` | POST | `services/curation-api.ts:385` |
+| `/api/v1/reconcile/queue` | GET | `services/curation-api.ts:418` |
+| `/api/v1/reconcile/review/confirm` | POST | `services/curation-api.ts:421` |
+| `/api/v1/reconcile/review/reject` | POST | `services/curation-api.ts:427` |
+| `/api/v1/upkeep/predicates` | GET | `services/curation-api.ts:353` |
+| `/api/v1/upkeep/predicates/propose` | POST | `services/curation-api.ts:356` |
+| `/api/v1/upkeep/predicates/apply` | POST | `services/curation-api.ts:362` |
+| `/api/v1/upkeep/predicates/{record_id}/confirm` | POST | `services/curation-api.ts:368` |
+| `/api/v1/upkeep/predicates/{record_id}/reject` | POST | `services/curation-api.ts:373` |
+| `/api/v1/quality/semantic` | POST | `services/curation-api.ts:158` |
+| `/api/v1/quality/semantic/governance` | GET | `services/curation-api.ts:166` |
+| `/api/v1/ingest-batch` | POST | `services/ingest-api.ts:26` |
+| `/api/v1/ingest-queue` | GET | `services/ingest-api.ts:34` |
+| `/api/v1/ingest-queue/{item_id}` | GET | `services/ingest-api.ts:39` |
+| `/api/v1/ingest-queue/{item_id}/retry` | POST | `services/ingest-api.ts:44` |
+| `/api/v1/ingest-cancel` | POST | `services/ingest-api.ts:52` |
+| `/api/v1/folder-watch/status` | GET | `services/folder-watch-api.ts:8` |
+| `/api/v1/credentials` | GET, POST | `services/provider-api.ts:5`, `:12` |
+| `/api/v1/credentials/{credential_id}` | PUT, DELETE | `services/provider-api.ts:24`, `:33` |
+| `/api/v1/credentials/provider` | PUT | `services/config-api.ts:42` |
+| `/api/v1/providers` | GET, POST | `services/provider-api.ts:37`, `:61` |
+| `/api/v1/providers/{provider_id}` | PATCH, DELETE | `services/provider-api.ts:73`, `:82` |
+| `/api/v1/provider-types` | GET | `services/provider-api.ts:44` |
+| `/api/v1/llm/test` | POST | `services/llm-test-api.ts:23` |
+| `/api/v1/llm/test-completion` | POST | `services/llm-test-api.ts:45` |
+| `/api/v1/embedding/test` | POST | `services/embedding-api.ts:31` |
+| `/api/v1/embedding/models` | POST | `services/embedding-api.ts:52` |
+| `/api/v1/embedding/reembed` | POST | `services/embedding-api.ts:65` |
+| `/api/v1/embedding/reembed/status` | GET | `services/embedding-api.ts:75` |
+| `/api/v1/config/defaults` | GET, PATCH | `services/config-api.ts:15`, `:26` |
+| `/api/v1/config/defaults/llm/test` | POST | `services/llm-test-api.ts:23` |
+| `/api/v1/config/defaults/llm/test-completion` | POST | `services/llm-test-api.ts:45` |
+| `/api/v1/config/defaults/embedding/test` | POST | `services/embedding-api.ts:31` |
+| `/api/v1/config/defaults/embedding/models` | POST | `services/embedding-api.ts:52` |
+| `/api/v1/vaults/reembed` | POST | `services/vault-api.ts:46` |
+| `/api/v1/vaults/reembed/status` | GET | `services/vault-api.ts:55` |
+| `/api/v1/detect-drift` | POST | `services/curation-api.ts:189` |
+| `/api/v1/review-queue` | GET | `services/curation-api.ts:222` |
+| `/api/v1/review-queue/batch` | POST | `services/curation-api.ts:242` |
+| `/api/v1/resolve-review` | POST | `services/curation-api.ts:227` |
+
+Four `/config/defaults/...` rows share a caller with their vault-scoped twin. `llm-test-api.ts:23` and `embedding-api.ts:31` pick between the two paths on a `scope` argument: `application` sends the `/config/defaults/...` form, anything else sends the vault-scoped one. The same branch appears at `llm-test-api.ts:45` and `embedding-api.ts:52`, and at `config-api.ts:15` and `:26` for `/api/v1/config/defaults` against `/api/v1/config`.
+
+Five registered routes are called by neither the shipped CLI nor the frontend: `GET /api/v1/vaults/current`, `POST /api/v1/vaults/switch`, `PUT /api/v1/llm/credential`, `/api/v1/graph/integrity` under both GET and POST, and `DELETE /api/v1/ingest-queue/{item_id}`. The frontend reads that queue item and retries it, and nothing deletes it (`frontend/src/services/ingest-api.ts:34-48`). They are listed in [/help/known-gaps](/help/known-gaps).
+
+## Errors as the CLI sees them
+
+<ParamField path="connection failure" type="exit 2">
+The CLI prints this message verbatim, then exits 2. It raises on a connect error or a connect timeout. There are no retries and no fallback to opening the vault directly.
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+</ParamField>
+
+<ParamField path="status 400 or above" type="exit 1">
+The CLI raises on any response with status 400 or above. It prints `server error <status>: <detail>`. `detail` is the JSON body's `detail` field when present, otherwise the whole JSON body, otherwise the response text or the HTTP reason phrase.
+</ParamField>
+
+A response below 400 whose body is not valid JSON is also reported as `server error <status>: invalid JSON response: <error>`, carrying that response's own status code.
+
+## Two route blocks, three relationships
+
+The server registers a versioned block and then a bare block. The relationships between them are not uniform.
+
+<AccordionGroup>
+<Accordion title="True aliases: one handler, two paths">
+`/detect-drift`, `/review-queue`, `/review-queue/batch` and `/resolve-review` are registered twice, under `/api/v1/...` and bare, pointing at the same handler object. Same behavior either way.
+</Accordion>
+
+<Accordion title="Separate handlers with different response shapes">
+`/recall` returns a `results` list; `/api/v1/recall` returns a `hits` list built by a different serializer. `/ask` returns `status`, `text`, `citations` and `retrieval`; `/api/v1/ask` returns those plus `hits`. These are not aliases and they do not return the same thing.
+</Accordion>
+
+<Accordion title="Routes with no counterpart">
+`/health` and `/version` exist only unversioned. `/query` has no versioned twin. `/add` has no versioned twin either; the nearest versioned relative is `/api/v1/ingest`, which is a separate handler, not an alias. There is no `/api/v1/query` and no `/api/v1/add`.
+</Accordion>
+</AccordionGroup>
+
+Nothing in the server marks any route deprecated. There is no `Deprecation` or `Sunset` header, no warning log and no removal date. The source marks the bare routes as ones to keep, because the CLI speaks them over loopback (`src/okto_neuron/server/http.py:7026`).
+
+`API_VERSION` is the literal constant `"v1"`. There is no `/api/v2`, no `Accept-Version` header and no content negotiation.
+
+Route order is load-bearing. The versioned routes are registered first, then the bare routes, then the single-page-app `StaticFiles` mount at `/` is appended last, because a catch-all at `/` would otherwise shadow everything above it. When no frontend build exists the mount is omitted entirely and the server runs API-only.
+
+## Loopback restriction is per handler
+
+The loopback restriction is not a property of a block. It is a check inside individual handlers, so a bare route and a versioned route can both be restricted. `POST /add` refuses non-loopback callers with 403 because it materializes content into the vault. `/review-queue` refuses them with 403 through either of its two paths.
+
+## POST /api/v1/curation/rollback
+
+Reads no request body and takes no confirmation token (`src/okto_neuron/server/http.py:6692-6723`). A bare POST is the whole request; send `X-Okto-Neuron-Vault` with it, because the route is vault-scoped (see [which routes are vault-scoped](#which-routes-are-vault-scoped)).
+
+```bash
+curl -X POST http://127.0.0.1:7777/api/v1/curation/rollback \
+  -H 'X-Okto-Neuron-Vault: /absolute/path/to/vault'
+```
+
+It refuses non-loopback callers with 403 `forbidden`. It returns 409 `busy` while the vault is draining or a rebuild, rollback, heal or reembed job is queued or running (`src/okto_neuron/server/http.py:6654-6668`), and 409 `rollback_unavailable` when the live generation is missing or the backend has no verified checkpoint for it.
+
+On acceptance it returns 202 with `{"status": "ok", "job": {...}}`. The job object carries `id`, `kind`, `status`, `label`, `params`, `progress`, `result`, `error`, `created_at`, `started_at` and `finished_at` (`src/okto_neuron/server/_jobs.py:139-153`). The restore itself runs in the background, so a 202 is not a completed rollback. Poll `GET /api/v1/curation/rebuild/status?kind=rollback`, which returns the rollback state file under `phase` and the job record under `last_rollback`.
+
+The recovery sequence this belongs to is on [rebuilding](/vault/rebuilding#after-a-failed-post-swap-audit).
+
+## Destructive routes
+
+<Warning>
+Both routes below are irreversible. Both refuse non-loopback callers with 403, so neither can be driven remotely, with or without a token.
+</Warning>
+
+### POST /api/v1/reset
+
+Reads no request body and takes no confirmation token. It fences the vault, deletes the graph, vault-local derived state and user content, preserves `okto-neuron.yaml`, then re-scaffolds and reopens the same vault. It returns 409 when there is no active vault (`no_active_vault`), when maintenance is in flight (`busy`), or when the vault is already fenced (`vault_fenced`). On success the vault still exists and is usable.
+
+### DELETE /api/v1/vaults/{vault_id}
+
+Requires a JSON body containing exactly one field, `confirm_name`, matching the registry entry's `name`. Any other field set, or a non-string value, returns 400. A mismatched name returns 409 `confirmation_mismatch`. An unregistered id returns 404. A non-deletable vault returns 409 `vault_protected` with the registry's own reason. On success the whole vault directory is removed with `shutil.rmtree`, `okto-neuron.yaml` included, and nothing is re-created.
+
+A vault is marked `deletable` only when it is a non-symlink direct child of a configured vault root, under a root and parent that are not symlinks, not a home directory, its parent, or a filesystem root, and holds `okto-neuron.yaml` as a regular non-symlink file. Anything else comes back with `deletable: false` and a `delete_reason` naming the failed condition.
+
+## GET /api/v1/backends
+
+The odd one out in shape. It returns a bare JSON array of `{name, capabilities}` objects with no status envelope. Backends are enumerated without importing or validating them, so an unregistered or broken third-party backend still appears in the list. A `null` `capabilities` means the backend registered no capabilities entry, which the server treats as valid.
+
+## Graph browse reads
+
+`/api/v1/nodes`, `/api/v1/nodes/{id}`, `/api/v1/nodes/{id}/neighbors`, `/api/v1/node-types`, `/api/v1/graph` and `/api/v1/graph/stats` share one visibility rule: closed-schema node types only, infra nodes always hidden, and deterministic structural Claims (predicates `has_heading`, `has_tag`, `links_to`) hidden unless you pass `?include_structural=1`.
+
+The cap policies differ between them.
+
+| Endpoint | Parameter | Default | Cap | Over the cap |
+| --- | --- | --- | --- | --- |
+| `/api/v1/nodes` | `limit` | 50 | 500 | 400 `bad_request` |
+| `/api/v1/graph` | `limit` | 1500 | 5000 | silently clamped |
+| `/api/v1/nodes/{id}/neighbors` | `limit` | 500 | 2000 | silently clamped |
+| `/api/v1/nodes/{id}/neighbors` | `hops` | 1 | 3 | silently clamped |
+
+Three further asymmetries are worth knowing before you read a response:
+
+- The `types` query parameter is validated against the closed schema. The `relations` parameter is not: edge types are an open, pack-defined vocabulary and are filtered as given.
+- `degree` means different things on the two graph endpoints. On `/api/v1/graph` it is computed over the full filtered subgraph before the cap. On `/neighbors` it is computed only within the returned set.
+- On `/api/v1/graph/stats`, `total_nodes` counts visible nodes only, while `total_edges` counts every edge with no filtering. They do not describe one population.
+
+## Response bodies
+
+Response fields are documented here only where a CLI `--format json` or `--json` path dumps them, or where the handler's return was read directly. Field sets may change without notice while Okto Neuron is prerelease (0.3.0).
+
+Response fields for the web-UI routes above were not surveyed and are not documented anywhere on this site, except for `POST /api/v1/curation/rollback` above. Routes called by neither the shipped CLI nor the frontend are tracked in [/help/known-gaps](/help/known-gaps), including the bare `/remember`, `/recall` and `/ask` and the five versioned routes with no caller.

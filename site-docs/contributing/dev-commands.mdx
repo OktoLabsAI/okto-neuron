@@ -1,0 +1,130 @@
+---
+title: Developer commands
+description: dev, models and pilot, contributor tooling that must not appear in user workflows.
+---
+
+<Warning>
+These commands are quarantined. None of them belongs in a user-facing procedure, and no page outside Contributing links to them as a step. `dev` needs a source checkout and a Node toolchain, `pilot` writes an internal report and returns an internal gate result, and `models size` reports a number it can silently get wrong. If you are writing a user-facing page, use [/reference/cli/overview](/reference/cli/overview) instead.
+</Warning>
+
+<Note>
+Okto Neuron is prerelease. Every command on this page is contributor tooling and can change without a deprecation path.
+</Note>
+
+## okto-neuron dev
+
+Runs a local development server and restarts it when source files change. Requires the Okto Neuron source checkout: `run_dev` looks upward from the current directory and from the `okto_neuron.dev` module for a directory that holds both `pyproject.toml` and a `frontend/` directory, and raises `RuntimeError("dev mode requires the Okto Neuron source checkout")` when it finds neither (`src/okto_neuron/dev.py:150`).
+
+Set up the checkout first: see [/contributing/dev-install](/contributing/dev-install).
+
+```bash
+okto-neuron dev --vault demo --poll 0.5
+```
+
+### Flags
+
+<ParamField path="--vault" type="path">
+Vault name or root to open. Optional; when omitted, vault selection happens in the app (`src/okto_neuron/cli/__init__.py:2878`).
+</ParamField>
+
+<ParamField path="--host" type="string" default="127.0.0.1">
+Bind host (`src/okto_neuron/cli/__init__.py:2879`).
+</ParamField>
+
+<ParamField path="--allow-remote" type="flag" default="false">
+Reserved compatibility flag. Passing it raises a `ClickException` (`src/okto_neuron/cli/__init__.py:2881`, `:2911`).
+</ParamField>
+
+<ParamField path="--port" type="int" default="7777">
+REST/UI port (`src/okto_neuron/cli/__init__.py:2886`).
+</ParamField>
+
+<ParamField path="--mcp-port" type="int" default="8201">
+FastMCP port (`src/okto_neuron/cli/__init__.py:2887`).
+</ParamField>
+
+<ParamField path="--poll" type="float" default="1.0">
+File polling interval in seconds, typed as `click.FloatRange(min=0.1)`, so values below 0.1 are rejected by Click before `run_dev` runs (`src/okto_neuron/cli/__init__.py:2888`).
+</ParamField>
+
+<ParamField path="--build / --no-build" type="flag" default="--build">
+Build `frontend_dist` before start and after frontend source changes (`src/okto_neuron/cli/__init__.py:2896`).
+</ParamField>
+
+### Host and remote refusal
+
+Before importing anything, `dev` checks `if allow_remote or host not in {"127.0.0.1", "localhost", "::1"}` and raises a `ClickException` with the message `direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel` (`src/okto_neuron/cli/__init__.py:2911`). Any other host value is refused, not bound.
+
+### The build step
+
+With `--build` in effect, `run_dev` calls `build_web_ui`, which requires `npm` on `PATH` and raises `RuntimeError("npm not found on PATH; install Node.js before running dev mode")` otherwise. When `frontend/node_modules` is missing it runs `npm ci` in `frontend/`, then runs `npm run build` (`src/okto_neuron/dev.py:153-161`). A failing build is re-raised as `RuntimeError(f"frontend build failed with status {exc.returncode}")` (`src/okto_neuron/dev.py:75`).
+
+`run_dev` also raises `RuntimeError` when `--vault` names something that does not resolve to a vault, with a message pointing at `okto-neuron vault create <name> --embedder stub` (`src/okto_neuron/dev.py:62-67`).
+
+### Exit behaviour
+
+The command catches `RuntimeError` from `run_dev`, prints the message to stderr and exits 1 (`src/okto_neuron/cli/__init__.py:2930-2932`). Otherwise it exits with the integer `run_dev` returned (`src/okto_neuron/cli/__init__.py:2933`).
+
+<Warning>
+`dev` defaults to port 7777 for REST/UI and 8201 for FastMCP, the same defaults `okto-neuron serve` uses (`src/okto_neuron/cli/__init__.py:2670`, `:2671`). Running both at once collides on those ports. Stop the server before starting `dev`, or move `dev` with `--port` and `--mcp-port`.
+</Warning>
+
+## okto-neuron models size
+
+Prints a size breakdown and a total:
+
+```bash
+okto-neuron models size
+```
+
+The rows are the okto-neuron site-packages footprint, `~/.cache/huggingface`, `~/.cache/fastembed`, and `~/.cache/gliner` labelled `legacy GLiNER cache (unused)`; the last line is `total` (`src/okto_neuron/cli/models.py:47-59`). Directory rows sum the size of every file under the path and report 0 when the path does not exist (`src/okto_neuron/cli/models.py:17-20`).
+
+<Warning>
+The site-packages row is not authoritative. Its computation sits inside `try: ... except Exception: site_packages_size = 0`, so any failure resolving the installed distribution's files is swallowed and the row, and therefore the total, silently reads 0 (`src/okto_neuron/cli/models.py:35-41`). Do not quote either number as a measurement.
+</Warning>
+
+## okto-neuron pilot
+
+Internal evaluation tooling. It is not part of first run and it is not a health check.
+
+```bash
+okto-neuron pilot ./some-vault --report-dir docs
+```
+
+Takes one positional `VAULT_PATH` and `--report-dir`, which defaults to `docs` (`src/okto_neuron/cli/__init__.py:2612-2614`).
+
+Order of operations:
+
+<Steps>
+<Step title="Laptop gate">
+`OKTO_NEURON_LAPTOP_GATE` is read first. When it is set to any of `0`, `false`, `no`, `reject`, `rejected`, `deny`, `denied`, `block`, `blocked`, `fail` or `failed` (case-insensitive, trimmed), the command prints `laptop-gate: OKTO_NEURON_LAPTOP_GATE=<value>` to stderr and exits 2 (`src/okto_neuron/cli/__init__.py:2617-2620`, `:3312-3327`).
+</Step>
+<Step title="Vault checks">
+Exits 2 if the resolved path is not an existing directory, and exits 2 if it has no `okto-neuron.yaml` (`src/okto_neuron/cli/__init__.py:2621-2627`).
+</Step>
+<Step title="In-process ingest">
+Opens the vault and adds every `*.md` found by `rglob`, skipping any path with `.marginalia` in its parts. This happens in-process, not through a running server (`src/okto_neuron/cli/__init__.py:2629-2630`, `:3302-3309`).
+</Step>
+<Step title="Drift envelope">
+Runs `_drift_envelope` with `mode="on-query"` over `list(DETECTOR_NAMES)`, so every registered detector runs (`src/okto_neuron/cli/__init__.py:2631-2635`).
+</Step>
+<Step title="Report and exit">
+Writes `<report-dir>/pilot-log.<UTC date>.json`, creating the directory tree and resolving a relative `--report-dir` against the current working directory, prints `wrote <path>`, and exits 0 when the envelope's `total` is at least 1, otherwise 1 (`src/okto_neuron/cli/__init__.py:2636-2658`).
+</Step>
+</Steps>
+
+The envelope's `total` is the number of findings across all detectors (`src/okto_neuron/cli/__init__.py:3270`). So exit 0 means the detectors produced at least one finding. That is an internal gate on the corpus, and reading it as "the vault is healthy" inverts it.
+
+## The kg alias
+
+The package installs three console scripts: `okto-neuron = "okto_neuron.cli:app"`, `kg = "okto_neuron.cli:kg_cli"` and the pre-0.3.0 `marginalia = "okto_neuron.cli:legacy_app"`, which prints a rename warning and then runs `app` (`pyproject.toml:95-99`). `kg_cli` is its own Click group, documented in-tree as the "Compatibility CLI with graph commands flattened at the top level" (`src/okto_neuron/cli/__init__.py:111-122`).
+
+`_install_kg_compat_commands` builds it at import time. It copies every top-level command except the `kg` group itself into `kg_cli`, then adds each command from the `kg` group only when that name is not already taken (`src/okto_neuron/cli/__init__.py:3350-3357`). Top-level names therefore win: a name that exists both at the top level and inside the `kg` group resolves to the top-level command under `kg`. Treat `kg` as a historical alias with its own resolution order, not as a spelling of `okto-neuron kg`. See [/help/known-gaps](/help/known-gaps).
+
+## bin/acceptance.sh
+
+A maintainer harness, not a verify-my-install command. It describes itself as running "real scenarios end-to-end" with a hard rule that selected scenarios use no mocks and no reduced corpora, and that private-corpus and live-model scenarios are opt-in rather than part of the default suite (`bin/acceptance.sh:1-7`).
+
+Its exit codes are its own, documented in the header: 0 means all selected scenarios green, 1 means at least one regression, 2 means at least one `known_bug` with no regressions (`bin/acceptance.sh:8-11`). It reads scenarios from `tests/acceptance/scenarios` and writes reports under `OKTO_NEURON_ACCEPTANCE_DIR`, defaulting to `/tmp/okto-neuron-acceptance` (`bin/acceptance.sh:16-18`).
+
+Never point a user at it. For what is intentionally not shipped to users, see [/help/deliberately-absent](/help/deliberately-absent).

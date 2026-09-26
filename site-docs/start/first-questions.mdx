@@ -1,0 +1,233 @@
+---
+title: Add a note and ask about it
+description: Ingest your first markdown file, search it, and read a cited answer.
+---
+
+<Note>
+Okto Neuron is a prerelease. Commands, output lines and defaults can change between versions. See [/start/prerelease-status](/start/prerelease-status).
+</Note>
+
+You are going to put one markdown file into a vault, then find it again with a search. Those two steps run without a language model, so they work on a fresh install. A third step asks a question in prose, and that one needs an LLM provider configured.
+
+## Before you start
+
+Every command on this page is a thin client over a server you run yourself. `add`, `query` and `ask` all POST to the server and do nothing on their own: there is no auto-spawn, no retry, no fallback to opening the vault directly (`src/okto_neuron/cli/__init__.py:2447-2556`).
+
+Start the server in another terminal and leave it running:
+
+```bash
+okto-neuron serve
+```
+
+`serve` binds the HTTP surface the CLI talks to and the web UI on one loopback port, and the MCP listener on another. The addresses are listed in [/server/running](/server/running).
+
+The server works on one active vault. If none is active, the commands below fail with `server error 409: no vault selected; choose or create one in the application` and exit 1. Create a vault first if you have none:
+
+```bash
+okto-neuron init ~/notes
+```
+
+`init` creates the vault and prints `initialized vault at ~/notes` (`src/okto_neuron/cli/__init__.py:1039`).
+
+<Note>
+Two words show up while a vault is being created.
+
+A **pack** is a vocabulary: the node and edge types the graph is allowed to hold, and `init` enables `core`, `research` and `personal` by default (`src/okto_neuron/cli/__init__.py:923`). What each one contributes and how to change the list are on [/config/vault-yaml#packs](/config/vault-yaml#packs).
+
+A **graph backend** is where that derived graph is stored, and a new vault is pinned to `grafx`, also written Okto Grafx, unless you pass `--backend` (`src/okto_neuron/config/_vault.py:335`). What the backends are and what each one needs from you are on [/config/storage-backends](/config/storage-backends).
+</Note>
+
+`init` is the shortest route to a vault at a path you choose. Two other routes exist: `okto-neuron onboard` creates a vault and configures an LLM provider in the same pass, and `okto-neuron vault create NAME` makes a named vault under the managed vault root. The three are compared on [/vault/creating](/vault/creating), and onboarding is walked question by question on [/start/first-run](/start/first-run).
+
+`init` leaves your default vault alone, so on its own it does not clear the 409. Point the default at the new vault:
+
+```bash
+okto-neuron vault use ~/notes
+```
+
+That writes `default_vault` into `okto-neuron.toml` and prints `current vault: /Users/you/notes`. The server re-reads that setting on each request, so a server you already started picks up the new default without a restart. `vault use` never contacts the daemon; if the path has no `okto-neuron.yaml` it prints `vault not found: <path>` and exits 2. The rest of the group is on [/reference/cli/vault-commands](/reference/cli/vault-commands).
+
+You can also pin one vault for the life of the process instead. `serve --vault` points the server at a vault that already exists; it does not create one, and it prints `vault not found: <path>` and exits 2 when the path is not a vault.
+
+```bash
+okto-neuron serve --vault ~/notes
+```
+
+If the server is not running at all, each of the commands below prints this to stderr and exits with code 2:
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+## Step 1: add a note
+
+<Steps>
+<Step title="Write a markdown file">
+
+Put something in it you will recognize later. Use a decision you actually made, so you can recognize it in the output.
+
+```bash
+cat > note.md <<'MD'
+# Retrieval backend decision
+
+We moved this project's vault onto grafx, the backend a new vault is created with.
+It had been running on ladybug, the legacy default.
+MD
+```
+
+</Step>
+<Step title="Hand it to the server">
+
+```bash
+okto-neuron add note.md
+```
+
+`add` reads the file itself, sends the path and the file's text to the server, and the server writes the bytes to a durable location under `.marginalia/sources/` inside the vault before ingesting them (`src/okto_neuron/server/http.py:2114-2117`). The copy stays on disk because the stored provenance points at that path.
+
+</Step>
+<Step title="Read the confirmation">
+
+On success you get one line:
+
+```text
+added 7bb26e2d42bb6719bfcc0a655ae941eb63146d74d6229969914351cbcbb49715 (1 chunks)
+```
+
+The first value is the document id the server minted, and yours will be a different hash. The count in parentheses is what the server reported as `chunks_ingested`, and the `/add` route reports `1` (`src/okto_neuron/server/http.py:2147`).
+
+</Step>
+</Steps>
+
+<Note>
+`add` is a deterministic store. It runs no extraction pass over your prose, so the sentences in `note.md` do not become claims in the graph. The server records the ingest with `stage="stored"` for exactly that reason: "Same semantics (no LLM)" (`src/okto_neuron/server/http.py:2121-2128`). The only assertions minted are structural ones taken from headings, tags and wikilinks. Your sentences are still stored and still retrievable, because the Document node's content is the file's body text and the chunked Block nodes carry it too (`src/okto_neuron/ingest/markdown.py:400-403`, `src/okto_neuron/ingest/__init__.py:61-84`).
+
+There is no `okto-neuron curate` and no `okto-neuron remember` command. The CLI's routes for putting content into a vault are `add` (one file), `watch` (drains the vault's `.marginalia/incoming` inbox and runs the full curation pass) and the `watch-folder` group (registers folders with the running daemon) (`src/okto_neuron/cli/__init__.py:2447`, `:2967`, `:3019`). The `remember` tool that extracts claims from prose is reached from an agent over MCP, covered in [/mcp/tools/remember](/mcp/tools/remember) and [/start/connect-claude-code](/start/connect-claude-code). Both curation routes need a working LLM provider. All the ways in, and what each one extracts, are compared on [/vault/ingesting](/vault/ingesting).
+</Note>
+
+If the file is missing or the OS refuses to open it, `add` prints `cannot read <path>: <reason>` and exits 1 without contacting the server (`src/okto_neuron/cli/__init__.py:2456-2459`). `add` reads the file as UTF-8; a file that is not valid UTF-8 is not covered by that message. See [/help/known-gaps](/help/known-gaps).
+
+`add` also takes exactly one file argument and does not walk a directory (`src/okto_neuron/cli/__init__.py:2448`).
+
+## Step 2: find it with query
+
+This is the step that is guaranteed. No language model is involved, so it behaves the same whether or not you have configured a provider.
+
+```bash
+okto-neuron query "retrieval backend"
+```
+
+`query` asks the server for hits and prints one line per hit, in this order:
+
+```text
+score document_id path snippet
+```
+
+This is what the command printed, verbatim, for a vault created at `/tmp/demo/notes`:
+
+```text
+ 1.00 7bb26e2d42bb6719bfcc0a655ae941eb63146d74d6229969914351cbcbb49715 /private/tmp/demo/notes/.marginalia/sources/note.md note
+ 0.84 10c4f4296e78868fdb132ed204912abf83ddd97a84294e41d18c2e18e98b1a53 /private/tmp/demo/notes/.marginalia/sources/note.md heading: Retrieval backend decision
+```
+
+Your ids will not match those. A document id is a hash of the stored file's resolved path, so it changes with your vault location, and the scores move with what else is in the vault. The `path` column points into `.marginalia/sources/`, the durable copy the server wrote, not the `note.md` you typed.
+
+The second line is the assertion `add` minted from the heading, which is what the structural pass gives you without a model. The score is printed with two decimals in a five-character field, so the columns line up (`src/okto_neuron/cli/__init__.py:2504`). The `snippet` column is the node's title, not a passage of body text. If nothing matches, you get a single line:
+
+```text
+(no hits)
+```
+
+Read that output as the honest shape of Step 1: the file is in, the heading became a node, and the prose is stored and reachable rather than broken into claims.
+
+`--k` sets how many notes are retrieved. The default is in [/reference/cli/client-commands](/reference/cli/client-commands):
+
+```bash
+okto-neuron query "retrieval backend" --k 25
+```
+
+For the whole hit record instead of the four columns, ask for JSON:
+
+```bash
+okto-neuron query "retrieval backend" --format json
+```
+
+The JSON form prints the server's full hit records, which carry more fields than the four text columns show. They are listed in [/reference/cli/client-commands](/reference/cli/client-commands).
+
+## Step 3: ask a question
+
+<Note>
+This step needs an LLM provider configured, and the previous two do not. `ask` synthesises its answer with the provider you set up in [/config/llm-providers](/config/llm-providers). Without one, the rest of this page still works; you read your material through `query` instead.
+</Note>
+
+```bash
+okto-neuron ask "what did we decide about the retrieval backend"
+```
+
+`ask` retrieves hits the way `query` does, then synthesises one answer over them. It does not stop at the four columns you saw in Step 2. On the default path it also reads the stored source bytes behind each hit and puts those excerpts into the model's context, because the source block policy resolves to `always` when subgraph retrieval is off (`src/okto_neuron/companion/__init__.py:1936-1940`, `:7730-7737`, `:2137-2145`). That is how the sentence you wrote reaches the model even though no claim was extracted from it. Which of the two commands you want is covered in [/start/query-vs-ask](/start/query-vs-ask); the defaults are in [/reference/cli/client-commands](/reference/cli/client-commands).
+
+In text mode `ask` prints the answer, then, when there are any, a block like this (`src/okto_neuron/cli/__init__.py:2550-2555`):
+
+```text
+Citations:
+  - <path>
+  - <path>
+```
+
+Each line is the `path` field of one citation record, printed as-is. The wording of the answer comes from your provider, so it is not identical run to run, and this page does not promise you a sentence. What is promised is the citation block underneath it and the paths it names, which point at the file you added. Where the citations come from is covered in [/concepts/subgraph-answers](/concepts/subgraph-answers).
+
+<Note>
+When the provider is unavailable, the answer text comes back empty and the CLI prints `(no answer)` (`src/okto_neuron/cli/__init__.py:2549`). The response also carries a synthesis status, and empty text with a status of `provider_error` means the model was unreachable rather than the vault being silent on the subject. A status of `empty` means the provider answered with nothing. Read that status with `--format json`.
+</Note>
+
+Two flags you will reach for:
+
+```bash
+okto-neuron ask "what did we decide about the retrieval backend" --k 40
+okto-neuron ask "what did we decide about the retrieval backend" --format json
+```
+
+`--k` sets how many notes are retrieved before the answer is synthesised. `--format json` prints the whole response body, including the citations, the serialized hits and the retrieval record, which is what you want when you are working out why an answer came out the way it did.
+
+## The loop this turns into
+
+One note and one question is the demo. The working shape is four moves, and you repeat them. This is the daily loop the tutorial was preparing you for.
+
+<Steps>
+<Step title="Write markdown the way you already do">
+Nothing Okto Neuron derives edits your notes. You keep using your own editor and your own file layout, and the graph catches up when something ingests the file.
+</Step>
+<Step title="Get your real material in, not one file at a time">
+`add` stops being the right tool as soon as you have a folder. Register the folder with the daemon instead:
+
+```bash
+okto-neuron watch-folder add ~/projects/handbook
+```
+
+Registering a root also queues the files already in it, unless you pass `--no-initial-ingest`, and it turns continuous watching on: the registration route writes both the root and `folder_watch.enabled: true` into the vault config (`src/okto_neuron/cli/__init__.py:3117`, `src/okto_neuron/server/http.py:5051-5058`). A vault you never register a root with keeps the shipped default of `False`, so its polling loop stays inert. The switch, the roots and the ignore patterns are on [/config/vault-yaml](/config/vault-yaml), and what the loop does with a folder is on [/vault/watching](/vault/watching).
+</Step>
+<Step title="Ask, from the terminal or from an agent">
+`query` and `ask` against a vault with real content in it work the way they did above, with more to read in the output. See [/vault/asking](/vault/asking). If you would rather ask from Claude Code than from a shell, point it at the same daemon over MCP: [/start/connect-claude-code](/start/connect-claude-code).
+</Step>
+<Step title="Repair the graph when the files move on">
+Edited paragraphs, renamed files and deleted documents do not reach the graph on their own. `okto-neuron detect-drift` sweeps the vault against what was ingested and reports what no longer holds, and re-ingestion is what repairs it. See [/vault/drift](/vault/drift). When the derived side is wrong enough that repairing it piecemeal is not worth it, you throw it away and build it again from your markdown: [/vault/rebuilding](/vault/rebuilding).
+</Step>
+</Steps>
+
+## Where to go next
+
+Read [/vault/ingesting](/vault/ingesting) next. It is the step that turns this demo into the loop above, because it is where you load real material and where claim extraction actually happens.
+
+<CardGroup cols={2}>
+<Card title="Ingest a whole folder" href="/vault/ingesting">
+One file at a time gets old. This is how you load real material, and which routes extract claims.
+</Card>
+<Card title="query or ask?" href="/start/query-vs-ask">
+The full comparison, including when the raw hits are what you actually want.
+</Card>
+<Card title="Connect Claude Code" href="/start/connect-claude-code">
+Point an agent at the same vault over MCP so it can remember and ask for you.
+</Card>
+<Card title="How answers get their context" href="/concepts/subgraph-answers">
+Why `ask` can ground an answer in more than the notes it cites.
+</Card>
+</CardGroup>

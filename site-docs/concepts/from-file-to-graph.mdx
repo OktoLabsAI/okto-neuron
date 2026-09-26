@@ -1,0 +1,156 @@
+---
+title: The life of a note
+description: What happens between saving a markdown file and getting a cited answer about it.
+---
+
+You write a note. Later you ask a question and get an answer that points back at the exact bytes it came from. This page walks the path between those two moments, so you know what Okto Neuron did to your file and what it did not.
+
+<Note>
+Okto Neuron is prerelease. The shapes described here are the ones in the code today, and they can change.
+</Note>
+
+## What can go in
+
+Okto Neuron ingests plain text files: `.md`, `.markdown` and `.txt`. Anything else is refused with a `NotImplementedError` before parsing starts, so a PDF or a `.docx` never silently becomes an empty document.
+
+Your markdown file stays the trust root. Everything the graph holds is a pointer back into it, and superseding a stale claim is decided by what the file asserts today.
+
+## Step 1: the file becomes Blocks
+
+The parser reads the raw bytes and cuts them into **Blocks**. A Block is a byte range inside one path: it records the path, a block index, a byte start, a byte end, a block kind and a content hash of exactly those raw bytes, with no normalization.
+
+The cut is a byte window. The window size and the overlap are read from the vault's `ingest` config block, which is writable, and overlap must stay smaller than the window. Both shipped values are on [/config/vault-yaml](/config/vault-yaml).
+
+Because a Block's id is derived from its path, its content hash and its index, editing your file changes the hash and therefore mints a new Block instead of overwriting the old one in place. That property is what makes the later supersession step necessary.
+
+<Note>
+Frontmatter is handled separately. A leading `---` fenced YAML block is read into document metadata, and those bytes become block 0 with kind `code-block` ahead of the windowed body.
+</Note>
+
+## Step 2: deterministic claims
+
+Before any model is involved, the parser mints **Claims** it can prove by reading the text. Three predicates come out of this pass:
+
+- `has_tag`, from `tags:` in frontmatter and from inline `#tag` mentions
+- `has_heading`, from ATX headings (`#` through `######`), skipping anything inside a fenced code block
+- `links_to`, from `[[wikilink]]` targets
+
+Every one of these is minted with `confidence=1.0` and with the **Document** as its subject. The claim reads "this document has tag X", not "X is true". Each claim also carries the id of the Block it was found in, so the provenance chain survives.
+
+`has_tag` and `links_to` are deduplicated per document, so one real mention produces one Claim even when overlapping windows re-scan the same bytes. `has_heading` is deliberately not deduplicated, because a heading claim is the anchor for its own section. Heading claims are also tagged low-salience, which keeps a table of contents out of the graph-native answer path while leaving the Claim a real, provenance-bearing node.
+
+Ingest also writes the Document node itself, one node per Block, and the provenance edges that connect a Claim to its subject and object. See [/concepts/provenance](/concepts/provenance) for the edge shapes, and [/concepts/data-model](/concepts/data-model) for the node types.
+
+## Step 3: optional model extraction
+
+The deterministic pass only sees structure. To get entities and relationships out of the prose, a model has to read it, and that path is optional. `okto-neuron add` deliberately does not run it: the REST `/add` route it calls writes a Document and Blocks with no model extraction.
+
+When it runs, it does not write to the graph. It proposes **candidates**: a `NodeCandidate` for a proposed entity, an `EdgeCandidate` for a proposed relationship. A node candidate's id is a content hash over its type, its case-folded title and its content, so proposing the same thing twice is idempotent and two spellings of one name land on the same id. An edge candidate can carry the block id, byte range, content hash, confidence, model id and prompt hash of the passage it came from, and it can carry a literal object instead of a target node when the fact's object has no entity of its own.
+
+## Step 4: resolve, gate, commit
+
+A candidate is staged, resolved against the graph you already have, gated, and only then committed. Nothing a model proposed reaches the graph without passing that gate.
+
+<Steps>
+<Step title="Resolve">
+The resolver probes the store and mutates nothing. It looks for existing nodes similar to the candidate, and for existing Claims that assert the same subject and the same predicate with a **different** object. It then derives one confidence number: a candidate with nothing related scores highest, a contradicted one lowest, an ambiguous one in between.
+</Step>
+<Step title="Gate">
+The gate turns that outcome into one of two fates. A contradicted candidate routes to review no matter how confident it was, because contradiction takes precedence over confidence. Otherwise, a candidate at or above `consolidation.auto_commit_threshold` commits, and one below it routes to review as `low_confidence`. The threshold's shipped value is on [/config/vault-yaml](/config/vault-yaml).
+</Step>
+<Step title="Commit">
+Only after the gate says commit does the candidate become a real node or edge, carrying its provenance with it.
+</Step>
+</Steps>
+
+<Warning>
+The contradiction check is scoped to the candidate being resolved. It answers "does anything already in the graph disagree with **this** proposal", by matching that candidate's own subject and predicate. It is not a sweep that finds every pair of documents that disagree with each other.
+</Warning>
+
+## Step 5: stale claims get superseded
+
+Every ingest ends by cleaning up after the last one.
+
+Because Block and Claim ids are content-derived, deleting a tag from your file does not touch the old Claim. It just stops being re-minted. Left alone, that stale Claim would keep surfacing a fact your file no longer asserts.
+
+So at the end of every ingest, Okto Neuron walks the claims whose subject is this document, keeps only those the fresh parse produced again, and marks the rest superseded with a `valid_until` date. This is a pure removal: no replacement claim is written and no `supersedes` edge is drawn, because once a document no longer carries a tag, `has_tag: X` is definitively false about it. It applies to `has_tag`, `has_heading` and `links_to`, and it runs on every ingest.
+
+More on that distinction in [/concepts/supersession](/concepts/supersession).
+
+## Step 6: you ask
+
+Two commands read the graph, and they return different shapes.
+
+`okto-neuron query` gives you hits for an agent to work with. Each hit carries provenance: the path, the byte start, the byte end, the content hash, the extraction activity, the agent, the document id and the block id. That is what "byte-anchored" means here, you can re-read the exact source range yourself. A hit can also carry context spans, the neighbouring Blocks on the same path recovered at read time rather than stored.
+
+`okto-neuron ask` is one shot. Instead of handing the model raw byte slices of the top hits, it builds an **ego graph** around the seed nodes: the seeds, the Claims that bridge to them, and their one-hop neighbours through the subject and object edges, rendered as a compact typed block of nodes, relationships and claims. Infrastructure nodes, low-salience nodes and superseded claims are filtered out during that walk, and a degree cap keeps a popular node from dragging its whole neighbourhood in.
+
+[/concepts/subgraph-answers](/concepts/subgraph-answers) covers why the answer path works that way.
+
+## One file, end to end
+
+Say you save this:
+
+```markdown title="notes/ladybug.md"
+---
+tags: [storage]
+---
+
+# Storage backend
+
+We moved to ladybug. See [[Graph stores]].
+```
+
+Then ingest it, with the server already running:
+
+```bash
+okto-neuron add notes/ladybug.md
+```
+
+The command reads the file and posts it to the running server, then prints the new document id and the number of chunks stored.
+
+What lands in the graph:
+
+- one **Document** node for `notes/ladybug.md`
+- two **Block** nodes: block 0 for the frontmatter bytes (kind `code-block`), and one block for the body, which fits in a single window
+- a `has_tag` Claim with object `storage`, from frontmatter
+- a `has_heading` Claim with object `Storage backend`, marked low-salience
+- a `links_to` Claim with object `Graph stores`
+- provenance edges from each Claim to the Document that is its subject
+
+Every one of those claims has the Document as subject and confidence `1.0`, and no model ran.
+
+Now query it:
+
+```bash
+okto-neuron query "storage backend"
+```
+
+You get hits, each with the path `notes/ladybug.md` and a byte range you can open.
+
+Or ask it:
+
+```bash
+okto-neuron ask "what did we move storage to?"
+```
+
+The answer is synthesized from the ego graph around those seeds, with citations listing the source paths.
+
+Later you delete `storage` from the frontmatter `tags:` list and re-ingest. The old `has_tag` Claim is not edited, it is marked superseded with today's date, and it stops appearing in recall.
+
+## Where to go next
+
+<CardGroup cols={2}>
+<Card title="Ingesting a vault" href="/vault/ingesting">
+The practical steps for getting files in.
+</Card>
+<Card title="The data model" href="/concepts/data-model">
+Documents, Blocks, Claims and the edges between them.
+</Card>
+<Card title="Provenance" href="/concepts/provenance">
+What each hit carries back to your file.
+</Card>
+<Card title="Supersession" href="/concepts/supersession">
+How a fact stops being true without being deleted.
+</Card>
+</CardGroup>

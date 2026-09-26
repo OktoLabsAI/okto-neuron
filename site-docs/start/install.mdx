@@ -1,0 +1,202 @@
+---
+title: "Install Okto Neuron"
+description: "Get the code, run the installer, and know exactly what it puts on your machine."
+---
+
+<Note>
+Okto Neuron is prerelease. The package version is `0.3.0` and the packaging classifier is `Development Status :: 2 - Pre-Alpha`. See [prerelease status](/start/prerelease-status) before you rely on anything here. Releases up to 0.2.0 were published under the earlier name Marginalia; if you have one installed, read [upgrading from Marginalia](#upgrading-from-marginalia).
+</Note>
+
+You install Okto Neuron by running one shell script. The script provisions what it needs, installs the CLI as a global tool, starts the local daemon, and registers the MCP endpoint with Claude Code.
+
+## Before you start
+
+<Steps>
+  <Step title="A POSIX shell on macOS or Linux, or Windows PowerShell">
+    `install.sh` is a Bash script that dispatches on `uname -s`, with branches for `Darwin` and a generic fallback that uses `xdg-open`. `install.ps1` is the Windows PowerShell counterpart; no native Windows PowerShell 5.1 lifecycle has been verified for it yet.
+  </Step>
+  <Step title="Network access">
+    The installer downloads `uv` from `astral.sh` if it is not already on your `PATH`, then resolves Python and the Python dependencies.
+  </Step>
+</Steps>
+
+You do not need to install `uv` or Python yourself. If `uv` is missing, the installer fetches it and exports `~/.local/bin` onto `PATH` for the rest of the run. It then runs `uv python install 3.12` and resolves that interpreter, without touching your system Python. The package requires Python 3.12 or newer; the installer pins the interpreter it provisions to 3.12.
+
+## Getting the installer
+
+The source, the installers and the release manifest all live in [`OktoLabsAI/okto-neuron`](https://github.com/OktoLabsAI/okto-neuron). Each release attaches its wheel to a GitHub Release, and the same version is published on PyPI as `okto-neuron`.
+
+<Tabs>
+  <Tab title="Release installer (recommended)">
+    Download the script to a file, read it, then run it:
+
+    ```bash
+    curl -fsSLO https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/install.sh
+    less install.sh
+    bash install.sh
+    ```
+
+    Or, piped in one line:
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/install.sh | bash
+    ```
+
+    On Windows PowerShell:
+
+    ```powershell
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/install.ps1 | iex"
+    ```
+
+    The script carries the release wheel URL, the `release-manifest.json` URL and the expected version. It downloads the wheel, verifies it against the manifest, and installs that. The manifest pins one exact artifact: the version, the wheel `okto_neuron-<version>-py3-none-any.whl`, its download URL, its SHA-256 and the source commit it was built from. The installer refuses the wheel unless all of those agree. See [wheel verification](#wheel-verification).
+  </Tab>
+  <Tab title="From a clone">
+    ```bash
+    git clone https://github.com/OktoLabsAI/okto-neuron.git
+    cd okto-neuron
+    OKTO_NEURON_SRC="$PWD" bash install.sh
+    ```
+
+    Given `OKTO_NEURON_SRC`, or run from the root of a clone, the script builds from that checkout and downloads no wheel. The path must contain a `pyproject.toml`, or the run stops with `OKTO_NEURON_SRC has no pyproject.toml: <path>`. For a checkout you intend to edit, use [the development install](/contributing/dev-install) instead.
+  </Tab>
+</Tabs>
+
+## Upgrading from Marginalia
+
+Okto Neuron 0.3.0 replaces a Marginalia install in place when you run the installer above. It:
+
+- finds the `marginalia` uv tool and stops its daemon with that tool's own `marginalia stop`;
+- moves the old tool aside and installs `okto-neuron`, which also installs `marginalia` as an alias that prints a rename warning until 0.5;
+- copies the app-level files (`marginalia.toml` as `okto-neuron.toml`, `env`, `providers.yaml`, `defaults.yaml`) from `~/.marginalia` to `~/.okto-neuron` and leaves a `MOVED_TO` note in `~/.marginalia`;
+- leaves every vault where it is. `~/.marginalia/vaults` stays a vault root, and an existing `marginalia.yaml` is read in place, because document ids hash absolute paths;
+- keeps the daemon credential and registers `okto-neuron` with Claude in the same scope (user or local) as your `marginalia` entry. Once `okto-neuron` passes Claude's connection check, it removes the old `marginalia` entry from that same scope, but only if that entry pointed at the same endpoint. If the installer fails after that removal, it adds the old entry back as it was. A project-scope entry in a shared `.mcp.json` is left for you to rename.
+
+If anything fails before the new version is verified, the exact previous `marginalia` tool is restored and, if its daemon was running, restarted. Old `MARGINALIA_*` environment variables are still read, with a warning, when the matching `OKTO_NEURON_*` one is not set.
+
+To upgrade by hand instead, stop the old daemon with `marginalia stop`, run `uv tool uninstall marginalia`, then `uv tool install "okto-neuron[serve,litellm]"` (a plain install over the old tool fails with `Executables already exist: kg, marginalia`). Run `okto-neuron migrate-home` once to copy the app files; until you do, Okto Neuron reads them from `~/.marginalia`. If the old daemon is still running, for example after `uv tool install --force`, `okto-neuron serve` refuses to start while it holds `~/.marginalia/runtime`, so two daemons never serve the same vaults; `okto-neuron stop` stops that old daemon.
+
+## Run the installer
+
+From the directory holding the downloaded `install.sh`:
+
+```bash
+bash install.sh
+```
+
+`--no-onboard` is the only flag the script accepts. Anything else is fatal: an unrecognized argument stops the run with `unknown install.sh flag: <arg> (supported: --no-onboard)`.
+
+`--no-onboard` skips one thing: the first-run prompt that asks `Set up your vault and LLM provider now? [Y/n] (default Y)` and, on yes, runs `okto-neuron onboard`. That prompt only appears when the run is a plain fresh install, a real terminal is attached, and there is no existing vault config or `~/.okto-neuron/defaults.yaml`.
+
+## What the installer does
+
+The script prints a numbered sequence of steps, each one as a `==>` line.
+
+1. **Checking uv.** Installs `uv` if it is absent, then locates the uv tool directory and the uv tool bin directory.
+2. **Ensuring Python 3.12.** Runs `uv python install 3.12` and resolves the interpreter it will verify with.
+3. **Resolving and staging the Okto Neuron candidate.** Run from a clone, the script detects the sibling `pyproject.toml`, prints `running from a clone: <path>`, and builds from that source; given a wheel it prints `using wheel: <url>` or `using release wheel: <url>` and verifies that instead. It installs the candidate into a throwaway virtualenv, reads back the installed version, and checks that the first line of the staged `okto-neuron --version` matches. Your existing installation is untouched at this point.
+4. **Update discovery.** The script looks for a previously installed tool, an existing daemon, and existing vaults. What it finds decides whether this run is a fresh install or an update.
+5. **Activating the staged Okto Neuron.** The previous tool environment and the `okto-neuron` and `kg` launchers are moved aside into a backup directory, then `uv tool install --python 3.12` installs the new one.
+6. **Setup.** On a fresh install with no preseeded vault, this is the `Application-first setup` step. The installer prints `no vault preseed requested; create, select, and configure vaults in the Web UI`, then offers to do the setup in the terminal:
+
+    ```text
+    Okto Neuron first run: no vault configured.
+    Set up your vault and LLM provider now? [Y/n] (default Y)
+    ```
+
+    Press Enter and the installer runs `okto-neuron onboard`, where you name the vault yourself and pick an LLM provider. Answer `n` and the installer creates no vault; you create one in the Web UI instead. The offer appears only on a machine with no vault config and no `~/.okto-neuron/defaults.yaml`, and only when a terminal is attached. It is skipped when you pass `--no-onboard` or set `OKTO_NEURON_NO_OPEN=1`. See [first run](/start/first-run) for every question onboarding asks.
+7. **Starting the daemon.** The installer runs `okto-neuron serve --daemon --no-open` and then polls until the server reports the version that was just installed.
+8. **Wiring Claude Code.** If the daemon wrote its token file and the `claude` CLI is on your `PATH`, the installer registers a user-scope HTTP MCP server named `okto-neuron` at `http://127.0.0.1:8201/mcp`, with the token as a Bearer header. An existing registration that already points at that URL is preserved rather than replaced. An existing `okto-neuron` entry that points somewhere else is not overwritten: the installer stops with `Claude MCP registration conflict; resolve the existing entry and re-run this installer`. For a local- or project-scope entry it first suggests `claude mcp remove okto-neuron --scope <scope>`; otherwise it tells you to inspect the entry with `claude mcp get okto-neuron`. This happens after the new version is already committed, so remove the conflicting entry and re-run. If `claude` is not found, the installer says so and tells you to re-run it once Claude Code is installed.
+9. **Opening the app.** Unless it was told not to, the installer opens `http://127.0.0.1:7777/` in your browser.
+
+On a fresh install where the daemon started, the run ends like this:
+
+```text
+Okto Neuron 0.3.0 is ready.
+    vaults   : create and manage them in the Web UI
+    graph backend: chosen at vault creation, Okto Grafx by default (Ladybug or Neo4j selectable)
+    web UI   : http://127.0.0.1:7777/
+    stop     : okto-neuron stop
+    Claude MCP: authenticated user-scope connection registered as 'okto-neuron'
+    update   : re-run this installer
+```
+
+Two other endings exist. An update prints `Okto Neuron <version> updated and restarted.`, or `Okto Neuron <version> updated; daemon remains stopped.` when the daemon was already stopped before you started. An install that did not start a daemon prints `Okto Neuron <version> installed; daemon was not started.`
+
+If the daemon does not report the installed version, the installer tails the last 20 lines of `~/.okto-neuron/logs/okto-neuron-serve.log`, then stops with `candidate daemon verification failed; the previous installation will be restored` and rolls the activation back. On an update your previous version is restored; on a first install nothing is left installed. Go to [troubleshooting install problems](/help/troubleshoot-install).
+
+## Wheel verification
+
+When the installer is given a wheel instead of a source checkout, verification is mandatory and any failure is fatal. It requires a release manifest, or both an explicit `OKTO_NEURON_WHEEL_SHA256` and an explicit `OKTO_NEURON_EXPECTED_VERSION`. Without a version it stops with `wheel verification requires a manifest version or OKTO_NEURON_EXPECTED_VERSION`; without a digest it stops with `wheel verification requires OKTO_NEURON_MANIFEST or OKTO_NEURON_WHEEL_SHA256`. The SHA-256 must be 64 hexadecimal characters, the filename must end in `.whl`, and the computed digest of the downloaded file must match. A mismatch stops the run with `wheel SHA-256 mismatch`. When a manifest is present, the manifest's version, wheel URL, wheel filename and digest must all be present and must agree with what was requested.
+
+Running from a clone takes the source path instead, so no wheel is downloaded or verified on that path.
+
+## The install is transactional
+
+Once activation begins, the script owns an exit trap. If anything fails before the new installation is committed, the trap stops the candidate daemon, removes the new tool environment and launchers, moves the backed-up environment and launchers back, and verifies that the restored package reports the version that was there before. If the daemon had been running, it is restarted.
+
+The point of commit is the daemon verification: once the new server reports the installed version, the installer marks the activation committed and deletes the backup.
+
+<Warning>
+If the rollback itself fails, the installer keeps the backup directory and warns `rollback is incomplete; recovery backup retained at <path>`. That is the case where you need to look at the machine by hand rather than re-run.
+</Warning>
+
+Your data lives outside the transaction. Vault and provider configuration is never part of the tool directory the installer replaces.
+
+## Re-running to update
+
+Re-running the installer is the documented update path; the final output line says `update   : re-run this installer`.
+
+The script treats a run as an update when it finds a live verified daemon, an existing tool environment, or existing vault config files under `~/.okto-neuron/vaults/` or `~/.marginalia/vaults/`. On that path it prints:
+
+```text
+Update mode — leaving your vaults, default, and LLM config untouched
+```
+
+It creates no vault, does not change which vault is the default, and does not re-prompt for an LLM provider.
+
+An update stops the running daemon first, waits for it to release its process and port, and only then replaces the installed files. If it finds a live daemon it cannot verify through the status endpoint, or one serving a custom endpoint it cannot preserve, it aborts before touching your installation and tells you to run `okto-neuron stop` yourself.
+
+## Where things land
+
+- `~/.okto-neuron` holds your Okto Neuron home: `vaults/`, `logs/okto-neuron-serve.log`, the daemon token file `daemon-7777.token`, and `runtime/`. On a machine upgraded from Marginalia, `~/.marginalia/vaults/` stays where it is and new named vaults are created there too.
+- The package itself is installed as a uv tool, under the directory `uv tool dir` reports.
+- Three console scripts are installed: `okto-neuron`, `kg`, and `marginalia`, the pre-0.3.0 name, which prints a rename warning. All are entry points of the same package. See [the CLI reference](/reference/cli/overview) for what each one covers.
+
+The installer adds the uv tool bin directory to `PATH` for its own run, and then runs `uv tool update-shell`, which writes a `PATH` entry into your shell startup file so a new shell finds `okto-neuron`. If that step fails it warns `run 'uv tool update-shell' to persist PATH`. Set `OKTO_NEURON_NO_UPDATE_SHELL=1` to leave your shell files alone. If a new shell still cannot find `okto-neuron`, see [troubleshooting install problems](/help/troubleshoot-install).
+
+## Installing the package directly
+
+If you want the package without the installer's daemon and Claude Code wiring, install it from PyPI with the `serve` extra, for example as a uv tool:
+
+```bash
+uv tool install --python 3.12 "okto-neuron[serve,litellm]"
+```
+
+The PyPI name is `okto-neuron`. The unrelated PyPI projects called `marginalia` and `neuron` are not this package. You can also install a wheel file or the release wheel URL directly.
+
+Doing this yourself means you also skip the version checks, the staged install, the rollback and the MCP registration the script performs.
+
+`ladybug` is a base dependency, so a plain install gives you graph storage. The installer installs the extras `serve,litellm` and nothing else. If you want JSON-LD export, install the `jsonld` extra separately. Every declared extra and what it supplies is listed in [the installer reference](/reference/installer).
+
+## What the installer is not
+
+There is no Homebrew formula to install. The formula under `packaging/brew/` is an unpublished stub.
+
+The installer has no macOS CI coverage, so treat a macOS run as untested territory and report what you hit.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="First run" href="/start/first-run">
+    Create your first vault and put something in it.
+  </Card>
+  <Card title="Prerelease status" href="/start/prerelease-status">
+    What is settled, and what is not.
+  </Card>
+  <Card title="Installer reference" href="/reference/installer">
+    Every environment variable and exit path.
+  </Card>
+  <Card title="Troubleshoot install" href="/help/troubleshoot-install">
+    When the run fails partway.
+  </Card>
+</CardGroup>

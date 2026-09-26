@@ -1,0 +1,81 @@
+---
+title: "query or ask: which one do you want"
+description: "Two commands that look interchangeable and are not. One finds, one answers."
+---
+
+Okto Neuron gives you two ways to get something out of a vault. `query` finds. `ask` answers. They take the same kind of sentence and hand back two very different things, so pick by what you want to do with the result.
+
+## The one-sentence version
+
+`okto-neuron query "..."` posts your text to the running server and returns provenance-bearing hits: matched graph nodes (a Claim, when the hit is one), each carrying the path, byte range and content hash of the block it came from. `okto-neuron ask "..."` posts your question to the answering endpoint and returns written text plus a list of citations.
+
+<CodeGroup>
+```bash query
+okto-neuron query "retention policy"
+```
+
+```bash ask
+okto-neuron ask "what is our retention policy?"
+```
+</CodeGroup>
+
+`query` prints one line per hit: a score, the hit node's id, the file path, and the node title. The JSON field is named `snippet` for backward compatibility, but the server fills it with the title, not an excerpt. `ask` prints the answer text, then a `Citations:` block listing the paths it leaned on.
+
+## The wall you will hit first
+
+`query` runs on retrieval alone. The server embeds your text and does a vector search, and no answering model is involved. `ask` cannot work that way, because there is nothing to write the prose. If you skip LLM setup during onboarding, Okto Neuron tells you exactly this: exploring works without an LLM, and you re-run `okto-neuron onboard --reconfigure` to turn on `ask`.
+
+<Note>
+Okto Neuron 0.3.0 is prerelease. Behaviour described here is what the current code does, not a frozen contract.
+</Note>
+
+If `ask` prints `(no answer)`, do not read that as "the vault knows nothing". A degraded answer also prints `answer degraded: <status> (<reason>)` to stderr. With `--format json`, the top-level `status` is `degraded` and `retrieval.synthesis_status` says why: `no_llm` means no model is configured, so none was called (set one with `okto-neuron onboard --reconfigure`), `provider_error` means the answering model was unreachable (`retrieval.provider_error` carries the summary, so fix the provider and try again), `empty` means the model replied with nothing, `ok` means synthesis succeeded. See [/config/llm-providers](/config/llm-providers).
+
+## Why the seed counts differ
+
+`ask` retrieves more notes by default than `query`. The reason is in how each one is meant to be used. `query` is the recall surface: it feeds a caller (you, or an agent) who can look at the hits and query again, so it stays tight and you widen by asking a second question. `ask` is one-shot. It gets no second pass, so it seeds a wider candidate set before writing.
+
+Both accept `--k` to override the default. The two default values, and the exhaustive flag list, live on [/reference/cli/client-commands](/reference/cli/client-commands).
+
+## What you actually get back
+
+A hit from `query` is a structured record, not a sentence. Behind it sits a `QueryHit`: a node, a score between 0 and 1, and a provenance record with the file `path`, a `byte_start`, a `byte_end` and a `content_hash`. The server's JSON shape carries those through, along with `document_id`, `claim_id`, `title` and `snippet`. Run with `--format json` when you want the whole record instead of the one-line text render.
+
+An answer from `ask` is text with citations attached. The citations are the retrieval seeds. When a vault turns on subgraph retrieval, the answer is grounded in a wider neighbourhood than those seeds alone represent, and a separate set of evidence ids covers it. That mechanism is explained in [/concepts/subgraph-answers](/concepts/subgraph-answers).
+
+## Pick one
+
+| You want to | Use |
+| --- | --- |
+| Explore a corpus and see what is in there | `query` |
+| Check whether a document was ingested at all | `query` |
+| Feed hits into a script or another tool | `query` |
+| Get a written answer to a question | `ask` |
+| Let an agent answer in one shot | `ask` |
+| Work in a vault with no LLM configured | `query` |
+
+## The same split over MCP
+
+The MCP surface mirrors this. `explore` is the agentic retrieval path: you get structured graph back (nodes, relationships, claims), you re-query by node id to widen, and it makes no LLM call. It seeds narrower than `ask`. `ask` over MCP is the same one-shot synthesis as the CLI, returning `text`, `citations`, `subgraph_evidence_ids` and a `retrieval` block. Each tool's argument defaults are on [/mcp/tools/explore](/mcp/tools/explore) and [/mcp/tools/ask](/mcp/tools/ask).
+
+If your agent can issue follow-up calls, reach for `explore`. If it needs one answer and is done, reach for `ask`.
+
+<CardGroup cols={2}>
+  <Card title="explore (MCP)" href="/mcp/tools/explore">
+    Structured graph, no model call.
+  </Card>
+  <Card title="ask (MCP)" href="/mcp/tools/ask">
+    One-shot answer with citations.
+  </Card>
+</CardGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Asking a vault" href="/vault/asking">
+    The how-to for getting answers out of a vault.
+  </Card>
+  <Card title="LLM providers" href="/config/llm-providers">
+    Start here when ask is refused or returns nothing.
+  </Card>
+</CardGroup>

@@ -1,0 +1,60 @@
+---
+title: Okto Neuron
+description: "A local-first knowledge vault: your markdown stays the trust root, the graph is derived, and hits carry the file path and byte range they came from."
+---
+
+Okto Neuron turns a directory of your own notes into a knowledge graph you can query. The vault, the graph and the daemon all live on your machine; the daemon binds to loopback only. If you configure a model endpoint that is not on loopback, Okto Neuron requires you to opt in to that remote egress explicitly. You keep writing plain files. Okto Neuron reads them, splits each document into blocks, and records where every block started and ended in the file it came from. Text ingest accepts `.md`, `.markdown` and `.txt` files. The graph is derived from those files, so the files stay the thing you trust, and the graph is what Okto Neuron rebuilds from them.
+
+Nothing runs until you start it. You install the `okto-neuron` command, point it at a directory, and start a daemon yourself. There is no background service you did not ask for.
+
+## The four surfaces
+
+You work with Okto Neuron through four places, and they are all local.
+
+- **The `okto-neuron` command.** Installed as the `okto-neuron` console script, with a second `kg` script alongside it. See [/reference/cli/overview](/reference/cli/overview) and [/concepts/surfaces](/concepts/surfaces).
+- **The daemon's HTTP surface and local web interface**, on `127.0.0.1:7777` by default.
+- **MCP**, on `127.0.0.1:8201` by default, which is how an agent talks to your vault. See [/mcp/connect-an-agent](/mcp/connect-an-agent).
+- **Configuration files.** Machine-level state lives under `~/.okto-neuron`, and each vault carries its own `okto-neuron.yaml`.
+
+`okto-neuron serve` starts the HTTP surface and the MCP surface in one command. See [the CLI reference](/reference/cli/overview) for its flags and defaults.
+
+## Loopback only
+
+Okto Neuron binds to loopback. If you pass a host that is not `127.0.0.1`, `localhost` or `::1`, or you pass `--allow-remote`, `serve` prints a refusal, tells you to bind to `127.0.0.1` and use an SSH tunnel instead, and exits with code 2. It does not start.
+
+<Warning>
+There is no supported way to serve Okto Neuron to another machine directly. The flag only produces that refusal message.
+</Warning>
+
+## Answers point at bytes
+
+Every query hit carries provenance: a file path, a byte start, a byte end, and a content hash written as `sha256:<64 hex characters>`. Okto Neuron records that hash when it parses the document.
+
+When Okto Neuron gives you a hit whose provenance carries a path and a byte range, you can open that file, seek to the range, and compare the bytes against the hash recorded at parse time. A hit can also carry context spans, which are neighbouring blocks from the same file, recovered at read time and anchored to the same path.
+
+This is why the graph is derived rather than authoritative. It points back at your text. Read more in [/concepts/provenance](/concepts/provenance) and [/concepts/from-file-to-graph](/concepts/from-file-to-graph).
+
+## This is prerelease software
+
+<Note>
+Okto Neuron is version 0.3.0 and its packaging classifier is `Development Status :: 2 - Pre-Alpha`. Interfaces can change between versions. Read [/start/prerelease-status](/start/prerelease-status) before you rely on it, and [/help/known-gaps](/help/known-gaps) for what is unverified or missing today.
+</Note>
+
+Some things are absent on purpose. [/help/deliberately-absent](/help/deliberately-absent) lists them and says why.
+
+## Start here
+
+<CardGroup cols={2}>
+  <Card title="What is Okto Neuron" href="/start/what-is-okto-neuron">
+    The model behind the tool: vaults, blocks, and a graph you can throw away and rebuild.
+  </Card>
+  <Card title="Install" href="/start/install">
+    Get the `okto-neuron` command onto your machine.
+  </Card>
+  <Card title="First run" href="/start/first-run">
+    Create a vault, index your notes, and start the daemon.
+  </Card>
+  <Card title="Connect an agent" href="/mcp/connect-an-agent">
+    Point Claude Code at your vault over local MCP.
+  </Card>
+</CardGroup>

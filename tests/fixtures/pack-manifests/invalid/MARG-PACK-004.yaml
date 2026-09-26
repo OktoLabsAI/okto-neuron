@@ -1,0 +1,7 @@
+id: unknown-primitive
+version: "0.1.0"
+compatRange: ">=0.0.1"
+edge_types:
+  - name: knows
+    domain: Person
+    range: Asset

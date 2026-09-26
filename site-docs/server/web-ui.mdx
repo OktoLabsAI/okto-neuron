@@ -1,0 +1,95 @@
+---
+title: The local web UI
+description: What the browser interface is, how to open it, and exactly which settings it is allowed to change.
+---
+
+The daemon serves a browser interface from the same process and the same port as the REST surface. The default endpoint is `http://127.0.0.1:7777`, and the UI lives at `/`.
+
+<Note>
+Okto Neuron is at version 0.3.0 and is prerelease. Treat the interface and the routes behind it as subject to change.
+</Note>
+
+## Credentials
+
+The UI asks for no credentials. The bearer-token middleware is installed for the MCP surface only; REST and the UI do not install it. Two other layers stand in for authentication: a `Host` header guard that accepts only loopback names, and a middleware that rejects unsafe-method browser requests whose `Sec-Fetch-Site` or `Origin` is cross-origin.
+
+Sensitive writes carry a further restriction. Vault creation, deletion, switching and re-embed and the config `PATCH` route all require the connecting peer to be a loopback address, and return `403 forbidden` otherwise.
+
+## Opening it
+
+<Tabs>
+  <Tab title="After install">
+    The installer opens the UI once the daemon has started, unless `OKTO_NEURON_NO_OPEN=1` is set.
+  </Tab>
+  <Tab title="With the daemon">
+    ```bash
+    okto-neuron serve
+    ```
+    `serve` opens the UI after the server is ready. `--no-open` suppresses that. See [running the daemon](/server/running).
+  </Tab>
+  <Tab title="Against a running daemon">
+    ```bash
+    okto-neuron ui
+    ```
+    `ui` polls the daemon and opens the default browser.
+  </Tab>
+</Tabs>
+
+### `okto-neuron ui`
+
+`ui` takes `--endpoint`, `--open` / `--no-open` and a `--vault` value it discards. See [server commands](/reference/cli/server-commands).
+
+With `--no-open` the command prints `Okto Neuron UI is ready at <url>/; browser launch skipped` and returns. If the daemon does not answer the readiness poll, the command prints the unreachable message to stderr and exits `2`.
+
+The readiness check polls `GET /health` and accepts a `200` whose body is exactly `{"status": "ok"}`. That route answers from the daemon process itself, so it succeeds whether or not a UI build is present. `okto-neuron ui` therefore cannot tell you that the UI is missing: it opens the browser and exits `0` either way.
+
+## What the UI can change
+
+Vault creation and LLM configuration are reachable through the UI, as an alternative to `okto-neuron onboard`. Creating a vault goes through `POST /api/v1/vaults`; configuration goes through `PATCH /api/v1/config`.
+
+### The same actions from a terminal
+
+The vault routes the UI is built on have CLI equivalents, with one exception. Deleting a vault has no command.
+
+| Action | From a terminal |
+| --- | --- |
+| Create a vault | `okto-neuron vault create <name>`, or `okto-neuron init <path>` |
+| Choose which vault is active | `okto-neuron vault use <name\|path>` |
+| See which vault is active | `okto-neuron vault current`, or `okto-neuron vault list` |
+| Delete a vault | No command. `DELETE /api/v1/vaults/{vault_id}` is the only path. |
+| Re-embed a vault | `okto-neuron kg reembed <vault>`, which recomputes every vector without re-extracting ([/reference/cli/kg-lifecycle](/reference/cli/kg-lifecycle)) |
+
+`vault use` matters most when the CLI comes back with `server error 409: no vault selected; choose or create one in the application`. It writes the same global default that `POST /api/v1/vaults/switch` writes. A server started without `--vault` resolves that default per request, so it follows the change without a restart; a server started with `--vault` stays pinned to the path it was given. Every flag and every exit code for the four `vault` subcommands is on [/reference/cli/vault-commands](/reference/cli/vault-commands).
+
+Config changes are different. The UI patches the writable blocks listed below; a terminal edit means editing `okto-neuron.yaml` by hand, and everything outside those blocks is a file-only edit either way. See [okto-neuron.yaml reference](/config/vault-yaml).
+
+The config write surface is a hard boundary. Only these blocks can be patched:
+
+`embedding`, `llm`, `consolidation`, `upkeep`, `packs`, `folder_watch`, `ingest`.
+
+A patch naming any other key is rejected with an error listing the writable blocks. Everything else in the vault config, including `curation`, `storage`, `index`, `vault_id`, `inherits_application_defaults` and `federation_opt_in`, is a file-only edit. See [configuration overview](/config/overview) and [okto-neuron.yaml reference](/config/vault-yaml).
+
+<Note>
+Some embedding fields change the vector space and require a re-embed after saving. The [okto-neuron.yaml reference](/config/vault-yaml) lists them.
+</Note>
+
+## Where the build comes from
+
+The server resolves the built single-page app in two steps:
+
+<Steps>
+  <Step title="Installed package data">
+    `<package>/_webui/index.html`. The wheel build force-includes the repo-root `frontend_dist` directory as `okto_neuron/_webui`.
+  </Step>
+  <Step title="Repo-root fallback">
+    `frontend_dist/index.html` next to `src/`. `pip install -e` does not materialise the force-include, so an editable checkout relies on this path.
+  </Step>
+</Steps>
+
+When neither exists, the static mount is omitted entirely: `/` and `/assets/*` have no route. The server logs one INFO line, `no web UI build found (frontend_dist/ absent); serving API only`, and boots normally. The CLI and MCP surfaces are unaffected. What a browser displays for a routeless path is not documented here.
+
+The static mount is registered after the API routes.
+
+## No screen tour
+
+This page describes the UI as an operator surface only. There is no screen-by-screen walkthrough anywhere in these docs, and that omission is deliberate. See [deliberately absent](/help/deliberately-absent).

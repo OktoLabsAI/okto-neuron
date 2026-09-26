@@ -1,0 +1,11 @@
+# Golden dataset manifest - synthetic-ci
+# Small, fully-synthetic, commit-safe set for the DETERMINISTIC CI eval gate
+# (provenance byte-hash + hard recall@k + extraction-completeness). No secrets,
+# no PII, no real/famous entities - an invented fictional org (Halverson
+# Tidewater Collective). Targets are non-saturating by construction (planted
+# near-duplicate distractors + absent traps).
+name: synthetic-ci
+description: "Tiny invented-world (Halverson Tidewater Collective) synthetic set for the deterministic CI eval gate - fast, commit-safe, non-saturating hard-recall targets."
+
+settings:
+  embedder: fastembed

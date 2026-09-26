@@ -1,0 +1,97 @@
+---
+title: How these docs are written
+description: "The rules that keep the site honest: citations per bullet, one mode per page, one home per fact."
+---
+
+This page is the contract for writing on this site. It is a process reference, not a product page: nothing here describes what Okto Neuron does. Read it before you open a `.mdx` file, and use the checklist at the bottom before you ask for review.
+
+<Note>
+Okto Neuron is version 0.3.0 and its packaging metadata classifies it as `Development Status :: 2 - Pre-Alpha` (`pyproject.toml:7`, `pyproject.toml:15`). The rules below exist because a prerelease codebase changes more often than prose, and unchecked prose goes stale silently.
+</Note>
+
+## Rule 1. Every factual sentence carries a citation
+
+A sentence that asserts behaviour must trace to a `path:line` reference in the source tree, and you must have opened that file. The citation lives in the page plan (kept outside this repository), one per `must_cover` bullet, not in the rendered page. One page prints its citations in the body: [/help/known-gaps](/help/known-gaps). That page asserts what the source tree does not prove, so the reference is the evidence rather than a footnote. No other page prints one.
+
+If you cannot cite a behaviour, you do not write it. Not softened, not hedged, not moved into a parenthesis. Prose in `README.md`, `RFC.md` and `docs/` is not a source; it predates the current code and is treated as stale. The code wins every disagreement.
+
+If the plan's citation is wrong or points at a line that has moved, fix the plan from the real code and say so in your handoff. A stale citation is a defect at the same severity as a wrong sentence.
+
+## Rule 2. Each page carries its own must_not_claim list
+
+Every entry in the plan has a `must_not_claim` array, derived from the source survey's landmines: the places where the obvious reading of a flag, a help string or a filename is wrong. The site-wide list applies to every page on top of that.
+
+The list is the review artifact. A reviewer reads the page against the page's `must_not_claim` entries, item by item, before merge. A page that asserts something on its own list does not merge, even if the sentence is technically defensible.
+
+## Rule 3. Unverified behaviour goes to help/known-gaps
+
+When the survey could not confirm how something behaves, the behaviour is demoted to an entry in [/help/known-gaps](/help/known-gaps). It never appears in body prose as a soft claim, a "should", a "typically" or a "in most cases".
+
+The gap entry names the thing and says it is unverified. That is more useful to a reader than a confident sentence that might be wrong, and it is auditable: the gap list is a work queue.
+
+## Rule 4. Deliberate omissions go to help/deliberately-absent
+
+Some things are missing on purpose. Those go in [/help/deliberately-absent](/help/deliberately-absent) with the reason, so a reader who expected a page can tell the difference between an oversight and a decision.
+
+Absence without a record is indistinguishable from neglect. If you decide not to document something, write the decision down there in the same change.
+
+## Rule 5. One Diataxis mode per page
+
+A page is a tutorial, a how-to, a reference or an explanation. Never two.
+
+<AccordionGroup>
+  <Accordion title="tutorial">
+    A guaranteed-to-work path with concrete expected output. No alternatives, no flag tables, no rationale.
+  </Accordion>
+  <Accordion title="how-to">
+    The decision and the steps for a real goal. It may link to defaults; it may not enumerate them.
+  </Accordion>
+  <Accordion title="reference">
+    Exhaustive and dry. Every flag, every field, every default. No narrative.
+  </Accordion>
+  <Accordion title="explanation">
+    Why it works this way. No step lists, no flag tables.
+  </Accordion>
+</AccordionGroup>
+
+The worked example on this site is the graph lifecycle. The implementation lives in one place (`src/okto_neuron/cli/kg.py:454` for rebuild, `src/okto_neuron/cli/kg.py:1562` for reembed, `src/okto_neuron/cli/kg.py:1570` for reindex), but the documentation splits three ways by mode: the decision table lives only in [/vault/rebuilding](/vault/rebuilding), the cost rationale only in [/concepts/graph-lifecycle](/concepts/graph-lifecycle), and the flags only in [/reference/cli/kg-lifecycle](/reference/cli/kg-lifecycle). No one of those three pages may borrow from another.
+
+New-user pages carry no flag tables at all. Reference pages carry exhaustive ones.
+
+## Rule 6. One home per fact
+
+A default value, a flag or a config field is enumerated on exactly one reference page. Everywhere else links to it.
+
+The worked example is LLM configuration. The field defaults live in one block of source (`src/okto_neuron/config/_vault.py:972`, class `LLMDefaults`, fields from :977), and they are enumerated on exactly one page: [/config/llm-reference](/config/llm-reference). The setup path is a separate how-to, [/config/llm-providers](/config/llm-providers), which links to the reference and restates no default. A third page repeating a default is a defect even when the value is correct, because two copies drift.
+
+## Rule 7. How-to titles name the goal
+
+Title a how-to by what the reader wants to accomplish, not by the command it happens to use. "Change the embedding model", not "Run kg reembed". A reader searching the sidebar is searching for their goal; they do not yet know which command serves it.
+
+## Rule 8. Naming
+
+Write "Okto Neuron" on first mention in [/index](/index) only, and the bare token "Okto Neuron" everywhere else. Never "Okto" alone. Never "Okto-Okto Neuron". Lowercase `okto-neuron` appears only as the command name inside code.
+
+## Rule 9. Site chrome makes no claim prose could not
+
+The navigation, header and footer are held to Rule 1. A link is a claim.
+
+A chrome link to the source repository, `https://github.com/OktoLabsAI/okto-neuron`, or to the PyPI package `okto-neuron` is allowed only once that repository is public and that version is published; until then it is a claim prose cannot back. Never link the Homebrew formula: it is an unpublished stub whose `url`, `sha256` and `version` fields are placeholders (`packaging/README.md:74`, `packaging/README.md:75`).
+
+The same applies to search and analytics blocks, which assert an indexing arrangement that does not exist yet.
+
+## Reviewer checklist
+
+Run this against the diff before approving. Every answer must be yes.
+
+1. Does every factual sentence trace to a `path:line` the writer opened?
+2. Does the page violate nothing on its own `must_not_claim` list, or the site-wide list?
+3. Is every unverified behaviour in [/help/known-gaps](/help/known-gaps) rather than hedged in body prose?
+4. Is every deliberate omission recorded in [/help/deliberately-absent](/help/deliberately-absent) with its reason?
+5. Is the page exactly one Diataxis mode end to end?
+6. Is every default, flag and field enumerated here and nowhere else, with links replacing the copies?
+7. Does each how-to title name a goal rather than a command?
+8. Is the naming right, including lowercase `okto-neuron` only inside code?
+9. Does the chrome added by this change link only to things the prose could claim?
+
+To set up a checkout so you can verify citations yourself, see [/contributing/dev-install](/contributing/dev-install).

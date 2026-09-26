@@ -1,0 +1,252 @@
+---
+title: "kg init, rebuild, reembed, reindex"
+description: "Exact signatures, output lines and exit codes for the four graph lifecycle commands."
+---
+
+<Note>
+Okto Neuron is 0.3.0 and prerelease. Flags, output lines and state-file shapes on this page describe the current code and can change.
+</Note>
+
+These four commands create a vault graph and then re-derive it. Each one is documented here by signature, observable output, the files it writes and the exit code it returns. For which command to run when, see [/vault/rebuilding](/vault/rebuilding). For the command group as a whole, see [/reference/cli/kg-overview](/reference/cli/kg-overview).
+
+## kg init
+
+```bash
+okto-neuron kg init VAULT
+```
+
+`VAULT` is required and positional. The command initializes the vault graph and prints the scaffolded layout.
+
+### Flags
+
+<ParamField path="--backend" type="text" default="grafx">
+Graph backend to pin a new vault to. Ignored if the vault already exists. Omitting the flag does not apply the shown default; see [The --backend default](#the-backend-default).
+</ParamField>
+
+<ParamField path="--storage-uri" type="text" default="none">
+Remote storage endpoint URI for a non-Ladybug `--backend`, for example `bolt://host:7687`.
+</ParamField>
+
+<ParamField path="--storage-credential-env" type="text" default="none">
+Name of the environment variable holding the storage backend's credential.
+</ParamField>
+
+<ParamField path="--storage-database" type="text" default="none">
+Database or keyspace name for a server-side `--backend`.
+</ParamField>
+
+<ParamField path="--allow-remote-db" type="boolean" default="false">
+Confirm a non-loopback `--storage-uri`.
+</ParamField>
+
+<ParamField path="--accept-experimental" type="boolean" default="false">
+Deprecated. The flag is still accepted so older scripts keep parsing, and the value is ignored.
+</ParamField>
+
+<ParamField path="--debug" type="boolean" default="false">
+Print chained tracebacks.
+</ParamField>
+
+### Output
+
+On success the command echoes the resolved vault root, then the four scaffold entries, one per line, and exits 0:
+
+```text
+/absolute/path/to/vault/
+notes/
+refs/
+.marginalia/
+okto-neuron.yaml
+```
+
+The root line is the vault path expanded and resolved, with a trailing slash. The four entries are a fixed tuple in the source, printed whether or not the paths already existed.
+
+### The --backend default
+
+Omitting `--backend` does not pin the default the help text shows. [/config/storage-backends](/config/storage-backends) carries both defaults and what an absent `storage` block means.
+
+For this command:
+
+- `okto-neuron kg init VAULT` writes no `storage` block and leaves the vault unpinned.
+- `okto-neuron kg init VAULT --backend grafx` validates `grafx` against the backend registry and, when the vault has no `okto-neuron.yaml` yet, writes a `storage` block pinning it before the graph opens.
+
+Against a vault that already has a `okto-neuron.yaml`, an explicit `--backend` only re-validates the existing pin. It does not repin. A value that conflicts with the existing pin raises the same pin-mismatch error the other vault-creation paths raise.
+
+<Warning>
+The shown default and the effective default are different values. If you want a specific backend, pass `--backend` explicitly on the very first `kg init` for that vault. After `okto-neuron.yaml` exists, the flag can no longer change it.
+</Warning>
+
+The pinned block is written from the default vault config with a `storage` section added. For `ladybug` and `grafx` it carries `backend` and a null `reason`. `--storage-uri`, `--storage-credential-env`, `--storage-database` and `--allow-remote-db` each add their own key to that block when supplied. The config file is written with mode `0644`. See [/config/storage-backends](/config/storage-backends) for the block's full shape.
+
+### Remote storage consent
+
+When `--storage-uri` is supplied, the endpoint is classified before anything else runs. A loopback endpoint passes silently. A non-loopback endpoint without `--allow-remote-db` fails with `<uri> is not loopback; pass --allow-remote-db --yes to confirm remote egress`. The check runs non-interactively from this command, so there is no prompt to answer: pass the flag or the command stops.
+
+### Exit codes
+
+| Condition | Exit |
+| --- | --- |
+| Success | 0 |
+| `VAULT` exists and is a file, not a directory | 2 |
+| Non-loopback `--storage-uri` without `--allow-remote-db` | 1 |
+
+## kg rebuild
+
+```bash
+okto-neuron kg rebuild [VAULT]
+```
+
+`VAULT` is optional. When omitted it is resolved from the usual vault reference. The command takes no flags of its own.
+
+Rebuild treats the vault's markdown as the trust root and the graph as derived. It re-extracts every source file under `notes/`, `refs/` and `.marginalia/sources/` through the same full pipeline live ingest uses, including LLM entity and relationship extraction, into a brand-new empty graph, then atomically swaps that graph onto the live path.
+
+### Locking
+
+Rebuild first acquires a cross-process rebuild lease for the vault with `operation="rebuild"`. If an Okto Neuron server currently owns the vault, the lease is refused with a message naming the owning pid and telling you to stop the server first. Inside the lease it also takes the vault's `.marginalia/.bootstrap.lock` and closes live graph handles before building.
+
+### Signals
+
+For the duration of the build, `kg rebuild` installs its own handlers for `SIGINT` and `SIGTERM`. The handler records the interrupt rather than killing the process mid-write; the build then raises at its next interrupt checkpoint, the semantic policy side-files are restored, an interrupted state record is written, and the original handlers are put back.
+
+### Progress and state file
+
+Rebuild writes `.marginalia/rebuild.state.json` throughout. The phases written to that file are `in_progress`, `stabilizing_semantic_policy`, `semantic_policy_unstable`, `staged`, `validation_failed`, `post_swap_validation_failed`, `complete`, `failed` and `interrupted`. The completed record carries `completed_at`, the `sha256` of the resulting graph, the backup path, the post-swap audit payload and the build's own fields, including `graph_generation`, `identity_contract_version` and `embedding_dim`.
+
+### Internal bounds (not configurable)
+
+Three private module constants bound the rebuild. They have no flag, no config key and no environment variable.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `_MAX_SEMANTIC_DISCOVERY_PASSES` | 3 | The budget for passes that may change durable semantic policy. |
+| `_MAX_SEMANTIC_STABILIZATION_PASSES` | 4 | The discovery budget plus one. The loop runs pass indexes 1 through 4; the extra pass materializes the corpus once without further policy drift. A pass that reports a stable fingerprint returns immediately, and so does a pass whose instability is not retryable (it had failed files, a failing file, or a final audit that is not `verified`). |
+| `_REBUILD_ERROR_LIMIT` | 2000 | A character budget, not a count of errors: a failure's formatted `TypeName: text` string is truncated to 2000 characters before it is recorded. Configured API-key environment values are replaced with `[redacted]` in that text first. |
+
+### Swap and backup
+
+After the build, the staged graph is validated, a generation-keyed backup directory is prepared under `.marginalia/rebuild-artifacts/`, and the shared swap tail runs: recheck the lock, commit, fence the generation, audit after reopening the swapped graph, publish the integrity result. The post-swap audit payload is written to `post-swap-audit.json` in that artifact directory in both the success and the audit-failure case.
+
+### Exit codes
+
+| Condition | Exit |
+| --- | --- |
+| Success | 0 |
+| Vault is owned by a running server, or the handle lease is contended | 5 |
+| Interrupted by `SIGINT` or `SIGTERM` | 130 |
+| `VAULT` exists and is a file, not a directory | 2 |
+
+## kg reembed
+
+```bash
+okto-neuron kg reembed [VAULT]
+```
+
+`VAULT` is optional and there are no flags. Reembed is vectors only. It replays the existing graph's stored text through the configured embedder and rebuilds the graph at the configured width. It performs no LLM re-extraction.
+
+The `embedding` block reembed reads is documented at [/config/embedding-model](/config/embedding-model). For when each lifecycle command applies, see [/vault/rebuilding](/vault/rebuilding).
+
+### Sequence
+
+<Steps>
+<Step title="Acquire the lease">
+The same cross-process rebuild lease as `kg rebuild`, with `operation="reembed"`, then the vault's bootstrap lock.
+</Step>
+<Step title="Load embedding config">
+`VaultConfig.load(vault).embedding`. Unlike `kg rebuild`, reembed tolerates a missing or partial config: any exception falls back to `EmbeddingConfig()` defaults. The target width is `int(cfg.dimension)`. The pinned backend is read the same defensive way, falling back to `ladybug`.
+</Step>
+<Step title="Read the live graph">
+The live read uses a raw handle that bypasses the dimension guard, so an intentional width change does not trip the guard that protects normal opens. Nodes and edges are read into memory, then the live handles are closed. A vault that was never bootstrapped gets a fresh empty graph at the new width so the swap has a target.
+</Step>
+<Step title="Build at the new width">
+A fresh graph is bootstrapped at the staged path. Nodes are copied with their vectors recomputed, then edges are copied. Batching uses `embedding.batch_size` and `embedding.max_concurrent_batches`, re-read from config as the copy proceeds.
+</Step>
+<Step title="Health-check and swap">
+The closed staged graph is health-checked through the store's own `health()`, then the shared swap tail runs with integrity publication disabled. No post-swap audit runs and no generation fence is written.
+</Step>
+</Steps>
+
+### Progress and state file
+
+Reembed writes `.marginalia/reembed.state.json`. Phases are `reading`, then `embedding`, then `complete` or `failed`. During `embedding` the record carries `nodes_done` and `nodes_total`. Progress is written at most every 25 nodes (`_REEMBED_PROGRESS_EVERY`), plus one final write when `done` equals `total`.
+
+The `complete` record carries `completed_at`, the `sha256` of the resulting graph, `embedding_dim` set to the new width, and the copy statistics. A build or health failure writes a `failed` record with `started_at` and `failed_at`, then re-raises. A lock-held or swap failure raised at or after the lock recheck writes no state record at all.
+
+### Exit codes
+
+| Condition | Exit |
+| --- | --- |
+| Success | 0 |
+| Vault is owned by a running server, or the handle lease is contended | 5 |
+| `VAULT` exists and is a file, not a directory | 2 |
+
+## kg reindex
+
+```bash
+okto-neuron kg reindex [VAULT] [--force]
+```
+
+Reindex rebuilds the search index from the graph, or confirms it is already current. It reads each node's stored text and embedding straight off the graph. It makes no LLM calls and it does not re-embed.
+
+<ParamField path="--force" type="boolean" default="false">
+Rebuild even if the index is already current.
+</ParamField>
+
+### Locking
+
+Reindex requires an offline graph swap lease. If an Okto Neuron server is running for the vault, or the lease is otherwise held, the command prints to stderr:
+
+```text
+vault is open by another process; stop serve first
+```
+
+and returns 1. Note this is the one lifecycle command that catches the lock error itself rather than letting it propagate, so the exit code is 1, not the lock error's own code.
+
+### Behavior
+
+Inside the lease, live graph handles are closed and the graph store is opened through the pinned backend. The index's generation stamp is compared with `compute_graph_generation(store)`.
+
+Without `--force`, a matching stamp prints the following and exits 0 without touching the index:
+
+```text
+index up to date (generation 0a1b2c3d4e5f)
+```
+
+The generation is truncated to its first 12 characters.
+
+Otherwise the index is rebuilt and the command prints one summary line, then exits 0:
+
+```text
+doc_count=<n> embedded_count=<n> elapsed=<seconds>s generation=0a1b2c3d4e5f
+```
+
+`elapsed` is the wall-clock measurement of the reindex call, formatted to two decimals. `generation` here is the index's new stamp, also truncated to 12 characters.
+
+Once the store is open, any exception raised while comparing generations or reindexing is caught, printed to stderr as `error: <exception>`, and the command returns 1. The store is closed and the vault connection released in both the success and the caught-failure case. A failure while closing live handles, reading the pinned backend or opening the store happens before that guard and propagates with its own error class and exit code.
+
+### Exit codes
+
+| Condition | Exit |
+| --- | --- |
+| Index already current, no `--force` | 0 |
+| Index rebuilt | 0 |
+| Vault open by another process | 1 |
+| Index or store exception raised after the store is open | 1 |
+
+A failure before the store opens (closing live handles, reading the pinned backend, opening the backend) is not caught here and exits with that error's own code.
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Rebuilding a vault" href="/vault/rebuilding">
+Which lifecycle command a given change calls for.
+</Card>
+<Card title="Embedding model" href="/config/embedding-model">
+The `embedding` block `kg reembed` reads.
+</Card>
+<Card title="Storage backends" href="/config/storage-backends">
+The `storage` block `kg init --backend` pins.
+</Card>
+<Card title="kg command group" href="/reference/cli/kg-overview">
+Every other subcommand under `okto-neuron kg`.
+</Card>
+</CardGroup>

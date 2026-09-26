@@ -1,0 +1,195 @@
+---
+title: "kg snapshot reference"
+description: "dump, verify and load. Signatures, output lines, failure modes and what a snapshot does and does not carry."
+---
+
+<Note>
+Okto Neuron is prerelease software. The snapshot format is `format_version` 1 and carries no compatibility promise.
+</Note>
+
+`okto-neuron kg snapshot` dumps a vault's durable graph into a backend-agnostic directory, checks that directory, and replays it into a fresh vault. The group covers three commands: `dump`, `verify` and `load`.
+
+For the task-level walkthrough see [/vault/snapshots](/vault/snapshots). For the backend a restored vault gets pinned to, see [/config/storage-backends](/config/storage-backends). For the rest of the `kg` group, see [/reference/cli/kg-overview](/reference/cli/kg-overview).
+
+## Snapshot directory layout
+
+The group help describes a snapshot directory as `manifest.json`, `nodes.jsonl`, `edges.jsonl`, `embeddings.jsonl`, `sources/` and `CHECKSUMS.sha256`.
+
+| Entry | Contents |
+| --- | --- |
+| `manifest.json` | Origin metadata, counts and `content_sha256`. Written after every other file. |
+| `schema.json` | `schema_version`, `embedding_dim`, and the sorted closed and internal node type names. |
+| `nodes.jsonl` | One node per line, ascending id, with no embedding key. |
+| `edges.jsonl` | One edge per line, ascending id. |
+| `embeddings.jsonl` | `{id, embedding}` for every embedded node, ascending id. |
+| `sources/` | A copy of the origin vault's `.marginalia/sources/`. May be empty. |
+| `CHECKSUMS.sha256` | One `<sha256hex>  <relative path>` line per tracked file. |
+
+`CHECKSUMS.sha256` covers `schema.json`, `nodes.jsonl`, `edges.jsonl`, `embeddings.jsonl` and every file under `sources/`. It does not list `manifest.json` itself.
+
+The manifest fields are `format_version`, `marginalia_version`, `schema_version`, `vault_id`, `origin_backend`, `origin_graph_generation`, `origin_identity_contract_version`, `origin_sources_prefix`, `embedding`, `packs`, `node_count`, `edge_count`, `embedded_count`, `source_file_count`, `created_at` and `content_sha256`.
+
+### What the manifest does not carry
+
+The manifest never records the origin vault's absolute path. `origin_sources_prefix` is the fixed relative string `.marginalia/sources`, used as a rewrite anchor at load time, not a path to the origin machine.
+
+A snapshot also carries no live connection secrets. There is no `uri`, credential or database name in the dump, which is why a backend that needs an endpoint to open at all has to be re-supplied at load time (see `--storage-uri` below).
+
+## dump
+
+```bash
+okto-neuron kg snapshot dump VAULT DEST
+```
+
+Both arguments are positional and required.
+
+`dump` runs offline. It takes the same single-writer guard as `kg reindex`: if the Okto Neuron server is running for that vault the guard raises, and the command prints `vault is open by another process; stop serve first` to stderr and exits 1.
+
+With the lease held it closes live graph handles, reads the graph and index backends pinned in `okto-neuron.yaml`, and opens the store through the backend registry. Graph identity comes from two paths: for a `ladybug` vault it reads the identity directly off the on-disk graph file; for any other backend it builds the identity from `store.generation()` paired with the current identity contract version constant.
+
+It then loads `VaultConfig` and packs `embedding` as `{provider, model, dimension}` plus the vault's `packs` list into the manifest. `.marginalia/sources/` is included only when that directory exists.
+
+Everything is staged under `<DEST>.partial` and renamed into place at the end, with `manifest.json` written after every other file, so a torn dump never has a manifest.
+
+### dump refusals
+
+<Warning>
+`dump` refuses a destination that already exists and is not an empty directory, and refuses a destination path that exists and is not a directory. Both surface as `error: <message>` and exit 1.
+</Warning>
+
+It also refuses when `okto-neuron.yaml`'s `embedding.dimension` does not equal the graph's stored embedding width. The message names both values.
+
+Any exception raised while reading the store or writing the snapshot prints `error: <exception>` to stderr and exits 1.
+
+### dump output
+
+On success one line goes to stdout:
+
+```text
+nodes=1240 edges=3318 embedded=1198 sources=57 manifest=/path/to/DEST/manifest.json
+```
+
+The counts are the manifest's `node_count`, `edge_count`, `embedded_count` and `source_file_count`. The schema metadata node is excluded from the node scan, so it is not part of `node_count`.
+
+When the backend offers a pinned read point, the whole node and edge scan runs inside it and the manifest's `origin_graph_generation` is replaced with that pinned generation. A backend without one falls back to the consistency its caller guarantees, which here is the offline lease.
+
+## verify
+
+```bash
+okto-neuron kg snapshot verify SRC
+```
+
+`verify` takes no lock and touches no vault. It reads `manifest.json`, then recomputes every checksum listed in `CHECKSUMS.sha256`, recounts the three JSONL files, and recomputes `content_sha256` over the concatenated bytes of `nodes.jsonl`, `edges.jsonl` and `embeddings.jsonl` in that order.
+
+Success prints one line and exits 0:
+
+```text
+ok nodes=1240 edges=3318 embedded=1198 vault_id=my-vault
+```
+
+Failure prints each problem to stderr, then `verify failed`, and exits 1. The problems it can report:
+
+<AccordionGroup>
+<Accordion title="Manifest problems">
+`failed to read manifest.json: <exception>` when the file is missing, is not under a directory, is not valid JSON, or does not match the manifest field set. This is returned alone, with no other checks run.
+</Accordion>
+<Accordion title="Checksum problems">
+`CHECKSUMS.sha256 missing`; `malformed CHECKSUMS.sha256 line: <line>`; `missing file listed in CHECKSUMS.sha256: <path>`; `checksum mismatch for <path>`.
+</Accordion>
+<Accordion title="Count problems">
+`nodes.jsonl missing`, `edges.jsonl missing` or `embeddings.jsonl missing`; and `node_count mismatch: manifest=<n> actual=<n>`, `edge_count mismatch: …`, `embedded_count mismatch: …`.
+</Accordion>
+<Accordion title="Content problems">
+`content_sha256 mismatch`, checked only when all three JSONL files are present.
+</Accordion>
+</AccordionGroup>
+
+## load
+
+```bash
+okto-neuron kg snapshot load SRC VAULT [--skip-embeddings] \
+  [--storage-uri URI] [--storage-credential-env NAME] \
+  [--storage-database NAME] [--allow-remote-db]
+```
+
+`load` verifies `SRC` first. If verification finds any problem it prints each one plus `verify failed` and exits 1 without touching `VAULT`.
+
+`VAULT` must not exist, or must be an empty directory. An existing path that is not a directory gives `error: <path> exists and is not a directory`; a non-empty directory gives `error: <path> exists and is not empty`. Both exit 1.
+
+### Flags
+
+<ParamField path="--skip-embeddings" type="flag" default="false">
+Load nodes without their vectors. The embeddings file is not read and every node is written with no embedding. `skipped_embeddings=True` appears in the output line.
+</ParamField>
+
+<ParamField path="--storage-uri" type="string" default="null">
+Remote storage endpoint URI for a snapshot whose origin backend needs one to open at all. Written into the restored `okto-neuron.yaml` as `storage.uri`.
+</ParamField>
+
+<ParamField path="--storage-credential-env" type="string" default="null">
+Name of an environment variable holding the storage credential, paired with `--storage-uri`. Written as `storage.credential_env`.
+</ParamField>
+
+<ParamField path="--storage-database" type="string" default="null">
+Storage database or namespace name, paired with `--storage-uri`. Written as `storage.database`.
+</ParamField>
+
+<ParamField path="--allow-remote-db" type="flag" default="false">
+Writes `storage.allow_remote: true` into the restored `okto-neuron.yaml`. This page does not document a load-time check on the `--storage-uri` host.
+</ParamField>
+
+<Warning>
+These four flags are written verbatim into `storage`. Only a `neo4j` origin backend accepts `uri`, `database`, `credential_env` and `allow_remote` there; the `ladybug` and `grafx` storage blocks reject unknown keys, so passing them for such a snapshot writes a `okto-neuron.yaml` the vault cannot reopen.
+</Warning>
+
+### The config a load writes
+
+`load` writes `okto-neuron.yaml` before opening anything, so the graph bootstraps at the snapshot's own embedding width rather than a default. The file it writes contains:
+
+- `marginalia_yaml_version: 1`
+- `vault_id` set to the new vault directory's name, not the manifest's `vault_id`
+- `federation_opt_in: false`
+- `packs` copied verbatim from the manifest
+- `embedding` with the manifest's recorded `provider`, `model` and `dimension`
+- `storage.backend` set to the manifest's `origin_backend`
+
+For a `ladybug` or `grafx` origin backend the storage block also gets `reason: null`. For a `neo4j` origin backend a fresh random hex `vault_id` is added inside the storage block. The config file is written with mode `0644`.
+
+<Note>
+Because `storage.backend` comes from `origin_backend`, a snapshot dumped from a non-Ladybug backend restores pinned to that same backend. See [/config/storage-backends](/config/storage-backends).
+</Note>
+
+### The replay
+
+After the config exists, `load` opens the vault through the standard vault opener, which scaffolds `notes/`, `refs/` and `.marginalia/` and returns an `IndexedStore`, so every node written also upserts the index.
+
+The replay applies every node, then every edge, in file (ascending id) order, then checkpoints. When `src/sources` exists the source blobs are copied into `<VAULT>/.marginalia/sources/`, merging into whatever is there.
+
+Node facets carrying an absolute `source_path` are rewritten at load. The loader finds the manifest's `origin_sources_prefix` anchor as a substring and replaces everything up to and including it with the new sources destination. A facet with no `source_path`, a non-string value, or a value that does not contain the anchor is left untouched.
+
+The replay is idempotent: replaying the same snapshot onto the same store again yields the same graph, because node and edge writes are upserts with pinned `created_at` and immutable edge identity, and the facet rewrite is a pure function of the unchanged snapshot content.
+
+An edge that fails to apply raises with `edge <id> (<src> -> <dst>) failed to load: <reason>`, which reaches the command as `error: …`.
+
+### load output
+
+Two lines on success:
+
+```text
+nodes=1240 edges=3318 embeddings=1198 sources=57 skipped_embeddings=False
+index up to date (generation 4f2a9c1b77de)
+```
+
+The second line compares the index's generation against the graph generation computed after the replay. When they differ it reads `index generation mismatch (generation <stamp>)` instead. The stamp is the first 12 characters of the generation.
+
+### load failure cleanup
+
+Any exception during the config write, the vault open or the replay prints `error: <exception>` to stderr and exits 1. The vault directory is removed only when this command is the one that created it. A pre-existing empty directory you pointed at is left in place, with whatever the failed run put in it.
+
+<Warning>
+`--skip-embeddings` produces a vault whose nodes have no vectors. This page does not document a recovery path for that state.
+</Warning>
+
+## Exit codes
+
+Every command in this group returns 0 on success and 1 on any failure described above. See [/reference/cli/kg-overview](/reference/cli/kg-overview) for the shared `kg` exit code behavior.

@@ -1,0 +1,144 @@
+---
+title: Configuration overview
+description: Four files, one job each, and which settings the UI may change versus which are file-only edits.
+---
+
+Okto Neuron splits its configuration across four files. Each one owns a different scope, and knowing which file owns a setting tells you where to edit it and who else it affects.
+
+<Note>
+Okto Neuron is prerelease (version 0.3.0). Configuration shapes described here are the ones the code accepts today.
+</Note>
+
+## The four files
+
+<CardGroup cols={2}>
+  <Card title="~/.okto-neuron/okto-neuron.toml" href="/config/okto-neuron-toml">
+    Machine-wide settings: where Okto Neuron looks for vaults and which vault is the default.
+  </Card>
+  <Card title="&lt;vault&gt;/okto-neuron.yaml" href="/config/vault-yaml">
+    Everything about one vault: embedding, LLM, consolidation, upkeep, packs, folder watching, ingest, storage, index.
+  </Card>
+  <Card title="~/.okto-neuron/defaults.yaml" href="/config/shared-defaults">
+    An application-wide baseline that a vault can opt into inheriting.
+  </Card>
+  <Card title="~/.okto-neuron/providers.yaml" href="/config/providers-yaml">
+    The provider and credential registry: named provider profiles and the environment variable each credential reads from.
+  </Card>
+</CardGroup>
+
+`~/.okto-neuron` is the user-owned home directory that all three global files live in (`src/okto_neuron/config/_app_config.py:20-22`). The vault file lives inside the vault directory itself, so it travels with the vault.
+
+### okto-neuron.toml
+
+This is the only file loaded through a search chain. Okto Neuron takes the first path that exists out of an explicit path you pass, then `OKTO_NEURON_CONFIG` from the environment, then `~/.okto-neuron/okto-neuron.toml` (`src/okto_neuron/config/_app_config.py:123-140`). If none of them exist, the code defaults apply and nothing is read from disk (`src/okto_neuron/config/_app_config.py:81-86`).
+
+It carries `vault_roots` and `default_vault`. Both are expanded to absolute paths on load (`src/okto_neuron/config/_app_config.py:68-79`). See [okto-neuron.toml](/config/okto-neuron-toml) for the full field list and defaults.
+
+### okto-neuron.yaml
+
+One per vault. This is where nearly every knob lives, and it is the file the writable surface below applies to.
+
+### defaults.yaml
+
+A `VaultConfig` document stored at `~/.okto-neuron/defaults.yaml` (`src/okto_neuron/config/_vault.py:1568-1569`). If the file is missing, Okto Neuron falls back to the code defaults instead of failing (`src/okto_neuron/config/_vault.py:1575-1576`). Details in [shared defaults](/config/shared-defaults).
+
+### providers.yaml
+
+A separate registry document, not a `VaultConfig`. It holds a list of credentials and a list of provider profiles, and it is written atomically: a temp file in the same directory, then `os.replace`, with the file set to `0600` and its parent to `0700` (`src/okto_neuron/providers.py:338-357`). Unlike `okto-neuron.yaml`, this document rejects unknown top-level keys (`src/okto_neuron/providers.py:303-304`). See [providers.yaml](/config/providers-yaml).
+
+## Version stamps
+
+`okto-neuron.toml` carries `marginalia_toml_version` and `okto-neuron.yaml` carries `marginalia_yaml_version`. Both default to `1` and both accept only the value `1` (`src/okto_neuron/config/_app_config.py:16`, `src/okto_neuron/config/_vault.py:31`).
+
+Three cases:
+
+<AccordionGroup>
+  <Accordion title="The stamp is present and is 1">
+    The document loads normally.
+  </Accordion>
+  <Accordion title="The stamp is missing">
+    Okto Neuron emits a warning and treats the document as version 1. The warning fires once per resolved path per process (`src/okto_neuron/config/_app_config.py:47-56`).
+  </Accordion>
+  <Accordion title="The stamp is any other value">
+    Loading raises `ConfigVersionUnsupported`, naming the path, the value found and the supported versions (`src/okto_neuron/config/_app_config.py:109-115`, `src/okto_neuron/config/_vault.py:1788-1793`).
+  </Accordion>
+</AccordionGroup>
+
+Only the value `1` is accepted today. Nothing in the code describes how a future stamp would be handled, so do not write a different number into either file expecting it to be tolerated.
+
+## Inheriting application defaults
+
+A vault does not inherit `defaults.yaml` unless it asks to. The switch is the top-level `inherits_application_defaults` key in `okto-neuron.yaml`, which is `false` by default (`src/okto_neuron/config/_vault.py:1514`).
+
+When the key is exactly `true`, the load baseline is the application defaults document; otherwise the baseline is the built-in `VaultConfig.default()` (`src/okto_neuron/config/_vault.py:1613-1616`). Your vault file is then deep-merged over that baseline and the merged result is validated (`src/okto_neuron/config/_vault.py:1617-1622`).
+
+The practical consequence: an inheriting vault only stores the fields you actually changed, so later edits to `defaults.yaml` keep reaching every field the vault has not overridden (`src/okto_neuron/config/_vault.py:1761-1762`).
+
+## The writable surface
+
+Okto Neuron treats a subset of `okto-neuron.yaml` as writable through its config-write path. `WRITABLE_BLOCKS` is exactly seven names (`src/okto_neuron/config/_vault.py:1625-1633`):
+
+- `embedding`
+- `llm`
+- `consolidation`
+- `upkeep`
+- `packs`
+- `folder_watch`
+- `ingest`
+
+A patch whose top-level keys are not all in that tuple is rejected with an error naming the unknown keys and listing the writable blocks (`src/okto_neuron/config/_vault.py:1689-1694`). `packs` gets a second check: it must be a list of strings, and every entry must be a built-in pack name (`src/okto_neuron/config/_vault.py:1702-1706`).
+
+Everything else in `okto-neuron.yaml` is a file-only edit. That includes `storage`, `index`, `curation` and `vault_id`, which are typed fields of `VaultConfig` (`src/okto_neuron/config/_vault.py:1513-1542`) but sit outside `WRITABLE_BLOCKS`, so the config-write path rejects a patch that names them. To change one, edit the file. `storage.backend` is the exception: it is pinned when the vault is created and checked on every create or re-open, and a mismatch raises `VaultBackendMismatch` (`src/okto_neuron/vault.py:63-91`), so editing that key by hand does not move a vault to another backend. `vault_id` identifies existing stored data. See [storage backends](/config/storage-backends) before changing either.
+
+<Warning>
+Editing `okto-neuron.yaml` by hand skips the validation-before-write step described below. An invalid document surfaces as a `ConfigParseError` the next time the vault is loaded (`src/okto_neuron/config/_vault.py:1795-1797`).
+</Warning>
+
+## How a patch merges
+
+`apply_patch` takes a vault path and a partial mapping keyed by writable block name (`src/okto_neuron/config/_vault.py:1733`). The merge rules:
+
+- **Nested blocks merge recursively.** A two-level patch such as `{"llm": {"extraction": {"temperature": 0.5}}}` updates that one field and leaves the rest of `extraction` alone (`src/okto_neuron/config/_vault.py:1484-1494`).
+- **`packs` replaces wholesale.** It is a list, so the merge helper's non-dict branch overwrites it (`src/okto_neuron/config/_vault.py:1494-1495`).
+- **`sampling_payload` replaces wholesale.** The merge helper special-cases this key ahead of the recursive branch, so a new payload replaces the stored one rather than folding its keys together (`src/okto_neuron/config/_vault.py:1486-1493`).
+- **The merged document is validated before anything reaches disk.** The patch is merged into the current effective config, the whole result goes through `model_validate`, and only then is the file written (`src/okto_neuron/config/_vault.py:1756-1758`).
+- **Only patched fields are persisted.** The write projects the canonical, validated values back onto the shape of your patch and merges that into the raw file, so untouched keys stay exactly as they were (`src/okto_neuron/config/_vault.py:1761-1771`).
+
+### Unknown keys
+
+The two levels behave differently on purpose. `VaultConfig` itself is `extra="allow"`, so an unrecognised top-level key in `okto-neuron.yaml` survives a load and a partial write (`src/okto_neuron/config/_vault.py:1510`, `:1653-1658`). The nested block models are `extra="forbid"`, so a typo inside `embedding`, `llm`, `consolidation` or any other block fails validation instead of being silently ignored.
+
+## Change classes
+
+`apply_patch` returns a tuple: the validated merged config it just wrote, and a list of dotted paths whose value actually changed (`src/okto_neuron/config/_vault.py:1733`, `:1758`, `:1776`). That list is how a caller decides what a save costs.
+
+Two named sets classify the expensive paths:
+
+| Class | Fields | Why |
+| --- | --- | --- |
+| `REEMBED_FIELDS` | `embedding.provider_ref`, `embedding.provider`, `embedding.model`, `embedding.dimension` | Stored vectors were computed by a different model or width, so they need a vectors-only re-embed (`src/okto_neuron/config/_vault.py:1638-1645`) |
+| `SEMANTIC_REBUILD_FIELDS` | `consolidation.type_adjudication_enabled`, `consolidation.relation_curator_enabled` | These change graph materialization policy, so existing sources need a semantic rebuild before the stored graph reflects the new policy (`src/okto_neuron/config/_vault.py:1647-1652`) |
+
+Embedding transport knobs (`api_base`, `api_key_env`, `allow_remote`) are deliberately outside `REEMBED_FIELDS`: they affect where the embedder runs, not the vector space, so they take effect live (`src/okto_neuron/config/_vault.py:1635-1637`).
+
+The changed-path list only covers writable blocks. It walks each block, compares the before and after dumps field by field, and reports `packs` as a single entry rather than per-element (`src/okto_neuron/config/_vault.py:1813-1823`).
+
+For rebuild mechanics, see [rebuilding a vault](/vault/rebuilding).
+
+## Which page owns which block
+
+This page routes. Each block's exhaustive field list, with defaults, lives on exactly one reference page.
+
+| Block or file | Reference page |
+| --- | --- |
+| `vault_roots`, `default_vault`, `marginalia_toml_version` | [okto-neuron.toml](/config/okto-neuron-toml) |
+| `okto-neuron.yaml` structure, `packs`, `upkeep`, `folder_watch`, `ingest`, `curation`, `vault_id` | [okto-neuron.yaml](/config/vault-yaml) |
+| `embedding` | [embedding model](/config/embedding-model) |
+| `llm` | [LLM reference](/config/llm-reference) and [LLM providers](/config/llm-providers) |
+| `storage` | [storage backends](/config/storage-backends) |
+| `defaults.yaml`, `inherits_application_defaults` | [shared defaults](/config/shared-defaults) |
+| `providers.yaml`, credentials, provider profiles | [providers.yaml](/config/providers-yaml) |
+| Limits, caps and refusals | [guardrails](/config/guardrails) |
+| Environment variables | [environment variables](/config/environment-variables) |
+
+If a default value appears on more than one page, the reference page above is the one to trust.

@@ -1,0 +1,306 @@
+---
+title: "MCP tool: ask"
+description: "Full parameter schema, return shape, and how to tell a provider outage from an empty graph."
+---
+
+`ask` answers a question against one vault's knowledge graph and returns synthesised text with citations. It retrieves seeds, builds a context, and synthesises an answer. The model is called at most once on the default block path, not at all when retrieval returns no hits, and up to twice on the subgraph path, where one bounded escalation may re-ask with a larger source-block budget. If you can issue your own follow-up queries, [explore](/mcp/tools/explore) seeds tighter and hands back structured graph instead.
+
+<Note>
+Okto Neuron is prerelease. The tool schema on this page describes version 0.3.0 and can change between releases.
+</Note>
+
+## Signature
+
+```python
+ask(
+    question: str,
+    k: int = 20,
+    hops: int = 1,
+    vault: str | None = None,
+    enable_subgraph: bool | None = None,
+    source_block_policy: Literal["never", "on_coverage_miss", "always", "blend"] | None = None,
+    seed_k: int | None = None,
+    max_degree_per_seed: int | None = None,
+    neighbour_budget_tokens: int | None = None,
+    source_block_budget_tokens: int | None = None,
+    coverage_threshold: float | None = None,
+    min_claim_confidence: float | None = None,
+    max_nodes: int | None = None,
+    max_relationships: int | None = None,
+    max_claims: int | None = None,
+    relationship_types: list[str] | None = None,
+    include_sources: bool = False,
+) -> dict[str, object]
+```
+
+Every knob that defaults to `None` means "inherit the vault or config default for this call". Passing `None` never overwrites a configured value, because the server drops unset keys before it builds the retrieval policy. The configured values live in [the LLM config reference](/config/llm-reference).
+
+## Example calls
+
+Every argument except `question` is optional, so a minimal call carries one key.
+
+<Tabs>
+<Tab title="Minimal">
+```json
+{ "question": "what did we decide about the retention policy?" }
+```
+`k` stays at 20 and `hops` stays at 1. Every other knob inherits the vault config.
+</Tab>
+<Tab title="Broad question">
+```json
+{
+  "question": "how did the retention policy change over the year?",
+  "k": 40,
+  "vault": "work",
+  "include_sources": true
+}
+```
+A wider seed set for a multi-part question, read from the vault registered as `work`, with per-hit provenance in a `sources` list.
+</Tab>
+<Tab title="Subgraph walk">
+```json
+{
+  "question": "who owns the retention policy now?",
+  "enable_subgraph": true,
+  "hops": 2,
+  "source_block_policy": "on_coverage_miss",
+  "coverage_threshold": 0.6,
+  "max_nodes": 80,
+  "relationship_types": ["owns", "reports_to"]
+}
+```
+`hops` only applies because `enable_subgraph` is true; on the default block path the server ignores it. Read `retrieval.enable_subgraph` and `retrieval.hops` in the response to confirm what the call actually did.
+</Tab>
+</Tabs>
+
+## Parameters
+
+<ParamField path="question" type="string" required>
+The question to answer. Passed through to synthesis unchanged.
+</ParamField>
+
+<ParamField path="k" type="int" default="20">
+How many notes to retrieve. The server applies `min(int(k), 100)` before querying, so a larger value is silently reduced to the cap rather than rejected. Raise it for broad or multi-part questions, lower it for narrow lookups.
+</ParamField>
+
+<ParamField path="hops" type="int" default="1">
+Ego-graph radius. The server applies `max(1, min(int(hops), 5))`, so out-of-range values are silently clamped into 1..5. `hops` takes effect only when subgraph retrieval is active for this call. The default block-dump retrieval path ignores it.
+</ParamField>
+
+<ParamField path="vault" type="string | null" default="null">
+The registered NAME of the vault to read, never a path. Omit it to use the vault this connection is bound to. The name is always validated, so a path-shaped or unknown name fails the call even when the connection's `?vault=` selector takes precedence over your argument. See [vault selection](/mcp/vault-selection).
+</ParamField>
+
+<ParamField path="enable_subgraph" type="bool | null" default="null">
+Use ego-graph retrieval instead of the default source-block dump. When unset, the call inherits `llm.ask.enable_subgraph` from vault config. See [subgraph answers](/concepts/subgraph-answers).
+</ParamField>
+
+<ParamField path="source_block_policy" type='"never" | "on_coverage_miss" | "always" | "blend" | null' default="null">
+When raw source blocks get spliced into the context. Unset inherits the effective default for the retrieval path in use.
+</ParamField>
+
+<ParamField path="seed_k" type="int | null" default="null">
+How many retrieval seeds to fetch, overriding `k` for seeding. Validated as `>= 1`, then capped at 100 by the same `min(...)` the server applies to `k`.
+</ParamField>
+
+<ParamField path="max_degree_per_seed" type="int | null" default="null">
+Maximum neighbours expanded per seed node. Validated as `>= 1`.
+</ParamField>
+
+<ParamField path="neighbour_budget_tokens" type="int | null" default="null">
+Token budget for the neighbour context. Validated as `>= 1`.
+</ParamField>
+
+<ParamField path="source_block_budget_tokens" type="int | null" default="null">
+Token budget for spliced source blocks. Validated as `>= 1`.
+</ParamField>
+
+<ParamField path="coverage_threshold" type="float | null" default="null">
+Graph-coverage bar below which source blocks are spliced in. Validated in 0.0..1.0 inclusive.
+</ParamField>
+
+<ParamField path="min_claim_confidence" type="float | null" default="null">
+Floor on claim confidence. Validated in 0.0..1.0 inclusive.
+</ParamField>
+
+<ParamField path="max_nodes" type="int | null" default="null">
+Hard cap on nodes rendered into the assembled subgraph. Validated as `>= 1`.
+</ParamField>
+
+<ParamField path="max_relationships" type="int | null" default="null">
+Hard cap on relationships rendered. Validated as `>= 0`, so zero is accepted.
+</ParamField>
+
+<ParamField path="max_claims" type="int | null" default="null">
+Hard cap on claims rendered. Validated as `>= 0`, so zero is accepted.
+</ParamField>
+
+<ParamField path="relationship_types" type="string[] | null" default="null">
+Restrict edges to these predicate names. Entries are stripped of surrounding whitespace and empty entries are dropped. If nothing survives cleaning, the field resolves back to `null` (inherit).
+</ParamField>
+
+<ParamField path="include_sources" type="bool" default="false">
+Add a `sources` list with per-hit provenance to the response. Off by default, so the base payload is unchanged.
+</ParamField>
+
+### Clamped versus validated
+
+Two different mechanisms enforce the bounds, and they fail differently.
+
+<Tabs>
+  <Tab title="Silently clamped">
+    `k`, `seed_k` and `hops` are narrowed in the tool body before any validation runs. `k` and `seed_k` are reduced to at most `MAX_QUERY_K`, which is `100`. `hops` is forced into 1..5. None of these raise. Read the `retrieval` block back to see what was actually applied.
+  </Tab>
+  <Tab title="Validated, can fail">
+    The remaining knobs are handed to an `AskRetrievalPolicy` model configured with `extra="forbid"`. A value outside its bounds fails the whole call with `invalid retrieval policy: <field>: <message>`. Example: `coverage_threshold=1.5`.
+  </Tab>
+</Tabs>
+
+Because `hops` is clamped before the policy is constructed, the policy's own 1..5 check on `hops` is unreachable through this tool.
+
+## Return shape
+
+```json
+{
+  "status": "ok",
+  "text": "...",
+  "citations": ["..."],
+  "subgraph_evidence_ids": ["..."],
+  "retrieval": { "...": "..." }
+}
+```
+
+<ResponseField name="status" type="string">
+`"ok"` only when synthesis produced a clean answer. `"degraded"` for every other `retrieval.synthesis_status`, so a client that reads only this field never mistakes an empty or cut-off answer for a success. The REST `/api/v1/ask` response uses the same rule.
+</ResponseField>
+
+<ResponseField name="text" type="string">
+The synthesised answer. Empty when synthesis did not produce text. An empty `text` is never self-explanatory on its own, so always read `retrieval.synthesis_status`.
+</ResponseField>
+
+<ResponseField name="citations" type="string[]">
+Always exactly the retrieval seeds, one node id per hit, in hit order. It is not the full grounding set when subgraph retrieval is active.
+</ResponseField>
+
+<ResponseField name="subgraph_evidence_ids" type="string[]">
+Every node id and claim id rendered into the ego-graph context, so that `claim:<id>` and node anchors appearing in `text` resolve. Populated only on the subgraph path. Empty on the default block path, where `citations` already is the complete grounding set. Entity node rows are never budget-trimmed, while relationship and claim rows can be, so this can be a superset of what survived truncation into the prompt text.
+</ResponseField>
+
+<ResponseField name="retrieval" type="object">
+The trace of what the call actually did. See below.
+</ResponseField>
+
+<ResponseField name="sources" type="object[]">
+Present only when `include_sources=true`. One entry per hit.
+</ResponseField>
+
+### The retrieval block
+
+The MCP layer copies the companion's trace and then stamps four keys onto it.
+
+<ResponseField name="retrieval.mode" type="string">
+`"subgraph"` when subgraph retrieval ran, `"block"` otherwise.
+</ResponseField>
+
+<ResponseField name="retrieval.seed_k" type="int">
+The effective seed count: your `seed_k` when you passed one, otherwise the capped `k`.
+</ResponseField>
+
+<ResponseField name="retrieval.enable_subgraph" type="bool">
+Whether this call actually used subgraph retrieval, derived from `mode == "subgraph"`. Read this rather than assuming your argument won.
+</ResponseField>
+
+<ResponseField name="retrieval.hops" type="int | null">
+The clamped `hops` value when subgraph retrieval ran, and `null` when it did not, because the block path ignores `hops`.
+</ResponseField>
+
+<ResponseField name="retrieval.vault" type="string | null">
+The registry NAME of the vault that served the call. Never a path. Falls back to the directory basename when the serving vault is not in the registry, which is reachable only for a vault the caller themselves selected by path.
+</ResponseField>
+
+<ResponseField name="retrieval.vault_override_ignored" type="string">
+Present only when the connection's `?vault=` selector beat your `vault` argument. It carries the canonical registered name of the discarded vault, with casing and surrounding whitespace normalised to the registry's spelling, not your literal argument.
+</ResponseField>
+
+<ResponseField name="retrieval.synthesis_status" type="string">
+Always present. See the next section.
+</ResponseField>
+
+`source_block_policy` and `source_blocks_used` are always present. `seed_diversity` appears on the block path only. `source_block_budget_tokens`, `context_tokens_estimate` and `path` appear on both paths whenever retrieval returned at least one hit, and are absent when it returned none. `path` is one of `block_with_sources`, `block_without_sources`, `subgraph_only`, `subgraph_blend`, `subgraph_blend_escalated`, `subgraph_then_sources` or `subgraph_provider_error`. The subgraph path additionally echoes the effective `hops`, `max_degree_per_seed`, `neighbour_budget_tokens`, `coverage_threshold`, `min_claim_confidence`, `max_nodes`, `max_relationships`, `max_claims` and `relationship_types`. `source_blocks_used` is true only when at least one hit contributed real source bytes, not merely a non-empty context.
+
+### sources entries
+
+Each entry carries `id`, `block_id`, `byte_start`, `byte_end` and `content_hash`. A `path` key holds the vault-RELATIVE path, and it is omitted entirely when the stored absolute path cannot be relativized against the vault root. The absolute path is never emitted.
+
+Validity keys are added when they apply: `superseded` (with `valid_until` when set) and `detached` (with `valid_as_of` when set). These are the same keys the REST hit serializer emits.
+
+## synthesis_status
+
+`retrieval.synthesis_status` is always one of six values.
+
+<AccordionGroup>
+  <Accordion title="ok">
+    Synthesis succeeded and `text` is non-empty after stripping.
+  </Accordion>
+  <Accordion title="no_llm">
+    The vault has no usable LLM: it resolves to the built-in default provider and base with an empty model, or `llm.enabled` is `false`. No model is called at all. `citations` are still the retrieval hits, `text` is `""`, and `retrieval.no_llm_reason` names the setting to change (`llm.defaults.model`, or `okto-neuron onboard --reconfigure`). `explore` needs no LLM and works as normal.
+  </Accordion>
+  <Accordion title="empty">
+    Either retrieval returned no hits, in which case the model was never called and `retrieval.finish_reason` is absent, or the model was called and replied with nothing. Check `citations`: an empty list means retrieval found nothing, not that the model declined to answer.
+  </Accordion>
+  <Accordion title="provider_error">
+    The answering MODEL was unreachable and `text` degraded to `""`. This does NOT mean the graph lacks the answer. `retrieval.provider_error` carries a short redacted one-line summary of the exception, truncated with a trailing ellipsis when it is long. Retry, or fix the LLM config, rather than concluding the vault is empty.
+  </Accordion>
+  <Accordion title="truncated">
+    The provider hit its token budget, reporting `finish_reason == "length"`, so `text` is cut off mid-answer. A truncated answer that stripped to empty text still reports `truncated`, because the cause is known.
+  </Accordion>
+  <Accordion title="abnormal_stop">
+    The completion stopped for some other non-`stop` reason.
+  </Accordion>
+</AccordionGroup>
+
+`no_llm` is decided before any call, so it never combines with the others. Precedence when more than one of the rest applies: `provider_error` beats `truncated`, which beats `abnormal_stop`, which beats `empty`, which beats `ok`. `provider_error` is never overwritten.
+
+<Warning>
+Do not branch on `finish_reason` alone. litellm defaults a finish reason it has no mapping for to `"stop"`, and Okto Neuron flags that case, so `synthesis_status` can be `abnormal_stop` while `finish_reason` reads `"stop"`. A raw value litellm does know to be a stop alias (`end_turn`, `COMPLETE`, `eos_token`, `STOP`) stays clean. `synthesis_status` is the field to check.
+</Warning>
+
+### finish_reason and native_finish_reason
+
+`retrieval.finish_reason` carries the normalized reason whenever the provider reported one. `retrieval.native_finish_reason` is added only when the provider's raw value differs from the normalized value, which is the case where litellm normalized it away. Both are read from the per-call stats channel immediately after the completion returns.
+
+## Errors
+
+`ask` raises with these message strings.
+
+| Message | Cause |
+| --- | --- |
+| `invalid retrieval policy: <field>: <message>` | A validated knob is out of bounds, for example `coverage_threshold=1.5`. The policy model's `extra="forbid"` cannot be tripped through this tool, because the server builds the policy from a fixed set of keys. |
+| `shutting_down: server is shutting down` | The server is shutting down. Raised before any vault is leased, and again if a fenced pool is hit while shutting down. |
+| `maintenance: vault maintenance is in progress; try again shortly` | The vault pool is fenced for routine maintenance, for example a reembed. The call is safe to retry once maintenance finishes. |
+| `<code>: <sanitised message>` | Any other vault pool failure. The message is sanitised before it leaves the server, because raw pool messages embed the resolved absolute vault path. The machine-readable `code` prefix is stable. |
+
+A vault name that is path-shaped or unknown fails the call during resolution, before retrieval runs.
+
+## Read-only and remote access
+
+`ask` performs no writes and carries no loopback gate. Write tools do: `remember` refuses a non-loopback caller with `forbidden: remember is restricted to loopback callers; tunnel (e.g. SSH) to write remotely`.
+
+Direct remote serving is refused at startup. The server raises `direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel` when asked to bind anywhere but loopback. So the way to reach `ask` from another machine is an SSH tunnel to a loopback-bound server, and being read-only is what makes `ask` usable through one without tripping a write gate.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="MCP tool: explore" href="/mcp/tools/explore">
+    Structured graph to walk yourself, with tighter seeding.
+  </Card>
+  <Card title="Subgraph answers" href="/concepts/subgraph-answers">
+    What the ego-graph path changes about grounding.
+  </Card>
+  <Card title="LLM config reference" href="/config/llm-reference">
+    The `llm.ask` defaults every null knob inherits.
+  </Card>
+  <Card title="Vault selection" href="/mcp/vault-selection">
+    How the `vault` argument and the connection selector interact.
+  </Card>
+</CardGroup>

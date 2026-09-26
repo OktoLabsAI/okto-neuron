@@ -1,0 +1,96 @@
+---
+title: "Why the graph is derived, and what a rebuild costs"
+description: "Markdown is the trust root; the graph is disposable, always replaced whole, and the three regeneration paths differ in what they spend."
+---
+
+<Note>
+Okto Neuron is prerelease software. Behavior described here reflects the current code and can change.
+</Note>
+
+## Your markdown is the only thing that has to survive
+
+An Okto Neuron vault has two kinds of content, and only one of them is authoritative.
+
+The markdown under `notes/`, `refs/` and `.marginalia/sources/` is the trust root. It is the canonical source, and everything else is derived from it. The graph, the vectors and the search index are all products of running that markdown through a pipeline.
+
+That single split explains most of the design. If the graph is derived, you never have to repair it. You replace it. Rebuild "re-extracts every source file through the SAME full pipeline live ingest uses", producing a brand-new graph from the markdown you already have.
+
+So the rule for your own backups is short: back up the markdown. A lost or damaged graph is a regeneration, not a data loss.
+
+## Every regeneration builds a new graph and swaps it in
+
+Okto Neuron never edits the live graph in place during a regeneration. Three different paths all share the same shape: build a complete new graph somewhere else, check it, then swap it onto live in one step.
+
+<CardGroup cols={3}>
+  <Card title="rebuild">
+    Reads the markdown trust root, builds a fresh graph, atomic-swaps it onto live.
+  </Card>
+  <Card title="reembed">
+    Reads the live graph, bootstraps a fresh graph at the configured embedding width, copies nodes and edges, atomic-swaps.
+  </Card>
+  <Card title="reconcile heal">
+    Copies the live graph into a fresh graph with confirmed equivalences collapsed, atomic-swaps.
+  </Card>
+</CardGroup>
+
+The reason is stated in the rebuild code itself: a fresh generation "prevents partial topology and mixed semantic policy from becoming visible", and the verified result is then swapped atomically. You never see a half-built graph. Either the old one is live, or the new one is.
+
+Reembed builds fresh for a second reason too. The vector column is fixed-width, so a change of embedding model or dimension cannot be applied to the existing graph in place. It has to be a new graph at the new width.
+
+The new graph is built beside the old one, so a failure or interrupt during the build phase leaves the live graph exactly as it was: the staged graph is discarded and nothing was swapped. Once the swap has committed, a failing post-swap check leaves the new graph live and the previous one saved aside as a backup, which is what the rollback path exists for.
+
+## The three paths cost very different things
+
+Nothing here is a timing claim. It is about what each path actually spends.
+
+<AccordionGroup>
+  <Accordion title="rebuild: LLM extraction over the whole corpus">
+    Rebuild drives the full companion pipeline over every source file: the deterministic Document, Block and Claim structure plus LLM entity and relationship extraction. It is the only one of the three that re-runs the model over your whole corpus.
+  </Accordion>
+  <Accordion title="reembed: vectors only">
+    Reembed replays the existing graph's stored text through the configured embedder. There is no LLM re-extraction; the code is explicit that re-extraction is `kg rebuild`'s job. You pay for embedding calls, not extraction.
+  </Accordion>
+  <Accordion title="reindex: no model calls at all">
+    Reindex reads each node's stored text and embedding straight off the graph. No LLM calls and no re-embedding. It also short-circuits: when the index's generation stamp already matches the graph's current content, reindex does no work unless you force it. See [/reference/cli/kg-lifecycle](/reference/cli/kg-lifecycle) for how.
+  </Accordion>
+</AccordionGroup>
+
+The search index carries a generation stamp of its own, and it is a different thing from `graph_generation`. It is a digest computed over the graph's current nodes, which is what reindex recomputes and compares.
+
+Reconcile heal sits alongside these as a deterministic copy with no LLM step. The entities are already extracted, so the heal only materializes a map that already exists.
+
+For choosing which one to run for a given symptom, see [/vault/rebuilding](/vault/rebuilding). For the exact commands and flags, see [/reference/cli/kg-lifecycle](/reference/cli/kg-lifecycle).
+
+## Reconciliation stays off-graph until you ask for it
+
+Entity reconciliation (deciding that two extracted names are the same thing) is deliberately split into a reversible layer and a permanent one.
+
+`reconcile apply` auto-merges high-confidence clusters into an off-graph authority index and queues the rest for review. It "writes ONLY the two JSON side-files, never the graph". Review decisions (confirm, reject) also land in those side-files. Recall, Browse and Graph fold your answers through that map at query time, so merges take effect without the graph having changed.
+
+`reconcile heal` is the step that folds those confirmed equivalences into the graph topology: it drops variant nodes that merge onto a canonical, remaps edge and claim references through the equivalence map, drops the self-loops the collapse creates, and dedups by content-addressed edge id, all into a fresh graph that is then swapped in. The heal is re-runnable and idempotent; running it again on an already-collapsed graph is a verbatim copy.
+
+The markdown trust root has not changed, so a full re-derivation is always available.
+
+<Warning>
+`reconcile heal` replaces the live graph. Treat it as a graph-level change, not a note-level one.
+</Warning>
+
+More on the review loop lives at [/vault/duplicate-entities](/vault/duplicate-entities).
+
+## Generation and identity contract
+
+Every graph carries an identity: a `graph_generation` (a UUID minted when the graph is created) and an `identity_contract_version`.
+
+Fresh graphs and rebuilds mint `semantic_edges.v1`. That contract promises more than the older one: every deterministic (content-addressed) edge id equals `sha256_hex("edge", src, type, dst)`, and no two edges claim the same deterministic semantic identity under different ids. The integrity auditor runs those checks only for contracts that make the promise.
+
+Graphs predating the promise carry `legacy.v0` and are audited without those checks. A graph is treated as legacy when its contract version is `legacy.v0` or is unset.
+
+## Interrupting a rebuild
+
+A rebuild installs its own signal handlers while it runs, so an interrupt is noticed and handled rather than killing the process mid-write.
+
+Progress is written to `.marginalia/rebuild.state.json` as the rebuild goes. The build writes a state record before each file with `phase: "in_progress"`, the list of `files_done`, the `current_file`, and the started timestamp. When the run is interrupted, the file is rewritten with `phase: "interrupted"`, the files completed, the file in flight, the last file completed, and an `interrupted_at` timestamp. Reembed keeps its own progress file, `.marginalia/reembed.state.json`.
+
+The state file is a record of what happened, not a running graph. Because the interrupted work was going into a staging graph, your live graph is untouched, and the markdown it was derived from is untouched too.
+
+Anything left unfinished is regenerated the same way everything else is: from the markdown, into a fresh graph, swapped in whole.

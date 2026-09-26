@@ -1,0 +1,137 @@
+---
+title: "Create, reset or wipe a vault"
+description: "init, onboard and init_vault: three ways to make a vault, and what each one does differently."
+---
+
+A vault is a directory holding your notes, your references and the derived graph built from them. Okto Neuron gives you three ways to create one, and they differ in what they touch besides the directory.
+
+<Note>
+Okto Neuron is a prerelease. Commands and defaults on this page reflect the current source and can change between versions.
+</Note>
+
+## Pick a creation path
+
+<CardGroup cols={3}>
+  <Card title="okto-neuron init PATH">
+    You want a vault at an exact filesystem path, inside a project or on an external disk.
+  </Card>
+  <Card title="okto-neuron vault create NAME">
+    You want a named vault under the managed vault root, registered and selectable by name.
+  </Card>
+  <Card title="okto-neuron onboard">
+    You also want the LLM provider configured and the vault set as your default.
+  </Card>
+</CardGroup>
+
+| | Chooses the location | Registers the vault | Sets the default vault | Touches LLM config | Opens the store |
+|---|---|---|---|---|---|
+| `init PATH` | you, any path | no | no | no | yes |
+| `vault create NAME` | under the vault root | yes | yes, unless `--no-use` | no | no |
+| `onboard` | name or `--vault` | no | yes | yes | no |
+
+## Create a vault at a path
+
+<Steps>
+  <Step title="Run init">
+    ```bash
+    okto-neuron init ~/work/research-vault
+    ```
+    The command creates the vault root plus `notes/`, `refs/` and `.marginalia/`, each with mode `0700`, writes `okto-neuron.yaml`, then opens the graph store and sets the root itself to `0700`.
+  </Step>
+  <Step title="Read the confirmation">
+    ```text
+    initialized vault at /Users/you/work/research-vault
+    ```
+  </Step>
+</Steps>
+
+Because `init` opens the store as part of creation, the backend's graph storage is on disk when the command returns. See [the vault layout reference](/reference/vault-layout) for what each directory holds and [storage backends](/config/storage-backends) for the backends you can pin with `--backend`.
+
+`init` does not register the vault and does not change which vault other commands use by default. `okto-neuron vault list` only enumerates vaults under a configured vault root, plus your default vault and the one currently selected, so a vault created this way outside a configured root usually does not appear at all. When it does appear (because it is your default, or because `OKTO_NEURON_VAULT` or your working directory selects it), it lists with `managed` and `deletable` both false, since the registry only treats a direct child of a configured vault root as managed.
+
+Re-running `init` on a directory that already has a `okto-neuron.yaml` is not an error. The CLI always passes an embedder, so `Vault.init` reopens the existing vault and prints `initialized vault at <path>` again, leaving your notes and config alone. It refuses when the backend it is about to use differs from the one pinned in `okto-neuron.yaml`. Because `--backend` has a default, that check runs even when you do not pass the flag: a vault whose `okto-neuron.yaml` has no `storage` key counts as pinned to `ladybug`, so a bare re-run on one of those fails with a backend-mismatch error. Pass `--backend ladybug` to re-run against such a vault. Use `--wipe` if you meant to start over.
+
+## Create a named vault
+
+```bash
+okto-neuron vault create mynotes
+```
+
+`vault create` validates the name (it must start with a letter or number and contain only letters, numbers, `.`, `_` or `-`), places it under the first configured vault root, scaffolds it without opening the store, writes the managed-vault marker, and sets it as the default vault. Pass `--no-use` to create it without changing your default. If the target path is already a vault, the command prints `vault already exists: <path>` and exits with status 1.
+
+A managed vault is one the registry can also delete later, which is why the marker matters. Exhaustive flags for both commands live in the [vault command reference](/reference/cli/vault-commands).
+
+## Create a vault and configure the LLM in one pass
+
+```bash
+okto-neuron onboard --vault mynotes
+```
+
+`onboard` resolves the target from `--vault`, or from your current vault selection, or by prompting for a name (defaulting to `mynotes`) when it has nowhere else to look. If the target is already a vault it just sets it as the default and moves on to configuration. If it is not, `onboard` asks to create it, scaffolds it with packs `core,research,personal` and the `fastembed` embedder, and sets it as the default vault.
+
+`onboard` scaffolds without opening the store, so the backend's graph files only appear the first time something actually uses the vault.
+
+## Let an agent create a vault
+
+An agent connected over MCP can create a vault with the `init_vault` tool. It takes a `name`, an optional comma-separated `packs` string (default `core`), and optional backend and storage arguments. The tool is loopback-only and refuses non-loopback callers with `forbidden: vault creation is restricted to loopback callers`. It places the vault under the first configured vault root, the same location `vault create` uses, which is `~/.okto-neuron/vaults/<name>` when you have not configured one, marks it application-managed so the application can delete it later, and returns `{name, path}` without selecting it. If the name is already a vault, the call raises `vault_exists`. When the new vault has no usable LLM model the result carries a `hint`, and `remember` refuses until `llm.defaults.model` is set.
+
+See the [vault MCP tools](/mcp/tools/vaults) for the rest of the vault tools.
+
+## Which vault a command uses
+
+When you do not name a vault, Okto Neuron resolves one in this order:
+
+1. `OKTO_NEURON_VAULT`, if set.
+2. `default_vault` in the global `okto-neuron.toml`.
+3. The current working directory, if it is itself a vault.
+4. The single discovered vault, if exactly one exists.
+5. A vault named `default` under the first configured vault root, which is `~/.okto-neuron/vaults` when none is configured. This path is returned whether or not it exists.
+
+Step 5 returns a conventional path rather than an error, so a command can report a missing vault instead of guessing. `okto-neuron vault use NAME` sets the default explicitly.
+
+## Reset a vault
+
+<Warning>
+`okto-neuron init PATH --wipe` deletes your notes. It removes `notes/`, `refs/` and everything under `.marginalia/` (ingested sources, queue histories, curation sidecars, re-embed and rebuild progress, reconcile metadata) along with the backend's graph storage, then re-scaffolds an empty vault. There is no undo. Copy the directory first if you might want it back.
+</Warning>
+
+```bash
+okto-neuron init ~/work/research-vault --wipe
+```
+
+What happens:
+
+- If the path has no `okto-neuron.yaml`, `--wipe` is not taken and the command falls through to a normal create. The wipe itself refuses a directory that is not a vault, so it never deletes something Okto Neuron did not create.
+- If a server process holds the vault, the command prints that the server is running with its pid, tells you to stop it first, and exits with status 1. Stop the server, then re-run.
+- The pinned graph backend is read before anything is deleted, so the fresh empty graph is built on the same backend the vault was pinned to.
+- On success the command prints `wiped vault at <path>`.
+
+By default `okto-neuron.yaml` survives the wipe untouched, so your embedder, packs and LLM settings carry over into the empty vault. That changes if you pass `--packs`, `--embedder` or `--backend` on the command line: the config is deleted and the vault is re-initialized from those flags instead. Okto Neuron checks where the parameter value came from, so passing a default value explicitly on the command line still counts as explicit.
+
+<Accordion title="Wipe versus delete">
+`--wipe` empties a vault and leaves it in place, ready to use. No CLI command deletes a whole vault: to get rid of one you created with `okto-neuron init`, stop anything using it and remove the directory yourself.
+
+The running server has two more destructive operations that the CLI does not expose:
+
+- `POST /api/v1/reset` wipes the vault the server currently has open. It deletes the graph, the vault-local derived state and your content, keeps `okto-neuron.yaml`, then reopens the same vault empty. It reads no body and takes no confirmation token.
+- `DELETE /api/v1/vaults/{vault_id}` removes a registered vault's whole directory with `shutil.rmtree`, `okto-neuron.yaml` included, and re-creates nothing. It requires a JSON body holding exactly one field, `confirm_name`, matching that vault's registered name.
+
+Both refuse non-loopback callers with 403, and neither can be undone. Their status codes, guards and the rules that make a vault deletable are in [the HTTP endpoint reference](/reference/http-endpoints).
+</Accordion>
+
+## After creating
+
+<CardGroup cols={2}>
+  <Card title="Vault layout" href="/reference/vault-layout">
+    What lives in `notes/`, `refs/` and `.marginalia/`.
+  </Card>
+  <Card title="Vault commands" href="/reference/cli/vault-commands">
+    Every flag on `init`, `vault create`, `vault use` and `vault list`.
+  </Card>
+  <Card title="Storage backends" href="/config/storage-backends">
+    What `--backend` accepts and how a vault is pinned.
+  </Card>
+  <Card title="Vault tools over MCP" href="/mcp/tools/vaults">
+    `init_vault` and the rest of the agent-facing vault surface.
+  </Card>
+</CardGroup>

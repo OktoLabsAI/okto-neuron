@@ -1,0 +1,44 @@
+marginalia_yaml_version: 1
+vault_id: synthetic-ci-freeze
+federation_opt_in: false
+packs:
+- core
+- research
+- personal
+embedding:
+  provider: fastembed
+  model: BAAI/bge-small-en-v1.5
+storage:
+  backend: ladybug
+  reason: null
+compat_allow_external_sources: true
+llm:
+  allow_remote: true
+  defaults:
+    provider: openai
+    api_base: http://192.168.1.10:8081/v1
+    model: qwen3.6-35b
+    api_key_env: MARGINALIA_SYNTHCI_LLM_KEY
+    max_tokens: 16000
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    presence_penalty: 0.0
+    enable_thinking: true
+  extraction:
+    enable_thinking: false
+  judge:
+    temperature: 0.2
+    enable_thinking: false
+  curator:
+    temperature: 0.2
+    enable_thinking: false
+  relation_curator:
+    temperature: 0.2
+    enable_thinking: false
+  ask:
+    provider: openai
+    api_base: http://192.168.1.10:8081/v1
+    model: qwen3.6-35b
+    enable_thinking: true

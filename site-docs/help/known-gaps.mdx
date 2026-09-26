@@ -1,0 +1,130 @@
+---
+title: Known gaps
+description: What is missing, unverified or likely to change in 0.3.0, stated plainly, in one place.
+---
+
+This page exists so you can plan around what Okto Neuron has not proven about itself. Everything below was read out of the source tree, not out of a roadmap. Nothing here carries a date or a promise.
+
+<Note>
+Okto Neuron is version 0.3.0 and ships the `Development Status :: 2 - Pre-Alpha` classifier (`pyproject.toml:7`, `pyproject.toml:14`). Flags, defaults and messages can change between releases. See [/start/prerelease-status](/start/prerelease-status) for what that means for your vault.
+</Note>
+
+## Platform verification is uneven
+
+The installer and the daemon are shaped for macOS. The daemon spawner carries a Darwin-specific workaround: it uses fork+exec instead of the classic in-process double fork, because a process that forks without exec is flagged fork-unsafe by Darwin and dies in the kernel fork guard the first time it touches a CoreFoundation/XPC facility such as the macOS proxy lookup (`src/okto_neuron/server/lifecycle.py:663`). The packaging tree carries a `macos/` directory and a Homebrew formula (`packaging/README.md:72-74`).
+
+None of that runs on a macOS CI runner. Every job in the repository targets `ubuntu-latest` except one, which targets `windows-latest` (`.github/workflows/release-artifact-gate.yml:423`). The platform the code assumes most has the least automated verification behind it.
+
+Windows has no supported installer. Windows lifecycle code exists: the PID lock takes a `msvcrt` byte-range path (`src/okto_neuron/server/lifecycle.py:282`), the unlock mirrors it (`:307`), and `_spawn_windows_daemon` spawns a detached child equivalent to `serve --daemon` (`:718`). Both lock branches are marked `pragma: no cover`. The single Windows job runs focused managed-credential tests, not the daemon lifecycle (`.github/workflows/release-artifact-gate.yml:421-438`).
+
+## Installers and releases live in this repository
+
+From 0.3.0 `install.sh` and `install.ps1` sit at the root of `OktoLabsAI/okto-neuron`. Each release bakes its GitHub Release wheel URL, the `release-manifest.json` URL on `main` and the expected version into `install.sh`, and the installer refuses a wheel whose SHA-256 does not match the manifest. The earlier `OktoLabsAI/marginalia-dist` repository is frozen at 0.2.0; its one-liner forwards to this installer. Windows is the gap: `install.ps1` has not passed a native, interactive Windows PowerShell 5.1 lifecycle for any published version. The Homebrew formula is a stub with placeholder `url`, `sha256` and `version` fields and is not published to a tap; the README says outright not to run it as an installer (`packaging/README.md:72-81`). See [getting the source](/start/install#getting-the-source) for both routes.
+
+## Storage backends
+
+Three backends are registered in `_OFFICIAL`: `grafx`, `ladybug` and `neo4j` (`src/okto_neuron/store/registry.py:36-40`). The Neo4j gate is real but it is tag-gated, not per-PR: the job runs only on `refs/tags/v*` (`.github/workflows/release-artifact-gate.yml:559`, `:578`), and it has not run on hosted CI for any published version. The Neo4j backend gate (the Neo4j contract tests and acceptance scenario 84 against a live `neo4j:5-community`) last ran for 0.2.0, as a local reproduction. It has not been run against 0.3.0.
+
+`neptune` is in neither `_OFFICIAL` nor any entry point, so asking for it raises `NoSuchBackendError` (`src/okto_neuron/store/registry.py:43-60`). Backend selection is covered on [/config/storage-backends](/config/storage-backends).
+
+## Paths that were never exercised
+
+These are honest blanks. The code exists; nobody drove it end to end.
+
+<AccordionGroup>
+<Accordion title="Recovery after kg snapshot load --skip-embeddings">
+`kg_snapshot_load` accepts `skip_embeddings` (`src/okto_neuron/cli/kg.py:3241-3249`). Whether `kg reindex` alone restores usable vectors afterwards, or whether `kg reembed` is required, was not tested.
+</Accordion>
+<Accordion title="kg reconcile review reject on an unknown cluster id">
+`kg_reconcile_review_reject` calls `queue.reject(cluster_id)` with no guard and then echoes `rejected <id>` and returns 0 (`src/okto_neuron/cli/kg.py:3058-3066`). The sibling confirm path does check for a missing cluster and returns 1 (`:3050-3051`). What reject does with an id that is not queued was not verified.
+</Accordion>
+<Accordion title="okto-neuron watch against a daemon holding the vault lock">
+The PID lock is acquired non-blocking (`src/okto_neuron/server/lifecycle.py:279-303`). Running `watch` while a daemon holds the same vault's lock was not exercised, so the failure mode is unknown.
+</Accordion>
+<Accordion title="vault use when two vault roots hold same-named vaults">
+`AmbiguousVaultNameError` is raised when a registered name resolves to more than one configured root (`src/okto_neuron/vault_registry.py:32-40`, `:166-168`). Whether the CLI renders it as a clean message rather than a traceback was not checked.
+</Accordion>
+</AccordionGroup>
+
+## Surfaces that self-describe as provisional
+
+The `kg` executable's own help text calls it a "Compatibility CLI with graph commands flattened at the top level" (`src/okto_neuron/cli/__init__.py:118-124`). It is assembled by copying every top-level command into it, then copying `kg` subcommands only when that name is still free (`src/okto_neuron/cli/__init__.py:3349-3358`). Because a top-level `init` command exists (`:921`), it lands first and the `kg` group's own `init` (`:595`) never gets added. Under the `kg` executable, `kg init` is the top-level init. Treat the `kg` executable as a surface that can change; [/reference/cli/overview](/reference/cli/overview) documents the `okto-neuron` commands.
+
+`okto-neuron models size` builds its site-packages total inside a bare `try` whose `except Exception` sets the size to `0` (`src/okto_neuron/cli/models.py:33-40`). A failure to stat one file reports as zero for the whole row, so the total can silently understate what is on disk.
+
+`OKTO_NEURON_REFERENCE_DATE` defaults to the hardcoded string `"2026-05-19"` rather than today's date (`src/okto_neuron/detectors.py:182`). That reads like a test pin that leaked into a default. It is internal and not a user knob, but it does mean date-relative detector behaviour is anchored to a fixed day unless the variable is set.
+
+## Schema types with no writer
+
+`Authority` and `Work` are declared node models in the legacy schema module (`src/okto_neuron/core/schema/legacy.py:52`, `:74`). The only place that builds an `Authority` is `AuthorityRecord.to_authority_node`, whose docstring says it is for serialization shape only and must never reach `store.add_node` (`src/okto_neuron/reconcile/authority.py:80-88`). No code path observed produces either type in a graph.
+
+`Annotation` is likewise declared and never minted. The server's census names it explicitly: `_NEVER_MINTED_TYPES` is `{"Identifier", "Annotation", "Finding"}`, with a comment saying a count of 0 is the expected steady state (`src/okto_neuron/server/http.py:118-124`). Markdown ingest does not create annotations.
+
+## Error and exit-code residue
+
+Exit codes 1, 2, 3, 4, 5, 11 and 130 are traceable to real CLI failures. Two more are declared and effectively unreachable from the command line:
+
+| Code | Error class | Where it is raised |
+| --- | --- | --- |
+| 12 | `QueryError` (`src/okto_neuron/errors.py:299-302`) | `src/okto_neuron/vault.py:1090`, library only |
+| 13 | `ExportError` (`src/okto_neuron/errors.py:305-308`) | `src/okto_neuron/vault.py:583`, `:587`, library only |
+
+Neither name appears anywhere under `src/okto_neuron/cli`. Exit 13 belongs to JSON-LD export, which has no CLI, HTTP, UI or MCP entry point at all (`src/okto_neuron/vault.py:574-591`); it is reachable only by importing the vault API in Python.
+
+`NoVaultSpecified` declares exit code 2 (`src/okto_neuron/errors.py:107-109`) and has zero raise sites in the tree. The vault resolver falls back to `default` instead of raising it (`src/okto_neuron/vault_registry.py:154-160`).
+
+Exit codes 6, 7, 8, 9, 10, 14, 15 and 16 are declared on error classes in `src/okto_neuron/errors.py`, and those classes do have raise sites, but no command has been traced end to end to a shell exit carrying one of those numbers. Several of the raise sites sit under `src/okto_neuron/server/` or `src/okto_neuron/curation/`, for example `RebuildAuditFailed` at `server/_curation.py:1970`, `:1986`, `:2334`, `:2607` and `VaultCorrupted` at `server/_curation.py:2596`, `:2826`. A failure raised there reaches a thin-client command as `server error <status>` and exit 1, not as the class's own code. Other raise sites are `VaultCorrupted` at `store/ladybug.py:139` and `curation/orchestrate.py:631`, `BootstrapPartial` at `cli/kg.py:1997` and `store/_bootstrap.py:234`, `RebuildSwapFailed` at `store/staging.py:167`, `:538`, `:560`, `SchemaVersionMismatch` at `store/schema.py:304`, `GraphBackendError` at `store/grafx.py:789`, `:831` and `store/neo4j.py:692`, `:746`, and `EmbeddingDimMismatch` at `vault.py:204`, `store/schema.py:332`, `store/grafx.py:427` and `store/neo4j.py:367`. Do not script against these numbers. See [/reference/cli/exit-codes](/reference/cli/exit-codes).
+
+## Graph rollback is daemon-only
+
+Rollback of a graph swap ships, and it ships in exactly one place: `POST /api/v1/curation/rollback`
+on a running daemon (`src/okto_neuron/server/http.py:7007`). There is no `okto-neuron` subcommand and
+no MCP tool for it. The module that owns the swap tail says so directly: "There is deliberately no
+`rollback()` wrapper: rollback has no offline CLI owner today"
+(`src/okto_neuron/curation/orchestrate.py:15-18`).
+
+That matters when a rebuild reaches `post_swap_validation_failed`: the new graph is live, the
+previous one is on disk at `backup_path`, and with no daemon reachable the only recourse left to you
+is restoring a snapshot into a fresh vault. The checkpoint is also keyed to the live generation, so
+it stops being a rollback candidate once another rebuild, heal or reembed runs
+(`src/okto_neuron/curation/orchestrate.py:726-747`). See
+[/vault/rebuilding](/vault/rebuilding#after-a-failed-post-swap-audit).
+
+## HTTP surface
+
+Six unversioned routes are mounted at the server root: `/remember`, `/recall`, `/ask`, `/review-queue`, `/review-queue/batch` and `/resolve-review` (`src/okto_neuron/server/http.py:7030-7035`). Five of them have an `/api/v1` twin (`/api/v1/recall` at `:6932`, `/api/v1/ask` at `:6933`, and the review-queue and resolve-review routes at `:7019-7025`). `/remember` does not: the bare route at `:7030` is the only mount for that handler. They are reachable on the loopback server. No shipped CLI command and no frontend code calls them. The surrounding comment keeps bare routes because "the CLI speaks these", which is true of `/add`, `/query` and `/detect-drift` (`:7027-7029`) and not of these six.
+
+Five versioned routes have no caller either. `GET /api/v1/vaults/current` (`src/okto_neuron/server/http.py:6853`), `POST /api/v1/vaults/switch` (`:6854`), `PUT /api/v1/llm/credential` (`:6900`) and `/api/v1/graph/integrity` under both GET and POST (`:6842-6843`) are registered on the router, but the strings `vaults/current`, `vaults/switch`, `llm/credential` and `graph/integrity` do not appear anywhere under `frontend/src`, and no shipped CLI command sends them. `DELETE /api/v1/ingest-queue/{item_id}` (`:6942-6946`) is the fifth: the frontend lists the queue, reads one item and retries one item, and never deletes one (`frontend/src/services/ingest-api.ts:34-48`). All five are reachable on the loopback server and untested through any shipped surface. Do not build on them.
+
+`_routes()` returns 97 `Route()` registrations (`src/okto_neuron/server/http.py:6834-7038`): 86 `/api/v1` registrations over 76 distinct versioned paths, plus 11 bare paths. [/reference/http-endpoints](/reference/http-endpoints) lists the paths the CLI sends and the paths the bundled web UI calls, with the frontend module that calls each.
+
+Most of those 76 versioned paths belong to families that only the web UI drives, and this site documents no request or response fields for any of them. The families are:
+
+- `/api/v1/curation/...`: jobs, scheduler, companion-triage, rebuild, rollback, heal, reembed, rebuild/status.
+- `/api/v1/ledger/...`: runs, runs/{run_id}, summary.
+- `/api/v1/authority` and `/api/v1/authority/unmerge`.
+- `/api/v1/reconcile/...`: propose, apply, status, queue, review/confirm, review/reject.
+- `/api/v1/upkeep/predicates/...`: snapshot, propose, apply, {record_id}/confirm, {record_id}/reject.
+- `/api/v1/ingest-batch`, `/api/v1/ingest-queue`, `/api/v1/ingest-queue/{item_id}`, `/api/v1/ingest-queue/{item_id}/retry`, `/api/v1/ingest-cancel`.
+- `/api/v1/credentials/...` and `/api/v1/providers/...`, including the id-scoped update and delete forms.
+- `/api/v1/embedding/...`: models, test, reembed, reembed/status.
+- `/api/v1/config/defaults` and its four `/config/defaults/...` test paths.
+- `/api/v1/quality/semantic/governance` and `/api/v1/folder-watch/status`.
+
+This is a declared absence, not an oversight. These paths exist, the shipped UI calls them, and nothing on this site is a contract for them. Read the handler in `src/okto_neuron/server/http.py` before depending on one.
+
+`okto-neuron status --vault` is not discarded: the value is passed through to the client, which sends it as the `X-Okto-Neuron-Vault` header (`src/okto_neuron/cli/__init__.py:2374`, `src/okto_neuron/cli/_client.py:111-113`). What the server does with that header was not traced, so do not assume it scopes the response.
+
+## The UI command does not check for a UI
+
+`okto-neuron ui` waits for the server health endpoint, then opens a browser at the endpoint root and returns (`src/okto_neuron/cli/__init__.py:2277-2287`). It never asks whether a web UI build is mounted. If the daemon is running in API-only mode, the browser opens on a path with no route and the command still exits 0. `--vault` on this command is a deprecated compatibility option; the body does `del vault_path` (`src/okto_neuron/cli/__init__.py:2262-2279`).
+
+## Wipe is best effort
+
+<Warning>
+Vault deletion routes through `_remove_path`, which calls `shutil.rmtree(..., ignore_errors=True)` for directories and swallows `OSError` for everything else (`src/okto_neuron/store/vault.py:292-300`). A locked or undeletable file can survive a wipe that reported success, so a reported success is not proof the directory is gone.
+</Warning>
+
+## Omissions that are decisions
+
+Some things absent from Okto Neuron are missing on purpose rather than by oversight, and they are listed separately. See [/help/deliberately-absent](/help/deliberately-absent). For what Okto Neuron does today, start at [/](/).

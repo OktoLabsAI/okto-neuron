@@ -1,0 +1,185 @@
+---
+title: "Status, health and logs"
+description: "Read the daemon's state, its ingest counters and its warnings, in text or JSON."
+---
+
+<Note>
+Okto Neuron is prerelease. Output lines and payload fields on this page describe the code as it
+stands and may change between versions.
+</Note>
+
+`okto-neuron status` is the read-only health command. It talks to a daemon you already started
+(see [/server/running](/server/running)); it never starts one.
+
+## What the command does
+
+`status` makes two HTTP requests against the resolved endpoint:
+
+1. `GET /api/v1/status`
+2. `GET /version`
+
+It then assembles one payload from both responses and prints it. See
+[/reference/http-endpoints](/reference/http-endpoints) for the routes themselves.
+
+```bash
+okto-neuron status
+okto-neuron status --json
+okto-neuron status --endpoint http://127.0.0.1:7777 --timeout 5
+```
+
+`--endpoint` and `--timeout` resolve the way they do for every client command, and their
+defaults are on [/reference/cli/overview](/reference/cli/overview). The timeout applies to each
+of the two requests separately. For `--vault`, `--json` and the exact option spellings, see
+[/reference/cli/server-commands](/reference/cli/server-commands).
+
+## The text output, line by line
+
+The text form prints in this fixed order.
+
+| Line | Content |
+| --- | --- |
+| Header | `Okto Neuron <marginalia_version> — <status>`. The CLI prints `unknown` when the response carries no status. |
+| `Endpoint:` | The resolved endpoint URL |
+| `PID:` | The daemon process id, or `unknown` when the payload has none |
+| `Scope:` | `application` or `vault` |
+| `Vaults:` | Application scope only: the vault count, or `unknown` when it is not an integer |
+| `Fallback:` | Application scope only, and only when a fallback vault path is present |
+| `Backend:` | Printed after `Fallback:` or after `Vault:`, only when a backend is present |
+| `Vault:` | Vault scope only: the vault path, or `(unknown)` |
+| `Uptime:` | Seconds since the daemon started, one decimal place, suffixed `s`. Printed only when `uptime_s` is a number. |
+| `Ingest:` | Phase and counters (below) |
+| `UI:` | The endpoint with a trailing slash |
+| `Stop:` | The literal string `okto-neuron stop` |
+| `Warning:` | One line per degraded reason, in payload order |
+
+### The Ingest line
+
+```text
+  Ingest:   idle (0/0 terminal, 0 processing, 0 queued)
+```
+
+The phase is derived in this order:
+
+- `stopping` when the ingest summary has `cancel_requested` set
+- otherwise `active` when it has `active` set
+- otherwise `idle`
+
+`terminal` is the sum of the summary's `done`, `error` and `cancelled` counts. `total`,
+`processing` and `queued` are each read from the summary and coerced to an integer; a missing or
+null value prints `0`. If the `ingest` value is not a mapping, the whole line is skipped.
+
+## The `--json` payload
+
+`--json` prints the assembled payload with `indent=2` and sorted keys. Use this form in scripts;
+the text block is for reading.
+
+The payload has exactly these keys.
+
+<ResponseField name="status" type="string">`ok` or `degraded`, from `/api/v1/status`; `unknown` when absent.</ResponseField>
+<ResponseField name="scope" type="string">`application` or `vault`. If the server sends neither, the CLI derives it: `vault` when `active_vault` is truthy, otherwise `application`.</ResponseField>
+<ResponseField name="endpoint" type="string">The resolved endpoint URL.</ResponseField>
+<ResponseField name="pid" type="integer">The daemon process id.</ResponseField>
+<ResponseField name="vault_path" type="string">Vault path, or null.</ResponseField>
+<ResponseField name="backend" type="string">Graph backend name for that vault path, or null.</ResponseField>
+<ResponseField name="active_vault" type="boolean">Whether the reporting state has a vault. Defaults to `false`.</ResponseField>
+<ResponseField name="vault_count" type="integer">Number of runtimes counted server-side.</ResponseField>
+<ResponseField name="vaults" type="array">Per-vault summaries. Each entry carries `path`, `backend`, `draining`, `ingest`, `curation`, `maintenance` and `integrity`.</ResponseField>
+<ResponseField name="uptime_s" type="number">Daemon uptime in seconds.</ResponseField>
+<ResponseField name="queue_error_count" type="integer">Ingest items that failed or degraded. Defaults to `0`.</ResponseField>
+<ResponseField name="ingest" type="object">The ingest summary the text line is rendered from. Defaults to `{}`.</ResponseField>
+<ResponseField name="degraded_reasons" type="array">Reason strings. The server includes this key only when there is at least one reason; the CLI defaults it to an empty list.</ResponseField>
+<ResponseField name="marginalia_version" type="string">From `/version`; `unknown` when absent.</ResponseField>
+<ResponseField name="api_version" type="string">From `/version`; `unknown` when absent.</ResponseField>
+
+The server's `/api/v1/status` response carries more fields than the CLI forwards, among them
+`recovered_from_corruption`, `folder_watch_running` and `integrity`. If you need those, read the
+endpoint directly.
+
+## Degraded reasons
+
+`status` is `degraded` whenever the server collected at least one reason. Each reason string
+starts with a stable key before the colon. The keys the server can emit:
+
+| Key | Meaning |
+| --- | --- |
+| `recovered_from_corruption` | The graph was quarantined after on-disk corruption. Either it was recovered from the last checkpoint (writes since then were lost) or re-created empty. |
+| `integrity_fenced` | One or more vault graphs failed or could not complete integrity verification. Reads stay available; a fresh-graph rebuild is required. |
+| `folder_watch_stopped` | The folder-watch task is no longer running, so filesystem auto-ingest is stalled. The reason text carries the restart count. |
+| `folder_watch_stalled` | The folder-watch task has not polled within the stall threshold. |
+| `queue_errors` | The count of ingest items that failed or degraded. |
+
+The daemon logs `health degraded` at ERROR level, but only on a transition: the first degraded
+poll, or a change in the set of reason keys. When the reasons clear, it logs `health recovered`
+once at INFO. A daemon that stays degraded does not repeat the line on every poll.
+
+## Exit codes and errors
+
+| Condition | Output | Exit |
+| --- | --- | --- |
+| Success | The text block or the JSON payload | 0 |
+| Server unreachable | ``no okto-neuron server reachable at <url> — start with `okto-neuron serve` `` on stderr | 2 |
+| Non-2xx response | `server error <code>: <detail>` on stderr | 1 |
+
+The unreachable message is contract-stable. The source comments mark it as matched by scripts and
+humans, so treat the exact string as part of the interface.
+
+```bash
+okto-neuron status --json > /dev/null
+case $? in
+  0) echo "reachable" ;;
+  1) echo "server returned an error" ;;
+  2) echo "no daemon" ;;
+esac
+```
+
+## The daemon log
+
+By default a daemonized server writes to `~/.okto-neuron/logs/okto-neuron-serve.log`. Structured
+records are JSON, one per line. The daemon's raw stdout and stderr are redirected to the same file,
+so uncaught tracebacks and third-party output also appear there and are not JSON. Parse
+defensively. The file is size-rotated at 10 MiB with 3 backups kept. If the path already exists and is not
+a regular file (a character device such as `/dev/null`), it is written without rotation.
+
+When a start fails, read the tail of that file. The installer does the same thing: on a failed
+daemon start it prints the last 20 lines of the log.
+
+```bash
+tail -n 20 ~/.okto-neuron/logs/okto-neuron-serve.log
+```
+
+<Tip>
+Pair the log tail with `okto-neuron status --json`. The log explains a failed start; `status`
+explains a running daemon that is answering but unhealthy.
+</Tip>
+
+## Raising log verbosity
+
+Set `OKTO_NEURON_LOG_LEVEL` in the daemon's environment. When it is set to a non-empty value, it
+overrides the configured level for the `okto-neuron` logger.
+
+```bash
+OKTO_NEURON_LOG_LEVEL=DEBUG okto-neuron serve --daemon
+```
+
+<Warning>
+DEBUG surfaces full LLM prompts and raw completions in the log. Your document text and model
+output land in `~/.okto-neuron/logs/okto-neuron-serve.log` in readable form. Do not leave DEBUG on,
+and do not share a DEBUG log.
+</Warning>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Running the server" href="/server/running">
+    Starting, stopping and the daemon lifecycle.
+  </Card>
+  <Card title="Server command reference" href="/reference/cli/server-commands">
+    Exhaustive flags for every server command.
+  </Card>
+  <Card title="HTTP endpoints" href="/reference/http-endpoints">
+    The routes `status` reads.
+  </Card>
+  <Card title="Troubleshoot the runtime" href="/help/troubleshoot-runtime">
+    What to do when status reports degraded.
+  </Card>
+</CardGroup>

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd LaunchAgent template for okto-neuron.
+
+  This is a TEMPLATE. You must replace the placeholders before loading:
+    {{LOG_DIR}}             Absolute path to a writable log directory
+                            (e.g. /Users/<you>/Library/Logs/okto-neuron).
+    {{OKTO_NEURON_BIN}}      Absolute path to the okto-neuron binary
+                            (e.g. /opt/homebrew/bin/okto-neuron or
+                            /usr/local/bin/okto-neuron, or the path printed
+                            by `command -v okto-neuron`).
+
+  This template is OPT-IN. The main okto-neuron package never installs,
+  registers, or spawns a launchd job on your behalf. You install it
+  explicitly with the steps below.
+
+  Install (per-user LaunchAgent):
+    1. cp packaging/macos/com.oktolabs.okto-neuron.plist \
+         ~/Library/LaunchAgents/com.oktolabs.okto-neuron.plist
+    2. Edit the copy and replace every {{...}} placeholder with a real path.
+    3. mkdir -p <LOG_DIR>
+    4. launchctl load  ~/Library/LaunchAgents/com.oktolabs.okto-neuron.plist
+       launchctl start com.oktolabs.okto-neuron
+
+  Stop / uninstall:
+       launchctl stop   com.oktolabs.okto-neuron
+       launchctl unload ~/Library/LaunchAgents/com.oktolabs.okto-neuron.plist
+       rm ~/Library/LaunchAgents/com.oktolabs.okto-neuron.plist
+
+  Inspect:
+       launchctl list | grep com.oktolabs.okto-neuron
+       tail -f <LOG_DIR>/okto-neuron.out.log <LOG_DIR>/okto-neuron.err.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oktolabs.okto-neuron</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{OKTO_NEURON_BIN}}</string>
+        <string>serve</string>
+        <string>--foreground</string>
+        <string>--no-open</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/okto-neuron.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/okto-neuron.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

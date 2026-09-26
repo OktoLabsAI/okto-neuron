@@ -1,0 +1,3 @@
+id: semver
+version: "not a version"
+compatRange: ">=0.0.1"

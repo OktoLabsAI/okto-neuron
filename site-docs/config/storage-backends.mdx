@@ -1,0 +1,161 @@
+---
+title: Graph storage backends
+description: What the backend pin means, which backends actually exist, and why you cannot switch by editing a file.
+---
+
+A vault stores its knowledge graph through one graph backend. Most creation paths write that name into `okto-neuron.yaml` under the `storage` block, and it stays there. One path, `kg init` with no `--backend`, does not, and this page covers that case. This page is the single home for what that block contains, which backend names resolve, and what happens when a vault is opened under a different name than the one it was pinned to.
+
+<Note>
+Okto Neuron 0.3.0 is a prerelease. The fields on this page are the ones the config models declare today.
+</Note>
+
+## The backend registry
+
+Backend names resolve through an in-tree registry. `_OFFICIAL` maps three names to their store classes, in this declaration order:
+
+| Name | Target |
+| --- | --- |
+| `grafx` | `okto_neuron.store.grafx:GrafxStore` |
+| `ladybug` | `okto_neuron.store.ladybug:LadybugStore` |
+| `neo4j` | `okto_neuron.store.neo4j:Neo4jStore` |
+
+The source comment on that map names `grafx` the default, non-experimental graph backend, and lists `ladybug` and `neo4j` as the other selectable names.
+
+`resolve_graph_backend(name)` checks `_OFFICIAL` first, then the `marginalia.graph_backends` entry-point group. It fails closed: a name in neither source, or a resolved class that does not structurally satisfy the `GraphStore` protocol (a missing method or property, or a method whose signature cannot accept the protocol's call shape), raises `NoSuchBackendError` at registration time rather than on first write.
+
+`list_graph_backends()` returns the three official names in declaration order, then appends any additional name registered under the `marginalia.graph_backends` entry-point group, deduplicated. It enumerates names only. It does not import or validate any class, so a name it lists is not by itself proof that the backend is usable in this process.
+
+`neptune` is not in `_OFFICIAL`. There is a `NeptuneStorageConfig` model in the config module, described in its own docstring as not-yet-shipped, but the name does not resolve through the registry, so asking for it raises `NoSuchBackendError`.
+
+## The two defaults that look like a contradiction
+
+There are two different "defaults" in the code, and they do not mean the same thing.
+
+<Tabs>
+<Tab title="Absent storage key">
+`VaultConfig.storage` has the field default `None`. The comment on that field states this means "unpinned / legacy", never "pinned to the new default", and that every read site treats `storage is None` as `"ladybug"`: `vault.py::_check_backend_pin`, `store/vault.py::_read_pinned_backends`, `cli/kg.py::_resolve_pinned_backend`, and `reconcile/heal.py`.
+
+`VaultConfig.default()` is deliberately storage-less for the same reason: it also serves as `load()`'s deep-merge baseline for every existing vault, so giving it a non-`None` `storage` would silently re-pin every legacy no-`storage`-key vault on the next read.
+</Tab>
+<Tab title="Newly created vault">
+`DEFAULT_NEW_VAULT_BACKEND` is `"grafx"`. The comment above it states that a freshly created vault with no explicit `--backend` always means this constant, pinned explicitly and eagerly at creation time instead of ever relying on the absent-key fallback.
+
+The CLI creation entry points carry `default=DEFAULT_NEW_VAULT_BACKEND` with `show_default=True` on their `--backend` option.
+</Tab>
+</Tabs>
+
+One consequence worth holding on to: `VaultEntry.backend` in the vault registry has the dataclass default `"ladybug"`, with a comment naming it the legacy absent-key rule. A vault listed as `ladybug` was therefore not necessarily pinned to `ladybug`. It may simply have no `storage` key at all.
+
+The Python-level `Vault.init` signature also keeps `backend: str = "ladybug"` rather than the grafx constant. Its comment names `okto-neuron init`, `vault create` and `onboard` as the entry points that pass `DEFAULT_NEW_VAULT_BACKEND` explicitly, so this bare default only matters for a direct library or test caller that omits `backend`. `kg init` is the exception, covered below.
+
+## The `kg init --backend` trap
+
+<Warning>
+`kg init` shows `grafx` as the default for `--backend`, but omitting the flag does not pin grafx. The wrapper uses Click's `ParameterSource` to distinguish an explicit flag from the default, and passes `backend=None` when the flag was not typed on the command line.
+</Warning>
+
+With `backend=None`, `kg_init` leaves `okto-neuron.yaml` untouched and defers entirely to `store.vault._open_vault`'s own scaffolding. The docstring spells the result out: fresh vault, unpinned config, the `"ladybug"` absent-`storage`-key fallback. It does not newly opt a bare `kg init` into `DEFAULT_NEW_VAULT_BACKEND`.
+
+With an explicit `--backend`, `kg init` calls `_resolve_and_pin_backend`, and when the vault has no `okto-neuron.yaml` yet, writes the config itself through `_write_kg_init_vault_config`. That helper exists because `kg init` bypasses `Vault.scaffold` entirely, so it is the only place an explicit `--backend` can reach the config before the default unpinned config would otherwise be written.
+
+If you want a pinned vault from `kg init`, type the flag:
+
+```bash
+okto-neuron kg init --backend grafx /path/to/vault
+```
+
+See [/vault/creating](/vault/creating) for the other creation entry points.
+
+## The pin is enforced on open
+
+`_check_backend_pin(root, backend)` loads the vault config, takes `storage.backend` (or the literal `"ladybug"` when `storage` is absent), and raises `VaultBackendMismatch` when it differs from the requested backend, with the message `vault at {root} is pinned to backend {pinned!r}; cannot create or reopen it as backend {requested!r}`. A config that cannot be read or parsed is left to the caller's own path rather than judged here.
+
+`_resolve_and_pin_backend` runs `_validate_backend_name` (a registry resolution, failing with `click.BadParameter` on an unknown name) and then that same pin check. It is shared by `onboard`, `okto-neuron init`, `vault create` and `kg init`, so a caller that bypasses `Vault.scaffold`/`Vault.init` raises the identical `VaultBackendMismatch`.
+
+`storage.backend` is not in `VaultConfig.WRITABLE_BLOCKS`, which holds `embedding`, `llm`, `consolidation`, `upkeep`, `packs`, `folder_watch` and `ingest`. It is not switchable through a config write.
+
+<Warning>
+Do not hand-edit `storage.backend` in `okto-neuron.yaml` to move a vault to another backend. The pin describes graph data that already exists on disk in that backend's format. The supported route is a logical snapshot dump from the old vault and a load into a new vault. See [/vault/snapshots](/vault/snapshots).
+</Warning>
+
+`kg snapshot load` accepts `--storage-uri`, `--storage-credential-env`, `--storage-database` and `--allow-remote-db`, because a snapshot never carries live connection secrets. Its helper pins the new vault to `manifest.origin_backend`.
+
+## What the `storage` block contains
+
+`storage` is a discriminated union keyed on `backend`. Each variant is `extra="forbid"`, so an unknown key fails validation.
+
+<ParamField path="storage.backend" type="string">
+The pinned backend name. `LadybugStorageConfig` declares `Literal["ladybug"]` with a default of `"ladybug"`; `GrafxStorageConfig` declares `Literal["grafx"]`; `Neo4jStorageConfig` declares `Literal["neo4j"]`.
+</ParamField>
+
+<ParamField path="storage.reason" type="string | null" default="null">
+Free-text note, declared on the Ladybug, Grafx and Custom variants. The Neo4j and Neptune variants have no `reason` field. `Vault._write_config` writes `reason: null` for the Ladybug and Grafx backends, and its comment notes Neo4j's variant has no such field so it must not be written there.
+</ParamField>
+
+<ParamField path="storage.retry" type="object">
+Declared on the Grafx and Neo4j variants. See the retry table below.
+</ParamField>
+
+A backend registered only through the entry-point group has no typed variant. `CustomStorageConfig` catches it with `backend: str` plus `reason: str | null`, so a vault pinned to such a backend can be reopened after the config that pinned it was written. Backend-name validity stays the registry's job.
+
+### `storage.retry`
+
+`RetryConfig` is the optimistic-write-conflict retry policy. Its docstring calls it backend-neutral: a backend whose writes can lose a concurrent-write race under MVCC shares this one policy shape and `store/_retry.py`'s `retry_with_backoff` helper. The docstring describes the scheme as full-jitter exponential backoff from `backoff_base_ms` up to `backoff_cap_ms`, bounded by both `max_attempts` and a wall-clock `total_cap_s` ceiling, whichever is hit first.
+
+| Field | Type | Default | Constraint |
+| --- | --- | --- | --- |
+| `max_attempts` | int | `8` | `>= 1` |
+| `backoff_base_ms` | int | `50` | `>= 0` |
+| `backoff_cap_ms` | int | `2000` | `>= 0` |
+| `total_cap_s` | float | `30` | `>= 0` |
+
+### The `index` block
+
+`VaultConfig.index` is an `IndexConfig | None`, defaulting to `None`. `IndexConfig` is documented as index backend metadata captured at vault creation time and declares one field, `backend`, defaulting to `"ladybug_bm25+vector_scan"`. Treat it as creation-time metadata and leave it alone. It is not in `WRITABLE_BLOCKS` either. Field-by-field coverage of the rest of the file is on [/config/vault-yaml](/config/vault-yaml).
+
+## Neo4j
+
+This is the single home for the Neo4j topic. The fields exist and the plumbing is present. The configuration itself is not verified for 0.3.0, so what follows is an enumeration, not a procedure.
+
+`Neo4jStorageConfig` declares:
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `backend` | `Literal["neo4j"]` | required |
+| `uri` | str | required |
+| `database` | str | `"neo4j"` |
+| `credential_env` | str \| null | `null` |
+| `allow_remote` | bool | `false` |
+| `retry` | `RetryConfig` | see above |
+| `vault_id` | str \| null | `null` |
+
+`credential_env` runs through `_check_api_key_env` on validation. It names an environment variable, not a secret.
+
+The creation paths accept `--storage-uri`, `--storage-credential-env`, `--storage-database` and `--allow-remote-db`, mapping onto `uri`, `credential_env`, `database` and `allow_remote`. When the pinned backend is `neo4j`, both `Vault._write_config` and `kg init`'s config writer mint a `storage.vault_id` from `uuid.uuid4().hex`.
+
+A non-loopback `--storage-uri` requires explicit consent. `_confirm_remote_storage_endpoint` classifies the URI through `_classify_storage_endpoint`. A `loopback` classification returns without prompting. Otherwise, in the non-interactive path the creation commands use, it raises `ClickException` with `{uri} is not loopback; pass --allow-remote-db --yes to confirm remote egress`. Its interactive branches print that vault-derived context may be sent to the endpoint and ask for confirmation.
+
+<Warning>
+The Neo4j backend gate (the Neo4j contract tests and acceptance scenario 84 against a live `neo4j:5-community`) last ran for 0.2.0, as a local reproduction. It has not been run against 0.3.0. Treat this as an unverified configuration for 0.3.0. Treat the fields above as what the models accept, not as a tested deployment. See [/help/known-gaps](/help/known-gaps).
+</Warning>
+
+## `--accept-experimental`
+
+Every creation entry point still accepts `--accept-experimental`, and its help text reads "Deprecated, no longer required; kept for compatibility." The source comments state the flag is accepted and ignored, and that no backend is gated at vault creation any more. The former consent gate function was removed. Passing it changes nothing. It is listed on [/help/deliberately-absent](/help/deliberately-absent).
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Creating a vault" href="/vault/creating">
+The entry points that pin a backend, and what each one writes.
+</Card>
+<Card title="Snapshots" href="/vault/snapshots">
+Dump and load, the supported way to move a graph into a differently pinned vault.
+</Card>
+<Card title="okto-neuron.yaml" href="/config/vault-yaml">
+Every other block in the config file.
+</Card>
+<Card title="Known gaps" href="/help/known-gaps">
+What 0.3.0 has not verified, including Neo4j.
+</Card>
+</CardGroup>

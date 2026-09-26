@@ -1,0 +1,76 @@
+{
+  "fixture_schema": "semantic_quality_fixture.v1",
+  "run_ids": ["adversarial-run-v1"],
+  "registered_predicates": ["born_in", "has_role", "lives_in", "mentions", "protects"],
+  "records": [
+    {"kind":"ingest_run","run_id":"adversarial-run-v1","state":"started","semantic_policy_fingerprint":"fixture-policy-v1","config_fingerprint":"fixture-config-v1","extraction_fingerprint":"fixture-extraction-v1"},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"aragorn","candidate_kind":"node","state":"proposed","payload":{"type":"Agent","title":"Aragorn","surface":{"normalizer_version":"surface.v1","source_surface":"Aragorn","exact_key":"aragorn","discovery_key":"aragorn","canonical_title":"Aragorn","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"strider","candidate_kind":"node","state":"proposed","payload":{"type":"Agent","title":"Aragorn","surface":{"normalizer_version":"surface.v1","source_surface":"Strider","exact_key":"strider","discovery_key":"strider","canonical_title":"Aragorn","aliases":["Strider"],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"frodo-full","candidate_kind":"node","state":"proposed","payload":{"type":"Agent","title":"Frodo Baggins","surface":{"normalizer_version":"surface.v1","source_surface":"Frodo Baggins","exact_key":"frodo baggins","discovery_key":"frodo baggins","canonical_title":"Frodo Baggins","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"frodo-short","candidate_kind":"node","state":"proposed","payload":{"type":"Agent","title":"Frodo Baggins","surface":{"normalizer_version":"surface.v1","source_surface":"Frodo","exact_key":"frodo","discovery_key":"frodo","canonical_title":"Frodo Baggins","aliases":["Frodo"],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"joram-agent","candidate_kind":"node","state":"proposed","payload":{"type":"Agent","title":"Joram","surface":{"normalizer_version":"surface.v1","source_surface":"Joram","exact_key":"joram","discovery_key":"joram","canonical_title":"Joram","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"joram-place","candidate_kind":"node","state":"proposed","payload":{"type":"Place","title":"Joram","surface":{"normalizer_version":"surface.v1","source_surface":"Joram","exact_key":"joram","discovery_key":"joram","canonical_title":"Joram","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"ring-work","candidate_kind":"node","state":"proposed","payload":{"type":"InformationObject","title":"The Ring","surface":{"normalizer_version":"surface.v1","source_surface":"The Ring","exact_key":"the ring","discovery_key":"the ring","canonical_title":"The Ring","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"ring-object","candidate_kind":"node","state":"proposed","payload":{"type":"Concept","title":"The Ring","surface":{"normalizer_version":"surface.v1","source_surface":"The Ring","exact_key":"the ring","discovery_key":"the ring","canonical_title":"The Ring","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"council","candidate_kind":"node","state":"proposed","payload":{"type":"Concept","title":"Council","surface":{"normalizer_version":"surface.v1","source_surface":"Council","exact_key":"council","discovery_key":"council","canonical_title":"Council","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"rivendell","candidate_kind":"node","state":"proposed","payload":{"type":"Place","title":"Rivendell","surface":{"normalizer_version":"surface.v1","source_surface":"Rivendell","exact_key":"rivendell","discovery_key":"rivendell","canonical_title":"Rivendell","aliases":[],"normalization_flags":[]}}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-lives","candidate_kind":"edge","state":"proposed","payload":{"type":"lives_in","src_ref":"aragorn","dst_ref":"rivendell","dst_literal":null,"block_id":"block-1","byte_start":0,"byte_end":20,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-inverse","candidate_kind":"edge","state":"proposed","payload":{"type":"birthplace_of","src_ref":"rivendell","dst_ref":"aragorn","dst_literal":null,"block_id":"block-1","byte_start":21,"byte_end":45,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-role","candidate_kind":"edge","state":"proposed","payload":{"type":"has_role","src_ref":"frodo-full","dst_ref":null,"dst_literal":"ring-bearer","block_id":"block-1","byte_start":46,"byte_end":70,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-noise","candidate_kind":"edge","state":"proposed","payload":{"type":"mentions","src_ref":"ring-work","dst_ref":"council","dst_literal":null,"block_id":"block-1","byte_start":71,"byte_end":90,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-protects","candidate_kind":"edge","state":"proposed","payload":{"type":"protects","src_ref":"aragorn","dst_ref":"frodo-full","dst_literal":null,"block_id":"block-1","byte_start":91,"byte_end":120,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-unsupported","candidate_kind":"edge","state":"proposed","payload":{"type":"mystically_knows","src_ref":"aragorn","dst_ref":"ring-object","dst_literal":null,"block_id":"block-1","byte_start":121,"byte_end":140,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"candidate","run_id":"adversarial-run-v1","candidate_id":"e-object-kind","candidate_kind":"edge","state":"proposed","payload":{"type":"has_role","src_ref":"frodo-full","dst_ref":"ring-object","dst_literal":null,"block_id":"block-1","byte_start":141,"byte_end":165,"content_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"kind":"commit_plan","run_id":"adversarial-run-v1","plan_id":"adversarial-plan-v1","operations":[
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"aragorn","type":"Agent","title":"Aragorn"},
+      {"operation":"supersede_candidate","candidate_kind":"node","candidate_id":"strider","type":"Agent","title":"Aragorn","target_ref":"aragorn"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"frodo-full","type":"Agent","title":"Frodo Baggins"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"frodo-short","type":"Agent","title":"Frodo Baggins"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"joram-agent","type":"Agent","title":"Joram"},
+      {"operation":"supersede_candidate","candidate_kind":"node","candidate_id":"joram-place","type":"Place","title":"Joram","target_ref":"joram-agent"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"ring-work","type":"InformationObject","title":"The Ring"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"ring-object","type":"Concept","title":"The Ring"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"council","type":"Concept","title":"Council"},
+      {"operation":"create_node","candidate_kind":"node","candidate_id":"rivendell","type":"Place","title":"Rivendell"},
+      {"operation":"create_edge_or_claim","candidate_kind":"edge","candidate_id":"e-lives","type":"lives_in","src_ref":"aragorn","dst_ref":"rivendell","dst_literal":null},
+      {"operation":"create_edge_or_claim","candidate_kind":"edge","candidate_id":"e-inverse","type":"birthplace_of","src_ref":"rivendell","dst_ref":"aragorn","dst_literal":null},
+      {"operation":"create_edge_or_claim","candidate_kind":"edge","candidate_id":"e-role","type":"has_role","src_ref":"frodo-full","dst_ref":null,"dst_literal":"ring-bearer"},
+      {"operation":"create_edge_or_claim","candidate_kind":"edge","candidate_id":"e-noise","type":"mentions","src_ref":"ring-work","dst_ref":"council","dst_literal":null},
+      {"operation":"queue_review","candidate_kind":"edge","candidate_id":"e-protects","type":"protects","src_ref":"aragorn","dst_ref":"frodo-full","dst_literal":null},
+      {"operation":"dead_letter","candidate_kind":"edge","candidate_id":"e-unsupported","type":"mystically_knows","src_ref":"aragorn","dst_ref":"ring-object","dst_literal":null},
+      {"operation":"create_edge_or_claim","candidate_kind":"edge","candidate_id":"e-object-kind","type":"has_role","src_ref":"frodo-full","dst_ref":"ring-object","dst_literal":null}
+    ]},
+    {"kind":"commit_record","run_id":"adversarial-run-v1","plan_id":"adversarial-plan-v1","result":{}},
+    {"kind":"ingest_run","run_id":"adversarial-run-v1","state":"completed"}
+  ],
+  "recall_samples": [
+    {"schema_version":"recall_cost.v1","measurement_status":"measured","completion_calls":0,"generated_tokens":0,"query_embedding_calls":1,"query_embedding_latency_ms":1.0,"query_embedding_provider":"fixture","query_embedding_model":"fixture-embedding","query_embedding_execution":"remote","deterministic_retrieval_latency_ms":2.0,"deterministic_projection_latency_ms":0.5,"total_latency_ms":3.5,"retrieved_results":3,"retrieved_bytes":128,"completion_free":true}
+  ],
+  "adjudication": {
+    "schema_version": "semantic_adjudication.v1",
+    "fixture_id": "adr0040-adversarial-ledger-v1",
+    "instructions_version": "adr0040.v1",
+    "adjudicator": "repository-fixture-author",
+    "entities": [
+      {"candidate_id":"aragorn","expected_type":"Agent","expected_cluster_id":"aragorn-sense","expected_canonical_candidate_id":"aragorn","expected_canonical_title":"Aragorn","rationale":"The named person."},
+      {"candidate_id":"strider","expected_type":"Agent","expected_cluster_id":"aragorn-sense","expected_canonical_candidate_id":"aragorn","expected_canonical_title":"Aragorn","rationale":"A source-grounded alias of Aragorn."},
+      {"candidate_id":"frodo-full","expected_type":"Agent","expected_cluster_id":"frodo-sense","expected_canonical_candidate_id":"frodo-full","expected_canonical_title":"Frodo Baggins","rationale":"The named person with the stronger surface."},
+      {"candidate_id":"frodo-short","expected_type":"Agent","expected_cluster_id":"frodo-sense","expected_canonical_candidate_id":"frodo-full","expected_canonical_title":"Frodo Baggins","rationale":"An alias of Frodo Baggins."},
+      {"candidate_id":"joram-agent","expected_type":"Agent","expected_cluster_id":"joram-person-sense","expected_canonical_candidate_id":"joram-agent","expected_canonical_title":"Joram","rationale":"The person sense."},
+      {"candidate_id":"joram-place","expected_type":"Place","expected_cluster_id":"joram-place-sense","expected_canonical_candidate_id":"joram-place","expected_canonical_title":"Joram","rationale":"The place sense; same surface is not identity."},
+      {"candidate_id":"ring-work","expected_type":"InformationObject","expected_cluster_id":"ring-work-sense","expected_canonical_candidate_id":"ring-work","expected_canonical_title":"The Ring","rationale":"A named symbolic work."},
+      {"candidate_id":"ring-object","expected_type":"Concept","expected_cluster_id":"ring-object-sense","expected_canonical_candidate_id":"ring-object","expected_canonical_title":"The Ring","rationale":"The object sense is distinct from the work."},
+      {"candidate_id":"council","expected_type":"Activity","expected_cluster_id":"council-event","expected_canonical_candidate_id":"council","expected_canonical_title":"Council","rationale":"This mention denotes the meeting event."},
+      {"candidate_id":"rivendell","expected_type":"Place","expected_cluster_id":"rivendell-place","expected_canonical_candidate_id":"rivendell","expected_canonical_title":"Rivendell","rationale":"A spatial place."}
+    ],
+    "relations": [
+      {"candidate_id":"e-lives","expected_disposition":"accept","expected_predicate":"lives_in","expected_src_ref":"aragorn","expected_object_kind":"topology","expected_dst_ref":"rivendell","expected_dst_literal":null,"grounded":true,"useful":true,"rationale":"The cited source states the directed fact."},
+      {"candidate_id":"e-inverse","expected_disposition":"accept","expected_predicate":"born_in","expected_src_ref":"aragorn","expected_object_kind":"topology","expected_dst_ref":"rivendell","expected_dst_literal":null,"grounded":true,"useful":true,"rationale":"Confirmed inverse requires predicate rewrite and endpoint swap."},
+      {"candidate_id":"e-role","expected_disposition":"accept","expected_predicate":"has_role","expected_src_ref":"frodo-full","expected_object_kind":"literal","expected_dst_ref":null,"expected_dst_literal":"ring-bearer","grounded":true,"useful":true,"rationale":"A grounded literal fact, not topology."},
+      {"candidate_id":"e-noise","expected_disposition":"reject","expected_predicate":"mentions","expected_src_ref":"ring-work","expected_object_kind":"topology","expected_dst_ref":"council","expected_dst_literal":null,"grounded":false,"useful":false,"rationale":"Document attachment is structural noise."},
+      {"candidate_id":"e-protects","expected_disposition":"accept","expected_predicate":"protects","expected_src_ref":"aragorn","expected_object_kind":"topology","expected_dst_ref":"frodo-full","expected_dst_literal":null,"grounded":true,"useful":true,"rationale":"The source explicitly supports the useful relation."},
+      {"candidate_id":"e-unsupported","expected_disposition":"reject","expected_predicate":"mystically_knows","expected_src_ref":"aragorn","expected_object_kind":"topology","expected_dst_ref":"ring-object","expected_dst_literal":null,"grounded":false,"useful":false,"rationale":"The relation depends on unstated world knowledge."},
+      {"candidate_id":"e-object-kind","expected_disposition":"accept","expected_predicate":"has_role","expected_src_ref":"frodo-full","expected_object_kind":"literal","expected_dst_ref":null,"expected_dst_literal":"ring-bearer","grounded":true,"useful":true,"rationale":"The object is a literal role and must not become an entity edge."}
+    ]
+  }
+}

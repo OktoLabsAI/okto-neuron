@@ -1,0 +1,73 @@
+settings:
+  k: 10
+
+questions:
+  - id: t1-current-owner
+    tier: T1
+    question: "Who currently owns the Aster launch handoff?"
+    expected_answer: "Malik Daro currently owns the Aster launch handoff."
+    expected_source_paths: [01-correction-chat.md, 02-confirmation-chat.md]
+    must_contain: ["Malik Daro"]
+    gold_targets:
+      - source_path: 01-correction-chat.md
+        quote: "Correction: Malik Daro now owns the Aster launch handoff."
+      - source_path: 02-confirmation-chat.md
+        quote: "Malik Daro owns the Aster launch handoff now."
+
+  - id: t1-current-place
+    tier: T1
+    question: "Where is the Aster rehearsal currently scheduled?"
+    expected_answer: "The rehearsal is currently scheduled for South Annex."
+    expected_source_paths: [01-correction-chat.md, 02-confirmation-chat.md]
+    must_contain: ["South Annex"]
+    gold_targets:
+      - source_path: 01-correction-chat.md
+        quote: "The rehearsal moved from North Annex to South Annex. North Annex is no longer current."
+      - source_path: 02-confirmation-chat.md
+        quote: "Use South Annex for the May 14 rehearsal and keep the blue-lantern fallback rule."
+
+  - id: t1-stable-date
+    tier: T1
+    question: "What date remains scheduled for the Aster rehearsal?"
+    expected_answer: "The rehearsal date remains May 14."
+    expected_source_paths: [01-correction-chat.md, 02-confirmation-chat.md]
+    must_contain: ["May 14"]
+    gold_targets:
+      - source_path: 01-correction-chat.md
+        quote: "The rehearsal date stays May 14, and Aurora Notes remains the checklist."
+
+  - id: t2-alias
+    tier: T2
+    question: "Who does the alias Rin refer to in the Aster channel?"
+    expected_answer: "Rin refers to Rina Vale."
+    expected_source_paths: [00-initial-chat.md, 02-confirmation-chat.md]
+    must_contain: ["Rina Vale"]
+    gold_targets:
+      - source_path: 02-confirmation-chat.md
+        quote: "Confirming that Rin means Rina Vale in this channel."
+
+  - id: t3-correction-history
+    tier: T3
+    question: "What ownership and venue details changed after the initial Aster chat?"
+    expected_answer: >-
+      Ownership changed from Rina Vale to Malik Daro, and the venue changed from
+      North Annex to South Annex.
+    expected_source_paths: [00-initial-chat.md, 01-correction-chat.md]
+    must_contain: ["Malik Daro", "South Annex"]
+    gold_targets:
+      - source_path: 00-initial-chat.md
+        quote: "I own the Aster launch handoff."
+      - source_path: 00-initial-chat.md
+        quote: "The rehearsal is booked for North Annex on May 14."
+      - source_path: 01-correction-chat.md
+        quote: "Correction: Malik Daro now owns the Aster launch handoff."
+      - source_path: 01-correction-chat.md
+        quote: "The rehearsal moved from North Annex to South Annex. North Annex is no longer current."
+
+  - id: t4-absent-budget
+    tier: T4
+    question: "What monetary budget was approved for the Aster launch?"
+    expected_answer: "No monetary budget amount appears in the channel."
+    expected_source_paths: []
+    must_contain: []
+    negative_control: true

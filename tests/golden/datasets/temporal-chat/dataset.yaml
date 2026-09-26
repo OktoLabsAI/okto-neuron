@@ -1,0 +1,21 @@
+# Golden dataset manifest — temporal-chat
+name: temporal-chat
+description: >-
+  Small, privacy-safe synthetic chat export for alias resolution, sparse context,
+  explicit corrections, literal values, and latest-state retrieval.
+
+source:
+  origin: "in-repo synthetic fixture; no real people, messages, or organizations"
+  selected_on: "2026-07-17"
+  rationale: >-
+    Provides the ADR 0040 chat/temporal corpus without committing private WhatsApp
+    data. The owner-validation record remains pending in CREATING.md.
+
+settings:
+  k: 10
+  ingest_timeout_s: 3600
+
+files:
+  - 00-initial-chat.md
+  - 01-correction-chat.md
+  - 02-confirmation-chat.md

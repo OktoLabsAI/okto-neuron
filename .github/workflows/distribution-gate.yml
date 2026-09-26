@@ -1,0 +1,1717 @@
+name: distribution-gate
+
+# From 0.3.0 the public installers (install.sh, install.ps1 at the repository
+# root), their testers (bin/test-install.sh, bin/test-install.ps1) and the
+# SHA-256 release manifest live in this repository. This gate is the port of the
+# OktoLabsAI/marginalia-dist distribution gate (frozen at 0.2.0 together with its
+# release evidence) to the single-repository layout:
+#
+#   parity            shell syntax/shellcheck, preseed refusal, tester contract
+#                     and marker order, installer/manifest/docs parity, and, once
+#                     release-manifest.json exists, the published GitHub Release
+#                     (tag, prerelease, asset digest) and the public wheel's
+#                     checksum and metadata.
+#   bash-transaction  installer helper failure paths, predecessor pre-status
+#                     cleanup, and a real clean install, live-PID refusal,
+#                     checksum rejection, forced activation rollback and update
+#                     of a wheel built from this exact commit.
+#   powershell-syntax Windows PowerShell 5.1 parse, Claude MCP registration
+#                     parsing, the fail-closed PID guard, and the transaction and
+#                     sandbox contracts.
+#
+# The predecessor used by the upgrade drivers is Marginalia 0.2.0, pinned by the
+# marginalia-dist commit and the SHA-256 of its installers and manifest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check shell scripts
+        run: |
+          set -euo pipefail
+          bash -n install.sh bin/test-install.sh
+          shellcheck install.sh bin/test-install.sh
+          PRESEED_OUTPUT="$(mktemp)"
+          if OKTO_NEURON_LLM_PROVIDER=skip bash install.sh >"$PRESEED_OUTPUT" 2>&1; then
+            echo "installer accepted provider preseed without OKTO_NEURON_VAULT" >&2
+            exit 1
+          fi
+          grep -Fq 'OKTO_NEURON_LLM_PROVIDER requires OKTO_NEURON_VAULT' "$PRESEED_OUTPUT"
+          # A pre-0.3.0 name reaches the same guard, with a deprecation warning.
+          if MARGINALIA_LLM_PROVIDER=skip bash install.sh >"$PRESEED_OUTPUT" 2>&1; then
+            echo "installer accepted a legacy provider preseed without a vault" >&2
+            exit 1
+          fi
+          grep -Fq 'MARGINALIA_LLM_PROVIDER is deprecated; using it as OKTO_NEURON_LLM_PROVIDER' "$PRESEED_OUTPUT"
+          grep -Fq 'OKTO_NEURON_LLM_PROVIDER requires OKTO_NEURON_VAULT' "$PRESEED_OUTPUT"
+          rm -f "$PRESEED_OUTPUT"
+          ./bin/test-install.sh --help | grep -F -- '--profile release-lifecycle'
+          for marker in \
+            RELEASE_LIFECYCLE_PREDECESSOR_ROLLBACK_OK \
+            RELEASE_LIFECYCLE_PREDECESSOR_MIGRATION_OK \
+            RELEASE_LIFECYCLE_APP_FIRST_OK \
+            RELEASE_LIFECYCLE_FRESH_INSTALL_OK \
+            RELEASE_LIFECYCLE_STATUS_UI_OK \
+            RELEASE_LIFECYCLE_STOPPED_UPDATE_OK \
+            RELEASE_LIFECYCLE_RUNNING_UPDATE_OK \
+            RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK \
+            RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK \
+            RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK \
+            RELEASE_LIFECYCLE_ACTIVATION_ROLLBACK_OK \
+            RELEASE_LIFECYCLE_FINAL_STOP_OK
+          do
+            test "$(grep -Fc "$marker" bin/test-install.sh)" -eq 1
+          done
+          test "$(grep -Fc 'RELEASE_LIFECYCLE_PREDECESSOR_RUNNING_OK' bin/test-install.sh)" -eq 2
+          test "$(grep -Fc 'DOCKER_TMUX_RELEASE_LIFECYCLE_OK' bin/test-install.sh)" -eq 2
+          test "$(grep -Fc 'WINDOWS_RELEASE_LIFECYCLE_PREDECESSOR_STOPPED_UPDATE_OK' bin/test-install.ps1)" -eq 1
+          test "$(grep -Fc "sha256sum \"\$app_token_file\"" bin/test-install.sh)" -eq 1
+          grep -Fq 'okto-neuron ui --no-open' bin/test-install.sh
+          grep -Fq 'Okto Neuron UI is ready at' bin/test-install.sh
+          grep -Fq '.release-lifecycle-previous-tool-sentinel' bin/test-install.sh
+          grep -Fq "sha256sum \"\$rollback_sentinel\"" bin/test-install.sh
+
+      - name: Verify manifest, installers, docs, and public wheel
+        run: |
+          python3 - <<'PY'
+          import email
+          import hashlib
+          import io
+          import json
+          import re
+          import subprocess
+          import urllib.error
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          shell = Path("install.sh").read_text()
+          powershell = Path("install.ps1").read_text()
+          shell_test = Path("bin/test-install.sh").read_text()
+          powershell_test = Path("bin/test-install.ps1").read_text()
+          readme = Path("README.md").read_text()
+          install_doc = Path("site-docs/start/install.mdx").read_text()
+          manifest_url = (
+              "https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/release-manifest.json"
+          )
+          raw_install_sh = "https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/install.sh"
+          raw_install_ps1 = "https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/install.ps1"
+
+          # -- Installer and docs parity (release independent) ------------------
+          assert f"curl -fsSL {raw_install_sh} | bash" in shell
+          assert f'irm {raw_install_ps1} | iex' in powershell
+          assert f"curl -fsSL {raw_install_sh} | bash" in readme
+          assert f"irm {raw_install_ps1} | iex" in readme
+          assert raw_install_sh in install_doc
+          assert raw_install_ps1 in install_doc
+          for text in (readme, install_doc):
+              assert "okto-neuron/main/bin/install" not in text
+          assert f'OKTO_NEURON_DEFAULT_MANIFEST_URL:-{manifest_url}' in shell
+          assert f'"{manifest_url}"' in powershell
+          assert '"marginalia[' not in readme, "README must never resolve the unrelated PyPI project"
+          assert "verified wheel SHA-256" in shell
+          assert "restore_previous_tool" in shell
+          assert "verified wheel SHA-256" in powershell
+          assert "Restore-PreviousTool" in powershell
+          # MCP (owner decision V2): the only registration the installers remove is
+          # the pre-0.3.0 `marginalia` entry, in the scope the new `okto-neuron`
+          # entry was just verified as connected in; the rollback adds it back.
+          shell_removals = re.findall(
+              r"(?m)^\s*(?:(?:if|elif)\s+(?:!\s+)?|!\s+)?claude\s+mcp\s+remove\b.*$", shell
+          )
+          assert shell_removals == [
+              '  if ! claude mcp remove "${LEGACY_CLI}" --scope "${scope}" >/dev/null 2>&1; then'
+          ], shell_removals
+          powershell_removals = re.findall(r"(?m)^\s*(?:&\s*)?claude\s+mcp\s+remove\b.*$", powershell)
+          assert powershell_removals == [
+              "    & claude mcp remove $LegacyCliName --scope $Scope 2>$null | Out-Null"
+          ], powershell_removals
+          assert shell.index("register_mcp() {") < shell.index("remove_legacy_mcp() {")
+          assert 'register_mcp local && remove_legacy_mcp local "${LEGACY_MCP_OUTPUT}"' in shell
+          assert 'remove_legacy_mcp user "${LEGACY_MCP_OUTPUT}"' in shell
+          assert "restore_legacy_mcp || rc=1" in shell
+          assert 'if (Register-Mcp "local") { Remove-LegacyMcp "local" $legacyMcpOutput }' in powershell
+          assert (
+              'if ((Register-Mcp "user") -and $legacyMcpScope -eq "user") '
+              '{ Remove-LegacyMcp "user" $legacyMcpOutput }'
+          ) in powershell
+          assert "try { Restore-LegacyMcp }" in powershell
+          assert "claude_mcp_registration_matches" in shell
+          assert "Test-ClaudeMcpRegistrationMatches" in powershell
+          assert "Find-DaemonLockRoot" in powershell
+          assert "Find-VerifiedLegacyLockRoot" in powershell
+          assert "Find-UnverifiedLiveLegacyDaemon" in powershell
+          assert 'EXTRAS="serve,litellm"' in shell
+          assert '$Extras = "serve,litellm"' in powershell
+          assert 'DAEMON_PID_FILE="${DAEMON_RUNTIME_ROOT}/.marginalia/server.pid"' in shell
+          assert 'LEGACY_DAEMON_PID_FILE="${LEGACY_DAEMON_RUNTIME_ROOT}/.marginalia/server.pid"' in shell
+          assert 'DAEMON_TOKEN_FILE="${HOME_ROOT}/daemon-7777.token"' in shell
+          assert '$DaemonPidFile = Join-Path $DaemonRuntimeRoot ".marginalia\\server.pid"' in powershell
+          assert '$DaemonTokenFile = Join-Path $HomeRoot "daemon-7777.token"' in powershell
+          assert "Assert-ValidPreseedInputs" in powershell
+          assert "requires OKTO_NEURON_VAULT" in powershell
+          assert 'SERVE_ARGS=(serve --daemon --no-open)' in shell
+          assert 'SERVE_ARGS+=(--vault "${PREVIOUS_DAEMON_VAULT}")' in shell
+          assert '$serveArgs = @("serve", "--daemon", "--no-open")' in powershell
+          assert '$serveArgs += @("--vault", $script:PreviousDaemonVault)' in powershell
+          assert '& $cli @serveArgs' in powershell
+          assert 'STOP_COMMAND=("${STAGE_CLI}" stop --vault "${PREVIOUS_DAEMON_VAULT}" --timeout 30)' in shell
+          assert 'STOP_COMMAND=("${PREVIOUS_COMMAND}" stop --timeout 30)' in shell
+          assert '$stopArgs = @("stop", "--vault", $script:PreviousDaemonVault, "--timeout", "30")' in powershell
+          assert 'serve --help 2>/dev/null | grep -q -- \'--no-open\'' in shell
+          assert '$serveHelp -match \'(?m)--no-open\\b\'' in powershell
+          # Upgrade path from Marginalia: legacy tool detection, env shim, home migration.
+          for needle in ('LEGACY_TOOL_NAME="marginalia"', "import_legacy_env", "migrate-home --json"):
+              assert needle in shell, needle
+          for needle in ('$LegacyToolName = "marginalia"', "MARGINALIA_*", "migrate-home --json"):
+              assert needle in powershell, needle
+          assert "Authenticated Okto Neuron UI" not in shell_test
+          assert "Authenticated Okto Neuron UI" not in powershell_test
+          assert "Authorization: Bearer" not in shell_test
+          assert "Authorization = \"Bearer" not in powershell_test
+
+          # -- Tester lifecycle contract ----------------------------------------
+          linux_predecessor_markers = (
+              "RELEASE_LIFECYCLE_PREDECESSOR_RUNNING_OK",
+              "RELEASE_LIFECYCLE_PREDECESSOR_ROLLBACK_OK",
+              "RELEASE_LIFECYCLE_PREDECESSOR_MIGRATION_OK",
+          )
+          linux_lifecycle_markers = linux_predecessor_markers + (
+              "RELEASE_LIFECYCLE_APP_FIRST_OK",
+              "RELEASE_LIFECYCLE_FRESH_INSTALL_OK",
+              "RELEASE_LIFECYCLE_STATUS_UI_OK",
+              "RELEASE_LIFECYCLE_STOPPED_UPDATE_OK",
+              "RELEASE_LIFECYCLE_RUNNING_UPDATE_OK",
+              "RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK",
+              "RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK",
+              "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_SHA256=",
+              "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK",
+              "RELEASE_LIFECYCLE_ACTIVATION_ROLLBACK_OK",
+              "RELEASE_LIFECYCLE_FINAL_STOP_OK",
+              "DOCKER_TMUX_RELEASE_LIFECYCLE_OK",
+          )
+          for marker in linux_lifecycle_markers:
+              expected_count = 2 if marker in {
+                  "RELEASE_LIFECYCLE_PREDECESSOR_RUNNING_OK",
+                  "DOCKER_TMUX_RELEASE_LIFECYCLE_OK",
+              } else 1
+              assert shell_test.count(marker) == expected_count, marker
+          linux_marker_positions = [shell_test.index(marker) for marker in linux_lifecycle_markers]
+          assert linux_marker_positions == sorted(linux_marker_positions)
+          windows_lifecycle_markers = (
+              "WINDOWS_RELEASE_LIFECYCLE_PREDECESSOR_STOPPED_UPDATE_OK",
+              "WINDOWS_RELEASE_LIFECYCLE_APP_FIRST_OK",
+              "RELEASE_LIFECYCLE_FRESH_INSTALL_OK",
+              "RELEASE_LIFECYCLE_STATUS_UI_OK",
+              "RELEASE_LIFECYCLE_STOPPED_UPDATE_OK",
+              "RELEASE_LIFECYCLE_RUNNING_UPDATE_OK",
+              "RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK",
+              "RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK",
+              "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_SHA256=",
+              "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK",
+              "RELEASE_LIFECYCLE_ACTIVATION_ROLLBACK_OK",
+              "RELEASE_LIFECYCLE_FINAL_STOP_OK",
+              "WINDOWS_RELEASE_LIFECYCLE_OK",
+          )
+          for marker in windows_lifecycle_markers:
+              assert powershell_test.count(marker) == 1, marker
+          marker_positions = [powershell_test.index(marker) for marker in windows_lifecycle_markers]
+          assert marker_positions == sorted(marker_positions)
+          # Predecessor = Marginalia 0.2.0, installed by the exact marginalia-dist
+          # installer of that release (commit + installer + manifest SHA-256).
+          predecessor_commit = "29683d2156840eadaff43efd6133750cd7f24465"
+          predecessor_manifest_sha = "22eb2f07ee453a708052469d71382a2dc47b0491ff8534d7899325f3bea8068f"
+          for needle in (
+              predecessor_commit,
+              "a4c0f72b757bbfe54c17ee766885c84d8b89b2126fe1027df4d562f8824b15a8",
+              predecessor_manifest_sha,
+          ):
+              assert needle in shell_test, needle
+          for needle in (
+              predecessor_commit,
+              "3207bcbee4b738491afd617bcb10e0fa583a6e6af41df51cfd999459f23e7327",
+              predecessor_manifest_sha,
+              "59adee4483d8f85525e30a5e6271e6328238ac275d4b3fe05e29325d2ed29520",
+          ):
+              assert needle in powershell_test, needle
+          powershell_sentinel_create = powershell_test.index('-Value "previous-tool-only:$Version"')
+          assert powershell_sentinel_create < powershell_test.index("RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK")
+          assert powershell_sentinel_create < powershell_test.index("RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK")
+          assert powershell_test.count('-LiteralPath $rollbackSentinel') >= 4
+          assert '"release-lifecycle"' in powershell_test
+          assert ".release-lifecycle-previous-tool-sentinel" in powershell_test
+          assert 'Invoke-ReleaseLifecycle $sandboxCli' in powershell_test
+          assert 'if ($Profile -eq "skip")' in powershell_test
+          assert 'if ($Profile -in @("skip", "release-lifecycle")) {' not in powershell_test
+          assert '$env:UV_NO_MODIFY_PATH = "1"' in powershell_test
+          assert '$env:UV_PYTHON_NO_REGISTRY = "1"' in powershell_test
+          assert '$env:UV_PYTHON_INSTALL_REGISTRY = "0"' in powershell_test
+          assert "UV_UNMANAGED_INSTALL" in powershell_test
+          assert "OKTO_NEURON_PACKS" in powershell_test
+          assert "OKTO_NEURON_ALLOW_REMOTE_LLM" in powershell_test
+          assert "OKTO_NEURON_MANIFEST = $ManifestUrl" in powershell_test
+          assert "Initialize-TestSandbox" in powershell_test
+          assert "Export-PublicEvidence" in powershell_test
+          assert "requires Windows PowerShell 5.1 on Windows" in powershell_test
+          assert '$DriverUrl = "$rawBase/bin/test-install.ps1"' in powershell_test
+          assert '$InstallUrl = "$rawBase/install.ps1"' in powershell_test
+          assert "--driver-commit" in shell_test
+          assert "DRIVER_COMMIT=" in shell_test
+          assert 'okto-neuron/${DRIVER_COMMIT}/bin/test-install.sh' in shell_test
+          assert 'okto-neuron/${DRIVER_COMMIT}/install.sh' in shell_test
+          assert "OKTO_NEURON_MANIFEST=\"$MANIFEST_URL\"" in shell_test
+          assert "curl -fsS http://127.0.0.1:7777/" in shell_test
+          assert '-H "Authorization: Bearer $token"' not in shell_test
+          assert "test_home_is_owned" in shell_test
+          assert "refusing to delete test sandbox with invalid PID record" in shell_test
+          assert "#{pane_dead}" in shell_test
+          assert "tmux pane exited with status" in shell_test
+          assert shell_test.count('wait_for_daemon_stopped "$fresh_pid" 7777 8201') == 2
+          assert 'wait_for_daemon_stopped "$running_after" 7777 8201' in shell_test
+          assert 'wait_for_daemon_stopped "$custom_pid" 7788 8202' in shell_test
+          assert 'wait_for_daemon_stopped "$rollback_after" 7777 8201' in shell_test
+          sentinel_create = shell_test.index(
+              "printf 'previous-tool-only:%s\\n' \"$EXPECTED_VERSION\" > \"$rollback_sentinel\""
+          )
+          custom_refusal = shell_test.index("RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK")
+          live_pid_refusal = shell_test.index("RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK")
+          rollback_proof = shell_test.index("RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK")
+          assert sentinel_create < custom_refusal < live_pid_refusal < rollback_proof
+          register = shell.index("register_mcp() {")
+          assert register < shell.index('if output="$(claude mcp get "${CLI}"', register) < shell.index(
+              'if claude mcp add --scope "${scope}"', register
+          )
+          assert powershell.index("$output = (& claude mcp get $CliName") < powershell.index(
+              "& claude mcp add --scope $Scope"
+          )
+
+          # -- Release pins (only once a release has been baked) ----------------
+          manifest_path = Path("release-manifest.json")
+          if not manifest_path.exists():
+              print("release-manifest.json is not baked yet; release, tag and wheel checks skipped")
+              raise SystemExit(0)
+
+          subprocess.run(["python3", "scripts/release_manifest.py", "check"], check=True)
+          manifest = json.loads(manifest_path.read_text())
+          version = manifest["version"]
+          wheel = manifest["wheel"]
+          url = manifest["wheel_url"]
+          assert f"OKTO_NEURON_EXPECTED_VERSION:-{version}" in shell_test
+          assert f'else {{ "{version}" }}' in powershell_test
+
+          def github_api(path):
+              request = urllib.request.Request(
+                  f"https://api.github.com/{path}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "okto-neuron-distribution-gate",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          # The source tag must resolve to the manifest's source commit. In the
+          # single-repository layout that commit is public, so no operator pin
+          # table is needed.
+          try:
+              ref = github_api(f"repos/OktoLabsAI/okto-neuron/git/ref/tags/v{version}")
+          except urllib.error.HTTPError as error:
+              raise AssertionError(f"could not read tag v{version} (HTTP {error.code})") from error
+          assert ref["ref"] == f"refs/tags/v{version}"
+          target = ref["object"]
+          while target["type"] == "tag":
+              target = github_api(f"repos/OktoLabsAI/okto-neuron/git/tags/{target['sha']}")["object"]
+          assert target["type"] == "commit"
+          assert target["sha"] == manifest["source_commit"], (
+              "tag v{version} does not resolve to manifest.source_commit"
+          )
+
+          try:
+              release = github_api(f"repos/OktoLabsAI/okto-neuron/releases/tags/v{version}")
+          except urllib.error.HTTPError as error:
+              raise AssertionError(f"could not read release v{version} (HTTP {error.code})") from error
+          assert release["tag_name"] == f"v{version}"
+          assert release["draft"] is False, "the release must not be a draft"
+          assert release["prerelease"] is True, (
+              "the release must remain a prerelease while the real interactive "
+              "Windows PowerShell 5.1 lifecycle evidence is outstanding"
+          )
+          assets = {asset["name"]: asset for asset in release["assets"]}
+          assert set(assets) == {wheel, "SHA256SUMS", "release-manifest.json"}, sorted(assets)
+          asset = assets[wheel]
+          assert asset["browser_download_url"] == url, "release asset URL does not match manifest.wheel_url"
+          assert asset["digest"] == f'sha256:{manifest["sha256"]}', (
+              "the GitHub release asset digest does not match manifest.sha256"
+          )
+          with urllib.request.urlopen(assets["release-manifest.json"]["browser_download_url"], timeout=60) as response:
+              assert json.load(response) == manifest, "the release's manifest asset differs from main"
+          with urllib.request.urlopen(assets["SHA256SUMS"]["browser_download_url"], timeout=60) as response:
+              sums = response.read().decode()
+          assert f'{manifest["sha256"]}  {wheel}' in sums.splitlines()
+
+          with urllib.request.urlopen(url, timeout=60) as response:
+              data = response.read()
+          assert hashlib.sha256(data).hexdigest() == manifest["sha256"]
+          with zipfile.ZipFile(io.BytesIO(data)) as archive:
+              metadata_name = next(
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              )
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+          assert metadata["Name"] == "okto-neuron"
+          assert metadata["Version"] == version
+          print(f"distribution parity verified for {wheel}")
+          PY
+
+  bash-transaction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+          enable-cache: false
+
+      - name: Verify transaction helper failure paths
+        run: |
+          set -euo pipefail
+          TEST_ROOT="$(mktemp -d)"
+          LIVE_PID=""
+          cleanup() {
+            if [ -n "$LIVE_PID" ]; then
+              kill "$LIVE_PID" >/dev/null 2>&1 || true
+              wait "$LIVE_PID" 2>/dev/null || true
+            fi
+            rm -rf "$TEST_ROOT"
+          }
+          trap cleanup EXIT
+          awk '/^trap installer_exit EXIT/{exit} {print}' install.sh > "$TEST_ROOT/helpers.sh"
+          # shellcheck source=/dev/null
+          source "$TEST_ROOT/helpers.sh"
+          # State below is consumed by functions loaded from helpers.sh.
+          # shellcheck disable=SC2034
+          {
+            VERIFY_PYTHON="$(command -v python3)"
+            TOOL_ROOT="$TEST_ROOT/tools"
+            TOOL_BIN="$TEST_ROOT/bin"
+            HOME_ROOT="$TEST_ROOT/home/.okto-neuron"
+            DAEMON_RUNTIME_ROOT="$HOME_ROOT/runtime"
+            DAEMON_PID_FILE="$DAEMON_RUNTIME_ROOT/.marginalia/server.pid"
+            DAEMON_TOKEN_FILE="$HOME_ROOT/daemon-7777.token"
+            PREVIOUS_VERSION="old-version"
+            PREVIOUS_COMMAND="$TOOL_BIN/okto-neuron"
+            WAS_RUNNING=1
+            SHUTDOWN_REQUESTED=1
+            ACTIVATION_STARTED=""
+            OLD_PID=99999999
+          }
+          mkdir -p "$TOOL_BIN" "$(dirname "$DAEMON_PID_FILE")"
+          cat > "$TOOL_BIN/okto-neuron" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            serve) : > "$RESTART_MARKER" ;;
+            status) printf '%s\n' '{"okto_neuron_version":"old-version","marginalia_version":"old-version"}' ;;
+          esac
+          SH
+          chmod +x "$TOOL_BIN/okto-neuron"
+          export RESTART_MARKER="$TEST_ROOT/restarted"
+          set +e
+          (set +e; false; installer_exit) >"$TEST_ROOT/preactivation.out" 2>&1
+          PREACTIVATION_RC=$?
+          set -e
+          test "$PREACTIVATION_RC" -ne 0
+          test -f "$RESTART_MARKER"
+          grep -Fq 'restored and restarted Okto Neuron old-version' \
+            "$TEST_ROOT/preactivation.out"
+
+          # Preserve explicit compatibility coverage for pre-versioned integer
+          # records without presenting one as a current application owner.
+          printf '%s\n' 4242 > "$TEST_ROOT/legacy-integer.pid"
+          test "$(read_server_pid "$TEST_ROOT/legacy-integer.pid")" = 4242
+
+          # State below is consumed by functions loaded from helpers.sh.
+          # shellcheck disable=SC2034
+          {
+            BACKUP_ROOT="$TOOL_ROOT/.okto-neuron-installer-backup-test"
+            WORK_TMP="$TEST_ROOT/work"
+            PREVIOUS_VERSION="old-version"
+            ACTIVATION_STARTED=1
+            ACTIVATION_COMMITTED=""
+            CANDIDATE_DAEMON_STARTED=1
+            WAS_RUNNING=""
+          }
+          mkdir -p "$TOOL_ROOT/okto-neuron" "$BACKUP_ROOT/tool" \
+            "$BACKUP_ROOT/bin" "$WORK_TMP"
+          printf '%s\n' candidate > "$TOOL_ROOT/okto-neuron/marker"
+          printf '%s\n' previous > "$BACKUP_ROOT/tool/marker"
+          printf '#!/bin/sh\nexit 1\n' > "$TOOL_BIN/okto-neuron"
+          chmod +x "$TOOL_BIN/okto-neuron"
+          sleep 300 &
+          LIVE_PID=$!
+          # This helper-level rollback test needs only a parseable current-record
+          # shape. Exact PidFile ownership is exercised by the installed-tool
+          # refusal fixture below.
+          printf '{"version":1,"pid":%s,"start_token":"synthetic-helper","owner_id":"synthetic-helper"}\n' \
+            "$LIVE_PID" > "$DAEMON_PID_FILE"
+          port_in_use() { return 1; }
+          mcp_port_in_use() { return 1; }
+          if (installer_exit) >"$TEST_ROOT/rollback.out" 2>&1; then
+            echo "incomplete rollback unexpectedly succeeded" >&2
+            exit 1
+          fi
+          test "$(cat "$TOOL_ROOT/okto-neuron/marker")" = candidate
+          test "$(cat "$BACKUP_ROOT/tool/marker")" = previous
+          grep -Fq 'candidate daemon is still live; refusing to remove its environment' \
+            "$TEST_ROOT/rollback.out"
+          grep -Fq "recovery backup retained at $BACKUP_ROOT" "$TEST_ROOT/rollback.out"
+
+          MCP_URL='http://127.0.0.1:8201/mcp'
+          CONNECTED_USER="$(printf '%s\n' \
+            'Scope: User config' \
+            'Status: Connected' \
+            'Type: http' \
+            "URL: $MCP_URL")"
+          LOCAL_FAILED="$(printf '%s\n' \
+            'Scope: Local config' \
+            'Status: Failed to connect' \
+            'Type: http' \
+            "URL: $MCP_URL")"
+          NOT_CONNECTED="$(printf '%s\n' \
+            'Scope: User config' \
+            'Status: Not Connected' \
+            'Type: http' \
+            "URL: $MCP_URL")"
+          SCOPE_SUFFIX="$(printf '%s\n' \
+            'Scope: User config unexpected' \
+            'Status: Connected' \
+            'Type: http' \
+            "URL: $MCP_URL")"
+          TYPE_SUFFIX="$(printf '%s\n' \
+            'Scope: User config' \
+            'Status: Connected' \
+            'Type: http unexpected' \
+            "URL: $MCP_URL")"
+          URL_SUFFIX="$(printf '%s\n' \
+            'Scope: User config' \
+            'Status: Connected' \
+            'Type: http' \
+            "URL: $MCP_URL unexpected")"
+          DUPLICATE_SCOPE="$(printf '%s\n%s\n' \
+            "$CONNECTED_USER" 'Scope: Local config')"
+          DUPLICATE_STATUS="$(printf '%s\n%s\n' \
+            "$CONNECTED_USER" 'Status: Not Connected')"
+          DUPLICATE_TYPE="$(printf '%s\n%s\n' \
+            "$CONNECTED_USER" 'Type: stdio')"
+          DUPLICATE_URL="$(printf '%s\n%s\n' \
+            "$CONNECTED_USER" 'URL: http://127.0.0.1:9999/mcp')"
+          claude_mcp_registration_matches "$CONNECTED_USER" "$MCP_URL"
+          for invalid in \
+            "$LOCAL_FAILED" \
+            "$NOT_CONNECTED" \
+            "$SCOPE_SUFFIX" \
+            "$TYPE_SUFFIX" \
+            "$URL_SUFFIX" \
+            "$DUPLICATE_SCOPE" \
+            "$DUPLICATE_STATUS" \
+            "$DUPLICATE_TYPE" \
+            "$DUPLICATE_URL"
+          do
+            if claude_mcp_registration_matches "$invalid" "$MCP_URL"; then
+              echo "non-exact MCP registration was accepted" >&2
+              exit 1
+            fi
+          done
+          test "$(claude_mcp_registration_scope "$LOCAL_FAILED")" = local
+          test "$(claude_mcp_registration_scope "$SCOPE_SUFFIX")" = unknown
+
+          # V2 rollback: a failing exit after the legacy entry was removed re-adds it.
+          FAKE_CLAUDE_BIN="$TEST_ROOT/fake-claude"
+          mkdir -p "$FAKE_CLAUDE_BIN"
+          printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$TEST_ROOT/claude.calls" \
+            > "$FAKE_CLAUDE_BIN/claude"
+          chmod +x "$FAKE_CLAUDE_BIN/claude"
+          # State below is consumed by functions loaded from helpers.sh.
+          # shellcheck disable=SC2034
+          {
+            ACTIVATION_STARTED=""
+            SHUTDOWN_REQUESTED=""
+            BACKUP_ROOT=""
+            GLOBAL_URL="$MCP_URL"
+            AUTH_TOKEN="gate-token"
+            TOKEN_FILE="$TEST_ROOT/none"
+            LEGACY_MCP_REMOVED_SCOPE=local
+          }
+          set +e
+          (set +e; PATH="$FAKE_CLAUDE_BIN:$PATH"; false; installer_exit) \
+            >"$TEST_ROOT/mcp-rollback.out" 2>&1
+          MCP_ROLLBACK_RC=$?
+          set -e
+          test "$MCP_ROLLBACK_RC" -ne 0
+          grep -Fxq "mcp add --scope local --transport http marginalia $MCP_URL --header Authorization: Bearer gate-token" \
+            "$TEST_ROOT/claude.calls"
+          grep -Fq "re-added the old 'marginalia' local-scope Claude MCP entry" "$TEST_ROOT/mcp-rollback.out"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("install.sh").read_text()
+          status = source.index('STATUS_JSON="$(discover_daemon_status)"')
+          armed = source.index('SHUTDOWN_REQUESTED="1"', status)
+          legacy_stop = source.index(
+              'STOP_COMMAND=("${STAGE_CLI}" stop --vault "${PREVIOUS_DAEMON_VAULT}" --timeout 30)',
+              armed,
+          )
+          predecessor_stop = source.index('STOP_COMMAND=("${PREVIOUS_COMMAND}" stop --timeout 30)', armed)
+          app_stop = source.index('STOP_COMMAND=("${STAGE_CLI}" stop --timeout 30)', armed)
+          stop = source.index('if ! "${STOP_COMMAND[@]}"', app_stop)
+          activation = source.index('ACTIVATION_STARTED="1"', status)
+          assert status < armed < legacy_stop < predecessor_stop < app_stop < stop < activation
+          PY
+
+      - name: Verify predecessor pre-status cleanup
+        run: |
+          set -euo pipefail
+          TEST_ROOT="$(mktemp -d)"
+          MIGRATION_HOME="/tmp/okto-neuron-predecessor-migration"
+          UNRELATED_PID=""
+          cleanup() {
+            if [ -f "$MIGRATION_HOME/predecessor-owned.pid" ]; then
+              kill "$(cat "$MIGRATION_HOME/predecessor-owned.pid")" >/dev/null 2>&1 || true
+            fi
+            if [ -n "$UNRELATED_PID" ]; then
+              kill "$UNRELATED_PID" >/dev/null 2>&1 || true
+              wait "$UNRELATED_PID" 2>/dev/null || true
+            fi
+            rm -rf "$TEST_ROOT" "$MIGRATION_HOME"
+          }
+          trap cleanup EXIT
+          rm -rf "$MIGRATION_HOME"
+
+          sleep 300 &
+          UNRELATED_PID=$!
+          export UNRELATED_PID
+          # Stand-in for the pinned Marginalia 0.2.0 installer: it leaves a
+          # predecessor-owned daemon behind in ~/.marginalia/runtime and an
+          # unrelated live PID in the successor's ~/.okto-neuron/runtime.
+          cat > "$TEST_ROOT/predecessor-install.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          legacy_root="$HOME/.marginalia/runtime/.marginalia"
+          app_root="$HOME/.okto-neuron/runtime/.marginalia"
+          mkdir -p "$legacy_root" "$app_root" "$HOME/.local/bin"
+          cp "$(command -v sleep)" "$HOME/predecessor-owned"
+          nohup "$HOME/predecessor-owned" 300 >/dev/null 2>&1 &
+          owned_pid=$!
+          printf '%s\n' "$owned_pid" > "$HOME/predecessor-owned.pid"
+          printf '{"version":1,"pid":%s,"start_token":"owned","owner_id":"0123456789abcdef0123456789abcdef"}\n' \
+            "$owned_pid" > "$legacy_root/server.pid"
+          printf '{"version":1,"pid":%s,"start_token":"unowned","owner_id":"fedcba9876543210fedcba9876543210"}\n' \
+            "$UNRELATED_PID" > "$app_root/server.pid"
+          cat > "$HOME/.local/bin/marginalia" <<'CLI'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          printf '%s\n' "$*" >> "$HOME/predecessor-cleanup.calls"
+          case "$*" in
+            "stop --timeout "*)
+              record="$HOME/.marginalia/runtime/.marginalia/server.pid"
+              [ -f "$record" ] || exit 0
+              pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$record")"
+              kill "$pid" >/dev/null 2>&1 || true
+              for _ in $(seq 1 100); do
+                kill -0 "$pid" >/dev/null 2>&1 || break
+                sleep 0.02
+              done
+              kill -KILL "$pid" >/dev/null 2>&1 || true
+              rm -f "$record"
+              ;;
+          esac
+          CLI
+          chmod +x "$HOME/.local/bin/marginalia"
+          SH
+          chmod +x "$TEST_ROOT/predecessor-install.sh"
+          printf '{}\n' > "$TEST_ROOT/predecessor-manifest.json"
+          export PREDECESSOR_FIXTURE_ROOT="$TEST_ROOT"
+
+          curl() {
+            local url="" output=""
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                -o) output="$2"; shift 2 ;;
+                -*) shift ;;
+                *) url="$1"; shift ;;
+              esac
+            done
+            case "$url" in
+              */install.sh) cp "$PREDECESSOR_FIXTURE_ROOT/predecessor-install.sh" "$output" ;;
+              */release-manifest.json) cp "$PREDECESSOR_FIXTURE_ROOT/predecessor-manifest.json" "$output" ;;
+              *) return 64 ;;
+            esac
+          }
+          sha256sum() {
+            case "$1" in
+              */predecessor-install.sh)
+                printf 'a4c0f72b757bbfe54c17ee766885c84d8b89b2126fe1027df4d562f8824b15a8  %s\n' "$1"
+                ;;
+              */predecessor-manifest.json)
+                printf '22eb2f07ee453a708052469d71382a2dc47b0491ff8534d7899325f3bea8068f  %s\n' "$1"
+                ;;
+              *) command sha256sum "$@" ;;
+            esac
+          }
+          export -f curl sha256sum
+
+          sed -n \
+            '/^run_predecessor_migration() (/ , /^run_release_lifecycle() {/p' \
+            bin/test-install.sh | sed '$d' > "$TEST_ROOT/predecessor-function.sh"
+          grep -Fq 'run_predecessor_migration() (' "$TEST_ROOT/predecessor-function.sh"
+
+          set +e
+          (
+            export OKTO_NEURON_TEST_FAIL_PREDECESSOR_BEFORE_STATUS=1
+            export EXPECTED_VERSION="0.0.test"
+            export MANIFEST_URL="https://invalid.example/successor-manifest.json"
+            # shellcheck source=/dev/null
+            source "$TEST_ROOT/predecessor-function.sh"
+            run_predecessor_migration
+          ) > "$TEST_ROOT/output.log" 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          grep -Fq 'forced predecessor failure before status' "$TEST_ROOT/output.log"
+          owned_pid="$(cat "$MIGRATION_HOME/predecessor-owned.pid")"
+          for _ in $(seq 1 100); do
+            kill -0 "$owned_pid" >/dev/null 2>&1 || break
+            sleep 0.02
+          done
+          if kill -0 "$owned_pid" >/dev/null 2>&1; then
+            echo "predecessor-owned daemon survived pre-status failure cleanup" >&2
+            exit 1
+          fi
+          kill -0 "$UNRELATED_PID"
+          grep -Fxq 'stop --timeout 10' "$MIGRATION_HOME/predecessor-cleanup.calls"
+          printf 'BASH_PREDECESSOR_PRE_STATUS_CLEANUP_OK owned=%s unrelated=%s\n' \
+            "$owned_pid" "$UNRELATED_PID"
+
+      - name: Build the candidate wheel and its local release manifest
+        run: |
+          set -euo pipefail
+          uv build --wheel --out-dir "$RUNNER_TEMP/dist" .
+          WHEEL="$(find "$RUNNER_TEMP/dist" -name 'okto_neuron-*-py3-none-any.whl' -print -quit)"
+          test -n "$WHEEL"
+          python3 scripts/release_manifest.py write "$WHEEL" \
+            --source-commit "$(git rev-parse HEAD)" --output "$RUNNER_TEMP/release-manifest.json"
+          echo "CANDIDATE_WHEEL=$WHEEL" >> "$GITHUB_ENV"
+          echo "CANDIDATE_MANIFEST=$RUNNER_TEMP/release-manifest.json" >> "$GITHUB_ENV"
+
+      - name: Verify clean install, live-PID refusal, checksum rejection, rollback and update
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/okto-neuron-transaction-home"
+          export UV_TOOL_DIR="$RUNNER_TEMP/okto-neuron-transaction-tools"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/okto-neuron-transaction-bin"
+          export UV_CACHE_DIR="$RUNNER_TEMP/uv-cache"
+          export OKTO_NEURON_WHEEL="$CANDIDATE_WHEEL"
+          export OKTO_NEURON_MANIFEST="$CANDIDATE_MANIFEST"
+          export OKTO_NEURON_NO_SERVE=1
+          export OKTO_NEURON_NO_MCP=1
+          export OKTO_NEURON_NO_UPDATE_SHELL=1
+          mkdir -p "$HOME"
+
+          # Clean install.
+          bash install.sh >/dev/null
+          TOOL_PYTHON="$UV_TOOL_DIR/okto-neuron/bin/python"
+          tool_version() {
+            "$TOOL_PYTHON" -c 'import importlib.metadata; print(importlib.metadata.version("okto-neuron"))'
+          }
+          BEFORE_VERSION="$(tool_version)"
+          test "$BEFORE_VERSION" = "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$CANDIDATE_MANIFEST")"
+          "$UV_TOOL_BIN_DIR/okto-neuron" --version | head -n 1 | grep -Fxq "okto-neuron $BEFORE_VERSION"
+          test ! -e "$HOME/.okto-neuron/vaults/mynotes"
+
+          # A live, verified application PID owner blocks replacement.
+          GUARD_RUNTIME="$HOME/.okto-neuron/runtime"
+          GUARD_PID_FILE="$GUARD_RUNTIME/.marginalia/server.pid"
+          GUARD_OUTPUT="$RUNNER_TEMP/okto-neuron-live-pid-guard.out"
+          GUARD_READY="$RUNNER_TEMP/okto-neuron-live-pid-guard.ready"
+          GUARD_STOP="$RUNNER_TEMP/okto-neuron-live-pid-guard.stop"
+          GUARD_OWNER_LOG="$RUNNER_TEMP/okto-neuron-live-pid-guard-owner.log"
+          GUARD_JOB_PID=""
+          GUARD_PID=""
+          cleanup_guard_owner() {
+            [ -n "${GUARD_JOB_PID:-}" ] || return 0
+            : > "$GUARD_STOP"
+            for _ in $(seq 1 100); do
+              kill -0 "$GUARD_JOB_PID" >/dev/null 2>&1 || break
+              sleep 0.05
+            done
+            if kill -0 "$GUARD_JOB_PID" >/dev/null 2>&1; then
+              kill -KILL "$GUARD_JOB_PID" >/dev/null 2>&1 || true
+            fi
+            wait "$GUARD_JOB_PID" 2>/dev/null || true
+          }
+          trap cleanup_guard_owner EXIT
+          rm -f "$GUARD_READY" "$GUARD_STOP"
+          "$TOOL_PYTHON" - "$GUARD_RUNTIME" "$GUARD_READY" "$GUARD_STOP" \
+            >"$GUARD_OWNER_LOG" 2>&1 <<'PY' &
+          import os
+          from pathlib import Path
+          import sys
+          import time
+
+          from okto_neuron.server.lifecycle import PidFile
+
+          runtime_root, ready_path, stop_path = map(Path, sys.argv[1:])
+          with PidFile(runtime_root):
+              ready_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+              while not stop_path.exists():
+                  time.sleep(0.05)
+          PY
+          GUARD_JOB_PID=$!
+          for _ in $(seq 1 200); do
+            [ -s "$GUARD_READY" ] && break
+            if ! kill -0 "$GUARD_JOB_PID" >/dev/null 2>&1; then
+              wait "$GUARD_JOB_PID" 2>/dev/null || true
+              cat "$GUARD_OWNER_LOG" >&2
+              exit 1
+            fi
+            sleep 0.05
+          done
+          test -s "$GUARD_READY"
+          IFS= read -r GUARD_PID < "$GUARD_READY"
+          test "$GUARD_PID" = "$GUARD_JOB_PID"
+          validate_guard_record() {
+            "$TOOL_PYTHON" - "$GUARD_PID_FILE" "$GUARD_PID" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          from okto_neuron.server import lifecycle
+
+          path = Path(sys.argv[1])
+          expected_pid = int(sys.argv[2])
+          payload = json.loads(path.read_text(encoding="utf-8"))
+
+
+          def fail(message: str) -> None:
+              raise SystemExit(f"invalid canonical PID record: {message}")
+
+
+          if not isinstance(payload, dict):
+              fail("payload is not an object")
+          if set(payload) != {"version", "pid", "start_token", "owner_id"}:
+              fail("payload keys do not match the canonical schema")
+          if type(payload.get("version")) is not int:
+              fail("version is not an integer")
+          if payload["version"] != lifecycle.PID_RECORD_VERSION:
+              fail("version does not match the installed lifecycle contract")
+          if type(payload.get("pid")) is not int or payload["pid"] != expected_pid:
+              fail("pid does not match the live owner")
+          if not isinstance(payload.get("start_token"), str) or not payload["start_token"]:
+              fail("start_token is missing")
+          if not isinstance(payload.get("owner_id"), str) or not payload["owner_id"]:
+              fail("owner_id is missing")
+          current_start = lifecycle._process_start_token(expected_pid)
+          if current_start is None or payload["start_token"] != current_start:
+              fail("start_token does not match the live process birth identity")
+          print(
+              "canonical application PID owner verified: "
+              f"version={payload['version']} pid={expected_pid}"
+          )
+          PY
+          }
+          validate_guard_record
+          GUARD_RECORD_SHA="$(sha256sum "$GUARD_PID_FILE" | awk '{print $1}')"
+          if bash install.sh >"$GUARD_OUTPUT" 2>&1; then
+            echo "installer replaced the tool despite an unverified live PID record" >&2
+            exit 1
+          fi
+          grep -F "live Okto Neuron daemon (pid $GUARD_PID)" "$GUARD_OUTPUT"
+          grep -F "okto-neuron stop" "$GUARD_OUTPUT"
+          kill -0 "$GUARD_PID"
+          validate_guard_record
+          test "$(sha256sum "$GUARD_PID_FILE" | awk '{print $1}')" = "$GUARD_RECORD_SHA"
+          test "$(tool_version)" = "$BEFORE_VERSION"
+          : > "$GUARD_STOP"
+          for _ in $(seq 1 100); do
+            kill -0 "$GUARD_JOB_PID" >/dev/null 2>&1 || break
+            sleep 0.05
+          done
+          if kill -0 "$GUARD_JOB_PID" >/dev/null 2>&1; then
+            echo "canonical PID owner did not exit cleanly" >&2
+            cat "$GUARD_OWNER_LOG" >&2
+            exit 1
+          fi
+          wait "$GUARD_JOB_PID"
+          GUARD_JOB_PID=""
+          GUARD_PID=""
+          test ! -e "$GUARD_PID_FILE"
+          rm -f "$GUARD_READY" "$GUARD_STOP" "$GUARD_OWNER_LOG"
+          trap - EXIT
+
+          # Checksum rejection: a SHA-256 that conflicts with the manifest.
+          BAD_SHA="$(printf '0%.0s' {1..64})"
+          if OKTO_NEURON_WHEEL_SHA256="$BAD_SHA" bash install.sh >/dev/null 2>&1; then
+            echo "installer accepted a checksum that conflicts with the manifest" >&2
+            exit 1
+          fi
+          test "$(tool_version)" = "$BEFORE_VERSION"
+
+          # Forced activation failure: the exact previous tool is restored.
+          REAL_UV="$(command -v uv)"
+          # shellcheck disable=SC2329  # exported to the installer's subshell below
+          uv() {
+            if [ "${FAIL_UV_TOOL_INSTALL:-}" = 1 ] \
+               && [ "${1:-}" = tool ] && [ "${2:-}" = install ]; then
+              return 77
+            fi
+            "$REAL_UV" "$@"
+          }
+          export -f uv
+          export REAL_UV
+          if FAIL_UV_TOOL_INSTALL=1 bash install.sh >/dev/null 2>&1; then
+            echo "forced activation failure unexpectedly succeeded" >&2
+            exit 1
+          fi
+          unset -f uv
+          test "$(tool_version)" = "$BEFORE_VERSION"
+          test -x "$UV_TOOL_BIN_DIR/okto-neuron"
+          test ! -e "$HOME/.okto-neuron/vaults/mynotes"
+          test -z "$(find "$UV_TOOL_DIR" -maxdepth 1 -name '.okto-neuron-installer-backup-*' -print -quit)"
+
+          # Update: re-running the installer over the existing install succeeds in place.
+          UPDATE_OUTPUT="$RUNNER_TEMP/okto-neuron-update.out"
+          bash install.sh >"$UPDATE_OUTPUT" 2>&1
+          grep -Fq 'updating in place' "$UPDATE_OUTPUT"
+          test "$(tool_version)" = "$BEFORE_VERSION"
+          test -z "$(find "$UV_TOOL_DIR" -maxdepth 1 -name '.okto-neuron-installer-backup-*' -print -quit)"
+          printf 'clean install, checksum rejection, rollback and update verified for %s\n' "$BEFORE_VERSION"
+
+  powershell-syntax:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($path in @("install.ps1", "bin/test-install.ps1")) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-Host
+              $failed = $true
+            }
+          }
+
+          $tester = Get-Content -Raw -LiteralPath "bin/test-install.ps1"
+          $childMatch = [regex]::Match(
+            $tester,
+            '(?s)\$child = @''\r?\n(?<child>.*?)\r?\n''@'
+          )
+          if (-not $childMatch.Success) {
+            throw "test-install.ps1 child runner here-string was not found"
+          }
+          $childTokens = $null
+          $childErrors = $null
+          $childAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            $childMatch.Groups["child"].Value,
+            [ref]$childTokens,
+            [ref]$childErrors
+          )
+          if ($childErrors.Count -gt 0) {
+            $childErrors | Format-List | Out-Host
+            throw "generated Windows child runner did not parse"
+          }
+          $lifecycleAst = $childAst.Find(
+            {
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq "Invoke-ReleaseLifecycle"
+            },
+            $true
+          )
+          if ($null -eq $lifecycleAst) {
+            throw "generated Windows child runner has no Invoke-ReleaseLifecycle function"
+          }
+          $previousMarkerIndex = -1
+          foreach ($marker in @(
+            "WINDOWS_RELEASE_LIFECYCLE_PREDECESSOR_STOPPED_UPDATE_OK",
+            "WINDOWS_RELEASE_LIFECYCLE_APP_FIRST_OK",
+            "RELEASE_LIFECYCLE_FRESH_INSTALL_OK",
+            "RELEASE_LIFECYCLE_STATUS_UI_OK",
+            "RELEASE_LIFECYCLE_STOPPED_UPDATE_OK",
+            "RELEASE_LIFECYCLE_RUNNING_UPDATE_OK",
+            "RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK",
+            "RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK",
+            "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_SHA256=",
+            "RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK",
+            "RELEASE_LIFECYCLE_ACTIVATION_ROLLBACK_OK",
+            "RELEASE_LIFECYCLE_FINAL_STOP_OK",
+            "WINDOWS_RELEASE_LIFECYCLE_OK"
+          )) {
+            $matches = [regex]::Matches($tester, [regex]::Escape($marker))
+            if ($matches.Count -ne 1) {
+              throw "Windows lifecycle marker is missing or duplicated: $marker"
+            }
+            if ($matches[0].Index -le $previousMarkerIndex) {
+              throw "Windows lifecycle markers are out of order at: $marker"
+            }
+            $previousMarkerIndex = $matches[0].Index
+          }
+          foreach ($required in @(
+            '29683d2156840eadaff43efd6133750cd7f24465',
+            '3207bcbee4b738491afd617bcb10e0fa583a6e6af41df51cfd999459f23e7327',
+            '22eb2f07ee453a708052469d71382a2dc47b0491ff8534d7899325f3bea8068f',
+            '59adee4483d8f85525e30a5e6271e6328238ac275d4b3fe05e29325d2ed29520',
+            'Invoke-StoppedPredecessorUpdate $InstallUrl $ExpectedVersion $ManifestUrl $TestHome',
+            'PREDECESSOR_BOOTSTRAP_MODE=',
+            'WINDOWS_RELEASE_LIFECYCLE_PREDECESSOR_STOPPED_UPDATE_OK',
+            '$predecessorHome = Join-Path $HomePath "stopped-predecessor"',
+            '$env:OKTO_NEURON_DEFAULT_WHEEL_URL = $successorWheelUrl',
+            'Invoke-RawInstallerProcess $Url $successorOutput',
+            'Get-Content -Raw -LiteralPath $source | Invoke-Expression',
+            '.release-lifecycle-previous-tool-sentinel',
+            'RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_SHA256=',
+            '$Profile -in @("interactive", "release-lifecycle")',
+            'if ($Profile -eq "skip")',
+            '$env:UV_NO_MODIFY_PATH = "1"',
+            '$env:UV_PYTHON_NO_REGISTRY = "1"',
+            '$env:UV_PYTHON_INSTALL_REGISTRY = "0"',
+            '$env:UV_INSTALL_DIR = Join-Path $TestHome ".uv\bin"',
+            '$env:UV_PYTHON_BIN_DIR = Join-Path $TestHome ".uv\python-bin"',
+            '$env:UV_PYTHON_CACHE_DIR = Join-Path $TestHome ".uv\python-cache"',
+            '$env:XDG_BIN_HOME = Join-Path $TestHome ".local\bin"',
+            '$env:OKTO_NEURON_MANIFEST = $ManifestUrl',
+            'Remove-Item Env:OKTO_NEURON_VAULT -ErrorAction SilentlyContinue',
+            'Export-PublicEvidence',
+            'Initialize-TestSandbox',
+            '"okto-neuron-install-test-" + [guid]::NewGuid().ToString("N").Substring(0, 12)',
+            '$oldErrorActionPreference = $ErrorActionPreference',
+            '$ErrorActionPreference = "Continue"',
+            'Invoke-ReleaseLifecycle $sandboxCli'
+          )) {
+            if (-not $tester.Contains($required)) {
+              throw "Windows release lifecycle contract is missing: $required"
+            }
+          }
+          $sentinelCreateIndex = $tester.IndexOf('-Value "previous-tool-only:$Version"')
+          $customRefusalIndex = $tester.IndexOf('RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK')
+          $livePidRefusalIndex = $tester.IndexOf('RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK')
+          $sentinelPathChecks = [regex]::Matches(
+            $tester,
+            [regex]::Escape('-LiteralPath $rollbackSentinel')
+          ).Count
+          if ($sentinelCreateIndex -lt 0 -or
+              $sentinelCreateIndex -ge $customRefusalIndex -or
+              $sentinelCreateIndex -ge $livePidRefusalIndex -or
+              $sentinelPathChecks -lt 4) {
+            throw "Windows same-version refusal sentinel contract is incomplete"
+          }
+          $install = Get-Content -Raw -LiteralPath "install.ps1"
+          # Native Python probes must keep their quoted string argument under
+          # Windows PowerShell 5.1 native-argument passing.
+          $safeVersionProbe = "version(''okto-neuron'')"
+          if ([regex]::Matches($install, [regex]::Escape($safeVersionProbe)).Count -ne 2 -or
+              $install.Contains('version("okto-neuron")')) {
+            throw "Windows native Python version probes do not preserve their string argument"
+          }
+          $nativeProbe = ([string](& python -c 'print(''WINDOWS_NATIVE_ARG_OK'')')).Trim()
+          if ($LASTEXITCODE -ne 0 -or $nativeProbe -ne "WINDOWS_NATIVE_ARG_OK") {
+            throw "Windows native Python argument probe failed"
+          }
+          if ($failed) { throw "PowerShell syntax validation failed" }
+
+      - name: Verify Claude MCP registration parsing
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "install.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) { throw "install.ps1 did not parse" }
+
+          foreach ($functionName in @(
+            "Test-ClaudeMcpRegistrationMatches",
+            "Get-ClaudeMcpRegistrationScope"
+          )) {
+            $functionAst = $ast.Find(
+              {
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq $functionName
+              },
+              $true
+            )
+            if ($null -eq $functionAst) { throw "$functionName is missing" }
+            . ([scriptblock]::Create($functionAst.Extent.Text))
+          }
+
+          $expectedUrl = "http://127.0.0.1:8201/mcp"
+          $connectedUser = @(
+            "Scope: User config",
+            "Status: Connected",
+            "Type: http",
+            "URL: $expectedUrl"
+          ) -join "`n"
+          if (-not (Test-ClaudeMcpRegistrationMatches $connectedUser $expectedUrl)) {
+            throw "connected user-scope registration was rejected"
+          }
+          $decoratedConnectedUser = @(
+            "Scope: User config (available in all your projects)",
+            ("Status: {0} Connected" -f [char]0x2713),
+            "Type: http",
+            "URL: $expectedUrl"
+          ) -join "`n"
+          if (-not (Test-ClaudeMcpRegistrationMatches $decoratedConnectedUser $expectedUrl)) {
+            throw "decorated connected user-scope registration was rejected"
+          }
+
+          $invalidRegistrations = @(
+            (@(
+              "Scope: Local config",
+              "Status: Failed to connect",
+              "Type: http",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: Project config",
+              "Status: Connected",
+              "Type: http",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: Not Connected",
+              "Type: http",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: Connected",
+              "Type: stdio",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: Connected",
+              "Type: http",
+              "URL: http://127.0.0.1:9999/mcp"
+            ) -join "`n"),
+            (@(
+              "Scope: User config unexpected",
+              "Status: Connected",
+              "Type: http",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: Connected",
+              "Type: http",
+              "URL: $expectedUrl unexpected"
+            ) -join "`n"),
+            "$connectedUser`nScope: Local config",
+            "$connectedUser`nStatus: Not Connected",
+            "$connectedUser`nType: stdio",
+            "$connectedUser`nURL: http://127.0.0.1:9999/mcp",
+            (@(
+              "Scope: user config",
+              "Status: Connected",
+              "Type: http",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: connected",
+              "Type: http",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: Connected",
+              "Type: HTTP",
+              "URL: $expectedUrl"
+            ) -join "`n"),
+            (@(
+              "Scope: User config",
+              "Status: Connected",
+              "Type: http",
+              "URL: http://127.0.0.1:8201/MCP"
+            ) -join "`n")
+          )
+          foreach ($registration in $invalidRegistrations) {
+            if (Test-ClaudeMcpRegistrationMatches $registration $expectedUrl) {
+              throw "invalid registration was accepted: $registration"
+            }
+          }
+          if ((Get-ClaudeMcpRegistrationScope $invalidRegistrations[0]) -ne "local") {
+            throw "local registration scope was not identified"
+          }
+          if ((Get-ClaudeMcpRegistrationScope $invalidRegistrations[1]) -ne "project") {
+            throw "project registration scope was not identified"
+          }
+          if ((Get-ClaudeMcpRegistrationScope $invalidRegistrations[5]) -ne "unknown") {
+            throw "malformed registration scope was identified as user scope"
+          }
+          if ((Get-ClaudeMcpRegistrationScope $invalidRegistrations[11]) -ne "unknown") {
+            throw "case-variant registration scope was identified as user scope"
+          }
+
+          # Owner decision V2: the only command that removes a registration is the
+          # one for the pre-0.3.0 `marginalia` entry, inside Remove-LegacyMcp,
+          # which runs only after Register-Mcp verified `okto-neuron` as connected.
+          $source = Get-Content -Raw -LiteralPath "install.ps1"
+          $removeCommands = @($ast.FindAll(
+            {
+              param($node)
+              $node -is [System.Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq "claude" -and
+                $node.Extent.Text -match '(?i)claude\s+mcp\s+remove\b'
+            },
+            $true
+          ))
+          if ($removeCommands.Count -ne 1 -or
+              $removeCommands[0].Extent.Text -notmatch '^(&\s*)?claude mcp remove \$LegacyCliName --scope \$Scope') {
+            throw "the installer may remove only the legacy MCP entry: $($removeCommands | ForEach-Object { $_.Extent.Text })"
+          }
+          $removeFunction = $ast.Find(
+            {
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq "Remove-LegacyMcp"
+            },
+            $true
+          )
+          if ($null -eq $removeFunction -or
+              -not $removeFunction.Extent.Text.Contains($removeCommands[0].Extent.Text)) {
+            throw "the legacy MCP removal must live in Remove-LegacyMcp"
+          }
+          foreach ($required in @(
+            'if (Register-Mcp "local") { Remove-LegacyMcp "local" $legacyMcpOutput }',
+            'if ((Register-Mcp "user") -and $legacyMcpScope -eq "user") { Remove-LegacyMcp "user" $legacyMcpOutput }',
+            '$script:LegacyMcpRemovedScope = $Scope',
+            'try { Restore-LegacyMcp }',
+            '& claude mcp add --scope $scope --transport http $LegacyCliName $script:GlobalMcpUrl',
+            'Claude MCP registration conflict; resolve the existing entry and re-run this installer'
+          )) {
+            if (-not $source.Contains($required)) {
+              throw "MCP replacement contract is missing: $required"
+            }
+          }
+          $addIndex = $source.IndexOf('& claude mcp add --scope $Scope --transport http $CliName')
+          $postAddRead = $source.IndexOf('$output = (& claude mcp get $CliName', $addIndex)
+          $postAddVerify = $source.IndexOf('Test-ClaudeMcpRegistrationMatches $output $globalUrl', $postAddRead)
+          if ($addIndex -lt 0 -or $postAddRead -le $addIndex -or
+              $postAddVerify -le $postAddRead) {
+            throw "fresh MCP registration must be read back and verified"
+          }
+
+      - name: Verify fail-closed PID record guard
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "install.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) { throw "install.ps1 did not parse" }
+
+          foreach ($functionName in @(
+            "Test-ProcessAlive",
+            "Read-ServerProcessId",
+            "Find-DaemonLockRoot",
+            "Get-LegacyVaultPaths",
+            "Find-UnverifiedLiveLegacyDaemon",
+            "Find-VerifiedLegacyLockRoot",
+            "Assert-NoUndiscoveredLiveDaemon",
+            "Assert-ValidPreseedInputs"
+          )) {
+            $functionAst = $ast.Find(
+              {
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq $functionName
+              },
+              $true
+            )
+            if ($null -eq $functionAst) { throw "$functionName is missing" }
+            . ([scriptblock]::Create($functionAst.Extent.Text))
+          }
+
+          function Die([string]$Message) { throw $Message }
+          $oldProvider = $env:OKTO_NEURON_LLM_PROVIDER
+          try {
+            $Vault = ""
+            $env:OKTO_NEURON_LLM_PROVIDER = "skip"
+            $preseedError = ""
+            try { Assert-ValidPreseedInputs } catch { $preseedError = $_.Exception.Message }
+            if (-not $preseedError.Contains("OKTO_NEURON_LLM_PROVIDER requires OKTO_NEURON_VAULT")) {
+              throw "provider preseed without a vault was not rejected: $preseedError"
+            }
+            $Vault = "mynotes"
+            Assert-ValidPreseedInputs
+          } finally {
+            $env:OKTO_NEURON_LLM_PROVIDER = $oldProvider
+          }
+
+          $temp = Join-Path $env:RUNNER_TEMP "okto-neuron-server.pid"
+          try {
+            Set-Content -LiteralPath $temp -Value "4242" -Encoding ASCII
+            if ((Read-ServerProcessId $temp) -ne 4242) {
+              throw "legacy integer PID record was not parsed"
+            }
+            Set-Content -LiteralPath $temp -Value '{"version":1,"pid":4343,"start_token":"test","owner_id":"test"}' -Encoding ASCII
+            if ((Read-ServerProcessId $temp) -ne 4343) {
+              throw "JSON PID record was not parsed"
+            }
+            Set-Content -LiteralPath $temp -Value '{"pid":"invalid"}' -Encoding ASCII
+            if ((Read-ServerProcessId $temp) -ne 0) {
+              throw "invalid PID record did not fail closed"
+            }
+            Set-Content -LiteralPath $temp -Value ("1" * 16385) -Encoding ASCII
+            if ((Read-ServerProcessId $temp) -ne 0) {
+              throw "oversized PID record did not fail closed"
+            }
+          } finally {
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+          }
+
+          # A live PID in the successor's own ~/.okto-neuron runtime.
+          $HomeRoot = Join-Path $env:RUNNER_TEMP "okto-neuron-pid-guard-home"
+          $LegacyHomeRoot = Join-Path $env:RUNNER_TEMP "okto-neuron-pid-guard-legacy-home"
+          $RestUrl = "http://127.0.0.1:7777"
+          $DaemonRuntimeRoot = Join-Path $HomeRoot "runtime"
+          $LegacyDaemonRuntimeRoot = Join-Path $LegacyHomeRoot "runtime"
+          $DaemonPidFile = Join-Path $DaemonRuntimeRoot ".marginalia\server.pid"
+          $CliName = "okto-neuron"
+          $recordPath = $DaemonPidFile
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $recordPath) | Out-Null
+          Set-Content -LiteralPath $recordPath -Value ("{`"version`":1,`"pid`":$PID}") -Encoding ASCII
+          $lockRoot = Find-DaemonLockRoot $PID
+          if ($lockRoot -ne $DaemonRuntimeRoot) {
+            throw "application PID did not resolve to its lifecycle lock root: $lockRoot"
+          }
+          if (Find-DaemonLockRoot ($PID + 1)) {
+            throw "a mismatched PID was accepted as the lifecycle lock owner"
+          }
+          $script:PreviousCli = ""
+          $script:PreviousVersion = ""
+          $guardError = ""
+          try {
+            Assert-NoUndiscoveredLiveDaemon
+          } catch {
+            $guardError = $_.Exception.Message
+          } finally {
+            Remove-Item -LiteralPath $HomeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $guardError.Contains("Run: okto-neuron stop.")) {
+            throw "live PID guard did not provide exact stop guidance: $guardError"
+          }
+          if (-not $guardError.Contains("Custom endpoint/ports may require manual stop.")) {
+            throw "live PID guard did not provide custom-port guidance: $guardError"
+          }
+
+          # A live pre-0.3.0 daemon in ~/.marginalia/runtime is stopped with the
+          # previous tool's own command.
+          $recordPath = Join-Path $LegacyDaemonRuntimeRoot ".marginalia\server.pid"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $recordPath) | Out-Null
+          Set-Content -LiteralPath $recordPath -Value ("{`"version`":1,`"pid`":$PID}") -Encoding ASCII
+          if ((Find-DaemonLockRoot $PID) -ne $LegacyDaemonRuntimeRoot) {
+            throw "a pre-0.3.0 application PID did not resolve to ~/.marginalia/runtime"
+          }
+          $script:PreviousCli = "marginalia"
+          $script:PreviousVersion = "0.2.0"
+          $legacyGuardError = ""
+          try { Assert-NoUndiscoveredLiveDaemon } catch { $legacyGuardError = $_.Exception.Message }
+          if (-not $legacyGuardError.Contains("Run: marginalia stop.")) {
+            throw "pre-0.3.0 PID guard did not name the previous tool's stop command: $legacyGuardError"
+          }
+          Remove-Item -LiteralPath $LegacyHomeRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+          # The pre-versioned integer fallback of the 0.0.40 vault-scoped lock.
+          $HomeRoot = Join-Path $env:RUNNER_TEMP "okto-neuron-legacy-pid-guard-home"
+          $LegacyHomeRoot = $HomeRoot
+          $DaemonRuntimeRoot = Join-Path $HomeRoot "runtime-unused"
+          $LegacyDaemonRuntimeRoot = Join-Path $HomeRoot "runtime-unused-legacy"
+          $legacyVault = Join-Path (Join-Path $HomeRoot "vaults") "legacy-vault"
+          $legacyRecord = Join-Path $legacyVault ".marginalia\server.pid"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $legacyRecord) | Out-Null
+          Set-Content -LiteralPath (Join-Path $legacyVault "marginalia.yaml") -Value "vault_id: legacy-vault" -Encoding ASCII
+          Set-Content -LiteralPath $legacyRecord -Value ([string]$PID) -Encoding ASCII
+          $script:PreviousCommand = ""
+          $script:PreviousVersion = "0.0.40"
+          try {
+            if ((Find-VerifiedLegacyLockRoot $PID $legacyVault) -ne $legacyVault) {
+              throw "verified legacy-fallback PID did not resolve to its vault lock"
+            }
+            $legacy = Find-UnverifiedLiveLegacyDaemon
+            if ($null -eq $legacy -or [int]$legacy.pid -ne $PID -or
+                [string]$legacy.vault -ne $legacyVault) {
+              throw "live legacy-fallback PID was not discovered"
+            }
+            $legacyGuardError = ""
+            try { Assert-NoUndiscoveredLiveDaemon } catch { $legacyGuardError = $_.Exception.Message }
+            if (-not $legacyGuardError.Contains("Marginalia 0.0.40") -or
+                -not $legacyGuardError.Contains("marginalia stop --vault")) {
+              throw "legacy-fallback PID guard was incomplete: $legacyGuardError"
+            }
+          } finally {
+            Remove-Item -LiteralPath $HomeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $source = Get-Content -Raw -LiteralPath "install.ps1"
+          $statusIndex = $source.IndexOf('$status = Get-DaemonStatus')
+          $guardIndex = $source.IndexOf('Assert-NoUndiscoveredLiveDaemon', $statusIndex)
+          $activationIndex = $source.IndexOf('Step "Activating staged Okto Neuron', $statusIndex)
+          if ($statusIndex -lt 0 -or $guardIndex -le $statusIndex -or $activationIndex -le $guardIndex) {
+            throw "live PID guard must run after status discovery and before activation"
+          }
+          if (-not $source.Contains('Run: $stopCli stop.')) {
+            throw "live PID guard is missing app-scoped stop guidance"
+          }
+          if (-not $source.Contains('Custom endpoint/ports may require manual stop.')) {
+            throw "live PID guard is missing custom-port guidance"
+          }
+
+      - name: Verify Windows transaction and sandbox contracts
+        shell: powershell
+        run: |
+          $install = Get-Content -Raw -LiteralPath "install.ps1"
+          $statusIndex = $install.IndexOf('$status = Get-DaemonStatus')
+          $lockRootIndex = $install.IndexOf('$oldLockRoot = Find-DaemonLockRoot', $statusIndex)
+          $previousPidIndex = $install.IndexOf('$script:PreviousProcessId = $oldPid', $lockRootIndex)
+          $preStopArmIndex = $install.IndexOf('$script:TransactionArmed = $true', $previousPidIndex)
+          $stopArgsIndex = $install.IndexOf('$stopArgs = @("stop", "--timeout", "30")', $previousPidIndex)
+          $oldStopIndex = $install.IndexOf('& $stageCli @stopArgs', $stopArgsIndex)
+          $activationIndex = $install.IndexOf('Step "Activating staged Okto Neuron', $oldStopIndex)
+          if ($statusIndex -lt 0 -or $lockRootIndex -le $statusIndex -or
+              $previousPidIndex -le $lockRootIndex -or
+              $preStopArmIndex -le $previousPidIndex -or
+              $stopArgsIndex -le $preStopArmIndex -or $oldStopIndex -le $stopArgsIndex -or
+              $activationIndex -le $oldStopIndex) {
+            throw "PID lock ownership and rollback must be established before staged shutdown"
+          }
+          foreach ($required in @(
+            'status reported pid $oldPid, but its application lifecycle lock could not be verified',
+            'Marginalia 0.0.40 status reported pid $oldPid',
+            'Find-VerifiedLegacyLockRoot $oldPid $statusVault',
+            '$script:PreviousDaemonVault = $statusVault',
+            '$stopArgs = @("stop", "--vault", $script:PreviousDaemonVault, "--timeout", "30")',
+            '$serveArgs += @("--vault", $script:PreviousDaemonVault)',
+            '& $cli @serveArgs',
+            'Stop it first:',
+            'could not stop the verified daemon (pid $oldPid)'
+          )) {
+            if (-not $install.Contains($required)) {
+              throw "Windows lifecycle ownership contract is missing: $required"
+            }
+          }
+
+          $restoreIndex = $install.IndexOf('function Restore-PreviousTool')
+          $candidateStopIndex = $install.IndexOf('Stop-CandidateDaemonForRollback', $restoreIndex)
+          $candidateDeleteIndex = $install.IndexOf('Remove-DirectoryTree $activeTool', $restoreIndex)
+          if ($restoreIndex -lt 0 -or $candidateStopIndex -le $restoreIndex -or
+              $candidateDeleteIndex -le $candidateStopIndex) {
+            throw "candidate shutdown verification must precede environment deletion"
+          }
+          foreach ($required in @(
+            'is still live after graceful shutdown; active environment and backup retained',
+            'daemon remains running (pid $($script:PreviousProcessId))',
+            'Remove-InstallerTemps -KeepBackup:$keepBackup',
+            'rollback incomplete; previous tool backup retained'
+          )) {
+            if (-not $install.Contains($required)) {
+              throw "Windows rollback contract is missing: $required"
+            }
+          }
+
+          $tokens = $null
+          $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "install.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          $restoreDaemonAst = $ast.Find(
+            {
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq "Restore-PreviousDaemonState"
+            },
+            $true
+          )
+          if ($null -eq $restoreDaemonAst) { throw "Restore-PreviousDaemonState is missing" }
+          . ([scriptblock]::Create($restoreDaemonAst.Extent.Text))
+          function Test-ProcessAlive([int]$ProcessId) { return $true }
+          function Info([string]$Message) { $script:RestoreInfo = $Message }
+          $script:WasRunning = $true
+          $script:ActivationStarted = $false
+          $script:PreviousProcessId = 4242
+          $script:PreviousStopRequested = $true
+          $script:PreviousProduct = "Marginalia"
+          $script:RestoreInfo = ""
+          Restore-PreviousDaemonState
+          if ($script:PreviousStopRequested -or
+              -not $script:RestoreInfo.EndsWith("daemon remains running (pid 4242)")) {
+            throw "pre-activation rollback did not preserve the unchanged daemon: $($script:RestoreInfo)"
+          }
+
+          foreach ($functionName in @(
+            "Remove-DirectoryTree",
+            "Remove-InstallerTemps",
+            "Restore-PreviousTool"
+          )) {
+            $functionAst = $ast.Find(
+              {
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq $functionName
+              },
+              $true
+            )
+            if ($null -eq $functionAst) { throw "$functionName is missing" }
+            . ([scriptblock]::Create($functionAst.Extent.Text))
+          }
+          function Warn([string]$Message) {}
+          function Add-LongPathFixture([string]$Root) {
+            $path = Join-Path $Root "%OKTO_NEURON_CLEANUP_SENTINEL%"
+            while ($path.Length -le 320) {
+              $path = Join-Path $path ("long-path-" + ("x" * 40))
+            }
+            $extendedPath = if ($path.StartsWith("\\", [StringComparison]::Ordinal)) {
+              "\\?\UNC\" + $path.Substring(2)
+            } else {
+              "\\?\$path"
+            }
+            [IO.Directory]::CreateDirectory($extendedPath) | Out-Null
+            [IO.File]::WriteAllText(
+              [IO.Path]::Combine($extendedPath, "probe.txt"),
+              "probe"
+            )
+          }
+
+          $transactionRoot = Join-Path $env:RUNNER_TEMP "okto-neuron-transaction-retention"
+          $rollbackRoot = Join-Path $transactionRoot "rollback"
+          $script:ToolRoot = Join-Path $rollbackRoot "tools"
+          $script:ToolBin = Join-Path $rollbackRoot "bin"
+          $script:BackupRoot = Join-Path $script:ToolRoot "backup"
+          $ToolName = "okto-neuron"
+          $script:PreviousToolName = "okto-neuron"
+          $activeTool = Join-Path $script:ToolRoot "okto-neuron"
+          $backupTool = Join-Path $script:BackupRoot "tool"
+          New-Item -ItemType Directory -Force -Path $activeTool, $backupTool, $script:ToolBin |
+            Out-Null
+          Add-LongPathFixture $activeTool
+          Set-Content -LiteralPath (Join-Path $backupTool "marker") -Value "previous"
+          function Stop-CandidateDaemonForRollback {}
+          function Undo-AppHomeMigration {}
+          function Get-ToolVersion([string]$Root, [string]$Tool) { return "old-version" }
+          function Restore-PreviousDaemonState {}
+          $script:TransactionArmed = $true
+          $script:ActivationStarted = $true
+          $script:CandidateInstallAttempted = $true
+          $script:PreviousVersion = "old-version"
+          Restore-PreviousTool
+          if ((Get-Content -Raw -LiteralPath (Join-Path $activeTool "marker")).Trim() -ne
+              "previous") {
+            throw "long-path candidate rollback did not restore the previous tool"
+          }
+          if (Test-Path -LiteralPath (Join-Path $activeTool "%OKTO_NEURON_CLEANUP_SENTINEL%")) {
+            throw "long-path candidate content survived rollback"
+          }
+          Remove-DirectoryTree $rollbackRoot
+
+          $script:BackupRoot = Join-Path $transactionRoot "backup"
+          $script:WorkTmp = Join-Path $transactionRoot "work"
+          $script:CloneTmp = Join-Path $transactionRoot "clone"
+          New-Item -ItemType Directory -Force -Path `
+            $script:BackupRoot, $script:WorkTmp, $script:CloneTmp | Out-Null
+          Add-LongPathFixture $script:BackupRoot
+          Add-LongPathFixture $script:WorkTmp
+          Add-LongPathFixture $script:CloneTmp
+          try {
+            Remove-InstallerTemps -KeepBackup
+            if (-not (Test-Path -LiteralPath $script:BackupRoot)) {
+              throw "incomplete rollback deleted the previous tool backup"
+            }
+            if ((Test-Path -LiteralPath $script:WorkTmp) -or
+                (Test-Path -LiteralPath $script:CloneTmp)) {
+              throw "temporary staging paths were not cleaned"
+            }
+            Remove-InstallerTemps
+            if (Test-Path -LiteralPath $script:BackupRoot) {
+              throw "completed rollback did not clean the backup"
+            }
+          } finally {
+            Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $tester = Get-Content -Raw -LiteralPath "bin/test-install.ps1"
+          foreach ($name in @(
+            "UV_TOOL_DIR",
+            "UV_TOOL_BIN_DIR",
+            "UV_INSTALL_DIR",
+            "UV_UNMANAGED_INSTALL",
+            "UV_PYTHON_INSTALL_DIR",
+            "UV_PYTHON_BIN_DIR",
+            "UV_PYTHON_CACHE_DIR",
+            "UV_CACHE_DIR",
+            "UV_NO_MODIFY_PATH",
+            "UV_PYTHON_NO_REGISTRY",
+            "UV_PYTHON_INSTALL_REGISTRY",
+            "OKTO_NEURON_NO_OPEN",
+            "TEMP",
+            "TMP",
+            "XDG_BIN_HOME"
+          )) {
+            if ([regex]::Matches($tester, [regex]::Escape($name)).Count -lt 3) {
+              throw "$name is not isolated in both parent and child"
+            }
+          }
+          foreach ($name in @(
+            "OKTO_NEURON_WHEEL",
+            "OKTO_NEURON_SRC",
+            "OKTO_NEURON_MANIFEST",
+            "OKTO_NEURON_WHEEL_SHA256",
+            "OKTO_NEURON_DEFAULT_WHEEL_URL",
+            "OKTO_NEURON_DEFAULT_MANIFEST_URL",
+            "OKTO_NEURON_REPO",
+            "OKTO_NEURON_REF",
+            "OKTO_NEURON_PACKS",
+            "OKTO_NEURON_ENDPOINT",
+            "OKTO_NEURON_AUTH_TOKEN"
+          )) {
+            if ([regex]::Matches($tester, [regex]::Escape($name)).Count -lt 2) {
+              throw "$name is not scrubbed in both parent and child"
+            }
+          }
+          if (-not $tester.Contains('[Environment]::SetEnvironmentVariable($name, $oldEnv[$name], "Process")')) {
+            throw "parent environment restoration is missing"
+          }
+          $childRunIndex = $tester.IndexOf('& $powershell @childArgs')
+          $stopGuardIndex = $tester.IndexOf('if ($Cleanup -or $Profile -eq "release-lifecycle")', $childRunIndex)
+          $stopIndex = $tester.IndexOf('Stop-TestDaemon $TestHome', $stopGuardIndex)
+          $restoreIndex = $tester.IndexOf('foreach ($name in $envNames)', $stopIndex)
+          $exportIndex = $tester.IndexOf('Export-PublicEvidence', $restoreIndex)
+          $removeGuardIndex = $tester.IndexOf('if ($Cleanup)', $exportIndex)
+          $removeIndex = $tester.IndexOf('Remove-TestSandbox $TestHome', $removeGuardIndex)
+          $exitIndex = $tester.LastIndexOf('if ($childExitCode -ne 0)')
+          if ($childRunIndex -lt 0 -or $stopGuardIndex -le $childRunIndex -or
+              $stopIndex -le $stopGuardIndex -or $restoreIndex -le $stopIndex -or
+              $exportIndex -le $restoreIndex -or $removeGuardIndex -le $exportIndex -or
+              $removeIndex -le $removeGuardIndex -or $exitIndex -le $removeIndex) {
+            throw "sandbox stop, environment restoration, evidence export, removal, and exit propagation are out of order"
+          }
+
+          $testerTokens = $null
+          $testerErrors = $null
+          $testerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "bin/test-install.ps1"),
+            [ref]$testerTokens,
+            [ref]$testerErrors
+          )
+          if ($testerErrors.Count -gt 0) { throw "test-install.ps1 did not parse" }
+          foreach ($functionName in @(
+            "Remove-DirectoryTree",
+            "Initialize-TestSandbox",
+            "Remove-TestSandbox",
+            "Export-PublicEvidence"
+          )) {
+            $functionAst = $testerAst.Find(
+              {
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq $functionName
+              },
+              $true
+            )
+            if ($null -eq $functionAst) { throw "$functionName is missing" }
+            . ([scriptblock]::Create($functionAst.Extent.Text))
+          }
+
+          $unowned = Join-Path $env:RUNNER_TEMP "okto-neuron-install-test-unowned"
+          New-Item -ItemType Directory -Force -Path $unowned | Out-Null
+          try {
+            $refused = $false
+            try {
+              Initialize-TestSandbox $unowned $env:RUNNER_TEMP | Out-Null
+            } catch {
+              $refused = $_.Exception.Message.Contains("unowned test directory")
+            }
+            if (-not $refused) { throw "unowned Windows test directory was accepted" }
+          } finally {
+            Remove-Item -LiteralPath $unowned -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          $owned = Join-Path $env:RUNNER_TEMP "okto-neuron-install-test-owned"
+          $owned = Initialize-TestSandbox $owned $env:RUNNER_TEMP
+          Add-LongPathFixture $owned
+          Remove-TestSandbox $owned $env:RUNNER_TEMP
+          if (Test-Path -LiteralPath $owned) { throw "owned Windows test sandbox was not removed" }
+
+          $raw = Join-Path $env:RUNNER_TEMP "windows-private.raw.log"
+          $public = Join-Path $env:RUNNER_TEMP "windows-public.log"
+          $privateRoot = "C:\Users\alice\AppData\Local\Temp\okto-neuron-install-test-proof"
+          @(
+            "**********************",
+            "Windows PowerShell transcript start",
+            "Username: DOMAIN\alice",
+            "Machine: TESTHOST",
+            "**********************",
+            "TEST_HOME=$privateRoot",
+            "CALLER=C:\Users\alice",
+            "IDENTITY=DOMAIN\alice@TESTHOST",
+            "WINDOWS_RELEASE_LIFECYCLE_OK",
+            "**********************",
+            "Windows PowerShell transcript end",
+            "**********************"
+          ) | Set-Content -LiteralPath $raw -Encoding UTF8
+          try {
+            Export-PublicEvidence `
+              $raw $public $privateRoot "C:\Users\alice" "DOMAIN\alice" "TESTHOST"
+            $sanitized = Get-Content -Raw -LiteralPath $public
+            foreach ($required in @(
+              "TEST_HOME=<TEST_HOME>",
+              "CALLER=<CALLER_HOME>",
+              "IDENTITY=<WINDOWS_USER>@<WINDOWS_MACHINE>",
+              "WINDOWS_RELEASE_LIFECYCLE_OK"
+            )) {
+              if (-not $sanitized.Contains($required)) {
+                throw "sanitized evidence is missing: $required"
+              }
+            }
+            foreach ($forbidden in @(
+              "Windows PowerShell transcript",
+              "C:\Users\alice",
+              "DOMAIN\alice",
+              "TESTHOST"
+            )) {
+              if ($sanitized.Contains($forbidden)) {
+                throw "sanitized evidence retained private field: $forbidden"
+              }
+            }
+          } finally {
+            Remove-Item -LiteralPath $raw, $public -Force -ErrorAction SilentlyContinue
+          }

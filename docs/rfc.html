@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Okto Neuron — RFC v1.0</title>
+<style>
+:root{--bg:#0b0e14;--panel:#11151f;--panel2:#161b29;--ink:#e6e9f0;--dim:#8b93a7;
+--line:#222a3d;--accent:#7aa2f7;--green:#9ece6a;--amber:#e0af68;--red:#f7768e;
+--purple:#bb9af7;--cyan:#7dcfff;--mono:'SFMono-Regular',ui-monospace,Menlo,Consolas,monospace;}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--ink);line-height:1.65;
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background-image:radial-gradient(900px 600px at 88% -5%,#161d31 0%,transparent 60%),
+radial-gradient(800px 700px at -10% 35%,#141a2b 0%,transparent 55%);}
+code,.mono{font-family:var(--mono)}
+nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:18px;
+padding:14px 28px;border-bottom:1px solid var(--line);background:rgba(11,14,20,.85);backdrop-filter:blur(10px)}
+.logo{font-weight:700;font-size:17px}.logo .dot{color:var(--accent)}
+.sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
+.navlinks{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.navlinks a{text-decoration:none;color:var(--dim);font-size:13px;padding:7px 15px;border-radius:999px;
+border:1px solid var(--line);background:var(--panel);transition:.2s}
+.navlinks a:hover{color:#fff;border-color:var(--accent)}
+.navlinks a.cta{color:#fff;border-color:var(--accent);background:linear-gradient(180deg,#1b2540,#141a2b)}
+.navprog{position:absolute;left:0;bottom:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--purple));width:0}
+
+.md h1,.md h2,.md h3,.md h4{font-weight:680;line-height:1.3;margin:22px 0 10px}
+.md h1{font-size:25px;color:#fff;border-bottom:1px solid var(--line);padding-bottom:8px}
+.md h2{font-size:21px;color:#fff}.md h3{font-size:17px;color:var(--cyan)}.md h4{font-size:15px;color:var(--purple)}
+.md p{margin:10px 0;color:#cfd5e3}
+.md a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(122,162,247,.3)}
+.md a:hover{border-bottom-color:var(--accent)}
+.md ul,.md ol{margin:10px 0 10px 24px}.md li{margin:5px 0;color:#cfd5e3}
+.md strong{color:#fff}.md em{color:var(--purple)}
+.md code{font-family:var(--mono);font-size:13px;background:#0e1420;border:1px solid var(--line);padding:1px 6px;border-radius:5px;color:var(--cyan)}
+.md pre{background:#0a0d15;border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow-x:auto;margin:12px 0}
+.md pre code{background:none;border:none;padding:0;color:#d8dee9;font-size:12.5px;line-height:1.55}
+.md blockquote{border-left:3px solid var(--amber);background:var(--panel2);padding:8px 16px;margin:12px 0;border-radius:0 8px 8px 0;color:var(--dim)}
+.md table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13px;display:block;overflow-x:auto}
+.md th,.md td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+.md th{background:var(--panel2);color:#fff;font-weight:660}
+.md tr:nth-child(even) td{background:rgba(255,255,255,.015)}
+.md hr{border:none;border-top:1px solid var(--line);margin:20px 0}
+
+.doc-wrap{max-width:860px;margin:0 auto;padding:40px 28px 60px}
+.doc-wrap .md h1:first-child{margin-top:8px}
+footer{margin-top:60px;padding-top:24px;border-top:1px solid var(--line);text-align:center;color:var(--dim);font-size:12.5px}
+footer .mono{color:var(--accent)}
+</style></head><body>
+<nav><div><div class="logo">Okto Neuron<span class="dot">.</span></div><div class="sub">design bible · rendered from RFC.md</div></div><div class="navlinks"><a href="index.html">← Hub</a><a href="knowledge-base/index.html">📚 Knowledge Base</a><a href="../RFC.md">view source ↗</a></div><div class="navprog" id="navprog"></div></nav>
+<main class="doc-wrap"><article class="md"><h1 id="RFC--rfc-marginalia--a-standalone-local-first-knowledge-graph">RFC: Marginalia — A Standalone Local-First Knowledge Graph</h1>
+<blockquote>
+<p><strong>Name note (2026-09-25):</strong> this RFC was written while the product was named Marginalia. It ships as
+Okto Neuron from 0.3.0; code references below to the <code>marginalia</code> package, command and paths map to
+<code>okto_neuron</code>, <code>okto-neuron</code> and <code>src/okto_neuron</code>. See <a href="adr/0044-rename-to-okto-neuron.md">ADR 0044</a>.</p>
+</blockquote>
+<blockquote>
+<p>Status: <strong>v1.0 design baseline</strong>; current-state layer reconciled for the Okto Neuron 0.3.0 source release ·
+Author: Alex · Original date: 2026-05-19 · Reconciled: 2026-07-14, 2026-09-25
+Working name: <strong>Marginalia</strong> (alternates: <em>Stacks</em>, <em>Verso</em>, <em>Cartulary</em>)
+Predecessors: two research reviews dated 2026-05-19 (v1 and v2; internal, not published)
+Requirements: <code>docs/requirements-v1.md</code></p>
+</blockquote>
+<h2 id="RFC--0-how-to-read-this-rfc-now">0. How to read this RFC now</h2>
+<p>This RFC preserves the May 2026 design and the reasoning that produced Marginalia. The
+implementation has since moved far beyond the original <code>v0</code> sketch. The following is the
+authoritative current-state layer; historical forecasts later in the RFC are retained only
+as decision provenance where explicitly labelled.</p>
+<ul>
+<li><strong>Version and distribution:</strong> from 0.3.0 the product ships as Okto Neuron from the public
+<code>OktoLabsAI/okto-neuron</code> repository: installers, release manifest, and the wheel as a GitHub
+Release asset. A PyPI package named <code>okto-neuron</code> is planned. Versions up to 0.2.0 were published
+as Marginalia prereleases under Apache-2.0 through the <code>OktoLabsAI/marginalia-dist</code> installer
+repo, whose release manifest stays at 0.2.0. Per-version status lives in <code>docs/roadmap.json</code>.</li>
+<li><strong>Schema and provenance:</strong> the five primitive classes and six support types remain.
+<code>Block</code> is still stored. <code>SourceSpan</code> also ships and is populated on Claims; ADR 0003's
+final Block-removal cut is not implemented.</li>
+<li><strong>Storage and vaults:</strong> Ladybug is optional behind the <code>ladybug</code> extra. One graph and one
+immutable runtime per open vault, tab-scoped REST/UI selection, and per-connection MCP vault
+selection ship; cross-vault <code>MultiVault</code> fan-out does not.</li>
+<li><strong>Write path:</strong> LLM extraction, durable candidate-ledger records, deterministic and LLM
+resolve/curation, fail-closed gates, commit plans, incremental re-ingest, folder watch,
+and fresh-graph rebuild/heal all ship.</li>
+<li><strong>Read path:</strong> fused retrieval, graph walk, typed subgraph rendering, and bounded source
+blending ship. Block answering remains the default; graph-native/efficient-hybrid mode
+remains opt-in through <code>llm.ask.enable_subgraph</code>.</li>
+<li><strong>Surfaces:</strong> the Python <code>Vault</code> API, Click CLIs, bearer-authenticated five-tool FastMCP server,
+direct-loopback REST API, and compiled React Web UI ship. <code>Vault.export()</code> supports JSON-LD/JSON-LD-star
+with the <code>jsonld</code> extra; there is no <code>kg export</code> command.</li>
+<li><strong>Dependencies:</strong> Click and <code>email-validator</code> are core. The package keeps
+<code>serve</code> as the complete published Ladybug + FastMCP + embeddings application boundary;
+<code>mcp</code> is an identical compatibility alias for older install guidance. Lower-level <code>ladybug</code> and
+<code>embeddings</code> extras remain available to library consumers. RDFLib,
+LiteLLM, Bedrock, and Sentence Transformers remain explicit optional closures. Clean-wheel
+tests execute each public feature boundary without relying on a combined environment.</li>
+<li><strong>Release state:</strong> every version published so far is a prerelease. Exact-artifact Linux
+Docker+tmux lifecycle rehearsals are retained for the later prereleases; no published version has
+yet passed a real interactive Windows PowerShell 5.1 lifecycle. <code>0.0.40</code> and <code>0.0.41</code> are
+immutable and permanently non-promotable (a native Windows run of 0.0.41 exposed daemon lifecycle
+defects that later versions repaired). <code>docs/roadmap.json</code> records each version's evidence and
+limits; the dated application-quality audit and the release ledger are internal records.</li>
+<li><strong>Corrective compatibility:</strong> the successor deliberately replaces client-derived budget API
+names with <code>CORPUS_BUDGET_SECONDS</code> and the <code>corpus</code> suite key, without legacy aliases. The
+<code>marginalia pilot</code> command remains stable, while its report basename becomes
+<code>pilot-log.YYYY-MM-DD.json</code>. These privacy-neutralizing public compatibility breaks belong only
+to the corrective release; downstream Python callers and report consumers must migrate.</li>
+</ul>
+<hr />
+<h2 id="RFC--1-summary">1. Summary</h2>
+<p>Marginalia is a standalone, local-first knowledge graph usable as a Python library,
+Click CLI, bearer-authenticated FastMCP server, direct-loopback REST service, and Web UI. It is grounded in
+library and information science—faceted classification, authority control, SKOS, and
+provenance—combined with embeddings and LLM-assisted extraction.</p>
+<p>The schema is closed at five primitives (<code>Agent</code>, <code>Activity</code>, <code>InformationObject</code>,
+<code>Concept</code>, <code>Place</code>) over six support node types (<code>Document</code>, <code>Identifier</code>,
+<code>Annotation</code>, <code>Claim</code>, <code>Block</code>, <code>Finding</code>). A <code>Claim</code> is the atomic provenance
+unit, anchored to a stored <code>Block</code> and optionally carrying a byte-exact <code>SourceSpan</code>.
+JSON-LD and JSON-LD-star export are library features.</p>
+<p>Storage is one Ladybug graph and immutable runtime per vault. Each browser tab selects a vault
+for every scoped REST request, and each MCP connection selects one pooled vault, but no cross-vault
+fanout API ships. Pulse continues to consume its in-tree
+KG; migration remains a future RFC.</p>
+<hr />
+<h2 id="RFC--2-historical-motivation-and-product-thesis-may-2026">2. Historical motivation and product thesis (May 2026)</h2>
+<p>This section preserves the original market framing and research-era forecasts. It is decision
+provenance, not a current competitor/pricing survey or implementation checklist. The durable
+thesis still holds: local file ownership, provenance-bearing memory, a closed librarian-grade
+schema, and agent-facing surfaces are the product's differentiators.</p>
+<p>The KG inside Pulse is <strong>~20 600 LOC, ~28 % of core</strong> and technically generic,
+but its shipped schema (<code>Decision</code>, <code>Criterion</code>, <code>Constraint</code>, <code>Requirement</code>,
+<code>Alternative</code>, …) is engineering-decision-flavored. A user whose work is data-,
+research- or comms-centric has no use for those primitives — the graph feels
+welded to a workflow they don't run.</p>
+<p><strong>The wedge is agent-portable memory with a librarian-grade spine.</strong>
+The user complaint that triggers this need, recurring across HN and
+r/ObsidianMD in 2026, is: <em>&quot;I want my Claude and my Cursor to remember
+across sessions without paying $X/mo and without my notes living in a
+proprietary store.&quot;</em> Marginalia is a local-first knowledge-graph MCP server
+that any LLM tool (Claude Code, Cursor, custom agents) can call against one
+markdown vault the user owns, shipping structured retrieval (<code>Document</code>,
+<code>Annotation</code>, <code>Claim</code>, <code>Authority</code>, <code>SKOS</code>, Dublin Core) rather than
+embeddings over freeform notes.</p>
+<p><strong>The direct competitor is Basic Memory</strong> (basicmachines-co), not Obsidian.
+Basic Memory is OSS, MCP-shipped, markdown-canonical, and has real traction
+(~2.6k stars, May 2026). It also gates its useful tier behind a $14.25/mo paid
+SaaS and uses a freeform wikilink+observations schema with no Authority
+control, no <code>Document</code> layer with <code>Annotation</code>/<code>Claim</code>, and no SKOS edges.
+Marginalia adds, on top of that same surface area:</p>
+<ol>
+<li><strong>Librarianship-grounded schema</strong> that answers PKM complaints incumbents
+have left open — manual aliasing of &quot;JP&quot; vs &quot;Jordan Lee Carter&quot; (Authority),
+re-tagging every note when vocabulary evolves (SKOS induction), canonical
+entity merge — and avoids retrieval rot at scale, the bottleneck Basic
+Memory users hit first.</li>
+<li><strong>Apache 2.0 with no paid tier</strong>, full feature parity OSS forever. <em>(Through 0.2.0; see the 2026-09-25 license note in section 7.)</em></li>
+<li><strong>Headless library + CLI posture</strong> so agent frameworks can embed Marginalia
+as a dependency. Basic Memory <em>is</em> the app; Marginalia is the substrate.</li>
+<li><strong>Selectable built-in vocabulary profiles</strong> (<code>core</code>, <code>research</code>, <code>personal</code>,
+<code>sdlc</code>) — fixed label/edge registries for common domains while the primitive
+and support-node schema remains closed. External manifest packs are not a
+production plug-in surface.</li>
+</ol>
+<p><strong>Anytype is the medium-term threat</strong> — their 2026 &quot;local agents using
+Anytype objects as memory&quot; roadmap targets a structurally similar outcome on
+a proprietary object store. Marginalia's survivable differentiator is
+markdown-canonical: when the tool dies, the knowledge doesn't.</p>
+<p><strong>Graphiti (Zep) is the closest agent-memory competitor</strong>, not the mere backend
+the early research framing assumed. By 2026 it has ~45k stars, ships its own MCP
+server and REST surface, and through Zep targets agent memory head-on. The
+distinction that still holds is trust-root: Graphiti is graph-canonical (Neo4j /
+FalkorDB / Kuzu as the source of truth, no markdown vault), so it structurally
+cannot serve the file-owned, local-first niche Marginalia is built for. Where it
+genuinely leads is temporality — a peer-reviewed bi-temporal model (valid-time
+vs transaction-time) that Marginalia tracks today only as transaction-time and
+carries as a v1 roadmap item. The differentiator stands; the gap is named.</p>
+<p>Pulse keeps its in-tree KG unchanged; once Marginalia is mature it can shed
+28 % of core and consume Marginalia. Upside, not adoption pitch.</p>
+<p>Design tenets (Ranganathan's Five Laws of Library Science, 1931, restated for
+a personal KG): books are for use → optimize ingest friction (<code>kg add</code>); every
+reader their book → retrieval latency target &lt;100 ms p50; save the time of the
+reader → no ceremony at write time; the library is a growing organism → schema
+growth without migration pain. Tenets, not schema.</p>
+<hr />
+<h2 id="RFC--3-conceptual-grounding-librarianship--ml">3. Conceptual grounding: librarianship + ML</h2>
+<p>Modern KGs frequently re-invent (badly) what cataloguers settled a century
+ago. Marginalia adopts these established ideas explicitly:</p>
+<p>This is the conceptual lineage, not a field-by-field API contract. References to <code>v0</code>,
+<code>v0.1</code>, or <code>v0.3</code> in the table are May 2026 design forecasts; section 4 and the dated ADR
+status addenda control what actually ships.</p>
+<table>
+<thead>
+<tr>
+<th>Idea (source)</th>
+<th>What it means</th>
+<th>How Marginalia uses it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PIM lineage</strong> (Bush 1945; Engelbart 1968; Nelson; Jones 2007 <em>Keeping Found Things Found</em>)</td>
+<td>Personal information management as a 70-year research thread.</td>
+<td>Marginalia is the local-first, ML-native heir to this tradition.</td>
+</tr>
+<tr>
+<td><strong>Faceted classification</strong> (Ranganathan; modern: Notion / Airtable / Obsidian Dataview)</td>
+<td>Orthogonal properties, not nested folders.</td>
+<td>Tags and typed properties are facets. A note can be <code>topic:LLM</code>, <code>person:JP</code>, <code>place:internal</code>, <code>time:2026Q2</code> simultaneously.</td>
+</tr>
+<tr>
+<td><strong>BIBFRAME 2.x Work / Instance / Item</strong> (LC, 2016; supersedes FRBR 1998 / IFLA-LRM 2017)</td>
+<td>Collapse the abstract idea, its embodiment, and the physical carrier.</td>
+<td>Single optional <code>same_work_as</code> edge between <code>Document</code> nodes + optional <code>work_id</code> slot (Wikidata QID). No class hierarchy; at N=1 even Instance is implicit.</td>
+</tr>
+<tr>
+<td><strong>Authority control</strong> (LC, VIAF; modern: Wikidata QID hub — Heftberger 2024, Lemus-Rojas 2023)</td>
+<td>Canonical record per entity; all variants resolve to it.</td>
+<td><code>Agent</code> nodes + aliases + external <code>Identifier</code> (QID, ORCID, DOI, ISBN). Embeddings propose merges; user/policy commits.</td>
+</tr>
+<tr>
+<td><strong>SKOS</strong> (W3C Rec, 2009-08-18)</td>
+<td><code>broader</code>, <code>narrower</code>, <code>related</code>, <code>exactMatch</code>, <code>closeMatch</code>, <code>altLabel</code>.</td>
+<td>First-class v0 edge types for <code>Concept</code> hierarchies. LLM-assisted induction from folksonomy in v0.1 (SC-Taxo, TaxoAdapt ACL 2025).</td>
+</tr>
+<tr>
+<td><strong>Dublin Core / DCMI Terms</strong> (1995, expanded)</td>
+<td>Minimal interoperable metadata vocabulary.</td>
+<td>Conceptual alignment only. The live <code>Document</code> model stores carrier identity (<code>uri</code>, media type, byte length, SHA-256, discovery time); markdown <code>title</code>/<code>tags</code> and other frontmatter live on the compatibility Item/facets path rather than typed DCMI fields.</td>
+</tr>
+<tr>
+<td><strong>PROV-O</strong> (W3C Rec, 2013)</td>
+<td>Provenance vocabulary: agent, activity, entity.</td>
+<td>Every Claim carries <code>prov:wasDerivedFrom</code> → <code>Block</code>, <code>prov:wasGeneratedBy</code> → <code>Activity</code> (extraction), <code>prov:wasAttributedTo</code> → <code>Agent</code>.</td>
+</tr>
+<tr>
+<td><strong>CIDOC-CRM E13 Attribute Assignment</strong> (ISO 21127)</td>
+<td>Event-centric model where a statement is itself an event.</td>
+<td><code>Annotation</code> borrows E13 shape (&quot;X asserted Y about Z at time T&quot;). We don't ship the CRM ontology.</td>
+</tr>
+<tr>
+<td><strong>Folksonomy</strong> (Vander Wal 2007; Trant 2009)</td>
+<td>User-applied tags outperform expert taxonomies for personal corpora at small N.</td>
+<td>Free-form tags are first-class v0; 30–70% of user tags fall outside any taxonomy. LLM promotes frequent tags to SKOS <code>Concept</code> nodes.</td>
+</tr>
+<tr>
+<td><strong>Personal Knowledge Graph research</strong> (Balog &amp; Kenter 2019; Chakraborty et al. 2022 survey)</td>
+<td>The PKG as a distinct sub-field of KG research.</td>
+<td>Marginalia is a PKG implementation and cites the literature explicitly.</td>
+</tr>
+<tr>
+<td><strong>Sowa Conceptual Graphs</strong> (1984)</td>
+<td>Typed nodes + typed edges as the foundational pattern.</td>
+<td>Direct ancestor of Marginalia's primitive/relation core.</td>
+</tr>
+<tr>
+<td><strong>schema.org / JSON-LD</strong> (2011–; W3C JSON-LD Rec 2014)</td>
+<td>The largest deployed structured-data vocabulary.</td>
+<td>Export target for <code>kg export --format jsonld</code> (reserved; no CLI subcommand yet — <code>Vault.export()</code> exists as a library method, <code>kg export</code> is not implemented); cheap interop with the open web.</td>
+</tr>
+<tr>
+<td><strong>Nanopublications</strong> (Mons et al.; Kuhn 2013-2024)</td>
+<td><code>{assertion + provenance + pub-info}</code> smallest publishable unit.</td>
+<td>Marginalia <code>Claim</code> mirrors the shape <em>without</em> trusty-URI signing (single-user vault; markdown + git is trust root). Signing is future product work.</td>
+</tr>
+<tr>
+<td><strong>W3C Web Annotation Data Model (oa:Annotation)</strong> (W3C Rec 2017)</td>
+<td>Standard structure for annotations with selectors.</td>
+<td>Marginalia <code>Annotation</code> aligns with oa selectors for surface-form occurrences.</td>
+</tr>
+</tbody>
+</table>
+<p>What modern processing power changes:</p>
+<ul>
+<li><strong>Embeddings collapse synonymy</strong> that authority control used to require human labor for.</li>
+<li><strong>LLMs do extraction at ingest</strong> (entities, relations, claims) that cataloguers did by hand.</li>
+<li><strong>Hybrid retrieval</strong> (BM25 + dense + graph traversal) supplants either-or debates.</li>
+<li><strong>Faceted ≠ free-for-all</strong>: type packs provide just enough structure for queryability.</li>
+</ul>
+<p>The thesis: <em>catalogue like a librarian, retrieve like a 2026 ML system.</em></p>
+<hr />
+<h2 id="RFC--4-architecture">4. Architecture</h2>
+<h3 id="RFC--41-layered-design">4.1 Layered design</h3>
+<pre><code class="language-text">┌─────────────────────────────────────────────────────────────────────┐
+│ Surfaces: Python Vault API · Click CLIs · FastMCP · REST · React UI │
+├─────────────────────────────────────────────────────────────────────┤
+│ Runtime: daemon lifecycle/auth · vault pool · config · job scheduler│
+├─────────────────────────────────────────────────────────────────────┤
+│ Services: ingest/extract · ledger · resolve/curate · retrieve/ask   │
+│           drift detection · rebuild/heal/reembed                    │
+├─────────────────────────────────────────────────────────────────────┤
+│ Knowledge: built-in packs · five primitives · support/provenance    │
+├─────────────────────────────────────────────────────────────────────┤
+│ Storage: InMemoryStore (tests) · LadybugStore (one graph per vault) │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>The Python API is synchronous. The server owns asynchronous scheduling, serialized writes,
+and MCP/HTTP transport. ADR 0014's <code>VaultPool</code> selects one vault per request; it is not a
+cross-vault query engine.</p>
+<h3 id="RFC--42-core-schema">4.2 Core schema</h3>
+<p><strong>Five primitives (closed structural set):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Standards alignment</th>
+<th>Covers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Agent</code></td>
+<td>PROV-O / CIDOC CRM / FOAF</td>
+<td>Humans, organizations, AI systems, roles</td>
+</tr>
+<tr>
+<td><code>Activity</code></td>
+<td>PROV-O / CIDOC CRM</td>
+<td>Meetings, events, decisions-as-acts, actions</td>
+</tr>
+<tr>
+<td><code>InformationObject</code></td>
+<td>CIDOC CRM / FRBR-LRM</td>
+<td>Documents, claims, requirements, notes</td>
+</tr>
+<tr>
+<td><code>Concept</code></td>
+<td>SKOS</td>
+<td>Topics, categories, controlled vocabulary</td>
+</tr>
+<tr>
+<td><code>Place</code></td>
+<td>CIDOC CRM / Schema.org</td>
+<td>Locations</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Six support node types:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Document</code></td>
+<td>File/URL/message carrier and durable source identity.</td>
+</tr>
+<tr>
+<td><code>Identifier</code></td>
+<td>Typed external identifiers such as QID, ORCID, DOI, ISBN, email, and domain.</td>
+</tr>
+<tr>
+<td><code>Annotation</code></td>
+<td>A surface occurrence anchored to source content.</td>
+</tr>
+<tr>
+<td><code>Claim</code></td>
+<td>One S-P-O assertion with provenance anchors.</td>
+</tr>
+<tr>
+<td><code>Block</code></td>
+<td>Stored byte-anchored source unit.</td>
+</tr>
+<tr>
+<td><code>Finding</code></td>
+<td>Deterministic detector result value with evidence, severity, and status.</td>
+</tr>
+</tbody>
+</table>
+<p><code>SourceSpan</code> also ships as a frozen value object on Claims and Annotations; it is not a
+seventh graph node type. Legacy compatibility classes remain exported separately from this
+closed primitive/support model.</p>
+<p>The live pack path resolves the built-in <code>core</code>, <code>research</code>, <code>sdlc</code>, and <code>personal</code>
+registries named by vault configuration. Unknown pack names fail. The May 2026 external
+manifest/<code>kind_of</code> composition sketch did not become a production plug-in interface, and
+the legacy manifest validator is not on the ingest, CLI, or server path. Primitive closure
+is therefore structural: adding a primitive requires a reviewed Python code change; a data
+pack cannot add one at runtime.</p>
+<h3 id="RFC--43-atomic-provenance-unit">4.3 Atomic provenance unit</h3>
+<p>A <code>Claim</code> is the smallest meaningful assertion:</p>
+<pre><code class="language-text">Claim(S, P, exactly one of O_id or O_literal)
+  ├─ wasDerivedFrom → Block
+  ├─ wasGeneratedBy → ExtractionActivity
+  └─ wasAttributedTo → Agent
+</code></pre>
+<p>Every Claim carries the three provenance identifiers, confidence, and optional model/prompt
+metadata. Its optional <code>SourceSpan</code> records a vault-relative source path, byte start/end,
+and content hash while the stored <code>Block</code> remains the canonical graph anchor. ADR 0003's
+future Block-removal cut has not been accepted or implemented.</p>
+<p>Claim identities are deterministic on the path that creates them. Deterministic markdown
+claims include the Block content hash; resolved extracted relationships use stable semantic
+S-P-O identity. Incremental ingest validates byte slices against their content hashes,
+re-anchors changed content, and records supersedence rather than silently discarding history.</p>
+<p><code>Vault.export()</code> serializes JSON-LD or JSON-LD-star and preserves provenance. Trusty-URI
+and nanopublication signing remain future product ideas.</p>
+<h3 id="RFC--44-storage-layout-and-vault-isolation">4.4 Storage layout and vault isolation</h3>
+<pre><code class="language-text">~/.marginalia/
+├── marginalia.toml
+├── env
+└── vaults/
+    └── &lt;name&gt;/
+        ├── marginalia.yaml
+        ├── graph.lbug (+ checkpoint/WAL sidecars)
+        ├── notes/
+        ├── refs/
+        └── .marginalia/
+            ├── sources/
+            ├── candidate-ledger.jsonl
+            └── queue, curation, and maintenance sidecars
+</code></pre>
+<p>Markdown and durable source copies are the trust root; the graph is derived. <code>kg rebuild</code>
+builds a fresh graph and swaps it into place atomically. One application daemon owns a lazy,
+immutable runtime per registered vault. Browser tabs, CLI calls, and MCP requests select a
+runtime explicitly; each runtime owns its queues, jobs, locks, and sidecars, while <code>VaultPool</code>
+leases the matching Ladybug handle for the operation. This is request routing, not cross-vault
+query fanout. No <code>MultiVault</code>, authority-overlay, or catalog-federation API has shipped.</p>
+<p>Right-to-erasure is available in the application for idle vaults that Marginalia created and
+marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
+symlink/path safety, fences new leases, drains existing work, releases the owned handle, and
+removes only the confirmed vault directory. External, legacy, busy, or unowned vaults are never
+deletable through this flow. Installers and updaters preserve every vault directory.</p>
+<h3 id="RFC--45-provider-embedding-and-dependency-stack">4.5 Provider, embedding, and dependency stack</h3>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Shipped default</th>
+<th>Optional alternatives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Embeddings</td>
+<td><code>fastembed</code> with <code>BAAI/bge-small-en-v1.5</code>, 384 dimensions</td>
+<td>OpenAI-compatible external embeddings or Sentence Transformers</td>
+</tr>
+<tr>
+<td>LLM pipeline</td>
+<td>Per-step <code>llm.defaults</code> plus extraction/judge/curator/relation-curator/ask overrides; loopback OpenAI-compatible preset</td>
+<td>LiteLLM providers, Bedrock, Anthropic, hosted OpenAI-compatible endpoints, pi CLI, Codex CLI</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>In-memory for tests; Ladybug for persisted vaults</td>
+<td>One Ladybug graph per vault</td>
+</tr>
+<tr>
+<td>Server</td>
+<td>Starlette/Uvicorn plus FastMCP</td>
+<td>API-only library/CLI use without server extras</td>
+</tr>
+</tbody>
+</table>
+<p>The base wheel declares only the direct core closure. In v0.0.41, the public <code>serve</code> extra composes
+the full application boundary from Ladybug,
+FastMCP/Starlette/Uvicorn, FastEmbed, and NumPy. Lower-level
+optional paths remain explicit extras: <code>ladybug</code>, <code>jsonld</code> (RDFLib), <code>embeddings</code>,
+<code>litellm</code>, <code>bedrock</code>, <code>sentence-transformers</code>, and <code>dev</code>. The source-development lock remains
+exact, while wheel metadata uses compatibility bounds. The release gate executes the base wheel,
+both equivalent <code>serve</code>/<code>mcp</code> live server installs, JSON-LD export, and lower-level runtime extras
+independently so a combined environment cannot hide a missing direct dependency.</p>
+<p>The <code>0.0.41</code> wheel is 784,817 bytes. Its warmed clean-install footprint measured 362,987,647 bytes;
+model-server weights are external and
+are not bundled into the wheel. Embedding width is recorded in graph metadata and
+<code>kg reembed</code> performs a vectors-only fresh-graph swap after model/dimension changes.</p>
+<p>Provider configuration is owned by <code>marginalia onboard</code> and the validated Config API. LLM and
+embedding single-key providers share one managed credential endpoint; POSIX stores values in an
+owner-only file and Windows stores CurrentUser-DPAPI envelopes. YAML stores only generated
+<code>MARGINALIA_*</code> environment-variable names, not secrets. Remote model egress is explicit; the
+server itself remains loopback-only, with SSH tunnelling as the
+supported remote-access path.</p>
+<p><strong>Historical design disposition.</strong> The original GLiNER + Qwen3-4B/Ollama two-stage
+pipeline, bundled-model estimate, <code>embedding_epoch</code>/old-vector coexistence, <code>kg reindex</code>, and per-call egress-log proposal were not the architecture that shipped.
+Extraction is single-stage LLM propose/resolve, GLiNER is not in the production call
+chain, and model changes use explicit <code>kg reembed</code>.
+See <a href="adr/0001-rejected-models.md">ADR 0001 — Rejected Models</a> for the historical
+model-selection record.</p>
+<h3 id="RFC--46-surface-apis">4.6 Surface APIs</h3>
+<p><strong>Python library (synchronous):</strong></p>
+<pre><code class="language-python">from marginalia import Vault
+
+vault = Vault.open(&quot;~/.marginalia/vaults/demo&quot;)
+document = vault.add(&quot;~/.marginalia/vaults/demo/notes/idea.md&quot;)
+hits = vault.query(&quot;what did the team decide about pricing?&quot;, k=5)
+jsonld = vault.export(format=&quot;jsonld&quot;)  # requires marginalia[jsonld]
+vault.close()
+</code></pre>
+<p><code>Vault.export()</code> supports <code>jsonld</code> and <code>jsonld-star</code>. It is a library method, not a
+<code>kg export</code> subcommand. <code>MultiVault</code> has not shipped.</p>
+<p><strong>CLI:</strong> <code>marginalia</code> is the primary entrypoint. <code>kg</code> is a compatibility entrypoint that
+flattens graph-maintenance commands at its top level.</p>
+<pre><code class="language-console">marginalia onboard
+marginalia serve
+marginalia add notes/idea.md
+marginalia query &quot;what did the team decide about pricing?&quot; --k 10
+marginalia ask &quot;what did the team decide about pricing?&quot;
+marginalia kg rebuild [VAULT]
+marginalia kg reembed [VAULT]
+marginalia kg reconcile --help
+kg rebuild [VAULT]
+kg reembed [VAULT]
+kg reconcile --help
+</code></pre>
+<p>Other primary commands cover vault management, status/stop, UI, folder watching, pilot,
+model inspection, and drift detection. <code>add</code>, <code>query</code>, <code>ask</code>, and most operational commands
+are thin clients of the running server. There is no public <code>cypher</code>, <code>snapshot</code>, or
+<code>drift-report</code> command.</p>
+<p><strong>MCP:</strong> <code>marginalia serve</code> registers exactly five tools:</p>
+<ul>
+<li><code>ask(question, k=20, hops=1, ...)</code> — grounded prose plus citations.</li>
+<li><code>explore(topic, node_id, hops=1, k=12)</code> — structured graph traversal.</li>
+<li><code>remember(source, sensitivity=&quot;default&quot;)</code> — durable ingest and curation.</li>
+<li><code>list_vaults()</code> — the vault NAMES this server can reach, with <code>current</code> and <code>backend</code>;
+names only, never paths or ids (ADR 0043 D2).</li>
+<li><code>init_vault(name, packs=&quot;core&quot;)</code> — create and pool a named vault.</li>
+</ul>
+<p>The same server provides the production <code>/api/v1/*</code> REST surface and serves the compiled
+React application. API writes remain loopback-only; remote use is through a local tunnel.</p>
+<h3 id="RFC--47-ingest-pipeline">4.7 Ingest pipeline</h3>
+<pre><code class="language-text">file or durable raw-text source
+  → loader and byte-anchored Block/SourceSpan windows
+  → LLM extraction with structured validation
+  → durable candidate ledger
+  → entity resolution, deduplication, and curation
+  → fail-closed quality gate and commit plan
+  → Ladybug atomic commit
+  → incremental watch and scheduled maintenance
+</code></pre>
+<p>The production path is LLM propose/resolve; there is no GLiNER pre-pass. Candidate state is
+durable before graph mutation, and retries are idempotent. Markdown and copied source files
+remain the recoverable trust root. Rebuild, heal, re-embed, rollback, and curation operations
+preserve the fresh-graph/atomic-swap safety boundary.</p>
+<hr />
+<h2 id="RFC--5-anomaly-and-drift-detection">5. Anomaly and drift detection</h2>
+<p>The shipped detector registry is a closed set of three deterministic checks:</p>
+<table>
+<thead>
+<tr>
+<th>Detector</th>
+<th>Current behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>commitment_temporal_shacl</code></td>
+<td>Finds overdue commitment documents without referenced closure evidence. Despite the retained identifier, this is frontmatter/date logic, not a pySHACL engine.</td>
+</tr>
+<tr>
+<td><code>supersedence_stale_head</code></td>
+<td>Finds a decision marked as a non-head when another document supersedes its decision ID.</td>
+</tr>
+<tr>
+<td><code>authority_alias_collision</code></td>
+<td>Finds an authority alias whose agent name collides with a primary authority.</td>
+</tr>
+</tbody>
+</table>
+<p>Each detector reads the runtime bound to its request or scheduled job and returns <code>Finding</code> values. A finding has a
+stable ID, detector kind, <code>info|warn|error</code> severity, <code>open|acknowledged|resolved</code>
+status, at least one evidence Block/Document ID, a message, and a detection timestamp.
+The shipped detectors currently emit open warnings; the drift endpoint serializes them
+but does not persist graph nodes.</p>
+<p>Detection is available through <code>marginalia detect-drift</code>, the
+<code>POST /api/v1/detect-drift</code> and compatibility <code>POST /detect-drift</code> routes, and the
+scheduled curation job. The CLI accepts <code>on-query</code>, <code>on-ingest</code>, and <code>background</code>
+mode labels for compatibility; the server runs the configured closed detector set and
+reports a <code>drift.v1</code> envelope.</p>
+<p>There is no pySHACL dependency, contradiction <code>Finding</code> detector, versioned
+<code>snapshot</code>/<code>drift-report</code> command, <code>list-findings</code> command, or MCP findings tool.
+Contradiction matching elsewhere in reconciliation produces correlation candidates,
+not drift findings. Those ideas remain possible future product work, not release gates.</p>
+<hr />
+<h2 id="RFC--6-historical-v0-exclusions-and-current-disposition">6. Historical v0 exclusions and current disposition</h2>
+<p>The original list in this section described the May 2026 scaffold boundary. It is not a
+current limitation list. LLM extraction, durable consolidation/curation, on-ingest and
+background maintenance, REST, and the compiled Web UI all shipped after that baseline. ADR 0034
+subsequently replaced browser-token authentication with a direct-loopback local-application
+boundary and immutable per-vault runtimes.</p>
+<p>The following boundaries are still real:</p>
+<ul>
+<li>Markdown/<code>.markdown</code>/text ingest ships; native PDF, HTML, and email loaders do not.</li>
+<li>Markdown and copied sources feed the graph; two-way graph-to-markdown synchronization
+does not ship.</li>
+<li>Per-connection vault selection ships, but cross-vault query fanout, cross-vault writes,
+<code>MultiVault</code>, an authority-overlay vault, and catalog federation do not.</li>
+<li>The direct-loopback REST/UI application has strict Host and write-origin checks but no browser
+credential or session cookie. FastMCP keeps an application-scoped bearer token on its separate
+port. Neither surface is a shared, multi-user vault service.</li>
+<li>JSON-LD and JSON-LD-star export ship; trusty-URI and nanopublication signing do not.</li>
+<li>Pulse migration remains a separate future RFC.</li>
+</ul>
+<p>These are future product boundaries, not unfinished <code>0.0.40</code> release work.</p>
+<hr />
+<h2 id="RFC--7-naming-licensing-repository-and-distribution">7. Naming, licensing, repository, and distribution</h2>
+<blockquote>
+<p><strong>License note (2026-09-25):</strong> releases up to 0.2.0 (published as Marginalia) are
+Apache-2.0, and that grant stays in force for them. From 0.3.0 Okto Neuron is licensed under
+the Elastic License 2.0 with the Okto Labs SaaS, Competing Service, Internal Use, and Branding
+addendum (see <code>LICENSE</code>). The Apache-2.0 statements below describe the original decision and are
+kept as written.</p>
+</blockquote>
+<ul>
+<li><strong>Name and package:</strong> the product and wheel are <code>marginalia</code>. An unrelated project owns
+the PyPI name, so the supported public channel is not PyPI.</li>
+<li><strong>License:</strong> Apache-2.0.</li>
+<li><strong>Source repository:</strong> <code>OktoLabsAI/marginalia</code> is private.</li>
+<li><strong>Public distribution:</strong> <code>OktoLabsAI/marginalia-dist</code> is public and carries the
+installer, exact wheel, evidence, and GitHub release.</li>
+<li><strong>Storage dependency:</strong> Ladybug is deliberately optional behind
+<code>marginalia[ladybug]</code> and bounded to <code>&gt;=0.16,&lt;0.17</code>. Tests and the clean-wheel
+matrix validate extras independently.</li>
+<li><strong>Current release (as written):</strong> <code>v0.0.41</code> was then the public corrective prerelease; it is
+permanently non-promotable, as is <code>v0.0.40</code>. Current per-version status is in <code>docs/roadmap.json</code>.</li>
+</ul>
+<hr />
+<h2 id="RFC--8-roadmap-disposition">8. Roadmap disposition</h2>
+<table>
+<thead>
+<tr>
+<th>Milestone</th>
+<th>Current status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>v0.0.1</code> scaffold</td>
+<td>Historical and complete: closed primitives, support schema, in-memory path, initial CLI/MCP, tests, and RFC.</td>
+</tr>
+<tr>
+<td><code>v0.0.37</code> north-star quality</td>
+<td>Complete: extraction/resolve improvements lifted measured extraction recall to 82.3%, and the efficient-hybrid evaluation reached answer parity at 6.24x fewer context tokens.</td>
+</tr>
+<tr>
+<td><code>v0.0.40</code> immutable prerelease record</td>
+<td>Publishing, installer transaction lifecycle, public dist rebake, raw-URL validation, and Linux Docker+tmux evidence are complete and retained for that exact artifact. Later feature-boundary testing invalidated promotion: the recommended server extra is incomplete and dormant legacy MCP code bypasses the production security contract. Keep it prerelease permanently.</td>
+</tr>
+<tr>
+<td><code>v0.0.41</code> immutable prerelease record</td>
+<td><code>[serve]</code> closes the dependency boundary, legacy MCP construction fails closed, the dormant GLiNER path and personalized resources are removed, and the compatibility changes are recorded. Exact source, wheel, distribution, and Linux gates are green. Native Windows testing exposed three daemon-ownership defects in the immutable wheel, so it must never be promoted.</td>
+</tr>
+<tr>
+<td><code>v0.0.42</code> authorized successor</td>
+<td>Assigned source contains the Windows daemon and keyless private-LAN repairs. Publication requires a complete exact-source, artifact, distribution, Linux, and native Windows rerun.</td>
+</tr>
+<tr>
+<td>Future product work</td>
+<td>Tracked in <a href="roadmap.json"><code>docs/roadmap.json</code></a>. Product backlog remains separate from release blockers.</td>
+</tr>
+</tbody>
+</table>
+<p>The original <code>v0.1.0</code>/<code>v0.2.0</code>/<code>v0.3.0</code> forecasts were planning hypotheses, not
+the release history. Implemented features moved on the <code>0.0.x</code> line; unimplemented ideas
+were reclassified into the live product roadmap instead of remaining implicit RFC tasks.</p>
+<hr />
+<h2 id="RFC--9-resolved-decisions-and-future-product-questions">9. Resolved decisions and future product questions</h2>
+<p>Resolved in the implementation:</p>
+<ol>
+<li>FastEmbed <code>BAAI/bge-small-en-v1.5</code>, 384 dimensions, is the default embedding path.</li>
+<li>The CLIs use Click.</li>
+<li>The runtime MCP surface uses FastMCP and intentionally exposes five tools.</li>
+<li>Core/research/personal/sdlc packs ship built in.</li>
+<li>Ladybug remains the persisted property-graph store; in-memory storage supports tests.</li>
+<li><code>Vault.export()</code> supports both JSON-LD and JSON-LD-star behind the <code>jsonld</code> extra.</li>
+<li>Claim provenance is byte-anchored; <code>Block</code> remains stored while <code>SourceSpan</code> is
+populated on Claims.</li>
+</ol>
+<p>Still-open product questions:</p>
+<ol>
+<li>Whether vault scale ever justifies a <code>MultiVault</code> fanout/catalog layer.</li>
+<li>Whether the final provenance model should remove stored Blocks in favor of spans only.</li>
+<li>Whether to add nanopublication/trusty-URI signing.</li>
+<li>Whether to add bitemporal semantics and contradiction findings.</li>
+<li>Whether a future package registry channel is worth pursuing alongside GitHub Releases.</li>
+</ol>
+<p>None of these product questions caused the release block. The separately documented artifact
+dependency/security defects make <code>0.0.40</code> ineligible for promotion.</p>
+<hr />
+<h2 id="RFC--10-decision-record">10. Decision record</h2>
+<p>Adopted from advisor input, research-lab v1 + v2 rounds, and user direction (2026-05-19):
+the original intent is preserved below, with 2026-07-13 implementation amendments where
+the shipped architecture diverged.</p>
+<ul>
+<li><strong>DEC-001:</strong> Green-field, defer Pulse migration. <em>Why:</em> lets v0 ship without destabilizing Pulse.</li>
+<li><strong>DEC-002 (historical design, amended 2026-07-13):</strong> Two-layer schema
+(5 primitives plus domain vocabulary profiles). <em>Why:</em> a labels-filed-off Pulse
+schema fails the personal-knowledge use case; a closed primitive set keeps
+cross-domain interop precise. <strong>Implementation amendment:</strong> production loads only
+the fixed built-in <code>core</code>/<code>research</code>/<code>personal</code>/<code>sdlc</code> registries. The external
+manifest/<code>kind_of</code>/<code>extends</code> composition sketch is not a runtime plug-in interface.</li>
+<li><strong>DEC-003:</strong> Markdown tree is canonical, graph is derived. <em>Why:</em> survival of knowledge beyond the tool.</li>
+<li><strong>DEC-004:</strong> Sync core API, async MCP wrapper. <em>Why:</em> CLI users shouldn't need <code>asyncio.run</code>.</li>
+<li><strong>DEC-005 (historical design, amended 2026-07-13):</strong> Local-first default
+(<code>bge-small</code> + GLiNER + Qwen3-4B); API opt-in per step per corpus. <em>Why:</em>
+consulting-grade confidentiality posture. <strong>Implementation amendment:</strong> the local-first
+and explicit-egress principles stand, but GLiNER is not in the production extraction
+chain. <code>marginalia onboard</code> configures provider/model choices, including a loopback
+OpenAI-compatible preset, and per-step overrides own remote-provider selection.</li>
+<li><strong>DEC-006:</strong> Apache 2.0. <em>Why:</em> matches ecosystem; permits any use. <em>Superseded 2026-09-25 for 0.3.0 and later by ELv2 plus the Okto Labs addendum; 0.2.0 and earlier remain Apache-2.0.</em></li>
+<li><strong>DEC-007:</strong> Librarianship as conceptual spine — specifically Authority control (Entity/Identifier split via <code>Agent</code>+<code>Identifier</code>), SKOS edge vocabulary, Dublin Core item metadata, Folksonomy-first tagging, and PROV-O provenance. FRBR/BIBFRAME/Topic Maps/CIDOC-CRM inform but are not instantiated in v0.</li>
+<li><strong>DEC-008 (v2):</strong> Five-primitive closed core (<code>Agent</code>, <code>Activity</code>, <code>InformationObject</code>, <code>Concept</code>, <code>Place</code>). <em>Why:</em> drawn from PROV-O + CIDOC-CRM + SKOS convergence; small enough to memorize, expressive enough for the pilot mappings; closure prevents schema sprawl.</li>
+<li><strong>DEC-009 (v2):</strong> <code>Claim</code> is the atomic unit of provenance, anchored to <code>Block</code> via PROV-O edges; RDF-star on wire. <em>Why:</em> principled smallest meaningful unit (per user requirement); nanopublication shape without v0 signing cost.</li>
+<li><strong>DEC-010 (v2 design, partially implemented):</strong> One Ladybug graph per client plus
+opt-in <code>MultiVault</code> read-only fan-out. <em>Why:</em> satisfy N1 confidentiality through
+independent fences. <strong>Implementation amendment:</strong> one Ladybug graph and immutable
+runtime per vault ship, with client-scoped selection across browser, CLI, and MCP;
+<code>MultiVault</code> fanout does not. Guarded managed-vault deletion provides right-to-erasure
+without requiring daemon shutdown or exposing external vaults to deletion.
+<strong>Addendum — 2026-09-04:</strong> ADR 0041 (proposed) makes the graph engine a per-vault
+connector, chosen once at creation and recorded in <code>marginalia.yaml</code>, rather than a
+single hardwired implementation. Ladybug stays the default and the shipped one-<code>.lbug</code>
+-per-vault shape is unchanged; Okto Grafx and Neo4j are additional selectable
+implementations of the same <code>GraphStore</code> protocol, and AWS Neptune is a stretch backend
+behind the same seam. The Markdown vault remains the sole trust root regardless of
+engine — a selectable backend does not make Marginalia graph-canonical the way Graphiti
+is (see the Graphiti/Neo4j distinction above); rebuild-from-vault stays the recovery
+path, not a mechanism for changing backends. See ADR 0041.
+<strong>Addendum — 2026-09-07:</strong> retrieval moved behind a separate <code>IndexStore</code> port;
+the graph node embedding is the durable copy and the index is a rebuildable cache
+with a content stamp; scoring is pinned by <code>tests/store/contract</code>; ADR 0041 owns the
+backend-selection design.</li>
+</ul>
+</article>
+<footer>Rendered from <span class="mono">RFC.md</span> · re-run <span class="mono">docs/build_knowledge_base.py</span> to refresh.</footer>
+</main>
+<script>
+const prog=document.getElementById('navprog');
+addEventListener('scroll',()=>{const h=document.documentElement;
+prog.style.width=(h.scrollTop/(h.scrollHeight-h.clientHeight)*100)+'%';},{passive:true});
+</script>
+</body></html>

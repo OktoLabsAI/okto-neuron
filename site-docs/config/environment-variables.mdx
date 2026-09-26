@@ -1,0 +1,311 @@
+---
+title: Environment variables
+description: Every OKTO_NEURON_* variable the product reads, what it overrides, and which ones are internal.
+---
+
+<Note>
+Okto Neuron is prerelease. Variable names and behavior here describe the current
+source and can change between versions.
+</Note>
+
+Okto Neuron reads environment variables in two separate namespaces:
+
+- **Runtime variables**, read by the Python package under `src/okto_neuron`. These are the ones listed in the tables below.
+- **Installer variables**, read by `install.sh` during installation. Apart from `OKTO_NEURON_VAULT`, they are not read by the running process. See [/reference/installer](/reference/installer).
+
+One name lives in both namespaces with different meanings. `OKTO_NEURON_VAULT`
+is a vault *name* to preseed at install time, and a vault
+*reference* resolved at runtime (`src/okto_neuron/vault_registry.py:149`).
+
+`OKTO_NEURON_LLM_API_KEY_ENV` bridges the two: the installer passes its value to
+`okto-neuron onboard --api-key-env`, so the value must
+be the *name* of a runtime variable, not a key.
+
+## Runtime variables
+
+<Warning>
+Setting `OKTO_NEURON_LOG_LEVEL=DEBUG` raises the log level, and the LiteLLM
+path logs the full prompt (`src/okto_neuron/llm/__init__.py:1730-1732`) and the
+raw completion (`src/okto_neuron/llm/__init__.py:1790`) at debug level. Anything
+from your documents that reaches a prompt can land in the log
+(`src/okto_neuron/server/lifecycle.py:617-619`). See [/server/status-and-logs](/server/status-and-logs).
+</Warning>
+
+| Variable | What it does |
+| --- | --- |
+| `OKTO_NEURON_ENV_FILE` | Overrides the path of the generated env file. Read from the process environment only. |
+| `OKTO_NEURON_CONFIG` | Adds a candidate path for `okto-neuron.toml`. |
+| `OKTO_NEURON_VAULT` | Vault reference used when no vault is given explicitly. |
+| `OKTO_NEURON_ENDPOINT` | Server URL the CLI client talks to. |
+| `OKTO_NEURON_AUTH_TOKEN` | Legacy REST compatibility token. See the caveat below. |
+| `OKTO_NEURON_LOG_LEVEL` | Overrides the server log level, uppercased and stripped. |
+| `OKTO_NEURON_INCREMENTAL_INGEST` | Two-way override of incremental ingest. |
+| `OKTO_NEURON_SUBCHUNK_INGEST` | Two-way override of subchunk ingest. |
+| `OKTO_NEURON_LLM_REQUEST_TIMEOUT` | Request deadline for legacy inline LLM connections, in seconds. |
+| `OKTO_NEURON_CLAUDE_CLI_TIMEOUT` | Per-call timeout for the Claude CLI provider. Default `300.0`. |
+| `OKTO_NEURON_CODEX_CLI_TIMEOUT` | Per-call timeout for the Codex CLI provider. Default `300.0`. |
+| `OKTO_NEURON_PI_CLI_TIMEOUT` | Per-call timeout for the pi CLI provider. Default `300.0`. |
+| `OKTO_NEURON_PACK_PATH` | Extra search paths for type packs, separated by the platform path separator. |
+| `OKTO_NEURON_OLLAMA_BACKEND` | Forces the Ollama backend choice instead of auto-detection. |
+
+### Config and vault selection
+
+`OKTO_NEURON_CONFIG` appends a candidate to the config search list, ahead of the
+default path. A candidate that does not exist is skipped, though an `OSError`
+while checking it raises `ConfigParseError`
+(`src/okto_neuron/config/_app_config.py:123-140`, `:138-140`). When no config
+file exists anywhere in the search list, `OKTO_NEURON_CONFIG` also decides where
+a new `okto-neuron.toml` is written
+(`src/okto_neuron/vault_registry.py:435-442`). The full search order is
+documented once, on [/config/overview](/config/overview).
+
+When no vault reference is passed, `OKTO_NEURON_VAULT` is consulted first, ahead
+of the configured default vault and ahead of the current directory
+(`src/okto_neuron/vault_registry.py:148-150`).
+
+### Endpoint and token
+
+`OKTO_NEURON_ENDPOINT` sits between the `--endpoint` flag and the built-in default
+(`src/okto_neuron/cli/_client.py:17`, `:48-55`). The full order and the default value are on
+[/reference/cli/overview](/reference/cli/overview); the reasoning is on
+[/concepts/thin-client](/concepts/thin-client).
+
+<Warning>
+`OKTO_NEURON_AUTH_TOKEN` is a legacy REST compatibility path. `resolve_auth_token` reads it
+and `auth_headers` turns it into a bearer header
+(`src/okto_neuron/cli/_client.py:58-86`), but `auth_headers` has no caller
+anywhere in `src/okto_neuron`, so no CLI command sends the token. Ordinary REST
+is credential-free by design under ADR 0034
+(`src/okto_neuron/cli/_client.py:66-68`). Do not treat this variable as
+authentication for CLI calls.
+</Warning>
+
+### Ingest overrides
+
+`OKTO_NEURON_INCREMENTAL_INGEST` and `OKTO_NEURON_SUBCHUNK_INGEST` are two-way. The
+value is stripped and lowercased, then matched against a truthy set of `1`,
+`true`, `yes`, `on` and a falsy set of `0`, `false`, `no`, `off`. A truthy value
+forces the behavior on, a falsy value forces it off, and unset or unrecognized
+values defer to the vault config
+(`src/okto_neuron/companion/_incremental.py:56-70`).
+
+### Timeouts
+
+<Warning>
+None of the timeout variables apply to a connection that already carries a
+request policy. `OKTO_NEURON_LLM_REQUEST_TIMEOUT` is read only when the resolved
+connection has `request_timeout_s` set to `None` *and* no `provider_ref`
+(`src/okto_neuron/llm/__init__.py:1408-1410`). The three CLI-provider timeouts
+follow the same rule (`src/okto_neuron/llm/_cli_provider.py:142-144`).
+</Warning>
+
+For `OKTO_NEURON_LLM_REQUEST_TIMEOUT`, a value that does not parse as a float,
+or that parses to zero or a negative number, is ignored with a logged warning
+(`src/okto_neuron/llm/__init__.py:1411-1426`).
+
+For the CLI providers, an unparseable value falls back to the provider default
+of `300.0` seconds, and an unset variable does the same
+(`src/okto_neuron/llm/_cli_provider.py:144-148`). The variable names and defaults
+are declared per provider: `OKTO_NEURON_CLAUDE_CLI_TIMEOUT`
+(`src/okto_neuron/llm/_claude_cli.py:68-69`), `OKTO_NEURON_CODEX_CLI_TIMEOUT`
+(`src/okto_neuron/llm/_codex_cli.py:64-65`) and `OKTO_NEURON_PI_CLI_TIMEOUT`
+(`src/okto_neuron/llm/_pi_cli.py:75-76`).
+
+### Packs and model backend
+
+`OKTO_NEURON_PACK_PATH` is split on `os.pathsep` and each non-empty entry becomes
+a pack search root. It is consulted after the explicit path and the configured
+search paths, and before the built-in packs
+(`src/okto_neuron/core/schema/loader.py:150-167`).
+
+`OKTO_NEURON_OLLAMA_BACKEND` is stripped and lowercased, and is read before the
+config value in `detect_backend` (`src/okto_neuron/models/runtime.py:59-70`).
+
+## The generated env file
+
+Okto Neuron keeps managed provider credentials in a generated file at
+`~/.okto-neuron/env`. The directory comes from `default_app_home()`
+(`src/okto_neuron/config/_app_config.py:20-22`) and the file name is `env`
+(`src/okto_neuron/onboarding.py:35`). Setting `OKTO_NEURON_ENV_FILE` in the
+process environment overrides the whole path, expanded and resolved
+(`src/okto_neuron/onboarding.py:296-302`).
+
+<Warning>
+`OKTO_NEURON_ENV_FILE` cannot be set inside the env file. The path is resolved
+from `os.environ` before the file is opened
+(`src/okto_neuron/onboarding.py:299`).
+</Warning>
+
+`load_user_env_file()` runs as the first statement of both CLI group callbacks,
+the main `app` group (`src/okto_neuron/cli/__init__.py:106`) and the `kg_cli`
+compatibility group (`src/okto_neuron/cli/__init__.py:120`).
+
+### Parsing rules
+
+The file is read as UTF-8 and split into lines. A missing file or an `OSError`
+returns without doing anything (`src/okto_neuron/onboarding.py:482-485`). Each
+line is then handled as follows
+(`src/okto_neuron/onboarding.py:488-507`):
+
+<Steps>
+<Step title="Strip and skip">
+The line is stripped. Blank lines and lines starting with `#` are skipped.
+</Step>
+<Step title="Drop a leading export">
+A leading `export ` is removed and the remainder stripped again.
+</Step>
+<Step title="Split on the first =">
+A line with no `=` is skipped. Otherwise the line splits on the first `=` into a
+name and a value, and the name is stripped.
+</Step>
+<Step title="Filter the name">
+A name that does not start with `OKTO_NEURON_` is skipped. A name already present
+in `os.environ` is skipped. The name is then checked against
+`^OKTO_NEURON_[A-Z0-9_]+$` (`src/okto_neuron/config/_vault.py:471`, `:673-683`);
+a name that fails the pattern raises and the line is skipped.
+</Step>
+<Step title="Parse the value">
+The value goes through `shlex.split(value, comments=False, posix=True)` and only
+`parsed[0]` is kept. An empty result becomes the empty string. The result then
+passes through `_decode_stored_secret`, and the variable is set in `os.environ`.
+</Step>
+</Steps>
+
+<Warning>
+The env file is never sourced or executed. There is no shell expansion, no
+command substitution, and no variable interpolation. Because only `parsed[0]`
+survives `shlex.split`, a value that splits into more than one word keeps only
+its first word (`src/okto_neuron/onboarding.py:502-503`).
+</Warning>
+
+Two more consequences of the code above:
+
+- A value in the file never overrides a variable already present in the process environment (`src/okto_neuron/onboarding.py:498`).
+- Every failure is swallowed. Malformed lines, wrongly named lines, names that fail the pattern, and `OSError`/`ValueError` from decoding all hit a bare `continue` with no message on stdout, stderr or the log (`src/okto_neuron/onboarding.py:499-506`).
+
+<Warning>
+The env file holds managed Okto Neuron credentials only. The
+`^OKTO_NEURON_[A-Z0-9_]+$` check exists so a config write cannot point an API key
+at an arbitrary environment variable (`src/okto_neuron/config/_vault.py:673-683`).
+Do not use it as a general secrets file.
+</Warning>
+
+<Note>
+A stored value carrying the `dpapi-v1:` envelope fails to decode on this
+platform: `_decode_stored_secret` raises `OSError` whenever
+`os.name != "nt"` (`src/okto_neuron/onboarding.py:454-470`, `:342-345`). The bare
+`continue` in the loader catches it, so the variable is silently not set.
+</Note>
+
+### Who writes it
+
+`write_user_env_secret` persists one key at a time with owner-only permissions
+and also sets the variable in the current process
+(`src/okto_neuron/onboarding.py:509-566`). It is called from:
+
+- `okto-neuron onboard`, only after the pre-save verify succeeds, so a failed verify leaves nothing behind (`src/okto_neuron/cli/__init__.py:1436-1439`).
+- Three server HTTP paths: a provider credential write (`src/okto_neuron/server/http.py:4260`), a credential create (`src/okto_neuron/server/http.py:4366`) and a credential update (`src/okto_neuron/server/http.py:4416`).
+
+`delete_user_env_secret` rewrites the file without the named entry and removes
+the variable from the process when the file is missing
+(`src/okto_neuron/onboarding.py:569-590`).
+
+## Generated credential variable names
+
+You do not choose these names by hand; onboarding and the provider registry
+generate them.
+
+| Shape | Where it comes from |
+| --- | --- |
+| `OKTO_NEURON_CREDENTIAL_<ID>` | `ProviderRegistry.add_credential`, from the credential slug uppercased with `-` replaced by `_` (`src/okto_neuron/providers.py:376-377`). |
+| `OKTO_NEURON_PROVIDER_<PROVIDER>_API_KEY` | `default_api_key_env` for a standard preset base (`src/okto_neuron/onboarding.py:305-338`). |
+| `OKTO_NEURON_PROVIDER_<PROVIDER>_<HOST>[_<PORT>]_<HASH8>_API_KEY` | Same function when the base URL differs from the preset base. `<HASH8>` is the first 8 hex characters of the SHA-256 of the normalized base, uppercased (`src/okto_neuron/onboarding.py:328-338`). |
+
+Each provider preset also carries a fixed variable name
+(`src/okto_neuron/onboarding.py:77-223`), including
+`OKTO_NEURON_LOCAL_LLM_KEY`, `OKTO_NEURON_LM_STUDIO_API_KEY`,
+`OKTO_NEURON_OLLAMA_API_KEY`, `OKTO_NEURON_LITELLM_PROXY_API_KEY`,
+`OKTO_NEURON_OPENROUTER_API_KEY`, `OKTO_NEURON_OPENAI_API_KEY`,
+`OKTO_NEURON_GEMINI_API_KEY`, `OKTO_NEURON_ANTHROPIC_API_KEY` and
+`OKTO_NEURON_CUSTOM_LLM_KEY`. The `skip`, `pi_cli` and `codex_cli` presets carry
+an empty name. See [/config/llm-providers](/config/llm-providers).
+
+<Note>
+`OKTO_NEURON_NEO4J_PASSWORD` is not read by Okto Neuron. It is only the default
+answer offered by `click.prompt` when interactive storage onboarding asks which
+environment variable *name* holds the Neo4j credential
+(`src/okto_neuron/cli/__init__.py:1549-1552`).
+</Note>
+
+## Installer-only variables
+
+These are read by `install.sh` only. The one exception is
+`OKTO_NEURON_VAULT`, which the installer reads as a preseed name and the runtime also reads as a vault reference
+(`src/okto_neuron/vault_registry.py:149`); it is listed under Runtime variables
+above. These are documented on [/reference/installer](/reference/installer).
+
+`OKTO_NEURON_SRC`, `OKTO_NEURON_WHEEL`, `OKTO_NEURON_EXPECTED_VERSION`,
+`OKTO_NEURON_MANIFEST`, `OKTO_NEURON_WHEEL_SHA256`, `OKTO_NEURON_REPO`,
+`OKTO_NEURON_REF`, `OKTO_NEURON_PACKS`,
+`OKTO_NEURON_LLM_PROVIDER`, `OKTO_NEURON_LLM_API_BASE`, `OKTO_NEURON_LLM_MODEL`,
+`OKTO_NEURON_LLM_API_KEY_ENV`, `OKTO_NEURON_LLM_ALLOW_REMOTE`,
+`OKTO_NEURON_ONBOARD_NONINTERACTIVE`, `OKTO_NEURON_NO_SERVE`,
+`OKTO_NEURON_NO_OPEN`, `OKTO_NEURON_NO_MCP`. The script also reads
+`OKTO_NEURON_DEFAULT_WHEEL_URL` and `OKTO_NEURON_DEFAULT_MANIFEST_URL`, plus `OKTO_NEURON_LLM_SKIP_DISCOVERY` and
+`OKTO_NEURON_ALLOW_REMOTE_LLM` in its preseed validation.
+
+Setting any of `OKTO_NEURON_PACKS`, `OKTO_NEURON_LLM_PROVIDER`,
+`OKTO_NEURON_LLM_API_BASE`, `OKTO_NEURON_LLM_MODEL`,
+`OKTO_NEURON_LLM_API_KEY_ENV`, `OKTO_NEURON_LLM_SKIP_DISCOVERY`,
+`OKTO_NEURON_LLM_ALLOW_REMOTE`, `OKTO_NEURON_ALLOW_REMOTE_LLM` or
+`OKTO_NEURON_ONBOARD_NONINTERACTIVE` without `OKTO_NEURON_VAULT` makes the
+installer exit with an error.
+
+<Warning>
+`OKTO_NEURON_NO_MCP=1` only tells the installer to skip running `claude mcp add`. It has no effect on a daemon that is already
+running.
+</Warning>
+
+## Internal, not supported
+
+These names appear in the source but are not user knobs. They have no
+compatibility guarantee, and their behavior can change or disappear without
+notice.
+
+<AccordionGroup>
+<Accordion title="OKTO_NEURON_REFERENCE_DATE">
+Pins the reference date used by detectors, defaulting to `2026-05-19`; an
+unparseable value raises `ValueError`
+(`src/okto_neuron/detectors.py:182-185`).
+</Accordion>
+<Accordion title="OKTO_NEURON_LAPTOP_GATE">
+Read, stripped and lowercased inside the CLI and reported back as a gate string
+(`src/okto_neuron/cli/__init__.py:3313`, `:3327`).
+</Accordion>
+<Accordion title="OKTO_NEURON_QUERY_NEIGHBORS">
+A test/run pin for `query_neighbors` (`src/okto_neuron/vault.py:914-917`).
+</Accordion>
+<Accordion title="CODEX_OBSERVER_DIR">
+Not a `OKTO_NEURON_*` name, and a disclosure hazard. When set, the Codex CLI
+provider writes a JSON sidecar into that directory containing the full system
+prompt and the user text of each call, along with the command line and model
+(`src/okto_neuron/llm/_codex_cli.py:123-146`). Leave it unset.
+</Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Configuration overview" href="/config/overview">
+Where config lives and what reads it.
+</Card>
+<Card title="Installer reference" href="/reference/installer">
+The install-time variables and what they preseed.
+</Card>
+<Card title="Status and logs" href="/server/status-and-logs">
+Where log level takes effect.
+</Card>
+<Card title="Thin client" href="/concepts/thin-client">
+Why the CLI talks to an endpoint.
+</Card>
+</CardGroup>

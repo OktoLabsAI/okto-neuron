@@ -1,0 +1,223 @@
+---
+title: Back up, verify and restore a vault
+description: Portable, backend-agnostic snapshots. Dump before anything risky, verify before you trust.
+---
+
+A snapshot is a directory that holds a vault's durable knowledge in a form no backend owns. You dump one before you do anything risky, you verify it before you trust it, and you load it into a fresh vault when you need the knowledge back.
+
+<Note>
+Okto Neuron is prerelease. Treat a snapshot as one copy among several, and verify it on the machine you plan to restore on.
+</Note>
+
+## The three commands
+
+<Steps>
+<Step title="Dump">
+```bash
+okto-neuron kg snapshot dump ./my-vault ./backups/my-vault-snapshot
+```
+
+`dump` takes the vault path and a destination directory, and writes the snapshot there.
+
+DEST must not exist, or must be an empty directory. Otherwise `dump` prints `error: dump destination exists and is not empty: <path>` (or `error: dump destination exists and is not a directory: <path>`) and exits 1.
+
+On success it prints one line with the counts and the manifest path:
+
+```text
+nodes=1842 edges=5310 embedded=1802 sources=57 manifest=backups/my-vault-snapshot/manifest.json
+```
+</Step>
+
+<Step title="Verify">
+```bash
+okto-neuron kg snapshot verify ./backups/my-vault-snapshot
+```
+
+`verify` recomputes every checksum and count in the snapshot and compares them against the manifest.
+
+```text
+ok nodes=1842 edges=5310 embedded=1802 vault_id=my-vault
+```
+</Step>
+
+<Step title="Load">
+```bash
+okto-neuron kg snapshot load ./backups/my-vault-snapshot ./restored-vault
+```
+
+`load` replays the snapshot into a fresh vault at the second path.
+</Step>
+</Steps>
+
+For the full flag list on all three, see [the kg snapshot reference](/reference/cli/kg-snapshot).
+
+## Stop the server before you dump
+
+`dump` runs offline. It takes the same single-writer lease that `kg reindex` takes, so a running server or any other process holding the vault open blocks it. When the lease is held, the command prints
+
+```text
+vault is open by another process; stop serve first
+```
+
+to stderr and exits 1. Stop the daemon, then run the dump again.
+
+```bash
+okto-neuron stop
+```
+
+<Warning>
+`okto-neuron stop` stops the application daemon, not one vault's share of it. Any other vault that daemon is serving goes down with it. The `--vault` option does not narrow the shutdown; the daemon's lifecycle is never vault-scoped. See [rebuilding](/vault/rebuilding) for the same constraint on `kg reindex`, `kg rebuild` and `kg reembed`.
+</Warning>
+
+`verify` is different. It reads the snapshot directory and nothing else, takes no lease, and never touches a vault. You can run it while a server is up, on a copy on another machine, or against an archive you pulled off backup media.
+
+## What a snapshot contains
+
+The snapshot directory holds `manifest.json`, `schema.json`, `nodes.jsonl`, `edges.jsonl`, `embeddings.jsonl`, a `sources/` directory and `CHECKSUMS.sha256`.
+
+One thing the manifest records, and one it deliberately does not:
+
+- It records the **origin backend**, so a snapshot restores pinned to where it came from.
+- It **never records the vault's absolute path**. That is on purpose. A snapshot that carried the path it was dumped from would only restore cleanly back into that same directory. Absolute source paths stored inside nodes get rewritten at load time against the new vault's sources directory, so a restore into a different location keeps its grounding.
+
+<Warning>
+A snapshot is not a backup of your markdown vault. `dump` copies `<vault>/.marginalia/sources/` and nothing else off the filesystem; it never reads `notes/` or `refs/`. `sources/` holds the durable copies ingest made of the files it read, so some of your text may be in there, but under ingest's own paths rather than yours. On the way back, `load` does not restore `notes/` or `refs/`, it scaffolds them empty.
+
+This matters before anything that deletes vault content. `okto-neuron init PATH --wipe` deletes `notes/` and `refs/` along with the graph, and there is no undo. Copy or version-control the vault directory itself before you run it. See [creating a vault](/vault/creating) for what `--wipe` removes.
+</Warning>
+
+For anything more about the snapshot directory, see [the kg snapshot reference](/reference/cli/kg-snapshot).
+
+## Verify before you trust, and again before you restore
+
+Run `verify` after every dump. A dump you have not verified is a dump you cannot rely on restoring.
+
+`verify` reports each problem it finds on stderr, one per line, then prints `verify failed` and exits 1. Problems include a missing `CHECKSUMS.sha256`, a file listed in the checksums that is not on disk, a checksum mismatch, a missing `nodes.jsonl` / `edges.jsonl` / `embeddings.jsonl`, and a count that disagrees with the manifest.
+
+You do not have to remember to verify before restoring: `load` runs the same verification first and aborts on failure with the same problem lines and the same `verify failed` message. A snapshot that does not verify never becomes a vault.
+
+## Restoring
+
+The target vault path must either not exist, or exist as an **empty directory**. Anything else is refused:
+
+- if the path exists and is not a directory, `load` prints `error: <path> exists and is not a directory` and exits 1
+- if the path exists and has anything in it, `load` prints `error: <path> exists and is not empty` and exits 1
+
+<Warning>
+If `load` fails partway through, it cleans up only the vault directory it created itself. If you pointed it at an empty directory that already existed, that directory is left in place with whatever partial work happened inside it. Restore into a path that does not exist yet when you can.
+</Warning>
+
+`load` writes `okto-neuron.yaml` first, then opens the vault (which scaffolds `notes/`, `refs/` and `.marginalia/`), then replays the nodes, edges, embeddings and source blobs. See [vault layout](/reference/vault-layout) for what those directories hold.
+
+On success it prints two lines:
+
+```text
+nodes=1842 edges=5310 embeddings=1802 sources=57 skipped_embeddings=False
+index up to date (generation 4f2c91ab0e73)
+```
+
+The second line is the index check. `load` recomputes the graph generation from the restored graph and compares it against the index's own generation. If they agree you get `index up to date (generation ...)`; if they do not, you get `index generation mismatch (generation ...)` instead. A mismatch means the search index does not correspond to the graph you just restored, and the graph is the authority. Point `kg reindex` at the restored vault and it rewrites the index from the graph:
+
+```bash
+okto-neuron kg reindex ./restored-vault
+```
+
+You do not need `--force` here. The flag only matters when the stamps already agree; a mismatched stamp makes the command do the full work and print its `doc_count=... embedded_count=... elapsed=...s generation=...` summary. See [rebuild, re-embed or re-index](/vault/rebuilding) for the rest of that command, including why it needs the server stopped.
+
+## Re-add your llm block before you ingest
+
+The `okto-neuron.yaml` that `load` writes carries `marginalia_yaml_version`, `vault_id`, `federation_opt_in`, `packs`, `embedding` and `storage`, and nothing else. There is no `llm` block in it, even if the vault you dumped from had one.
+
+A config with no `llm` block still loads, and the restored vault opens on the graph you restored. Ingest is what stops. With no block the vault falls back to the built-in defaults, which are provider `openai`, api_base `http://127.0.0.1:8123/v1` and an empty model, and the first ingest refuses with:
+
+```text
+vault <path> has no LLM model configured: it resolved to provider='openai' api_base='http://127.0.0.1:8123/v1' with an empty model, which matches the built-in defaults. Set llm.defaults.model in okto-neuron.yaml to a model the endpoint serves before ingesting.
+```
+
+Copy the `llm` block out of the original vault's `okto-neuron.yaml` into the restored one, or write a new one, before you ingest anything. See [the llm reference](/config/llm-reference) for every field in that block.
+
+## Restoring a non-Ladybug vault
+
+A snapshot restores pinned to its **origin backend**. The `storage.backend` written into the restored `okto-neuron.yaml` comes from the manifest, so a vault dumped from a non-Ladybug backend comes back on that backend rather than quietly becoming a Ladybug vault. See [storage backends](/config/storage-backends) for which backends exist.
+
+A snapshot carries no live connection secrets. There is no `uri` and no credential in it to replay. A backend that cannot even open a store without one has to be handed it again at load time:
+
+```bash
+okto-neuron kg snapshot load ./snap ./restored-vault \
+  --storage-uri bolt://127.0.0.1:7687 \
+  --storage-credential-env MY_DB_PASSWORD \
+  --storage-database marginalia
+```
+
+`--storage-credential-env` names an environment variable that holds the credential; the credential itself never goes on the command line. `--storage-database` names the database or namespace. `--allow-remote-db` writes `storage.allow_remote: true` into the restored `okto-neuron.yaml`. On this command it records consent in the config; it is not enforced at load time the way it is on `vault create` and `kg init`. The expected case is restoring into the same server the snapshot came from.
+
+## Loading without vectors
+
+`--skip-embeddings` loads the nodes without their vectors:
+
+```bash
+okto-neuron kg snapshot load ./snap ./restored-vault --skip-embeddings
+```
+
+The nodes and edges arrive; the embeddings do not, and `skipped_embeddings=True` appears in the summary line. Use it when you want the graph back and are prepared to deal with the vectors separately.
+
+## A routine that holds up
+
+<AccordionGroup>
+<Accordion title="Before anything risky">
+Stop the server. Dump. Verify the dump. Copy the vault directory too, since the dump does not carry `notes/` or `refs/`. Only then run the risky thing.
+</Accordion>
+<Accordion title="On a schedule">
+Stop the server, dump to a fresh dated directory that does not exist yet, verify, then restart. A dump that was never verified is not a backup you can plan around.
+</Accordion>
+<Accordion title="Proving a restore works">
+Load the snapshot into a throwaway path that does not exist yet, read the two summary lines, and look at the restored vault. This exercises the whole path without touching the vault you actually use. A restored vault has no `llm` block, so add one before you try an ingest against it.
+</Accordion>
+</AccordionGroup>
+
+## Putting a restored vault back into service
+
+`load` writes `okto-neuron.yaml` into the target path, so what comes out the other end is an ordinary vault. Nothing else has to register it. Point Okto Neuron at it by path:
+
+```bash
+okto-neuron vault use ./restored-vault
+```
+
+That prints `current vault: /absolute/path/to/restored-vault` and records the absolute path as your default. If the path holds no `okto-neuron.yaml`, the command prints `vault not found: <path>` to stderr and exits 2. You can also skip the default entirely and set `OKTO_NEURON_VAULT` to the restored path for one shell. See [vault commands](/reference/cli/vault-commands) for the resolution order and every flag.
+
+Two details that follow from where the restored vault sits on disk:
+
+- `vault list` scans your vault roots, and adds the configured default wherever it lives. A restore into a vault root is listed because of the root scan. A restore anywhere else is listed once you have made it current.
+- A vault that is not a direct child of a configured vault root comes back `managed: false` and `deletable: false`, with `vault is not a direct child of a configured vault root` as the reason. That boundary is about the path, not about which command created the vault.
+
+### Replacing a vault at its own path
+
+`load` refuses a target that already has anything in it, and no command in the `vault` group deletes a vault. So swapping a damaged vault for a restored one at the same path is a move you make yourself:
+
+<Steps>
+<Step title="Stop anything holding the vault">
+Stop the server first. The daemon holds the vault, and the offline commands that write to it refuse to run while it is up.
+
+```bash
+okto-neuron stop
+```
+</Step>
+<Step title="Move the old directory aside">
+Rename it rather than deleting it, for example to `<vault>.broken`. Keep it until the restore has proven itself.
+</Step>
+<Step title="Load into the now-missing path">
+Run `okto-neuron kg snapshot load ./snap <vault>`. The path does not exist any more, so the refusal does not apply, and a failure part way through removes the directory the command created.
+</Step>
+<Step title="Check the two summary lines">
+Read the node, edge and embedding counts, and the index line. `index generation mismatch` means the search index no longer matches the graph; see [rebuilding](/vault/rebuilding).
+</Step>
+<Step title="Remove the old directory when you are satisfied">
+Delete `<vault>.broken` yourself once the restored vault answers the questions you expect.
+</Step>
+</Steps>
+
+<Warning>
+The old directory is the only copy of `notes/` and `refs/` you have. `load` scaffolds those empty rather than restoring them, so deleting the directory you moved aside throws away markdown no snapshot carries.
+</Warning>
+
+If the path you restored into was already your default, the config still points at it and there is nothing further to do. `vault use` is only needed when the restored vault lives somewhere new.

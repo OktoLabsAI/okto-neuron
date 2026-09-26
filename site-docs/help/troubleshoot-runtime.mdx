@@ -1,0 +1,223 @@
+---
+title: "When something stops working"
+description: "Map the error you are seeing to its cause: unreachable, locked, unauthorized, or a provider outage."
+---
+
+Start from the message you actually got. Each section below quotes the string the code emits, says what produced it, and gives you the next command to run.
+
+<Note>
+Okto Neuron is prerelease. Error strings and behavior can change between versions, so check the message against the version you are running.
+</Note>
+
+## "no okto-neuron server reachable at ..."
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+The CLI commands that talk to the daemon are thin HTTP clients. They never auto-spawn a server, never retry, and never fall back to opening the vault directly. When the connection fails, you get this message and the command exits 2.
+
+Two causes:
+
+1. No daemon is running. Start one with `okto-neuron serve`.
+2. A daemon is running, but the client is dialing somewhere else. See [/reference/cli/overview](/reference/cli/overview) for the order the endpoint is resolved in.
+
+<Steps>
+<Step title="Check what the client is dialing">
+```bash
+echo "$OKTO_NEURON_ENDPOINT"
+```
+An empty value means the default is in use. A stale export here is the most common cause of an "unreachable" error on a machine where the daemon is plainly up.
+</Step>
+<Step title="Start the server if it is not running">
+```bash
+okto-neuron serve
+```
+</Step>
+</Steps>
+
+For what each exit code means, see [/reference/cli/exit-codes](/reference/cli/exit-codes).
+
+## "server error ...": the daemon answered and refused
+
+```text
+server error <status>: <detail>
+```
+
+This is the opposite situation. The connection succeeded, the daemon replied with a non-2xx status, and the CLI printed the status code and the server's own detail text, then exited 1. Read the detail: it is the server's explanation, not a transport failure. Nothing about your endpoint configuration is wrong when you see this.
+
+## "vault is open by another process; stop serve first"
+
+```text
+vault is open by another process; stop serve first
+```
+
+Some `kg` work runs offline, directly against the graph files, under a single-writer lease. It cannot run while a daemon holds the vault. Two commands print exactly this message and return 1:
+
+- `okto-neuron kg reindex`
+- `okto-neuron kg snapshot dump`
+
+Stop the running server, run the offline command, then start the server again.
+
+## `serve` refuses because an instance is already running
+
+```text
+Okto Neuron server already running (pid=12345, pid_file=/path/to/server.pid)
+```
+
+`serve` takes an OS lock on a PID file. If another live process owns it, startup is refused and the command exits 1. Okto Neuron prints the URL of the local UI to stderr so you can go to the instance that is already up:
+
+```text
+UI: http://127.0.0.1:7777/
+```
+
+In `--daemon` mode the lock is checked in the parent process before forking, so the refusal reaches you before anything is backgrounded. That path also prints a `Stop:` line with the command to shut the running instance down.
+
+This is an idempotent start. Nothing was changed, and the running server is untouched.
+
+## Your MCP client cannot connect at all
+
+Your agent reports a transport or connection failure instead of a tool error: connection refused, a status that is not connected, or a client that lists no Okto Neuron tools. Nothing authenticated yet, so this is not a token problem.
+
+The MCP endpoint lives in the daemon `okto-neuron serve` starts. It is not a separate service you can start on its own, and no client spawns it for you. If no daemon is running, port 8201 has nothing listening on it (`src/okto_neuron/server/runtime.py:56-57`).
+
+<Steps>
+<Step title="Check whether the daemon is up">
+```bash
+okto-neuron status
+```
+This talks to the REST surface on port 7777, not to MCP. If it prints `no okto-neuron server reachable at ...`, no daemon is running and the MCP port is dead too; both listeners live in one process. Start it with `okto-neuron serve`.
+</Step>
+<Step title="Separate a dead port from a wrong port">
+```bash
+curl -i http://127.0.0.1:8201/mcp
+```
+Every request to the MCP surface without a valid bearer credential is answered with `401` and a `WWW-Authenticate: Bearer realm="okto-neuron-mcp"` header, on any path (`src/okto_neuron/server/http.py:581-612`). So a `401` here is good news: the listener is up and your client is failing somewhere else. `Connection refused` means nothing is bound to 8201.
+</Step>
+<Step title="Check the port your client is dialing">
+The daemon runs two listeners on two ports: REST and the web UI on 7777, MCP on 8201 (`src/okto_neuron/cli/__init__.py:2705`). A client pointed at 7777 does not reach MCP. If you moved either port with `--port` or `--mcp-port`, your client's URL has to move with it (`src/okto_neuron/cli/__init__.py:2670-2671`).
+</Step>
+</Steps>
+
+<Note>
+The token file is named after the **REST** port, so with default ports you connect to 8201 but read `~/.okto-neuron/daemon-7777.token`. See [/mcp/connect-an-agent](/mcp/connect-an-agent).
+</Note>
+
+Once the connection is established and the daemon starts refusing calls instead, read the next section.
+
+## MCP requests come back 401
+
+The MCP transport requires a bearer credential. Requests without a valid one get a 401 carrying:
+
+```http
+WWW-Authenticate: Bearer realm="okto-neuron-mcp"
+```
+
+The JSON body's `detail` field tells you which of four things went wrong.
+
+<AccordionGroup>
+<Accordion title="missing Authorization header; send `Authorization: Bearer <token>`">
+No `Authorization` header arrived at all. Your MCP client is not configured with the credential.
+</Accordion>
+<Accordion title="Authorization header carried an empty bearer credential; the token placeholder likely expanded to nothing">
+The header said `Bearer` with nothing after it. Usually a config template where a variable expanded to an empty string.
+</Accordion>
+<Accordion title="unsupported Authorization scheme; only `Bearer` is accepted">
+The header used some other scheme. Only `Bearer` is accepted.
+</Accordion>
+<Accordion title="bearer token is not valid for this server">
+A token arrived but did not match. You are most likely holding a token from a different daemon or a different REST port.
+</Accordion>
+</AccordionGroup>
+
+The credential lives at `~/.okto-neuron/daemon-<rest_port>.token`, created mode 0600 so only your user can read it. It is scoped to the daemon and its REST port, never to the selected vault, so switching vaults does not invalidate your MCP clients. The daemon also logs the path of this file at startup; it never logs the token itself.
+
+To rotate it, delete the file and start the daemon again. On start Okto Neuron reads the existing file and reuses its value; with no file present it writes a fresh token. Deleting the file does not change the credential of a daemon that is already running.
+
+More on the credential model and the loopback boundary: [/mcp/security](/mcp/security).
+
+## "forbidden: remember is restricted to loopback callers"
+
+```text
+forbidden: remember is restricted to loopback callers; tunnel (e.g. SSH) to write remotely
+```
+
+`remember` is a write, and writes are loopback-only. A caller that is not on loopback is refused. The fix is to tunnel to the host (SSH, for example) so the call originates on loopback.
+
+## "maintenance: vault maintenance is in progress; writes are paused"
+
+```text
+maintenance: vault maintenance is in progress; writes are paused
+```
+
+The vault runtime is draining. Writes are rejected until it finishes. If the runtime is shutting down rather than draining for maintenance, you get a different string instead:
+
+```text
+shutting_down: server is shutting down
+```
+
+Both are transient. Wait, then retry. Neither means the vault is damaged.
+
+## An `ask` came back with no answer
+
+An empty answer is ambiguous on its face, so every `ask` path stamps a status into the retrieval trace. Read `retrieval.synthesis_status` before concluding anything. It is always one of six values, and [/mcp/tools/ask](/mcp/tools/ask) defines each one. For troubleshooting, the value that matters is `provider_error`.
+
+`text == ""` together with `synthesis_status == "provider_error"` means the model was unreachable. It does not mean the graph lacks the answer. In that case go check the LLM endpoint, not the vault.
+
+When the answer came through the MCP `ask` tool, the response's `retrieval.vault` names which vault actually served the call, so you can rule out asking the wrong one. That field is injected by the MCP layer, so do not look for it in the companion's own trace on other surfaces. If the MCP connection pinned a vault and your call also passed one, `retrieval.vault_override_ignored` names the argument that was discarded.
+
+## `remember` refuses: no LLM model configured
+
+```text
+vault /path/to/vault has no LLM model configured: it resolved to provider=... api_base=... with an empty model, which matches the built-in defaults. Set llm.defaults.model in okto-neuron.yaml to a model the endpoint serves before ingesting.
+```
+
+A vault created on the built-in defaults inherits a provider and an api_base but an empty model. Vault creation succeeds, so you only find out at the first ingest. Set `llm.defaults.model` in the vault's `okto-neuron.yaml` to a model your endpoint actually serves.
+
+This guard fires only for the unconfigured-default shape: the resolved provider and api_base both match the built-in defaults and the model is empty. A vault that pinned its own provider with an empty model is treated as your deliberate choice and is left alone.
+
+Vault creation emits the same warning as a hint, so if you kept the output of the command that created the vault, the problem was flagged there.
+
+## A vault refuses to open after an embedding change
+
+The embedding column is fixed width. The width is baked into the graph at bootstrap, and the graph records it. On open, Okto Neuron compares the recorded width against `embedding.dimension` in `okto-neuron.yaml` and refuses when they disagree:
+
+```text
+embedding dimension does not match the stored graph
+```
+
+Only a change to `embedding.dimension` makes the vault refuse to open, because the open-time check compares the stored width against the configured one. Changing `embedding.provider_ref`, `embedding.provider` or `embedding.model` at the same width does not block opening, but the stored vectors were computed by a different model and would score wrong, so those changes also call for `kg reembed`. The transport settings (`api_base`, `api_key_env`, `allow_remote`) do not affect the vector space and take effect live.
+
+The remedy is to recompute the vectors at the configured width:
+
+```bash
+okto-neuron kg reembed /path/to/vault
+```
+
+<Warning>
+`kg reembed` rebuilds the vault's vectors. It runs under cross-process graph ownership, taking a rebuild lock on the vault. If you did not intend to change the embedding configuration, revert `okto-neuron.yaml` instead of re-embedding.
+</Warning>
+
+If the server was started against a vault it could not open for this reason, it starts without that vault and reports a warning carrying `code: "embedding_dim_mismatch"`, the vault path, the detail and a remedy line naming the `kg reembed` command for that path. The alternative the warning offers is to switch to another vault.
+
+Background on which settings are load-bearing: [/config/embedding-model](/config/embedding-model).
+
+## Turning up the log level
+
+Set `OKTO_NEURON_LOG_LEVEL` to override the log level without a code change. The value is read from the environment, uppercased, and applied to the `okto-neuron` logger:
+
+```bash
+OKTO_NEURON_LOG_LEVEL=DEBUG okto-neuron serve
+```
+
+<Warning>
+`DEBUG` surfaces full LLM prompts and raw completions in the log. That is the point of the setting, and it is also its risk: everything you ingested or asked about can end up in a file on disk. Use it for a specific reproduction and turn it back off.
+</Warning>
+
+Daemonized servers log to `~/.okto-neuron/logs/okto-neuron-serve.log` by default, written through a size-rotating handler. Raw stdout and stderr go to the same file, so uncaught tracebacks and third-party prints land there too. A log file you pass explicitly overrides the default. Pointing the log at a character device such as `/dev/null` skips rotation.
+
+For reading server state alongside the log, see [/server/status-and-logs](/server/status-and-logs).
+
+## Still stuck
+
+If the behavior you hit is not described above, check [/help/known-gaps](/help/known-gaps) before assuming it is a bug in your setup. Some runtime interactions are untested and deliberately undocumented.

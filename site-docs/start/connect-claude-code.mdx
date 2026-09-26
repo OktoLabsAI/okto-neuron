@@ -1,0 +1,190 @@
+---
+title: Use Okto Neuron from Claude Code
+description: Register the running daemon's MCP endpoint with Claude Code and confirm the tools appear.
+---
+
+Okto Neuron exposes its agent tools over MCP on a loopback HTTP endpoint. Claude Code is the
+one MCP host the installer wires up. This page shows you what the installer already did, how
+to do it by hand when it could not, and how to fix a registration that does not connect.
+
+<Note>
+Okto Neuron is version 0.3.0 and prerelease. Tool names and arguments can change between
+releases.
+</Note>
+
+## What the installer registers
+
+When the installer reaches its Claude Code step, it runs the equivalent of this command:
+
+```bash
+claude mcp add --scope user --transport http \
+  okto-neuron http://127.0.0.1:8201/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Three parts matter:
+
+- **User scope.** The entry lives in your user config, so it is available in every project,
+  not just the directory you installed from.
+- **HTTP transport at `http://127.0.0.1:8201/mcp`.** The daemon serves the UI and its HTTP
+  endpoints on port 7777 and MCP on port 8201.
+- **An `Authorization: Bearer` header.** The MCP endpoint requires it. A request with no
+  `Authorization` header, a non-`Bearer` scheme, an empty credential, or a token that does not
+  match gets a `401` whose JSON body has `error` set to `unauthorized`. The full body shape and the four `detail` strings
+  are in [/mcp/security](/mcp/security).
+
+After adding the entry, the installer reads it back with `claude mcp get okto-neuron` and only
+accepts it when the output shows scope `User config`, status `Connected`, type `http`, and
+exactly that URL.
+
+## Where the token lives
+
+The daemon writes its MCP credential to `~/.okto-neuron/daemon-7777.token`, readable only by
+your account. The path is tied to the daemon and its port, never to a vault, so switching
+vaults does not invalidate an MCP client. Deleting the file rotates it, and any registration
+still carrying the old value stops authenticating. See [/mcp/security](/mcp/security) for the
+full credential model.
+
+The installer reads the token out of that file and passes it straight into the `--header`
+argument. It never prints the value to its own output.
+
+<Warning>
+The token is a capability. Anyone who can read it can call the MCP tools against your graph.
+Do not paste it into a shared config file, a screenshot, or a bug report.
+</Warning>
+
+## Why a first install may need a second run
+
+The installer only wires Claude Code if it can read a non-empty token. On a first-ever
+install the daemon may not have written the file yet. In that case the installer prints
+`Claude Code wiring deferred` and tells you to start the daemon and re-run it. Nothing is
+broken; the ordering just did not work out.
+
+Re-run the installer once the daemon has started. See [/server/running](/server/running) for
+starting and checking the daemon.
+
+## Registering by hand
+
+If the `claude` CLI was not on `PATH` when you installed, the installer prints
+`Claude Code CLI not found` and skips the step. Install Claude
+Code and then either re-run the installer or register the endpoint yourself.
+
+<Steps>
+  <Step title="Confirm the token file exists">
+    ```bash
+    ls -l ~/.okto-neuron/daemon-7777.token
+    ```
+
+    If the file is missing, start the daemon first and check again.
+  </Step>
+
+  <Step title="Add the server">
+    ```bash
+    claude mcp add --scope user --transport http \
+      okto-neuron http://127.0.0.1:8201/mcp \
+      --header "Authorization: Bearer $(cat ~/.okto-neuron/daemon-7777.token)"
+    ```
+
+    Substituting the token with `$(cat ...)` keeps it off your shell history in plain form.
+  </Step>
+
+  <Step title="Verify the registration">
+    ```bash
+    claude mcp get okto-neuron
+    ```
+
+    Look for the same four things the installer checks: `Scope: User config`,
+    `Status: Connected`, `Type: http`, and `URL: http://127.0.0.1:8201/mcp`.
+  </Step>
+</Steps>
+
+## Upgrading from a `marginalia` entry
+
+Releases up to 0.2.0 registered the server as `marginalia`. On an upgrade the installer
+registers `okto-neuron` in the scope the old entry had (user or local) and checks that it
+connects. Only then does it remove the old `marginalia` entry from that same scope, and only if
+that entry pointed at `http://127.0.0.1:8201/mcp`. If the installer fails after the removal, it
+adds the `marginalia` entry back as it was. A `marginalia` entry in project scope (a shared
+`.mcp.json`) is left alone; rename it to `okto-neuron` in that file yourself. Tools then appear
+as `mcp__okto-neuron__*` instead of `mcp__marginalia__*`.
+
+## Fixing an entry that is not the connected user-scope endpoint
+
+The installer never deletes a working `okto-neuron` registration. When `claude mcp get okto-neuron` returns
+an entry that does not match all four checks, the installer warns that the existing entry is
+not the connected user-scope endpoint and stops with a registration conflict, so you can
+decide what to remove.
+
+If the conflicting entry is in `local` or `project` scope, it tells you the exact command:
+
+```bash
+claude mcp remove okto-neuron --scope local
+```
+
+```bash
+claude mcp remove okto-neuron --scope project
+```
+
+Otherwise it tells you to inspect the entry with `claude mcp get okto-neuron`. Remove the stale
+entry, then re-run the installer.
+
+<AccordionGroup>
+  <Accordion title="Status is not Connected">
+    The URL is registered but Claude Code could not reach the endpoint. Check that the
+    daemon is running and serving MCP on port 8201. See [/server/running](/server/running).
+    If the daemon is up and the client still will not connect, see
+    [/help/troubleshoot-runtime](/help/troubleshoot-runtime).
+  </Accordion>
+
+  <Accordion title="The tools are listed but every call fails as unauthorized">
+    The header is missing, malformed, or carries a token the daemon no longer accepts. The
+    `401` detail names the case: a missing header, an empty credential (which usually means
+    a token placeholder expanded to nothing), a non-`Bearer` scheme, or a token that is not
+    valid for this server. Remove the entry and
+    re-add it with the current contents of `~/.okto-neuron/daemon-7777.token`.
+  </Accordion>
+
+  <Accordion title="The URL differs from the one the installer uses">
+    Any other URL fails the installer's check, including a different host or port. Remove the
+    entry and register
+    `http://127.0.0.1:8201/mcp`.
+  </Accordion>
+</AccordionGroup>
+
+## OKTO_NEURON_NO_MCP=1
+
+Setting `OKTO_NEURON_NO_MCP=1` makes the installer skip the Claude Code wiring step and print
+`Skipping Claude Code wiring`. That is the whole effect. It is an installer variable, so it changes nothing about the daemon you are
+running or the MCP endpoint it serves. Use it when you want to manage the Claude Code entry
+yourself.
+
+## Confirming the tools appear
+
+Once the registration connects, the agent gets five tools from the `okto-neuron` server: `ask`, `explore`, `remember`, `list_vaults` and `init_vault`. Ask the agent to list its tools, or run `claude mcp get okto-neuron` and read the tool list it prints. If you see a different number, you are talking to something other than a current daemon.
+
+Start with `list_vaults`. It returns the vault names this server can reach, which is what you pass as `vault=<name>` to the other tools. What each tool takes and returns is on [/mcp/overview](/mcp/overview), and per-tool detail is on [/mcp/tools/ask](/mcp/tools/ask), [/mcp/tools/explore](/mcp/tools/explore), [/mcp/tools/remember](/mcp/tools/remember) and [/mcp/tools/vaults](/mcp/tools/vaults). Which vault a call lands in is on [/mcp/vault-selection](/mcp/vault-selection).
+
+## One host, for now
+
+Claude Code is the MCP host Okto Neuron wires up. The installer's only client-registration
+path is the `claude` CLI, and nothing else is configured for you.
+
+Every behaviour on this page was read out of the source tree. To set up a checkout and verify
+it yourself, see [/contributing/dev-install](/contributing/dev-install).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="MCP overview" href="/mcp/overview">
+    The five tools, their arguments, and how the surface relates to the daemon.
+  </Card>
+  <Card title="Connect an agent" href="/mcp/connect-an-agent">
+    Vault selectors on the URL, and what a non-Claude-Code HTTP client needs.
+  </Card>
+  <Card title="MCP security" href="/mcp/security">
+    The bearer credential, loopback binding, and what they do and do not protect.
+  </Card>
+  <Card title="Running the server" href="/server/running">
+    Starting, checking, and stopping the daemon.
+  </Card>
+</CardGroup>

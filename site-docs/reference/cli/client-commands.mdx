@@ -1,0 +1,390 @@
+---
+title: "Client commands: add, query, ask, detect-drift, watch-folder"
+description: "The thin HTTP client half of the CLI: exact flags, request shapes and output formats."
+---
+
+These commands do no work themselves. Each one resolves an endpoint, sends a single JSON request to a running Okto Neuron server, and prints what comes back. There is no auto-spawn, no retry and no fallback to opening the vault directly (`src/okto_neuron/cli/_client.py`).
+
+<Note>
+Okto Neuron is at version 0.3.0 and classified as pre-alpha. Output lines and flags on this page describe that release and can change.
+</Note>
+
+For the endpoint paths these commands post to, see [/reference/http-endpoints](/reference/http-endpoints). For why the CLI is built this way, see [/concepts/thin-client](/concepts/thin-client).
+
+## The shared contract
+
+Every command below goes through the same helper, so the transport behaviour is identical across all of them.
+
+### Endpoint resolution
+
+Every command below takes `--endpoint`. The precedence and the built-in default are on [/reference/cli/overview](/reference/cli/overview).
+
+```bash
+okto-neuron query "release process" --endpoint http://127.0.0.1:7777
+OKTO_NEURON_ENDPOINT=http://127.0.0.1:7777 okto-neuron query "release process"
+```
+
+### Timeout
+
+`--timeout` takes a float and is passed straight to the HTTP client as the request timeout. Its default, like the endpoint precedence, is on [/reference/cli/overview](/reference/cli/overview).
+
+### Vault selection
+
+`--vault` accepts a vault name or a path. When given, the value is sent as the `X-Okto-Neuron-Vault` request header (`src/okto_neuron/cli/_client.py:111`). It is a per-request selector; how the server resolves that header end to end was not traced.
+
+### Failure modes
+
+<ParamField path="unreachable" type="exit 2">
+A connect error or connect timeout prints, to stderr, exactly:
+
+```text
+no okto-neuron server reachable at <url> — start with `okto-neuron serve`
+```
+
+The exact string is asserted verbatim in `tests/cli/test_thin_client.py:52`. The `<url>` is the resolved endpoint, not the full path.
+</ParamField>
+
+<ParamField path="server error" type="exit 1">
+Any response status of 400 or above prints `server error <status>: <detail>` to stderr. `<detail>` is the `detail` field of the JSON body when there is one, otherwise the stringified body, otherwise the trimmed response text or the HTTP reason phrase. A 2xx response whose body is not valid JSON also exits 1, printing the same `server error <status>: <detail>` shape with the 2xx status and the detail `invalid JSON response: <error>`, for example `server error 200: invalid JSON response: ...`.
+</ParamField>
+
+A single attempt is made in both cases. Nothing is retried. See [/reference/cli/exit-codes](/reference/cli/exit-codes) for the codes traced across the whole CLI.
+
+<Note>
+`--format` on `query` and `ask` is a plain string option, not a validated set of choices. Only the exact value `json` selects JSON. Anything else, including a typo like `jsno`, falls through to the text renderer without an error.
+</Note>
+
+## add
+
+Ingest one file through the running server.
+
+```bash
+okto-neuron add notes/release-process.md
+```
+
+The command reads the file locally as UTF-8, then POSTs `{"path": "<path as given>", "content": "<file text>"}` to `/add`.
+
+### Flags
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `FILE` | path (argument) | required | The file to read and send. |
+| `--vault` | name or path | unset | Sent as `X-Okto-Neuron-Vault`. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+### Output
+
+On success one line:
+
+```text
+added <document_id> (<chunks_ingested> chunks)
+```
+
+`document_id` falls back to an empty string and the chunk count to `?` when the response omits those fields.
+
+### Failures
+
+<Warning>
+If the local read raises an `OSError` (missing file, permission denied, a directory), the command prints `cannot read <path>: <err>` to stderr and exits 1. The server is never contacted.
+</Warning>
+
+Only `OSError` is handled. A file whose bytes are not valid UTF-8 raises a decode error that is not caught by this command; the CLI's top-level handler prints a Python traceback to stderr and exits 1.
+
+More on ingest as a task: [/vault/ingesting](/vault/ingesting).
+
+## query
+
+Return provenance-bearing hits for a search string.
+
+```bash
+okto-neuron query "how do we cut a release" --k 5
+```
+
+POSTs `{"query": "<text>", "k": <k>}` to `/query` and reads the `results` array from the response.
+
+### Flags
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `TEXT` | string (argument) | required | The query string. |
+| `--k` | int | `10` | Notes to retrieve. |
+| `--format` | string | `text` | `json` selects JSON; any other value renders text. |
+| `--vault` | name or path | unset | Sent as `X-Okto-Neuron-Vault`. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+The `--k` default of 10 is deliberate: `query` feeds an agent that can re-query, so the candidate set stays tight. `ask` seeds wider.
+
+### Output
+
+<Tabs>
+<Tab title="text">
+One line per hit, built as `f"{score:5.2f} {document_id} {path} {snippet}"` and then right-stripped:
+
+```text
+ 0.82 doc-4f1a notes/release-process.md we tag from main and let CI publish
+```
+
+The score is width 5 with two decimals, so low scores are space-padded. Missing fields default to `0.0` for the score and empty strings elsewhere. When `results` is empty or absent, the command prints exactly:
+
+```text
+(no hits)
+```
+</Tab>
+<Tab title="json">
+`--format json` prints only the `results` array, indented by 2. The rest of the response body is not shown.
+
+```json
+[
+  {
+    "score": 0.82,
+    "document_id": "doc-4f1a",
+    "path": "notes/release-process.md",
+    "snippet": "we tag from main and let CI publish"
+  }
+]
+```
+
+The empty case prints `[]`, not `(no hits)`.
+</Tab>
+</Tabs>
+
+## ask
+
+Get one synthesised, citation-bearing answer instead of raw hits.
+
+```bash
+okto-neuron ask "how do we cut a release?"
+```
+
+POSTs `{"question": "<text>", "k": <k>}` to `/api/v1/ask`.
+
+### Flags
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `TEXT` | string (argument) | required | The question. |
+| `--k` | int | `20` | Notes to retrieve. |
+| `--hops` | int | `1` | Graph neighbourhood depth when subgraph retrieval is enabled. |
+| `--format` | string | `text` | `json` selects JSON; any other value renders text. |
+| `--vault` | name or path | unset | Sent as `X-Okto-Neuron-Vault`. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+`--hops` only reaches the wire when it differs from the default. At `--hops 1` the request body is just `question` and `k`. At any other value the command adds `"retrieval_policy": {"hops": <hops>}`.
+
+<Note>
+The help text describes `--hops` as 1-5, but the option is a plain integer. The CLI does not reject a value outside that range; whatever you pass is forwarded to the server.
+</Note>
+
+### Output
+
+<Tabs>
+<Tab title="text">
+The response `text` field, or `(no answer)` when it is empty or absent. If the body carries a non-empty `citations` array, a blank line and a `Citations:` header follow, then one `  - <path>` line per citation. A citation object contributes its `path` field; a non-object citation is stringified.
+
+```text
+We tag from main and let CI publish the artifacts.
+
+Citations:
+  - notes/release-process.md
+  - notes/ci.md
+```
+
+No citations means no header at all.
+</Tab>
+<Tab title="json">
+`--format json` prints the entire response body, indented by 2, with no post-processing.
+</Tab>
+</Tabs>
+
+### Degraded answers exit 17
+
+When the response's top-level `status` is `degraded` (no LLM is configured, the provider failed, the answer was truncated or stopped early, or it came back empty), `ask` still prints its output and then exits 17. In text format it also prints one line to stderr naming `retrieval.synthesis_status` and the reason:
+
+```text
+(no answer)
+answer degraded: no_llm (no LLM model is configured for this vault; ...)
+```
+
+Exit 0 means a clean answer. Check the exit code in scripts instead of testing the text for emptiness.
+
+Task-level guidance lives in [/vault/asking](/vault/asking).
+
+## detect-drift
+
+Ask the server to diff a corpus root against what it has stored.
+
+```bash
+okto-neuron detect-drift --corpus-root ~/notes --dry-run
+```
+
+POSTs `{"corpus_root": "<expanded, resolved absolute path>", "dry_run": <bool>}` to `/detect-drift`.
+
+### Flags
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `--corpus-root` | path | unset | The root to diff against. |
+| `--vault` | name or path | unset | Sent as `X-Okto-Neuron-Vault`, and used as the corpus root when `--corpus-root` is absent. |
+| `--mode` | string | `on-query` | Validated against `on-query`, `on-ingest`, `background`. |
+| `--algos` | comma-separated string | the built-in detector names | Accepted for back-compat and discarded before the request (`del algos`); it does not select detectors. The server runs its configured detectors. |
+| `--dry-run` | flag | off | Sent as `dry_run`; detect without remediating. |
+| `--json` | flag | off | Emit the raw JSON envelope. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+`--mode` is checked locally before any request. A value outside the three accepted strings raises a bad-parameter error with the message `mode must be on-query, on-ingest, or background`. The mode is not part of the request body; it is only echoed in the text output line.
+
+The root is resolved in this order: `--corpus-root` if given, otherwise `--vault`. If neither is given, the command raises a bad-parameter error with `--corpus-root (or back-compat --vault) is required`. Whichever value wins is user-expanded and resolved to an absolute path before it is sent.
+
+<Warning>
+`--dry-run` is off by default, so a plain `okto-neuron detect-drift --corpus-root ...` asks the server to remediate. Pass `--dry-run` when you only want to see the diff.
+</Warning>
+
+### Output
+
+With `--json`, the response body is dumped indented by 2 with sorted keys, and nothing else is printed.
+
+Without it, one summary line and then one line per action:
+
+```text
+drift: +3 -1 ~2 (on-query)
+- update notes/release-process.md
+- remove notes/old-plan.md
+```
+
+The counts come from the `added`, `removed` and `changed` fields, each defaulting to 0. Each action line is `- <op> <path>` from the `actions` array.
+
+Background on what drift means: [/vault/drift](/vault/drift).
+
+## watch-folder
+
+Manage the roots the daemon polls for new or changed files. Roots are stored in the selected vault's `okto-neuron.yaml` under `folder_watch.roots`.
+
+All three subcommands take `--vault`, `--endpoint` and `--timeout`, and `add` also takes `--no-initial-ingest`. All three require a running daemon. Unlike `add`/`query`/`ask`, `--vault` here is resolved locally to an absolute path before any request is sent, and the resolved path is what travels in `X-Okto-Neuron-Vault`.
+
+### Flags
+
+<Tabs>
+<Tab title="list">
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `--vault` | name or path | unset | Resolved locally, then sent as `X-Okto-Neuron-Vault`. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+</Tab>
+<Tab title="add">
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `ROOT_PATH` | path (argument) | required | The folder to register. |
+| `--no-initial-ingest` | flag | off | Register the root without the follow-up ingest request. |
+| `--vault` | name or path | unset | Resolved locally, then sent as `X-Okto-Neuron-Vault`. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+</Tab>
+<Tab title="remove">
+
+| Flag | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `ROOT_PATH` | path (argument) | required | The folder to stop watching. |
+| `--vault` | name or path | unset | Resolved locally, then sent as `X-Okto-Neuron-Vault`. |
+| `--endpoint` | URL | [see the shared contract](/reference/cli/overview) | Server endpoint. |
+| `--timeout` | float | [see the shared contract](/reference/cli/overview) | HTTP request timeout in seconds. |
+
+</Tab>
+</Tabs>
+
+### Vault resolution
+
+`add`, `remove` and `list` all resolve the vault before touching the network. If the resolved path is not a vault, the command prints to stderr:
+
+```text
+vault not found: <path>; pass --vault when multiple vaults exist and no default is configured
+```
+
+and exits 2.
+
+### watch-folder list
+
+```bash
+okto-neuron watch-folder list
+```
+
+Sends `GET /api/v1/config` and reads the `folder_watch` block. Output:
+
+```text
+vault: /Users/you/notes
+folder_watch.enabled: True
+  /Users/you/inbox
+```
+
+The `enabled` line is the Python boolean rendering of `folder_watch.enabled`, defaulting to `False`. When the `roots` list is empty or absent, the third line is replaced by:
+
+```text
+no watched roots configured
+```
+
+### watch-folder add
+
+```bash
+okto-neuron watch-folder add ~/inbox
+```
+
+<Steps>
+<Step title="Local checks">
+The path is user-expanded and resolved. If it does not exist or is not a directory, the command prints `path not found or not a directory: <root>` to stderr and exits 1. The vault is resolved next, and a bad vault exits 2.
+</Step>
+<Step title="Register">
+POSTs `{"path": "<resolved root>"}` to `/api/v1/folder-watch/roots`, then prints `registered: <root>`.
+</Step>
+<Step title="Initial ingest">
+Unless `--no-initial-ingest` was given, POSTs `{"path": "<resolved root>", "recursive": <bool>}` to `/api/v1/ingest-folder`. The `recursive` value is read from the registration response's `folder_watch.recursive`, defaulting to `True`. The request body key is `path`, pinned by a contract test.
+</Step>
+</Steps>
+
+The closing line is assembled from the ingest response:
+
+```text
+initial ingest: 12 file(s) queued, 2 already queued (refreshed), 1 non-text skipped
+```
+
+The first clause always prints, from `enqueued`. The `refreshed` clause is appended only when `refreshed` is non-zero, and the skipped clause only when `skipped_non_text` is non-zero.
+
+<Warning>
+Registration and initial ingest are two separate requests. If the second one fails, the root stays registered. An unreachable server prints `root was registered, but initial ingest failed: <unreachable message>` and exits 2; a server error prints `root was registered, but initial ingest failed: server error <status>: <detail>` and exits 1.
+</Warning>
+
+With `--no-initial-ingest` the command returns right after `registered: <root>`.
+
+### watch-folder remove
+
+```bash
+okto-neuron watch-folder remove ~/inbox
+```
+
+Resolves the path, resolves the vault, then sends `DELETE /api/v1/folder-watch/roots` with `{"path": "<resolved root>"}` and prints `removed: <root>`.
+
+The manifest sidecar is left in place; its historical hashes are harmless.
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="HTTP endpoints" href="/reference/http-endpoints">
+The paths these commands post to.
+</Card>
+<Card title="Exit codes" href="/reference/cli/exit-codes">
+Which codes are traced and what they mean.
+</Card>
+<Card title="Thin client" href="/concepts/thin-client">
+Why the CLI does no work of its own.
+</Card>
+<Card title="Asking" href="/vault/asking">
+Using ask against a real vault.
+</Card>
+</CardGroup>

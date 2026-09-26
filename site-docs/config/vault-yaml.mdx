@@ -1,0 +1,390 @@
+---
+title: "okto-neuron.yaml reference"
+description: "Every block a vault config can carry, with types, defaults, ranges and the errors you will actually see."
+---
+
+<Note>
+Okto Neuron is prerelease. Field names, defaults and validation rules in this reference describe the current source and can change between versions.
+</Note>
+
+Each vault holds one `okto-neuron.yaml` at its root. This page lists every block the typed config model declares, with the exact default and the exact range the validator enforces.
+
+## How the file is loaded
+
+`VaultConfig.load()` reads `okto-neuron.yaml` from the vault path, then deep-merges the parsed mapping over a baseline.
+
+<Steps>
+<Step title="Pick the baseline">
+If the file sets `inherits_application_defaults: true`, the baseline is `defaults.yaml` from the application home, loaded by `load_application_defaults()`. Otherwise the baseline is `VaultConfig.default()`, the code defaults (`src/okto_neuron/config/_vault.py:1588`, `:1614-1617`).
+</Step>
+<Step title="Deep-merge the file over the baseline">
+Nested mappings merge field by field. Scalars and lists replace what the baseline had. The one special case is `sampling_payload`, which always replaces wholesale rather than merging its keys (`src/okto_neuron/config/_vault.py:1485`).
+</Step>
+<Step title="Validate the merged document">
+The merged mapping is validated as a whole, so a range or enum violation anywhere in the file fails the load.
+</Step>
+</Steps>
+
+If `defaults.yaml` does not exist, `load_application_defaults()` falls back to the code defaults instead of failing (`src/okto_neuron/config/_vault.py:1572-1580`).
+
+Two load-time failures you will meet:
+
+- **`ConfigNotFound`** when `okto-neuron.yaml` is missing. Exit code 2 (`src/okto_neuron/errors.py:122`).
+- **`ConfigParseError`** when the YAML is malformed. It carries the offending line number when PyYAML reported one. Exit code 3 (`src/okto_neuron/errors.py:136`, `src/okto_neuron/config/_vault.py:1596-1608`).
+
+A file with no `marginalia_yaml_version` key loads anyway and emits a one-time warning per path: `missing marginalia_yaml_version; treating config as version 1` (`src/okto_neuron/config/_vault.py:53-61`).
+
+The top-level model is declared `extra="allow"`, so unknown top-level keys survive a load without raising (`src/okto_neuron/config/_vault.py:1510`). That is not the same as being supported. Only the blocks below are typed and validated.
+
+## Top-level keys
+
+<ParamField path="marginalia_yaml_version" type="int" default="1">
+Config schema version. `VaultConfig.default()` writes `1` (`src/okto_neuron/config/_vault.py:1512`, `:1551`).
+</ParamField>
+
+<ParamField path="vault_id" type="string | null" default="null">
+Vault identifier. Written at creation and preserved untouched through a config patch, because the patch path reads the raw mapping first (`src/okto_neuron/config/_vault.py:1513`, `:1654`).
+</ParamField>
+
+<ParamField path="inherits_application_defaults" type="bool" default="false">
+When true, the load baseline becomes `defaults.yaml` instead of the code defaults (`src/okto_neuron/config/_vault.py:1514`, `:1614-1617`).
+</ParamField>
+
+<ParamField path="federation_opt_in" type="bool" default="false">
+Declared and validated as a boolean. No code reads this value to change behaviour. It is persisted in the file and round-tripped by snapshot restore, nothing more (`src/okto_neuron/config/_vault.py:1515`).
+</ParamField>
+
+<ParamField path="packs" type="list[string]" default='["core", "research", "personal"]'>
+Type packs enabled for the vault. Must contain at least one entry. See [Packs](#packs) below (`src/okto_neuron/config/_vault.py:1516`, `:1543-1548`).
+</ParamField>
+
+The remaining top-level keys are blocks: `embedding`, `llm`, `consolidation`, `curation`, `upkeep`, `folder_watch`, `ingest`, `storage`, `index`.
+
+For the `llm` block, see [the LLM configuration reference](/config/llm-reference). For `storage` and `index`, see [storage backends](/config/storage-backends).
+
+## The writable surface
+
+The config patch API accepts only these top-level blocks (`src/okto_neuron/config/_vault.py:1625`):
+
+```text
+embedding  llm  consolidation  upkeep  packs  folder_watch  ingest
+```
+
+Anything else in a patch is rejected before it reaches disk:
+
+```text
+unknown config field(s): ['curation']; writable blocks are ['embedding', 'llm', 'consolidation', 'upkeep', 'packs', 'folder_watch', 'ingest']
+```
+
+That message comes from `_validate_writable_patch()` (`src/okto_neuron/config/_vault.py:1690-1695`). Blocks outside the list, including `curation`, `storage` and `index`, are edited by hand in `okto-neuron.yaml`.
+
+A patch merges nested blocks recursively and then validates the full merged document, so an out-of-range value in a patch never lands on disk (`src/okto_neuron/config/_vault.py:1750-1760`).
+
+Two classifications sit alongside the writable list:
+
+- **`REEMBED_FIELDS`**: `embedding.provider_ref`, `embedding.provider`, `embedding.model`, `embedding.dimension`. Changing one of these means the stored vectors were computed by a different model or width (`src/okto_neuron/config/_vault.py:1638-1643`).
+- **`SEMANTIC_REBUILD_FIELDS`**: `consolidation.type_adjudication_enabled` and `consolidation.relation_curator_enabled`. Saving is allowed, and existing sources need a semantic rebuild before the stored graph represents the new policy (`src/okto_neuron/config/_vault.py:1647-1650`).
+
+## embedding
+
+Declared `extra="forbid"`, so an unknown key inside the block fails validation (`src/okto_neuron/config/_vault.py:130`).
+
+<ParamField path="embedding.provider" type="string" default="fastembed">
+Must be one of the allowed providers below.
+</ParamField>
+
+<ParamField path="embedding.model" type="string" default="BAAI/bge-small-en-v1.5">
+Model identifier passed to the provider.
+</ParamField>
+
+<ParamField path="embedding.dimension" type="int" default="384">
+Must be greater than 0. The vector column is fixed width, so this value is baked into the graph at bootstrap and a change lands in `REEMBED_FIELDS`.
+</ParamField>
+
+<ParamField path="embedding.api_base" type="string | null" default="null">
+Endpoint URL for a routed provider. Validated against the loopback check unless `allow_remote` is true. Local in-process providers leave it unset and skip the check.
+</ParamField>
+
+<ParamField path="embedding.allow_remote" type="bool" default="false">
+Permits a non-loopback `api_base`. Config *writes* stay loopback-only regardless, enforced at the API layer.
+</ParamField>
+
+<ParamField path="embedding.api_key_env" type="string | null" default="null">
+Name of the environment variable holding the credential. Validated by `_check_api_key_env`.
+</ParamField>
+
+<ParamField path="embedding.batch_size" type="int" default="32">
+Range 1 to 256. Execution policy only, deliberately absent from `REEMBED_FIELDS`.
+</ParamField>
+
+<ParamField path="embedding.max_concurrent_batches" type="int" default="1">
+Range 1 to 32. Execution policy only.
+</ParamField>
+
+<ParamField path="embedding.provider_ref" type="string | null" default="null">
+Reference to an application provider profile. On resolution, the referenced profile supplies `provider`, `api_base`, `api_key_env` and `allow_remote`. A profile whose driver does not declare embedding use raises `provider <ref> does not support embeddings`.
+</ParamField>
+
+All fields above: `src/okto_neuron/config/_vault.py:134-182`.
+
+### Allowed providers
+
+`stub`, `fastembed` and `sentence-transformers` run in-process. Every other value is a LiteLLM provider prefix (`src/okto_neuron/config/_vault.py:63-100`):
+
+```text
+azure            azure_ai         bedrock          cohere
+databricks       fastembed        fireworks_ai     gemini
+gigachat         github_copilot   libertai         litellm_proxy
+llamagate        lm_studio        mistral          nebius
+novita           oci              ollama           openai
+perplexity       scaleway         sentence-transformers
+snowflake        stub             together_ai      vercel_ai_gateway
+vertex_ai        volcengine       voyage
+```
+
+Three legacy aliases are accepted and canonicalized on load (`src/okto_neuron/config/_vault.py:103-107`):
+
+| You write | Stored as |
+| --- | --- |
+| `default` | `fastembed` |
+| `openai-compat` | `openai` |
+| `local` | `openai` |
+
+Anything else raises `unknown embedding provider: '<value>'; expected one of [...]` (`src/okto_neuron/config/_vault.py:115`).
+
+## consolidation
+
+Confidence-gate policy. Declared `extra="forbid"` (`src/okto_neuron/config/_vault.py:1346-1369`).
+
+| Key | Type | Default | Range |
+| --- | --- | --- | --- |
+| `auto_commit_threshold` | float | `0.75` | 0.0 to 1.0 |
+| `review_on_contradiction` | bool | `true` | |
+| `type_adjudication_enabled` | bool | `true` | |
+| `relation_curator_enabled` | bool | `true` | |
+| `audit_superseded_nodes_with_llm` | bool | `false` | |
+| `audit_superseded_relations_with_llm` | bool | `false` | |
+| `curation_max_concurrent` | int | `1` | 1 to 32 |
+| `curation_call_timeout_s` | float \| null | `null` | greater than 0 when set |
+| `curation_batch_size` | int | `1` | 1 to 32 |
+
+Notes that matter when you change these:
+
+- Disabling `type_adjudication_enabled` or `relation_curator_enabled` is fail-closed. Affected candidates are queued for review and the corresponding provider is never called (`src/okto_neuron/config/_vault.py:1346-1349`).
+- `curation_max_concurrent` at `1` is strictly sequential curation. Raising it only pays when the LLM endpoint accepts concurrent requests (`src/okto_neuron/config/_vault.py:1355-1358`).
+- `curation_call_timeout_s` of `null` is intentionally unbounded. Request policy belongs to the provider connection, and shutdown uses the explicit cancellable-call boundary (`src/okto_neuron/config/_vault.py:1360-1364`).
+- `curation_batch_size` at `1` means per-candidate calls. Above 1, up to K same-block candidates are evaluated per LLM call with schema-constrained output and a per-candidate single-call fallback (`src/okto_neuron/config/_vault.py:1365-1369`).
+
+See [throughput knobs](/config/throughput) for how these interact.
+
+### consolidation.prefilter
+
+A deterministic pre-filter for low-value candidates (`src/okto_neuron/config/_vault.py:1318-1337`).
+
+| Key | Type | Default | Range |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | |
+| `demote_predicates` | list[string] | `["discusses", "mentions", "mentioned", "states", "stated"]` | |
+| `min_mentions` | int | `1` | at least 1 |
+| `max_trivial_node_chars` | int | `160` | greater than 0 |
+| `established_entity_fastpath` | bool | `true` | |
+
+Rules 1 to 3 (predicate demotion, low-signal node demotion, near-duplicate literal collapse) run only when `enabled` is true. `established_entity_fastpath` is gated independently and defaults on, because it fires only where the candidate would merge into an already-live store node with no novel content. Demotion always means queue, reviewable through the existing review surface, never silent discard (`src/okto_neuron/config/_vault.py:1318-1328`).
+
+## curation
+
+The continuous-curation loop the serve process runs (`src/okto_neuron/config/_vault.py:1371-1398`).
+
+| Key | Type | Default | Range |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | |
+| `quiet_debounce_s` | int | `60` | at least 0 |
+| `min_interval_s` | int | `3600` | greater than 0 |
+
+The loop auto-submits sweep jobs to the curation job queue as you ingest. The job kinds it may submit are a code constant, not config: `reconcile-propose`, `predicate-propose` and `detect-drift` (`src/okto_neuron/server/_scheduler.py:52`). It never auto-runs a destructive or irreversible operation, so no apply, heal, rebuild, reembed or reset (`src/okto_neuron/config/_vault.py:1379-1382`).
+
+`quiet_debounce_s` is the ingest quiet period the scheduler waits for before sweeping. `min_interval_s` is the floor between two auto sweeps. Both are read per tick, so a change takes effect without a restart: the scheduler calls `VaultConfig.load(path).curation` on each evaluation (`src/okto_neuron/server/_scheduler.py:63-73`, `:145-147`).
+
+<Warning>
+`curation` is not in `WRITABLE_BLOCKS` (`src/okto_neuron/config/_vault.py:1625`). A patch that includes it is rejected with `unknown config field(s): ['curation']`. Edit it directly in `okto-neuron.yaml`.
+</Warning>
+
+## upkeep
+
+Judge-driven graph upkeep policy (`src/okto_neuron/config/_vault.py:1400-1410`).
+
+| Key | Type | Default | Range |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | |
+| `max_pairs_per_run` | int | `30` | 1 to 200 |
+| `min_support` | int | `2` | 1 to 100 |
+| `cluster_threshold` | float | `0.80` | 0.5 to 0.99 |
+| `auto_fold_threshold` | float | `0.85` | 0.5 to 1.0 |
+
+`auto_fold_threshold` is the confidence floor the predicate judge uses to mark a proposed predicate fold `auto` instead of `queued` (`src/okto_neuron/server/_curation.py:1233`, `src/okto_neuron/predicates/judge.py:347`). It marks a proposal; the `predicate-propose` job does not apply it. A judge reply whose canonical label cannot be normalized is queued regardless of confidence.
+
+## ingest
+
+Ingestion policy (`src/okto_neuron/config/_vault.py:1420-1441`).
+
+| Key | Type | Default | Range |
+| --- | --- | --- | --- |
+| `incremental` | bool | `true` | |
+| `subchunk` | bool | `true` | |
+| `chunk_size_bytes` | int | `6000` | 256 to 1000000 |
+| `chunk_overlap_bytes` | int | `0` | 0 to 999999 |
+
+With `incremental` on, re-ingesting an unchanged source skips extraction entirely. With `subchunk` on, an edited source extracts only its changed hunks, and removals detach their claims (`src/okto_neuron/config/_vault.py:1420-1425`).
+
+`OKTO_NEURON_INCREMENTAL_INGEST` and `OKTO_NEURON_SUBCHUNK_INGEST` are two-way overrides: `1` forces on, `0` forces off, unset defers to this config (`src/okto_neuron/config/_vault.py:1427-1430`).
+
+A cross-field validator rejects an overlap that is not smaller than the chunk (`src/okto_neuron/config/_vault.py:1439-1441`):
+
+```text
+ingest.chunk_overlap_bytes must be smaller than chunk_size_bytes
+```
+
+## folder_watch
+
+Continuous folder monitoring. Off by default (`src/okto_neuron/config/_vault.py:1444-1478`).
+
+| Key | Type | Default |
+| --- | --- | --- |
+| `enabled` | bool | `false` |
+| `poll_interval_s` | float | `5.0` (greater than 0) |
+| `quiet_debounce_s` | float | `3.0` (at least 0) |
+| `min_interval_s` | float | `10.0` (at least 0) |
+| `recursive` | bool | `true` |
+| `ignore_globs` | list[string] | `["*.swp", "*.tmp", "4913", "*~", ".#*"]` |
+| `ignore_dir_globs` | list[string] | `[".*", "__pycache__", "node_modules"]` |
+| `roots` | list[string] | `[]` |
+
+The serve process runs a global polling loop that iterates every vault declaring `roots` here, not only the active one (`src/okto_neuron/config/_vault.py:1446-1449`).
+
+`ignore_dir_globs` matches with `fnmatch` on each path component, and a matching directory is pruned before descent, so its whole subtree is skipped without being stat-walked. The default patterns keep hidden state directories such as `.state/`, `.remember/` and `.git/` out of the graph entirely (`src/okto_neuron/config/_vault.py:1412-1417`, `:1463-1466`).
+
+`roots` holds absolute paths and is empty by default. Add entries with `okto-neuron watch-folder add <path>` or by editing `okto-neuron.yaml` (`src/okto_neuron/config/_vault.py:1467-1469`). Adding a root through `watch-folder add` also writes `enabled: true`, so that command turns the loop on as well as registering the path (`src/okto_neuron/server/http.py:5051-5058`). See [watching folders](/vault/watching).
+
+## storage and index
+
+Read-only from this page's point of view.
+
+`storage` defaults to `null`, and that default is deliberate: `load()` uses `VaultConfig.default()` as the merge baseline for every existing vault, so a non-null default would silently re-pin a legacy vault that has no `storage` key. Every read site treats `storage is None` as `ladybug` (`src/okto_neuron/config/_vault.py:1526-1540`). A newly created vault gets `storage` written explicitly at creation time.
+
+`index` defaults to `null`. When present, `index.backend` defaults to `ladybug_bm25+vector_scan` (`src/okto_neuron/config/_vault.py:338-343`).
+
+`storage` is not in `WRITABLE_BLOCKS`. See [storage backends](/config/storage-backends).
+
+## Packs
+
+`packs` selects type packs. Four packs ship, hardcoded in a module-level dict (`src/okto_neuron/packs/__init__.py:9-14`):
+
+```text
+core  research  personal  sdlc
+```
+
+Validation on load is one rule: the list must not be empty (`src/okto_neuron/config/_vault.py:1543-1548`).
+
+```text
+packs must contain at least one pack
+```
+
+On a config patch, `packs` replaces the stored list wholesale rather than merging, and every entry must be a string that exists in `BUILTIN` (`src/okto_neuron/config/_vault.py:1699-1706`).
+
+### Defaults differ by entry point
+
+| Entry point | Default packs | Source |
+| --- | --- | --- |
+| `okto-neuron init --packs` | `core,research,personal` | `src/okto_neuron/cli/__init__.py:923` |
+| `okto-neuron vault create --packs` | `core,research,personal` | `src/okto_neuron/cli/__init__.py:168` |
+| `okto-neuron onboard` | `core`, `research`, `personal` (hardcoded, no flag) | `src/okto_neuron/cli/__init__.py:1605` |
+| MCP `init_vault` tool | `core` | `src/okto_neuron/server/runtime.py:1685` |
+| `Vault.init()` / `Vault.scaffold()` Python API | `("core",)` | `src/okto_neuron/vault.py:258`, `:311` |
+| HTTP scaffold with no `packs` given | `core`, `research`, `personal` | `src/okto_neuron/server/http.py:1141-1143` |
+
+The MCP tool and the Python API give you one pack. The CLI gives you three.
+
+<Warning>
+Pack-name validation is asymmetric. The CLI paths split `--packs` on commas and pass the list straight through with no membership check (`src/okto_neuron/cli/__init__.py:233`, `:979`), and the HTTP scaffold parser only checks that entries are non-empty strings (`src/okto_neuron/server/http.py:1141-1150`). A typo such as `resarch` is accepted at creation and written into `okto-neuron.yaml`. A later config write that itself includes `packs` then rejects the value with `unknown pack(s): ['resarch']; built-in packs are ['core', 'personal', 'research', 'sdlc']` (`src/okto_neuron/config/_vault.py:1697-1706`). A write that does not touch `packs` passes, and `VaultConfig.load()` never checks pack membership, so the typo can sit in the file indefinitely. Check the spelling of `packs` in `okto-neuron.yaml` after creating a vault.
+</Warning>
+
+### What the sdlc pack changes
+
+`sdlc` is the one pack whose name is read directly by pipeline code. Enabling it changes five things.
+
+<AccordionGroup>
+<Accordion title="Extraction prompt">
+`extraction_system_prompt()` appends `_SDLC_EXTRACTION_GUIDANCE` to the base prompt when `sdlc` is in the enabled set. The base prompt is corpus-agnostic, so a non-software vault does not inherit software-practice priors (`src/okto_neuron/extract/__init__.py:585-597`).
+</Accordion>
+<Accordion title="Candidate curator prompt">
+`candidate_curator_system()` appends `_SDLC_CURATOR_GUIDANCE` (`src/okto_neuron/curator.py:86-90`).
+</Accordion>
+<Accordion title="Relation curator prompt">
+`relation_curator_system()` appends `_SDLC_RELATION_CURATOR_GUIDANCE` (`src/okto_neuron/curator.py:220-225`).
+</Accordion>
+<Accordion title="Predicate aliases">
+`builtin_predicate_aliases()` folds 16 extra source-to-target mappings in on top of the core aliases, using `setdefault` so a pack alias cannot replace a core mapping (`src/okto_neuron/curator.py:397-416`, `src/okto_neuron/predicates/registry.py:515-528`). The targets are `includes`, `validated_by`, `enables`, `risk`, `impact` and `mitigates`.
+</Accordion>
+<Accordion title="Canonical predicates">
+Five predicate definitions are seeded into the vault predicate registry: `enables`, `impact`, `mitigates`, `risk`, `validated_by` (`src/okto_neuron/predicates/registry.py:132-146`). Registry construction checks that every sdlc alias target has a definition and raises `pack predicate definitions missing for 'sdlc': [...]` otherwise (`src/okto_neuron/predicates/registry.py:479-488`).
+</Accordion>
+</AccordionGroup>
+
+Two title rewrites are also gated on `sdlc`. `Concept` titles matching `epics`, `stories` or `tasks` become `Epic`, `Story` and `Task` (`src/okto_neuron/extract/__init__.py:892-896`, `:932-936`). A `Concept` or `InformationObject` whose title matches the pillar pattern is rewritten to the underlying topic as a `Concept` (`src/okto_neuron/extract/__init__.py:958-967`).
+
+The pack itself also declares node types (`Decision`, `Criterion`, `Constraint`, `Requirement`, `Assumption`, `Alternative`, `APIContract`, `TestScenario`, `Bug`, `Learning`) and edge types (`implements`, `tests`, `validates`, `violates`, `depends_on`, `derives_from`) (`src/okto_neuron/packs/sdlc.py:4-19`).
+
+### Changing packs on an existing vault
+
+The enabled pack list is part of both the config fingerprint and the extraction fingerprint. `_pack_payload()` emits each pack's sorted node and edge types, and that payload is embedded under the `packs` key of both fingerprints (`src/okto_neuron/semantic_fingerprint.py:513-527`, `:615-662`). Those fingerprints are what rebuild and drift decisions compare against, so editing `packs` changes them.
+
+Packs also travel in snapshots. A snapshot records `list(cfg.packs)` in its manifest, and restore writes `list(manifest.packs)` back into the reconstructed `okto-neuron.yaml` verbatim (`src/okto_neuron/cli/kg.py:3142`, `:3228`).
+
+## Errors you will see
+
+<AccordionGroup>
+<Accordion title="packs must contain at least one pack">
+`packs: []` in the file, or a patch that sets it empty. Validator at `src/okto_neuron/config/_vault.py:1543-1548`.
+</Accordion>
+<Accordion title="unknown pack(s): ['x']; built-in packs are ['core', 'personal', 'research', 'sdlc']">
+A config patch whose `packs` list contains a name not in `BUILTIN`. It fires on the list the patch sends, including one a creation command accepted earlier and the write path re-submits unchanged. `src/okto_neuron/config/_vault.py:1704-1706`.
+</Accordion>
+<Accordion title="packs must be a list of strings">
+A patch where `packs` is not a list, or contains a non-string. `src/okto_neuron/config/_vault.py:1700-1702`.
+</Accordion>
+<Accordion title="unknown embedding provider: 'x'; expected one of [...]">
+`embedding.provider` outside the allowlist and not one of the three legacy aliases. `src/okto_neuron/config/_vault.py:110-118`.
+</Accordion>
+<Accordion title="ingest.chunk_overlap_bytes must be smaller than chunk_size_bytes">
+Overlap greater than or equal to chunk size. Both values pass their own ranges, and the cross-field validator rejects the pair. `src/okto_neuron/config/_vault.py:1439-1441`.
+</Accordion>
+<Accordion title="unknown config field(s): [...]; writable blocks are [...]">
+A patch touching a top-level key outside `WRITABLE_BLOCKS`. `src/okto_neuron/config/_vault.py:1690-1695`.
+</Accordion>
+<Accordion title="provider <ref> does not support embeddings">
+`embedding.provider_ref` names a profile whose driver does not declare embedding use. `src/okto_neuron/config/_vault.py:174`.
+</Accordion>
+<Accordion title="configuration file was not found / configuration file is malformed">
+`ConfigNotFound` (exit 2) and `ConfigParseError` (exit 3). `src/okto_neuron/errors.py:122`, `:136`.
+</Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Configuration overview" href="/config/overview">
+Where config lives and which surfaces can write it.
+</Card>
+<Card title="LLM configuration" href="/config/llm-reference">
+Every field of the `llm` block.
+</Card>
+<Card title="Storage backends" href="/config/storage-backends">
+The `storage` and `index` blocks.
+</Card>
+<Card title="Throughput knobs" href="/config/throughput">
+How the curation and embedding concurrency fields interact.
+</Card>
+<Card title="Watching folders" href="/vault/watching">
+Managing `folder_watch.roots`.
+</Card>
+</CardGroup>

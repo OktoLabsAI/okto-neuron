@@ -1,0 +1,89 @@
+---
+title: "Reconcile a vault with its source files"
+description: "Compare what is on disk with what was ingested, preview the difference, then remediate."
+---
+
+Files on disk move on. Paragraphs get edited. A commitment passes its due date, or the document holding it is deleted. The graph only learns about any of that when you tell it to. `okto-neuron detect-drift` asks a running daemon to sweep the vault and report what no longer holds, and re-ingestion is what actually repairs it.
+
+<Note>
+Okto Neuron is a prerelease. Flags, output shape and envelope keys can change between versions.
+</Note>
+
+## Before you start
+
+`detect-drift` is a thin client. It does not open the vault directly and it does not retry. It will not start a daemon for you. Start the daemon first. Otherwise the command exits with code 2 after printing:
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+<Steps>
+<Step title="Point the command at a corpus root">
+
+```bash
+okto-neuron detect-drift --corpus-root ~/notes --dry-run
+```
+
+`--corpus-root` is the directory to diff against. `--vault` still works as a back-compatibility fallback for the same value. Pass neither and the command fails with `--corpus-root (or back-compat --vault) is required`.
+
+The path you give is expanded (`~`) and resolved to an absolute path before it is sent. The daemon rejects a relative `corpus_root` with a 400 and a root that does not exist with a 404, which surfaces as `server error 404: ...` and exit code 1.
+
+Note that `--vault` does double duty: whatever you pass there is also sent as the `X-Okto-Neuron-Vault` request selector, so on a daemon serving several vaults prefer `--corpus-root` for the path and `--vault` only when you mean to select a vault.
+
+</Step>
+
+<Step title="Read the summary line">
+
+Without `--json` the command prints one summary line, then one line per action:
+
+```text
+drift: +0 -0 ~3 (on-query)
+- update supersedence_stale_head
+- update supersedence_stale_head
+- update commitment_temporal_shacl
+```
+
+Read that line carefully. The three counters come straight from the envelope, and the daemon currently reports `added` and `removed` as a constant 0 and sets `changed` to the total number of findings. So `~3` means "three findings", not "three changed files". The trailing `(on-query)` is the local `--mode` value you passed, printed by the client.
+
+Each action line is `- <op> <path>` with no finding id; the id is only in the `--json` envelope, under each action's `finding` key. The daemon emits `op` as `update` for every finding and puts the detector's name in `path`, so those lines group findings by detector rather than by file. To see which document a finding cites, use `--json`.
+
+</Step>
+
+<Step title="Switch to JSON when you need the detail">
+
+```bash
+okto-neuron detect-drift --corpus-root ~/notes --json
+```
+
+`--json` prints the whole envelope, indented and key-sorted. It carries `schema_version` (`drift.v1`), `vault_name`, `vault_root`, `ran_at`, `mode`, the full `findings` list, `counts` per detector, `total`, the back-compatibility `added`/`removed`/`changed` keys, `actions` and `dry_run`. The `mode` in the envelope is the daemon's own default of `on-query`: the client does not forward `--mode` over the wire, so it always reads `on-query` regardless of what you passed.
+
+</Step>
+</Steps>
+
+## Deciding what to run
+
+The sweep never writes. The drift endpoint takes no writer lock and writes no nodes or edges, so a run with or without `--dry-run` reports the same way and repairs nothing. Plan on re-ingesting to remediate, and treat `detect-drift` as a report.
+
+`--mode` only changes the text summary line, because the client does not send it to the daemon. Accepted values and the error it raises are in [the client command reference](/reference/cli/client-commands).
+
+You cannot pick detectors. `--algos` is accepted for back-compatibility and discarded before anything uses it, so the daemon always runs its own configured set. The full flag list, including `--endpoint` and `--timeout`, is in [the client command reference](/reference/cli/client-commands).
+
+## Remediating what the report found
+
+Since the sweep does not write, reconciliation happens through ingestion. Re-run the [ingest path](/vault/ingesting) over the changed files and the incremental pass does the repair work:
+
+<AccordionGroup>
+<Accordion title="Superseded claims">
+When a claim minted in this run corrects an existing one, the old claim gets stamped with a superseded marker and a `valid_until` date, it drops out of recall, and a `supersedes` edge is written from the new claim to the old one so the history stays walkable.
+</Accordion>
+
+<Accordion title="Detached claims">
+When a claim's supporting source text is gone, the old claim is stamped detached with a `valid_as_of` date. It stays in recall, marked source-absent.
+</Accordion>
+</AccordionGroup>
+
+<Warning>
+The correction pass is an incremental edit tool scoped to the claims whose prior evidence this exact edit removed. It does not compare claims across your vault or across documents, so a contradiction between two untouched files will not be caught by re-ingesting a third.
+</Warning>
+
+For the rules behind both markers, see [supersession](/concepts/supersession).

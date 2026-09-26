@@ -1,0 +1,122 @@
+---
+title: Connect an agent
+description: Point an MCP client at the daemon with the right URL, vault selector and bearer header.
+---
+
+Okto Neuron exposes its agent surface over MCP from the daemon that `okto-neuron serve` starts. To connect a client you need three things: the MCP URL, a vault selector on that URL, and the daemon's bearer token in an `Authorization` header.
+
+<Note>
+Okto Neuron is a prerelease. The MCP surface, its tool set and its argument names can change between versions. See [/start/prerelease-status](/start/prerelease-status).
+</Note>
+
+## 1. Start the daemon
+
+The MCP server only exists inside a running `okto-neuron serve` process. `serve` binds REST/UI on port 7777 and FastMCP on port 8201 by default.
+
+```bash
+okto-neuron serve
+```
+
+If you have not installed Okto Neuron yet, start at [/start/install](/start/install).
+
+<Warning>
+Do not import or call `okto_neuron.mcp_server`. That module is a retired compatibility shim: `build_app()` and `run()` both raise `RuntimeError` instead of constructing anything, and the message tells you to run `okto-neuron serve`. There is no second server to stand up.
+</Warning>
+
+## 2. Read the daemon token
+
+On start, the daemon writes its capability token to a file under your home directory:
+
+```bash
+cat ~/.okto-neuron/daemon-7777.token
+```
+
+Two details matter here.
+
+The filename tracks the **REST** port, not the MCP port. The path is built as `~/.okto-neuron/daemon-<rest_port>.token`, so with default ports you connect to 8201 but read `daemon-7777.token`. If you moved the REST port with `--port`, the filename moves with it.
+
+The credential is application-scoped. Selecting a different vault does not rotate it and does not relocate the file. One token serves every vault the daemon can reach.
+
+The file is created and chmod'd `0600`, so only your user account can read it. The bearer gate itself is described in [/mcp/security](/mcp/security).
+
+## 3. Register the server with Claude Code
+
+Claude Code is the MCP host Okto Neuron's installer wires up. The registration is an HTTP-transport server at user scope with the token passed as a header:
+
+```bash
+claude mcp add --scope user --transport http \
+  okto-neuron "http://127.0.0.1:8201/mcp" \
+  --header "Authorization: Bearer $(cat ~/.okto-neuron/daemon-7777.token)"
+```
+
+<Note>
+Register the bare URL, with no `?vault=` query string, if you want to keep re-running the installer. A registered URL that carries a selector fails the installer's re-run check, described below. Add a vault selector only if you accept that trade, or select the vault per call instead.
+</Note>
+
+The installer runs the same command shape for you when it can. Two cases stop it:
+
+<AccordionGroup>
+  <Accordion title="Claude Code wiring deferred">
+    The installer reads the token out of `~/.okto-neuron/daemon-7777.token` before it wires anything. If that file does not exist or is empty, no daemon has run yet, so the installer has no credential to register. It prints `Claude Code wiring deferred` and tells you to start the daemon and re-run the installer. You can also just run the `claude mcp add` command above yourself once the token file exists.
+  </Accordion>
+  <Accordion title="OKTO_NEURON_NO_MCP=1">
+    Setting `OKTO_NEURON_NO_MCP=1` makes the installer skip the `claude mcp add` step entirely. That is all it does. It is read only by the installer, so it does not disable the daemon's MCP server and does not change what a running daemon serves.
+  </Accordion>
+</AccordionGroup>
+
+On a re-run the installer inspects the existing entry with `claude mcp get okto-neuron`. It keeps that entry only when all four checks pass: scope `User config`, status `Connected`, type `http`, and a `URL:` line equal to `http://127.0.0.1:8201/mcp`. Anything else is a registration conflict and the installer stops. If the entry is at `local` or `project` scope it tells you to run `claude mcp remove okto-neuron --scope <scope>`; otherwise it tells you to inspect it with `claude mcp get okto-neuron`. A conflict can also mean the entry is correct but not currently connected, so start the daemon before re-running the installer.
+
+## 4. What any other HTTP MCP client needs
+
+Only Claude Code is wired and exercised. If you are configuring some other HTTP-capable MCP client by hand, the connection is fully described by three values:
+
+<ParamField path="transport" type="string" required>
+  Streamable HTTP. The daemon serves MCP over HTTP; there is no stdio entry point.
+</ParamField>
+
+<ParamField path="url" type="string" required>
+  `http://127.0.0.1:8201/mcp`, with an optional `?vault=<name>` query parameter. The daemon refuses to bind anything except a loopback host, so this address is always local. See [/server/remote-access](/server/remote-access).
+</ParamField>
+
+<ParamField path="Authorization" type="header" required>
+  `Bearer <token>`, where `<token>` is the contents of the token file. The header is the only accepted credential surface: query parameters, cookies and other headers are not credentials, and an unsupported scheme or an empty bearer value is rejected with a specific reason.
+</ParamField>
+
+## 5. Choosing the vault
+
+The `?vault=<name>` parameter on the connection URL is what routes every call made over that connection. The server does not store it at connect time. It reads the query string off the in-flight HTTP request each time a tool runs (`src/okto_neuron/server/runtime.py:938-955`), so every call carries the selector again.
+
+Tools also take a `vault` argument per call. When the connection already carries a selector, the connection wins: the per-call name is validated (an unknown name still errors) but it does not change which vault serves the call. [/mcp/vault-selection](/mcp/vault-selection) covers the resolution order and the error names.
+
+Okto Neuron's MCP tool docstrings describe a convention: a `.marginalia-vault` file in the project directory holding `{"vault": "<name>"}`. It is a convention only. No code in Okto Neuron writes, reads, parses or validates that file, and nothing enforces it, so an agent that ignores it works against whatever vault the connection resolves to. The server deliberately never reads it, because one daemon serves every project and the daemon's working directory is not yours.
+
+## 6. Confirm the connection
+
+First check the client sees the server:
+
+```bash
+claude mcp get okto-neuron
+```
+
+Then check the tool list. A correctly connected Okto Neuron daemon exposes exactly five tools: `ask`, `explore`, `remember`, `list_vaults` and `init_vault`. If you see a different number, you are talking to something other than a current `okto-neuron serve` daemon. [/mcp/overview](/mcp/overview) is the reference for what each one does, which are writes, and where each is registered.
+
+Last, ask the agent to call `list_vaults`. It returns `{vaults: [{name, current, backend}, ...]}`, where `current` marks the vault **this connection** resolves to (the one an `ask` or `explore` without `vault=` reads) and `backend` is that vault's pinned graph backend. If the name you put in `?vault=` comes back with `current: true`, the selector resolved. If the name is missing from the list entirely, it is not a registered vault and calls against it will fail.
+
+`list_vaults` returns names only. It does not return vault paths or ids, by design, so it will not tell you where on disk anything lives.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Claude Code setup" href="/start/connect-claude-code">
+    The guided first-time path, end to end.
+  </Card>
+  <Card title="MCP security" href="/mcp/security">
+    The bearer gate, the token file, and what is deliberately not exposed.
+  </Card>
+  <Card title="Vault selection" href="/mcp/vault-selection">
+    Connection selector, per-call override, and resolution errors.
+  </Card>
+  <Card title="Remote access" href="/server/remote-access">
+    Why the daemon is loopback-only and what to do instead.
+  </Card>
+</CardGroup>

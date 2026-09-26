@@ -1,0 +1,197 @@
+---
+title: How a vault is chosen for an MCP call
+description: The connection URL wins, per-call names lose, and paths are loopback-only.
+---
+
+One Okto Neuron daemon can serve several vaults. Every MCP tool call therefore has to
+answer one question before it does anything else: which vault am I reading or writing?
+This page explains how that question gets answered, in what order, and what you see
+when it cannot be.
+
+<Note>
+Okto Neuron is prerelease. The resolution behaviour described here is read from the
+server source, and the shapes below can change between versions.
+</Note>
+
+## Two selectors, one winner
+
+There are two ways an MCP caller can name a vault.
+
+The first is the connection selector: `?vault=` on the URL your MCP client is
+configured with. The second is the per-call argument: `vault=` passed to `ask`,
+`explore` or `remember`.
+
+The connection selector wins. When the connection supplied a selector, the per-call
+argument never routes the call. The reasoning is in the resolver itself: `?vault=` is a
+deliberate hand edit of a client config, and an agent-chosen tool argument must not
+silently override it (`src/okto_neuron/server/runtime.py:874-880`). The per-call argument
+is substituted into the selector position only when the connection supplied none
+(`src/okto_neuron/server/runtime.py:908-909`), so every downstream rule (configured
+default, sole registered vault, typed errors) stays identical whichever way the name
+arrived.
+
+Losing does not mean being ignored. A supplied `vault=` is validated on every call, even
+on the path where it is about to be discarded (`src/okto_neuron/server/runtime.py:891-899`).
+Before that change, a pinned connection swallowed `vault="../../../etc"` and
+`vault="nao-existe-xyz"` alike and returned a normal answer, so a traversal attempt and a
+plain typo both produced no signal. Now the name is proven to resolve, and an invalid one
+fails the call.
+
+A whitespace-only `vault=` is treated as no override at all rather than as a name to
+resolve (`src/okto_neuron/server/runtime.py:901-907`).
+
+## Per-call names are names, never paths
+
+The per-call argument accepts registry names only. Anything that looks like a path is
+rejected outright: a leading `~`, an absolute path, a forward or backward slash, or a
+drive letter (`src/okto_neuron/server/runtime.py:830-845`). The error is
+`forbidden_path_selector`, and its message says where to go instead:
+
+```text
+the per-call 'vault' argument accepts registered vault NAMES only (see list_vaults);
+pass a path with ?vault=<path> on the connection instead
+```
+
+The reason is a specific gap. The path branch of the resolver is gated on loopback, and
+the MCP request reader reports `is_loopback=True` whenever there is no HTTP context at
+all (`src/okto_neuron/server/runtime.py:939-956`). Allowing a path in an agent-supplied
+argument would hand any agent an unfenced read of arbitrary on-disk vaults through that
+default-open gate (`src/okto_neuron/server/runtime.py:817-828`).
+
+A path selector on the connection is a different matter. It is accepted, but only from a
+loopback caller; a non-loopback connection asking for an absolute path gets
+`forbidden_path_selector` too (`src/okto_neuron/server/runtime.py:738-743`). See
+[/mcp/security](/mcp/security) for the wider posture.
+
+## When the override lost, `ask` and `explore` say so
+
+If your `vault=` argument was discarded because the connection was pinned, `ask` and
+`explore` tell you in the response. The `retrieval` map carries
+`vault_override_ignored`, set to the registry's own spelling of the name you passed, not
+your raw string (`src/okto_neuron/server/runtime.py:1453`,
+`src/okto_neuron/server/runtime.py:1532`). The canonicalisation matches case-insensitively
+on the string, never on the resolved path, so `BETA` comes back as the registered `beta`
+(`src/okto_neuron/server/runtime.py:846-865`). `retrieval["vault"]` alongside it names the
+vault that actually answered.
+
+`remember` does not carry this echo. Its return payload has no `retrieval` map at all
+(`src/okto_neuron/server/runtime.py:1620-1632`), so a per-call `vault=` that lost on a
+write is discarded without a marker in the response. Validation still applies, so a bad
+name still errors, but a pinned connection quietly routes the write elsewhere. Treat the
+connection selector as the source of truth for writes.
+
+## The resolution error codes
+
+Vault resolution raises `VaultResolutionError` with a machine `code`. Seven codes come from
+the resolver itself (`src/okto_neuron/server/runtime.py:561-568`). Branch on the `code` field;
+the wording can change.
+
+- `no_vault`: no vault is registered at all and the connection gave no selector
+  (`src/okto_neuron/server/runtime.py:723-727`).
+- `vault_selector_required`: several vaults are registered, no default is configured, and
+  nothing selected one. The server refuses to guess
+  (`src/okto_neuron/server/runtime.py:728-733`).
+- `forbidden_path_selector`: a path shape in a per-call argument, or an absolute path
+  from a non-loopback connection (`src/okto_neuron/server/runtime.py:837-845`,
+  `src/okto_neuron/server/runtime.py:739-743`).
+- `unknown_vault`: the name or path resolved, but there is no vault there. The message
+  points at `init_vault` (`src/okto_neuron/server/runtime.py:751-755`,
+  `src/okto_neuron/server/runtime.py:768-772`).
+- `ambiguous_vault`: the name matches more than one registered vault
+  (`src/okto_neuron/server/runtime.py:764-765`).
+- `bad_vault_name`: the name itself is invalid (`src/okto_neuron/server/runtime.py:766-767`).
+- `vault_unavailable`: a filesystem error during resolution or open. It covers a permission
+  or I/O failure on a vault that is there, and also a selector that never resolved at all,
+  such as a name long enough to make `os.stat` fail
+  (`src/okto_neuron/server/runtime.py:599-635`, `src/okto_neuron/server/runtime.py:664-696`).
+  It is a separate code from `unknown_vault` on purpose, because telling an agent to run
+  `init_vault` is false remediation for a permission or I/O error on a vault that is
+  already there (`src/okto_neuron/server/runtime.py:620-622`).
+
+Pool failures come out of the same call. When `runtime_for` fails, the pool error is
+re-shaped by the same sanitiser `vault_unavailable` uses, and it keeps the pool's own
+`code`, a value such as `pool_full`, `open_failed` or `vault_fenced`
+(`src/okto_neuron/server/runtime.py:929-933`, `src/okto_neuron/server/_vault_pool.py:28-32`).
+Branch on whichever code you receive, including codes outside the seven above. A fence
+hit later, when the call takes its lease, is rendered as the friendlier
+`maintenance: vault maintenance is in progress; try again shortly`
+(`src/okto_neuron/server/runtime.py:1262-1271`); the write surfaces raise
+`maintenance: vault maintenance is in progress; writes are paused`
+(`src/okto_neuron/server/runtime.py:1578`, `src/okto_neuron/server/runtime.py:1717`).
+A maintenance fence clears on its own, so retry rather than reconfigure.
+
+## Client-facing messages are path-free on purpose
+
+Every selector that reaches a client message passes through one renderer. A name is your
+own input and is echoed back in quotes; anything path-shaped, and the empty selector,
+collapses to the neutral phrase `the selected vault`
+(`src/okto_neuron/server/runtime.py:575-596`). Resolving a path expands symlinks, so
+echoing the resolved target would disclose more of the on-disk layout than you supplied.
+
+The same discipline runs through the failure envelopes. A raw `OSError` carries the
+offending absolute path in its text, its `strerror` context and its `filename`; the
+`vault_unavailable` envelope strips all of it and logs the full detail for the operator
+instead (`src/okto_neuron/server/runtime.py:612-635`). Pool errors embed the resolved
+vault path and get the same treatment (`src/okto_neuron/server/runtime.py:637-655`).
+`list_vaults` returns names only, with no `path` and no `id`, and its own source says not
+to re-add them (`src/okto_neuron/server/runtime.py:1652-1660`). See
+[/mcp/tools/vaults](/mcp/tools/vaults).
+
+## The `.marginalia-vault` project pin
+
+Four MCP tool docstrings tell the agent to check the project directory for a
+`.marginalia-vault` file holding `{"vault": "<name>"}` and to pass the name it pins
+(`src/okto_neuron/server/runtime.py:1346`, `:1510`, `:1560`, `:1636-1643`).
+
+<Warning>
+This is a convention stated in docstrings, and nothing more. A search of `src/`, `bin/`
+and `packaging/` finds those docstrings and no other reference to the filename: nothing
+in the codebase opens, parses, validates or writes the file. `list_vaults` says as much
+in its own text, that the server deliberately does not read it because one daemon serves
+every project and its working directory is not yours
+(`src/okto_neuron/server/runtime.py:1640-1643`). Nothing enforces the pin. An agent that
+ignores it works against whichever vault the connection resolves to, silently and with a
+normal-looking answer.
+</Warning>
+
+The value is a registered name. It is not a path, and a path-shaped value fails the MCP
+call's own validation like any other per-call override
+(`src/okto_neuron/server/runtime.py:837-845`). It does not override a connection's
+`?vault=`.
+
+## Non-MCP resolution, which the pin has no part in
+
+The CLI and library share a different precedence that does not involve the pin or the
+connection selector. With no explicit reference, `resolve_vault_reference` tries
+`OKTO_NEURON_VAULT`, then the configured default vault, then the current working directory
+when that directory is itself a vault, then the sole registered vault when exactly one is
+registered, and finally the conventional default path
+(`src/okto_neuron/vault_registry.py:148-160`).
+
+## The `x-okto-neuron-vault` header is a separate mechanism
+
+Do not confuse the pin or the connection selector with the HTTP header. On vault-scoped
+HTTP paths, the middleware reads `x-okto-neuron-vault` as the request's vault selector, and
+falls back to the pre-0.3.0 `x-marginalia-vault` when the new header is absent
+(`src/okto_neuron/_compat.py:329-335`, `src/okto_neuron/server/http.py:854`). The disclosure
+posture is the opposite of the MCP layer's: a successful response echoes both headers back
+holding the resolved vault path as a string (`src/okto_neuron/server/http.py:897-901`).
+
+Its failures are HTTP status codes, not the MCP code list: 409 `ambiguous_vault`, 400
+`bad_vault_selector`, 404 `vault_not_found`, 409 `no_active_vault` when no vault is
+selected, and a pool error as 503 for `pool_full` or 409 otherwise
+(`src/okto_neuron/server/http.py:767-796`).
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="MCP overview" href="/mcp/overview">
+    How the MCP surface is exposed and what tools exist.
+  </Card>
+  <Card title="Vault tools" href="/mcp/tools/vaults">
+    `list_vaults` and the vault-scoped arguments in full.
+  </Card>
+  <Card title="MCP security" href="/mcp/security">
+    Loopback gates, write restrictions and non-disclosure rules.
+  </Card>
+</CardGroup>

@@ -1,0 +1,291 @@
+---
+title: "Create your first vault"
+description: "Walk through onboarding question by question, create a vault, and get the server running."
+---
+
+A vault is the directory Okto Neuron keeps your notes and graph in. This page takes you from a fresh install to a running server with one vault configured, answering every question the onboarding flow asks.
+
+<Note>
+Okto Neuron is version 0.3.0 and classified as pre-alpha. Expect commands, config keys and output to change between releases.
+</Note>
+
+## Before you start
+
+You need Okto Neuron installed. If you have not done that yet, see [/start/install](/start/install).
+
+## The prompt the installer shows once
+
+On a machine with no vault config and no defaults file, the installer offers to run onboarding for you. It prints:
+
+```text
+Okto Neuron first run: no vault configured.
+Set up your vault and LLM provider now? [Y/n] (default Y)
+```
+
+Pressing Enter, or anything other than `n`, runs `okto-neuron onboard` for you and you name your own vault during the flow.
+
+Answering `n` (or `no`) skips setup and prints a hint instead:
+
+```text
+run 'okto-neuron onboard' from any shell to do this setup in the terminal
+```
+
+Nothing is lost by answering `n`. The prompt only appears when a real terminal is attached, and it is skipped when `OKTO_NEURON_NO_OPEN=1` is set or `--no-onboard` was passed, in which case you run onboarding yourself.
+
+## Run onboarding
+
+```bash
+okto-neuron onboard
+```
+
+The flow asks its questions in this order.
+
+<Steps>
+<Step title="Pick a graph backend">
+```text
+Which graph backend should this vault use?
+  grafx: default, embedded, by Okto Labs
+  ladybug: embedded single file, the legacy default
+  neo4j: external server, needs a bolt URI and a credential env var
+Graph backend [grafx]:
+```
+
+Press Enter to take `grafx`, the default for new vaults. Grafx, also written Okto Grafx, is the embedded graph store Okto Labs writes; it keeps the graph in a `graph.grafx` directory inside the vault. `ladybug` is the older embedded store and keeps the graph in a single `graph.lbug` file. `neo4j` talks to a Neo4j server you run and maintain yourself. This prompt only appears when you did not pass `--backend` on the command line.
+
+<Warning>
+Your answer is pinned into `okto-neuron.yaml` when the vault is created, and `storage.backend` is not a writable config block, so you cannot move the vault to another backend by editing that file. The supported route is a snapshot out of the old vault and a load into a new one. What each name resolves to, and the pin rules, are on [/config/storage-backends](/config/storage-backends).
+</Warning>
+</Step>
+
+<Step title="Answer the Neo4j questions, if you chose neo4j">
+Choosing `neo4j` adds three more prompts, each with a default you can accept with Enter:
+
+```text
+Neo4j storage URI [bolt://127.0.0.1:7687]:
+Env var holding the Neo4j credential [OKTO_NEURON_NEO4J_PASSWORD]:
+Neo4j database [neo4j]:
+```
+
+If the URI you give is not on loopback, onboarding asks you to confirm the remote endpoint before it continues.
+</Step>
+
+<Step title="Name the vault">
+```text
+Vault name [mynotes]:
+```
+
+The name becomes a directory under your vault root, which is `~/.okto-neuron/vaults` unless you have configured a different root. So the default answer gives you `~/.okto-neuron/vaults/mynotes`.
+
+This prompt is skipped when onboarding already has a vault to work with: you passed `--vault`, `OKTO_NEURON_VAULT` is set, a default vault is already configured, the directory you are standing in is a vault, or exactly one vault already exists. In those cases onboarding reuses that vault and the summary reports `created:  no`.
+</Step>
+
+<Step title="Confirm creation">
+```text
+Create vault at /Users/you/.marginalia/vaults/mynotes? [Y/n]:
+```
+
+Answering no aborts the whole command and writes nothing. Answering yes creates the vault with the `core`, `research` and `personal` packs and the `fastembed` embedder.
+
+A pack is a vocabulary: the node types and edge types extraction is allowed to produce, and the enabled list is folded into the prompts the model sees. `core` is the generic substrate (`Node`, `Authority`, `Work`, `Item`). `research` adds note-taking types such as `Note`, `Source`, `Claim` and `Question`. `personal` adds `Person`, `Event`, `Place`, `Org`, `Conversation` and `Commitment`. Onboarding always uses these three and gives you no prompt for them. A fourth pack, `sdlc`, ships but is off by default. The full list, what each one contributes and how to change the list on an existing vault are on [/config/vault-yaml#packs](/config/vault-yaml#packs).
+</Step>
+
+<Step title="Choose a provider">
+```text
+Choose a provider:
+  0. Skip LLM setup
+  1. Auto-detect local runtime (auto) - Probes LM Studio, Ollama, and LiteLLM Proxy on loopback only.
+  ...
+Provider [1]:
+```
+
+Entry `0` skips LLM setup entirely (see [below](#skipping-the-llm-setup)). The numbered entries are the provider presets, covering local OpenAI-compatible runtimes and hosted providers. You can type the number or the provider id. A number outside the menu, or a name that is not a preset id, is rejected.
+
+For the full list of presets and what each one writes into config, see [/config/llm-providers](/config/llm-providers).
+</Step>
+
+<Step title="Confirm the base URL">
+```text
+Base URL [<the preset's base URL>]:
+```
+
+The default is the preset's own base URL, so Enter is usually the right answer. Presets that have no HTTP endpoint skip this question.
+
+If the base URL you end up with is not on loopback, onboarding asks you to confirm the remote endpoint before it goes on.
+</Step>
+
+<Step title="Enter the API key">
+```text
+API key (press Enter if this local endpoint has no key):
+```
+
+For a preset that requires a key the wording changes to name the environment variable it will be saved as, for example `saved as OKTO_NEURON_OPENAI_API_KEY; leave blank only if already exported`. Input is hidden. Leave it blank if you already exported that variable yourself.
+</Step>
+
+<Step title="Pick a model">
+Onboarding calls the provider's model-list endpoint. When it returns models, you get a numbered list:
+
+```text
+Available models:
+  1. <model-id>
+  2. <model-id>
+Type a number from the list or paste a model ID.
+Model [1]:
+```
+
+The default selection is the preset's own default model if it appears in the list, otherwise the first entry. A number outside the list is rejected; anything that is not a number is taken as a model id verbatim.
+
+If the listing fails you get:
+
+```text
+model discovery failed (<error>); enter a model manually
+```
+
+and then a plain `Model` prompt defaulting to the preset's declared default model.
+</Step>
+</Steps>
+
+## Onboarding verifies the provider before it saves
+
+Before anything is written, onboarding sends one real minimal completion to the base URL and model you chose.
+
+If that call fails, you see:
+
+```text
+verify failed — nothing was saved:
+  <error>
+```
+
+and the command exits with `onboarding aborted; re-check the base URL and model`. No config patch is written and no secret is stored. Fix the base URL or the model and run `okto-neuron onboard` again.
+
+The verify step is skipped for `--dry-run` and for presets that have no HTTP endpoint.
+
+When it succeeds, the API key is written to a user env file, the LLM config is patched into the vault's `okto-neuron.yaml`, and you get a summary:
+
+```text
+Okto Neuron onboarding complete
+  vault:    /Users/you/.marginalia/vaults/mynotes
+  created:  yes
+  state:    configured
+  provider: openai
+  model:    gpt-4.1-mini
+  base URL: https://api.openai.com/v1
+  key env:  OKTO_NEURON_OPENAI_API_KEY (/Users/you/.marginalia/env)
+  changed:  ...
+```
+
+## Skipping the LLM setup
+
+Choosing `0. Skip LLM setup` removes any explicit LLM config from the vault, prints the same summary with `state: not_configured`, and tells you:
+
+```text
+explore works without an LLM; run 'okto-neuron onboard --reconfigure' to enable ask/remember.
+```
+
+A vault with no `llm.defaults.model` is not set up for `ask` or `remember`; run onboarding again with `--reconfigure` when you have a provider to point at. You can create the vault now and decide about the provider later.
+
+## Onboarding sets the default vault
+
+When onboarding finishes creating (or selecting) the vault, it sets that vault as the global default. `okto-neuron init` does not: it creates the vault, prints `initialized vault at <path>`, and leaves your default alone. If you use `init`, point the default at the new vault yourself with `okto-neuron vault use <name>`.
+
+## Start the server
+
+```bash
+okto-neuron serve
+```
+
+This starts the app server in the foreground with the HTTP server and UI on port `7777` and FastMCP on port `8201`, bound to `127.0.0.1`. The UI opens in your browser by default; pass `--no-open` to suppress that. Open it yourself at:
+
+```text
+http://127.0.0.1:7777/
+```
+
+<Warning>
+`serve` binds to loopback only. Passing a non-loopback `--host`, or `--allow-remote`, is refused with exit code 2 and a message telling you to bind to `127.0.0.1` and use an SSH tunnel instead.
+</Warning>
+
+To run it in the background instead, add `--daemon`:
+
+```bash
+okto-neuron serve --daemon
+```
+
+The daemon path prints what you need to manage it:
+
+```text
+Okto Neuron is running in the background (pid=<pid>)
+  UI: http://127.0.0.1:7777/
+  Status: ...
+  Stop: ...
+  Logs: /Users/you/.marginalia/logs/okto-neuron-serve.log
+```
+
+A daemonized server writes to a default log file, printed on the `Logs:` line above. Both structured logs and raw stdout and stderr go there, so uncaught tracebacks survive. Pass `--log-file /dev/null` to silence it. The flag and its default are on [/reference/cli/server-commands](/reference/cli/server-commands).
+
+More on ports, lock files and startup behavior is in [/server/running](/server/running).
+
+## Confirm it is up
+
+```bash
+okto-neuron status
+```
+
+```text
+Okto Neuron <version> — <status>
+  Endpoint: http://127.0.0.1:7777
+  PID:      <pid>
+  Scope:    application
+  Vaults:   1
+  Uptime:   ...
+  Ingest:   idle (0/0 terminal, 0 processing, 0 queued)
+  UI:       ...
+  Stop:     okto-neuron stop
+```
+
+`status` talks to the running server over HTTP. It resolves its endpoint the way every client command does ([/reference/cli/overview](/reference/cli/overview)). Add `--json` for a machine-readable payload. Any line beginning with `Warning:` is a degraded reason reported by the server.
+
+If nothing is listening, `status` reports the endpoint as unreachable and exits non-zero.
+
+## Stop it
+
+```bash
+okto-neuron stop
+```
+
+It prints the shutdown line, waits for a drain and escalates automatically, then confirms:
+
+```text
+stopping okto-neuron server (pid=<pid>); waiting up to <timeout>s for drain, then escalating automatically
+stopped okto-neuron server (pid=<pid>)
+```
+
+How long it waits comes from `--timeout`; its default is on the CLI reference page.
+
+## What just got created
+
+<CardGroup cols={2}>
+<Card title="A vault directory" icon="folder">
+Created at your vault root, with the `core`, `research` and `personal` packs and the `fastembed` embedder, pinned to the graph backend you chose. The vault root and its `notes`, `refs` and `.marginalia` directories are created owner-only.
+</Card>
+<Card title="A vault config file" icon="file-code">
+`okto-neuron.yaml` inside the vault, holding the backend pin and, unless you skipped LLM setup, the provider, model, base URL and API key env var.
+</Card>
+<Card title="A user env file" icon="key">
+Written only if you typed an API key during onboarding, under your Okto Neuron home.
+</Card>
+<Card title="A default vault pointer" icon="bookmark">
+Onboarding records the new vault as the global default, so later commands find it without `--vault`.
+</Card>
+</CardGroup>
+
+Every file and directory in a vault is listed in [/reference/vault-layout](/reference/vault-layout).
+
+## Next
+
+<CardGroup cols={2}>
+<Card title="Ask your first questions" icon="comments" href="/start/first-questions">
+Add a document and query the vault.
+</Card>
+<Card title="Configure a provider" icon="sliders" href="/config/llm-providers">
+The presets, config keys and what each one needs.
+</Card>
+</CardGroup>

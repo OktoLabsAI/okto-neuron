@@ -1,0 +1,318 @@
+---
+title: "Graph schema reference"
+description: "The tables a Ladybug-backed vault creates, their shared columns, the vector indexes and the version stamps."
+---
+
+<Note>
+Okto Neuron is prerelease. The schema below is what the code declares today, at
+`CURRENT_SCHEMA_VERSION = 1`. There is no automatic migration path between
+schema versions.
+</Note>
+
+<Note>
+This page documents the Ladybug schema in `src/okto_neuron/store/schema.py`. A
+vault created with the default `grafx` backend (`DEFAULT_NEW_VAULT_BACKEND =
+"grafx"`, `src/okto_neuron/config/_vault.py:335`) declares only `Node` and
+`Edge` plus a vector space, not the keep list below
+(`src/okto_neuron/store/grafx.py:246-275`).
+</Note>
+
+`src/okto_neuron/store/schema.py` is the Ladybug graph schema DDL for vault
+storage. Its module docstring names the keep-list in that file as the source of
+truth for graph tables and vector indexes. On a real open
+(`src/okto_neuron/store/_bootstrap.py:210-224`) bootstrap verifies the stored
+schema version, then the stored embedding width, then executes
+`ddl_statements()` in order, then verifies the schema version again.
+
+## The keep list
+
+`KEEP_LIST` declares eight tables in a deliberately stable order. That order is
+not node-tables-first: `Edge` is second and `Reference` precedes the `Document`
+table it references. `ddl_statements()` emits every node table before any
+relation table, which is what keeps the DDL valid.
+
+| Table | Kind | From / To | Vector index |
+| --- | --- | --- | --- |
+| `Node` | node | | |
+| `Edge` | rel | `Node` -> `Node` | |
+| `Authority` | node | | `authority_embedding_idx` |
+| `Annotation` | node | | `annotation_embedding_idx` |
+| `Reference` | rel | `Document` -> `Document` | |
+| `Work` | node | | |
+| `Document` | node | | `document_embedding_idx` |
+| `Block` | node | | `block_embedding_idx` |
+
+`table_names()` returns these names in that order. `vector_index_names()`
+returns the four index names derived from the same dictionary.
+
+### What actually gets written
+
+The table inventory is what the DDL declares, which is not the same thing as
+where a node lands. `LadybugStore.add_node` runs a single
+`MERGE (n:Node {id: $id})` and sets `type` as a column on that row, so a
+`Document` or a `Block` is a row in the `Node` table carrying
+`type = "Document"`, not a row in the `Document` table.
+`LadybugStore.add_edge` likewise creates `(s:Node)-[e:Edge {...}]->(d:Node)`.
+
+Treat `Authority`, `Work` and `Reference` as schema headroom. The closed type
+set (below) does not contain `Authority` or `Work`, and
+`require_writable_node_type` raises `ValueError` for any type outside it, so a
+store refuses to persist a node of either type.
+
+## Shared node columns
+
+Every node table in `KEEP_LIST` starts from `_COMMON_NODE_COLUMNS`.
+
+| Column | DDL type | Notes |
+| --- | --- | --- |
+| `id` | `STRING PRIMARY KEY` | |
+| `type` | `STRING` | |
+| `title` | `STRING` | |
+| `content` | `STRING` | |
+| `tags` | `STRING[]` | |
+| `facets` | `STRING` | serialized; see below |
+| `provenance` | `STRING` | |
+| `created_at` | `TIMESTAMP` | |
+| `schema_version` | `INT64` | meaningful only on the schema-metadata node |
+| `embedding_dim` | `INT64` | set only on the schema-metadata node, `NULL` on data nodes |
+| `graph_generation` | `STRING` | set only on a new graph under the current identity contract |
+| `identity_contract_version` | `STRING` | same |
+| `embedding` | `DOUBLE[<dim>]` | width parameterized, see Embedding width |
+
+`facets` is a `STRING` column in the DDL while the Python `Node.facets` is a
+dict, so backends serialize it: `GrafxStore` and `Neo4jStore` both `_json_dump`
+it on write and `_json_load` it on read.
+
+`_EMBEDDING_COLUMN_PLACEHOLDER` is the sentinel `DOUBLE[]`; `_column_sql`
+rewrites it to `DOUBLE[<dim>]` so the width is parameterized in one place.
+
+### Per-table extra columns
+
+<AccordionGroup>
+<Accordion title="Authority">
+`canonical_name STRING`, `variants STRING[]`.
+</Accordion>
+<Accordion title="Annotation">
+`block_id STRING`, `target_id STRING`, `byte_start INT64`, `byte_end INT64`,
+`surface_form STRING`.
+</Accordion>
+<Accordion title="Work">
+`work_uri STRING`.
+</Accordion>
+<Accordion title="Document">
+`uri STRING`, `media_type STRING`, `byte_length INT64`, `sha256 STRING`,
+`discovered_at TIMESTAMP`, `work_id STRING`.
+</Accordion>
+<Accordion title="Block">
+`document_id STRING`, `path STRING`, `block_index INT64`, `byte_start INT64`,
+`byte_end INT64`, `block_kind STRING`, `content_hash STRING`.
+</Accordion>
+</AccordionGroup>
+
+## Shared edge columns
+
+`_COMMON_EDGE_COLUMNS` gives both relation tables `id STRING`, `type STRING`,
+`src STRING`, `dst STRING`, `weight DOUBLE`, `provenance STRING`,
+`created_at TIMESTAMP`. `Reference` adds `locator STRING` and
+`citation_text STRING`.
+
+## Vector indexes
+
+Four tables carry a `vector_index` key: `Authority`, `Annotation`, `Document`
+and `Block`. `ddl_statements()` emits `INSTALL VECTOR` and `LOAD VECTOR`, then
+one index statement per entry, built by `_build_vector_index_ddl` as:
+
+```sql
+CALL CREATE_VECTOR_INDEX('<table>', '<index>', 'embedding', metric := 'cosine')
+```
+
+The `vector_index_names()` docstring calls these HNSW vector index names. The
+DDL string itself specifies only the column and the cosine metric.
+
+## Embedding width
+
+`DEFAULT_EMBEDDING_DIM = 384`, documented in source as the fastembed
+`BAAI/bge-small-en-v1.5` width. The vector column is fixed-width in Ladybug, so
+the configured model's `dimension` is baked into the DDL at bootstrap and
+recorded on the schema-metadata node.
+
+`verify_embedding_dim(connection, configured_dim)` compares the two:
+
+<Steps>
+<Step title="No stored width">
+Returns without raising. A graph built before the column existed, or one never
+bootstrapped, is accepted. A fresh bootstrap records the width going forward.
+</Step>
+<Step title="Stored width equals configured width">
+Returns without raising.
+</Step>
+<Step title="Stored width disagrees">
+Raises `EmbeddingDimMismatch` carrying the file path, `stored_dim` and
+`configured_dim`. The docstring names `kg reembed` as the remedy, which
+rebuilds the graph at the configured width.
+</Step>
+</Steps>
+
+See [/config/embedding-model](/config/embedding-model) for how the configured
+model is selected.
+
+## Schema version
+
+`CURRENT_SCHEMA_VERSION = 1`. The metadata singleton lives at node id
+`__marginalia_schema__` (`SCHEMA_METADATA_NODE_ID`).
+
+`verify_schema_version(connection)` is narrower than a plain equality check:
+
+- Missing metadata returns without raising, so first bootstrap is accepted.
+- A numeric stored version lower than or equal to `CURRENT_SCHEMA_VERSION`
+  returns without raising.
+- A non-numeric stored value whose text form equals `"1"` returns without
+  raising.
+- Anything else raises `SchemaVersionMismatch(file_path, stored_version,
+  CURRENT_SCHEMA_VERSION)`. The docstring states future versions fail loud
+  because no automatic migration path ships.
+
+<Warning>
+A vault stamped with a schema version above `1` will not open, and the code
+offers no in-place upgrade for it.
+</Warning>
+
+### Additive column migration
+
+`CREATE NODE TABLE IF NOT EXISTS` never alters an existing table, so
+`_migration_ddl(dim)` emits idempotent `ALTER TABLE ... ADD` statements for the
+three columns introduced after the initial schema shipped: `embedding_dim`,
+`graph_generation`, `identity_contract_version`. These run before the metadata
+statement that references them.
+
+## Graph identity
+
+Two constants stamp a graph's identity contract:
+
+| Constant | Value |
+| --- | --- |
+| `LEGACY_IDENTITY_CONTRACT_VERSION` | `legacy.v0` |
+| `CURRENT_IDENTITY_CONTRACT_VERSION` | `semantic_edges.v1` |
+
+`new_graph_identity()` mints `GraphIdentity(str(uuid4()),
+CURRENT_IDENTITY_CONTRACT_VERSION)`, described in source as the identity
+persisted by a genuinely fresh graph or a rebuild. `GraphIdentity.is_unset` is
+true when either field is `None`; `is_legacy` is true when the contract version
+is `None` or `legacy.v0`.
+
+`semantic_edges.v1` additionally promises that every deterministic
+(content-addressed) edge id equals `sha256_hex("edge", src, type, dst)`, and
+that no two edges claim the same deterministic semantic identity under
+different ids. The integrity auditor runs those checks only for contracts in
+`DETERMINISTIC_EDGE_IDENTITY_CONTRACTS`, which contains `semantic_edges.v1`
+alone; legacy graphs predate the promise and are audited without them.
+
+`read_graph_identity(connection)` represents both a missing column and a
+missing value as `None`, and never upgrades a legacy graph in place.
+
+One more sentinel: `NEO4J_METADATA_GENERATION = "__meta__"` tags the Neo4j
+per-vault metadata singleton, which is deliberately not generation-scoped like
+every other `(id, vault_id, _generation)` node.
+
+See [/concepts/graph-lifecycle](/concepts/graph-lifecycle) for when a rebuild
+mints a new generation.
+
+## The closed node-type set
+
+`src/okto_neuron/store/closed_set.py` is the single definition of the types a
+store will persist. ADR 0040 locks the graph to five primitives plus six
+support types.
+
+| Kind | Types |
+| --- | --- |
+| primitive | `Agent`, `Activity`, `InformationObject`, `Concept`, `Place` |
+| support | `Document`, `Identifier`, `Annotation`, `Claim`, `Block`, `Finding` |
+
+`CLOSED_NODE_TYPES` is the frozenset union of the two tuples.
+`INTERNAL_NODE_TYPES` holds `SchemaMetadata` alone, and
+`WRITABLE_NODE_TYPES = CLOSED_NODE_TYPES | INTERNAL_NODE_TYPES` is everything a
+store may persist. `require_writable_node_type` raises `ValueError` for
+anything else, and both `LadybugStore` and `InMemoryStore` call it in
+`add_node`.
+
+`SchemaMetadata` is writable but not part of the closed schema: bootstrap writes
+it with raw Cypher, so `list_nodes` yields it and the rebuild/reembed copy paths
+hand it back to `add_node`. It is excluded from the semantic surfaces.
+
+`require_same_edge_identity` is the sibling invariant on edges: reusing an
+existing edge id for a different `(type, src, dst)` raises `ValueError`.
+
+### The node-type census
+
+`GET /api/v1/node-types` returns one entry per closed-set type, each with
+`name`, `kind` from `_TYPE_KIND`, `count`, and
+`minted_by_ingest: t not in _NEVER_MINTED_TYPES`.
+
+`_NEVER_MINTED_TYPES` is `{"Identifier", "Annotation", "Finding"}`. The source
+comment states no ingest path ever writes these to the store, so a count of 0 is
+the expected steady state rather than a regression signal: `Finding` is computed
+on demand by the detectors and returned as a value, while `Identifier` and
+`Annotation` are declared models with no writer. The census reports them so the
+closed schema stays visible and flags them so a reader can tell "never minted"
+apart from a live type that happens to be empty. Adding a write path for one of
+these means removing it from that set.
+
+The census also skips infrastructure nodes, and skips structural Claims unless
+`include_structural` is set.
+
+## Type-specific facets
+
+Markdown ingest writes `facets` dicts whose shape depends on the node type.
+
+<Tabs>
+<Tab title="Document">
+`document_facets` is `ingest.document.model_dump(mode="json")` plus
+`path` (the string path) and `metadata` (a JSON-safe copy). When an existing
+`Document` node already carries `discovered_at`, that value is preserved.
+Provenance is `source="ingest", rule_id="deterministic-v1"`.
+</Tab>
+<Tab title="Block">
+`parsed.block.model_dump(mode="json")` plus `chunk_size_bytes`,
+`chunk_overlap_bytes` and `source_path`. The `Block` model carries `id`
+(HEX64), `path`, `block_index`, `byte_start`, `byte_end`, `block_kind` and
+`content_hash` (HEX64). `BlockKind` is a locked enum: `paragraph`, `heading`,
+`list-item`, `code-block`, `transcript-utterance`.
+</Tab>
+<Tab title="Claim">
+`parsed.claim.model_dump(mode="json")` plus `source_path`. Claims with
+`P == "has_heading"` also get the low-salience facet. The `Claim` model carries
+`id`, `S_id`, `P`, exactly one of `O_id` / `O_literal`, `confidence` in
+`[0.0, 1.0]`, the PROV anchors `block_id`, `extraction_activity_id` and
+`agent_id`, optional `model_id`, `prompt_hash` and `source_span`. `P` may not
+be `kind_of`, which is reserved for primitive composition.
+</Tab>
+</Tabs>
+
+Ingest sets `_superseded` and `valid_until` on deterministic claims a later
+ingest of the same document no longer produced, for the predicates `has_tag`,
+`has_heading` and `links_to`.
+
+All six support types are frozen Pydantic v2 value objects with
+`extra="forbid"`. `HEX64` is the lowercase-hex sha256 alias. `PATH_MAX_LENGTH`
+is 4096 and `validate_safe_path` rejects a NUL byte, an absolute path, a
+backslash and a `..` traversal segment before NFC-normalizing the result.
+
+See [/concepts/data-model](/concepts/data-model) for what these types mean, and
+[/reference/python-api](/reference/python-api) for the objects you get back.
+
+## Tables that are not yours
+
+`PULSE_ONLY_TABLES` names fourteen tables belonging to a different product:
+`Decision`, `Criterion`, `Constraint`, `Requirement`, `Alternative`, `Spec`,
+`Card`, `Sprint`, `Ideation`, `Refinement`, `Topic`, `Story`, `Guideline`,
+`BoardMeta`. None of them is part of an Okto Neuron vault, and none is in
+`KEEP_LIST`.
+
+## Pack type vocabularies
+
+The pack modules declare `node_types` and `edge_types` as plain string tuples on
+a `Pack` object. The core pack lists `Node`, `Authority`, `Work`, `Item`; the
+research pack lists `Note`, `Source`, `Claim`, `Topic`, `Quote`, `Question`,
+`Finding`; the personal pack lists `Person`, `Event`, `Place`, `Org`,
+`Conversation`, `Commitment`. These are vocabulary declarations. The closed set
+in `closed_set.py` is what a store will accept on write.

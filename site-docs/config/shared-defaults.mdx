@@ -1,0 +1,99 @@
+---
+title: "Share settings across vaults"
+description: "One application baseline in defaults.yaml, opted into per vault."
+---
+
+You run more than one vault and you do not want to paste the same embedding block, LLM block and upkeep block into each `okto-neuron.yaml`. Okto Neuron has one application-wide baseline file. A vault that opts in reads its settings from that baseline and keeps only the fields it deliberately overrides.
+
+<Note>
+Okto Neuron is at version 0.3.0 and carries a "2 - Pre-Alpha" classifier. The shapes on this page are what the code reads today, not a settled contract.
+</Note>
+
+## The three files, and which one this page is about
+
+<ParamField path="~/.okto-neuron/okto-neuron.toml" type="application settings">
+  Application-level settings such as the daemon's host and port. Separate file, separate format. See [/config/okto-neuron-toml](/config/okto-neuron-toml).
+</ParamField>
+
+<ParamField path="~/.okto-neuron/defaults.yaml" type="shared vault baseline">
+  The baseline this page covers. `VaultConfig.application_defaults_path()` resolves it as `default_app_home() / "defaults.yaml"`, and `default_app_home()` is `Path.home() / ".marginalia"`.
+</ParamField>
+
+<ParamField path="<vault>/okto-neuron.yaml" type="per-vault config">
+  One per vault. It always wins over the baseline. See [/config/vault-yaml](/config/vault-yaml).
+</ParamField>
+
+Start from [/config/overview](/config/overview) if you have not seen how the three fit together.
+
+## What defaults.yaml may contain
+
+`defaults.yaml` is parsed as a full `VaultConfig`, the same model as a vault's `okto-neuron.yaml`, so it takes the same block names: `embedding`, `llm`, `consolidation`, `curation`, `upkeep`, `packs`, `folder_watch`, `ingest`, plus `marginalia_yaml_version`. The model is declared with `extra="allow"`, so unknown keys parse rather than fail.
+
+A patch to the baseline is held to the same writable surface as a vault config: the seven `WRITABLE_BLOCKS` names enumerated in [/config/overview](/config/overview). Anything outside that list is rejected with `unknown config field(s)`. `curation` is a typed field of the model but is not on that list, so you set it by editing the file.
+
+When the daemon writes the file for you through `PATCH /api/v1/config/defaults`, it serializes the whole validated config minus three keys: `vault_id`, `inherits_application_defaults` and `storage` are stripped before the write. That same write creates `~/.okto-neuron` if needed and chmods it to `0700`, then chmods `defaults.yaml` to `0600`. A `defaults.yaml` you create by hand gets no chmod from Okto Neuron, so set those modes yourself.
+
+Field-by-field values live on the reference pages, not here. LLM fields are on [/config/llm-reference](/config/llm-reference); the per-vault block shapes are on [/config/vault-yaml](/config/vault-yaml).
+
+<Note>
+Nothing in the installer or the onboarding path creates `defaults.yaml`. `install.sh` only tests whether the file exists, as part of deciding whether the home directory is greenfield. If you want a baseline, you create it.
+</Note>
+
+## Opt a vault in
+
+A vault reads the baseline only when its own `okto-neuron.yaml` has `inherits_application_defaults: true`. Any other value, including the key being absent, makes `load()` merge against code defaults instead.
+
+You cannot set that flag through the config write path: it is not in `WRITABLE_BLOCKS`, so a PATCH naming it is rejected. There is one in-code helper that sets it, `VaultConfig.enable_application_inheritance()`, and the only caller is the daemon's vault-creation helper. So for a vault that already exists, opting in is an edit to the file.
+
+<Steps>
+  <Step title="Edit while nothing else is patching">
+    Both the config-write path and `enable_application_inheritance()` rewrite `okto-neuron.yaml` with `yaml.safe_dump` of the parsed mapping, so comments and formatting in a hand-edited file do not survive a config write. Untyped top-level keys do survive: `apply_patch` starts from the raw mapping.
+  </Step>
+  <Step title="Add the flag">
+    Add these two keys to the existing `okto-neuron.yaml`. Leave every other key in place, especially `vault_id` and `storage`: removing `storage` makes the vault read as an unpinned legacy vault.
+
+    ```yaml
+    # add to the existing okto-neuron.yaml
+    marginalia_yaml_version: 1
+    inherits_application_defaults: true
+    ```
+  </Step>
+  <Step title="Delete the fields you want inherited">
+    `load()` deep-merges the vault's own data *over* the baseline, and the merge recurses into nested mappings. Only the leaf fields present in `okto-neuron.yaml` win: keep `embedding.model` there and `embedding.provider` still tracks the baseline. Remove a field, or the whole block, to inherit it. `packs` is a list, not a mapping, so a `packs:` line replaces the baseline's list outright.
+  </Step>
+  <Step title="Check the effective config">
+    `GET /api/v1/config` reports the effective config for the vault the daemon currently has selected, and the payload carries `inherits_application_defaults`. See [/reference/http-endpoints](/reference/http-endpoints).
+  </Step>
+</Steps>
+
+## Vaults created by the daemon already inherit
+
+`_create_inheriting_vault()` scaffolds the vault and then calls `enable_application_inheritance(target_path)` unconditionally. That helper runs for every vault created through `POST /api/v1/vaults` and through the MCP `init_vault` tool, both of which route into `_initialize_managed_vault()`. Those vaults start opted in. `_create_inheriting_vault()` has exactly one caller, `_initialize_managed_vault()` (src/okto_neuron/server/http.py:1213), so a vault created by any other route does not get the flag and has to be opted in with the file edit above.
+
+<Warning>
+`enable_application_inheritance()` rewrites `okto-neuron.yaml` and drops every writable block from it: it keeps only keys that are *not* in `WRITABLE_BLOCKS`, then sets `marginalia_yaml_version: 1` and the inherit flag, and writes that compacted mapping over the file. On a fresh scaffold that is the intent. Run it against a vault whose config you have tuned and you lose those blocks from disk.
+</Warning>
+
+## Only patched fields get written back
+
+When you patch an inheriting vault's config, Okto Neuron validates the full merged document, then persists only the fields you explicitly named. Everything you did not touch stays absent from `okto-neuron.yaml` and keeps tracking `defaults.yaml`. That is what makes a shared baseline useful: one override does not freeze the rest of the block.
+
+## Moving the baseline moves every inheriting vault
+
+<Warning>
+After an application-defaults patch, the daemon walks every registered vault, skips the ones that are not inheriting, and recomputes each inheriting vault's effective config before and after. A baseline change to the embedding identity marks those vaults as needing a re-embed; a change to the consolidation toggles marks them as needing a semantic rebuild. One edit to `defaults.yaml` can therefore put several vaults into that state at once. See [/config/embedding-model](/config/embedding-model) and [/vault/rebuilding](/vault/rebuilding) for what each one costs you.
+</Warning>
+
+## When the baseline is missing or broken
+
+<AccordionGroup>
+  <Accordion title="The file does not exist">
+    `load_application_defaults()` catches `FileNotFoundError` and returns code defaults. Nothing warns. An inheriting vault with no `defaults.yaml` on disk behaves like a vault built on code defaults.
+  </Accordion>
+  <Accordion title="The file is malformed or unreadable">
+    A YAML parse error or an `OSError` raises `ConfigParseError` against the `defaults.yaml` path, with the YAML error line when one is available. Malformed is loud; missing is silent.
+  </Accordion>
+  <Accordion title="A field fails validation">
+    `defaults.yaml` goes through the same `_validate_data()` as a vault config, so an unsupported `marginalia_yaml_version` or a field that fails its validator raises rather than loading a half-good baseline.
+  </Accordion>
+</AccordionGroup>

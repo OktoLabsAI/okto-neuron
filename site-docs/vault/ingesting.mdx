@@ -1,0 +1,173 @@
+---
+title: Get content into a vault
+description: One file, a whole folder, or an agent write, and which of these need the daemon running.
+---
+
+A vault only knows what you put into it. There are four ways to get content in, and they differ in one practical way: whether an Okto Neuron server has to be running.
+
+<Note>
+Okto Neuron is prerelease (version 0.3.0, classified `2 - Pre-Alpha`). Command names, flags and output can change between versions.
+</Note>
+
+## Pick a path
+
+<CardGroup cols={2}>
+  <Card title="One file, right now" icon="file">
+    `okto-neuron add FILE` posts the file to the running server and stores it.
+  </Card>
+  <Card title="A folder, continuously" icon="folder">
+    `okto-neuron watch-folder add ROOT` registers a directory the daemon keeps polling.
+  </Card>
+  <Card title="From an agent" icon="robot">
+    The MCP `remember` tool takes a file path or raw text and curates it.
+  </Card>
+  <Card title="An inbox, no daemon" icon="inbox">
+    `okto-neuron watch VAULT` drains `.marginalia/incoming` in your own terminal.
+  </Card>
+</CardGroup>
+
+## Add a single file
+
+<Steps>
+  <Step title="Start the server">
+    ```bash
+    okto-neuron serve --daemon
+    ```
+    `--daemon` detaches the server so you get your prompt back. Without it, `serve` runs in the foreground and you need a second terminal for step 2.
+  </Step>
+  <Step title="Add the file">
+    ```bash
+    okto-neuron add ~/notes/architecture-review.md
+    ```
+    On success the command prints the document id and the chunk count:
+    ```text
+    added <document-id> (<n> chunks)
+    ```
+  </Step>
+</Steps>
+
+The CLI reads the file itself and sends both the path string and the file's text in the request body. The server writes those bytes to a durable file under `.marginalia/sources/` inside the vault and ingests from there, so the server never needs filesystem access to the path you typed. The path you typed is still recorded on the request and its basename is used as the queue entry's name.
+
+That matters in two situations:
+
+- The vault lives on another machine and you reach it through an SSH tunnel. The server cannot open `~/notes/...` on your laptop, and it does not need to.
+- The file sits outside the vault directory. `add` still works, because the content travels in the body.
+
+If your shell user cannot read the file, nothing is sent. The CLI prints `cannot read <path>: <err>` on stderr and exits `1`.
+
+`add` is a store, not a curation pass. It records the document and its chunks with no LLM extraction, and the ingest queue marks the entry `stored` rather than a full `remember()` extraction. The claims it does write are the structural ones a parser can read off the page: `has_tag`, `has_heading` and `links_to`. When you want claims and relationships extracted from your prose, use the MCP `remember` tool, or, without an agent, `okto-neuron watch` over the vault inbox (see [/vault/ingesting#the-in-process-inbox](/vault/ingesting#the-in-process-inbox)).
+
+<Warning>
+`add` is a write, and writes are loopback-only. A non-loopback caller gets a 403 with `add is restricted to loopback callers; tunnel (e.g. SSH) to write remotely`. The server itself only binds loopback, so reach a remote vault through an SSH tunnel.
+</Warning>
+
+### There is no directory form
+
+`okto-neuron add` takes exactly one `FILE` argument. Pointing it at a directory does not walk the directory. For a whole tree, register the tree with `watch-folder`.
+
+## Watch a folder
+
+`watch-folder` registers a directory in the vault's config and lets the running daemon poll it.
+
+<Steps>
+  <Step title="Register the root">
+    ```bash
+    okto-neuron watch-folder add ~/notes
+    ```
+    The command resolves the path, checks it exists and is a directory, then asks the server to record it. It prints:
+    ```text
+    registered: /Users/you/notes
+    ```
+  </Step>
+  <Step title="Let the initial ingest run">
+    Registering also queues every existing file under the root, and the command reports what happened:
+    ```text
+    initial ingest: <n> file(s) queued
+    ```
+    That line grows when files were already queued (`already queued (refreshed)`) or when files were passed over (`non-text skipped`).
+  </Step>
+  <Step title="Confirm what is registered">
+    ```bash
+    okto-neuron watch-folder list
+    ```
+    It prints the vault path, the `folder_watch.enabled` value, and one line per registered root, or `no watched roots configured` when the list is empty.
+  </Step>
+</Steps>
+
+Skip the initial pass with `--no-initial-ingest` when you only want future changes picked up:
+
+```bash
+okto-neuron watch-folder add ~/notes --no-initial-ingest
+```
+
+To stop watching:
+
+```bash
+okto-neuron watch-folder remove ~/notes
+```
+
+The root leaves the config and the command prints `removed: /Users/you/notes`. The manifest sidecar is left in place, because its historical hashes are harmless.
+
+### Where roots live
+
+Roots are stored per vault in that vault's `okto-neuron.yaml`, under `folder_watch.roots`, as absolute paths. Registering a root through `watch-folder add` also sets `folder_watch.enabled` to `true`, which matters because folder watching is off by default. The daemon's polling loop is vault-aware: it iterates every vault that declares roots, not only the one you last selected.
+
+Field-by-field detail on the `folder_watch` block lives in [/config/vault-yaml](/config/vault-yaml). See [/vault/watching](/vault/watching) for how the polling loop decides a file has settled.
+
+<Warning>
+`watch-folder add` and `watch-folder remove` need the daemon running. If the initial ingest cannot reach it, the root stays registered and the command tells you the ingest failed.
+</Warning>
+
+## Let an agent write
+
+The MCP `remember` tool is the agent-side entry point. Its `source` argument is either a file path or raw text, and the tool decides which conservatively:
+
+- A multi-line string is always treated as raw text.
+- A single-line string counts as raw text only when it is not path-shaped. Path-shaped means an existing file or directory, a string containing a slash or backslash, a space-free `~` prefix, or a space-free name carrying a short file suffix.
+- A path-shaped source is passed through unchanged and fails loudly as a path error if it does not resolve.
+
+Raw text is first materialized to a durable file under `.marginalia/sources/`, the same convention `add` uses, and that file is then ingested. Unlike `add`, `remember` runs the full curation pass: it ingests the source and curates it into the graph.
+
+`remember` takes a `sensitivity` argument that must be exactly `local_only` or `default`, enforced by the tool schema. `local_only` keeps the source off any remote LLM path.
+
+Writes are serialized per vault by that vault's writer lock, and `remember` is loopback-only for the same reason `add` is. Full argument detail is at [/mcp/tools/remember](/mcp/tools/remember).
+
+## The in-process inbox
+
+`okto-neuron watch VAULT` is the one path that does not talk to a server. It runs the companion in your terminal over the vault's inbox at `.marginalia/incoming`:
+
+```bash
+okto-neuron watch ~/vaults/work
+```
+
+It prints a `watching <vault>/.marginalia/incoming` line naming the poll interval, then a `processed N file(s)` line each time it picks something up. Drop a markdown note into that inbox and the companion remembers it: the confidence gate auto-commits high-confidence candidates and parks the rest on the review queue.
+
+Use `--once` to drain the inbox a single time and exit, and `--poll` to change the interval. If the path is not a directory, or has no `okto-neuron.yaml`, the command exits `2` with `vault not found:` or `vault is missing okto-neuron.yaml:`.
+
+## Which paths need the daemon
+
+| Path | Daemon required | Notes |
+| --- | --- | --- |
+| `okto-neuron add FILE` | Yes | Posts to the running server; unreachable exits `2`, a server error exits `1`. |
+| `okto-neuron watch-folder add/list/remove` | Yes | Every subcommand is an HTTP call to the server. |
+| MCP `remember` | Yes | The tool only exists inside the running MCP server. |
+| `okto-neuron watch VAULT` | No | Opens the vault directly and runs the companion in your process. |
+
+## Re-ingesting the same content
+
+Incremental ingest is on by default. Re-ingesting an unchanged source skips extraction entirely, an edited source extracts only its changed hunks, and removals detach their claims. Sub-chunk diffing is on by default too.
+
+So you can leave a folder registered and re-save a file without paying for a full re-extraction of the whole document. What changed is what gets re-read.
+
+When a re-ingest changes what the graph believes, that is where drift detection comes in. See [/vault/drift](/vault/drift).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="From file to graph" href="/concepts/from-file-to-graph">
+    What actually happens to a document between ingest and a queryable graph.
+  </Card>
+  <Card title="Watching folders" href="/vault/watching">
+    How the polling loop decides a file is ready.
+  </Card>
+</CardGroup>

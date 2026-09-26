@@ -1,0 +1,265 @@
+---
+title: "MCP tool: remember"
+description: "The only write-to-graph tool: path or raw text in, ingest counters out."
+---
+
+`remember` is the write tool on the Okto Neuron MCP server. It ingests one source into the selected vault, extracts candidates from it, and returns counters describing what was committed and what was parked for review.
+
+<Note>
+Okto Neuron is prerelease. Tool names, arguments and payload fields can change between versions.
+</Note>
+
+## Signature
+
+```python
+async def remember(
+    source: str,
+    sensitivity: Literal["local_only", "default"] = "default",
+    vault: str | None = None,
+) -> dict[str, object]
+```
+
+The tool is declared `async` on the MCP server and the blocking ingest runs on a worker thread via `asyncio.to_thread`, so the ingest does not run on the event loop.
+
+<ParamField path="source" type="string" required>
+Either a file path or raw text. See [Path versus raw text](#path-versus-raw-text) for how the two are told apart.
+</ParamField>
+
+<ParamField path="sensitivity" type='"local_only" | "default"' default='"default"'>
+`local_only` keeps the source off any remote LLM path. The two values are the only ones the tool schema accepts.
+</ParamField>
+
+<ParamField path="vault" type="string | null" default="null">
+The **name** of a registered vault to write to, never a path. Omit it to use the vault this connection resolves to. Get names from [the `list_vaults` tool](/mcp/tools/vaults). The server does not read a project's `.marginalia-vault` file (`{"vault": "<name>"}`) for you, so reading it and passing the pinned name is the client's job.
+</ParamField>
+
+## Example calls
+
+`source` is the only required argument.
+
+<Tabs>
+<Tab title="A file">
+```json
+{ "source": "/Users/you/notes/retention-policy.md" }
+```
+The path is passed through unchanged. It has to resolve, and it has to sit inside the vault root or a configured watch root.
+</Tab>
+<Tab title="Raw text">
+```json
+{
+  "source": "Retention policy review, 12 March.\nLegal asked for 7 years on contracts.",
+  "vault": "work"
+}
+```
+The newline makes this raw text with no filesystem probe. The server materializes it under `<vault>/.marginalia/sources/` and ingests that file.
+</Tab>
+<Tab title="Kept off hosted providers">
+```json
+{
+  "source": "/Users/you/notes/salary-bands.md",
+  "sensitivity": "local_only"
+}
+```
+The call is refused if the vault's provider is hosted. `local_only` and `default` are the only two values the tool schema accepts.
+</Tab>
+</Tabs>
+
+## Path versus raw text
+
+`source` is classified before anything is ingested.
+
+A multi-line `source` (it contains a newline) is **always** raw text. No filesystem probe runs at all, so a multi-line note that begins with `~` cannot trip a `Path.expanduser()` failure.
+
+A single-line `source` is treated as a **path** when any of these hold:
+
+- it names an existing file or directory;
+- it contains `/` or `\`;
+- it matches a Windows drive-letter prefix such as `C:`;
+- it starts with `~` and contains no spaces;
+- it contains no spaces, no slash, and ends in a 1 to 5 character alphanumeric suffix, for example `note.pdf`.
+
+Anything else, including any ordinary single-line sentence, is raw text. A sentence like `~5 minutes to set up` contains a space, so the tilde rule does not fire and it stays text.
+
+<Warning>
+A path-shaped `source` is passed through unchanged. If it does not resolve, the call fails loudly as a path error. It is never silently ingested as a document whose body is the literal path string.
+</Warning>
+
+Detected raw text is materialized first: it is written to a file under `<vault>/.marginalia/sources/`, and that file is what gets ingested. This is the same durable-copy convention the HTTP ingest endpoints use, and it exists because a Block's provenance anchors to the path on disk, so the bytes have to persist. The filename comes from a short hash of the content. If that name already exists with **different** content, the file is re-minted under the full content hash instead of overwriting, so an earlier source's byte-anchored provenance stays intact. Re-pasting identical content reuses the same file and stays idempotent.
+
+The materialized file lands under the pooled vault you selected, not under whatever vault the daemon booted with.
+
+## Sensitivity
+
+`sensitivity="local_only"` refuses to run the extraction against a hosted LLM provider. A provider counts as local when it has no `api_base` at all, or its `api_base` host is `127.0.0.1`, `localhost` or `::1`. The check is a pure attribute inspection and never touches the network.
+
+When the provider is hosted, the call raises with:
+
+```text
+sensitivity='local_only' refuses a hosted LLM provider; pin a local base_url for sensitive vaults
+```
+
+This check happens after the document and block anchors are written, so a refused `local_only` ingest can still have persisted the document's anchors before failing.
+
+## Return payload
+
+On success the tool returns a flat object with these fields.
+
+<ResponseField name="document_id" type="string">
+Id of the ingested document.
+</ResponseField>
+
+<ResponseField name="committed" type="integer">
+Candidates that passed the gate and were written to the graph.
+</ResponseField>
+
+<ResponseField name="queued" type="integer">
+Candidates parked on the review queue instead of committed.
+</ResponseField>
+
+<ResponseField name="blocks_total" type="integer">
+Blocks the source parsed into.
+</ResponseField>
+
+<ResponseField name="nodes_extracted" type="integer">
+Node candidates produced by extraction.
+</ResponseField>
+
+<ResponseField name="edges_extracted" type="integer">
+Edge candidates produced by extraction.
+</ResponseField>
+
+<ResponseField name="claims_minted" type="integer">
+Claims minted during this ingest.
+</ResponseField>
+
+<ResponseField name="provider_error" type="string | null">
+A provider-level failure message, or `null`. It stays `null` when the LLM is deliberately disabled.
+</ResponseField>
+
+<ResponseField name="provider_failures" type="integer">
+How many attempted blocks hit an LLM provider error during extraction.
+</ResponseField>
+
+<ResponseField name="empty_after_retry_blocks" type="integer">
+Blocks that had non-empty text but still yielded zero candidates after the extractor's own empty-result retry. Together with `provider_failures` this makes a silent zero-yield ingest visible in the payload rather than only in the log.
+</ResponseField>
+
+<ResponseField name="llm_disabled" type="boolean">
+`true` when the LLM was deliberately turned off for this vault. Treat this as a healthy configuration, not a provider failure.
+</ResponseField>
+
+<ResponseField name="outcomes" type="array">
+One entry per node candidate, each with `candidate_id`, `type`, `title`, `action` (`"committed"` or `"queued"`), `confidence` (0.0 to 1.0) and `correlations`.
+</ResponseField>
+
+<ResponseField name="outcome" type="object">
+An additive object carrying unit, plan and integrity evidence for the run. When the run's `quality` is not `failed` or `integrity_failed` and its `integrity.status` is `verified` or `not_applicable`, a `cross_document_reconciliation` entry is attached to it under the trigger `verified_file_commit`.
+</ResponseField>
+
+The `RememberResult` model carries more fields than the tool returns (`dead_lettered`, for instance). The twelve fields above plus `outcome` are what the MCP payload exposes.
+
+## Serialization
+
+`remember` runs under the selected vault runtime's writer lock. That lock is the vault runtime's write seam. It is shared with the HTTP curation surface and the background job and ingest workers when the selected vault is the connection's active runtime; a `vault=` selection of a different runtime takes that runtime's own lock. Two different vaults have separate runtimes and separate locks, so a write to one never waits on the other.
+
+A second `remember` against the same vault waits. It does not fail fast, and it does not come back with a busy error. The call parks at the lock until the holder releases it, then runs, and waiters are served in the order they arrived. There is no wait timeout and no cap on how many calls can be parked, so a client that fires several `remember` calls at once gets them applied one after another rather than rejected. A background job registered as a writer, such as a rebuild, holds the same lock for its whole run, so a `remember` issued during one waits for the job to finish. If you need to stop waiting, cancel on the client side.
+
+The drain checks run before the lock, not inside it. A `remember` that arrives while the vault is already draining raises `shutting_down:` or `maintenance:` straight away instead of queueing. A call that is already parked on the lock is not re-checked against draining; once it acquires the lock it proceeds to the write-time integrity fence described under [Errors](#errors).
+
+## The loopback write gate
+
+Before anything else, `remember` checks that the caller is on loopback. This gate applies even when the server was started with a wider bind, because write surfaces never widen. When the check fails, the tool raises:
+
+```text
+forbidden: remember is restricted to loopback callers; tunnel (e.g. SSH) to write remotely
+```
+
+To write from another machine, tunnel to the server (SSH port forwarding, for example) so the request arrives on loopback. When there is no HTTP request context at all, as with an in-memory client, the gate allows the call. The same gate guards `init_vault`. See [MCP security](/mcp/security) for the read/write split.
+
+## Errors
+
+Some refusals are raised directly as a `RuntimeError` with a stable prefix: the loopback gate (`forbidden:`), `shutting_down:` and `maintenance:`. Three exception classes are caught and re-raised as a prefixed `RuntimeError`: `SourceOutsideVaultError` as `forbidden:`, `IngestError` as `ladybug_write_failed:`, and `IntegrityFenceError` carrying its own `integrity_fenced:` prefix. Pool errors keep their machine-readable code prefix. The `local_only` refusal and the no-model refusal are not caught, so they propagate as unprefixed `CompanionError`, and the no-model message contains the vault path.
+
+<AccordionGroup>
+<Accordion title="forbidden: remember is restricted to loopback callers; …">
+The caller is not on loopback. See [the loopback write gate](#the-loopback-write-gate).
+</Accordion>
+
+<Accordion title="shutting_down: server is shutting down">
+The runtime is draining and the server is on its way down. Retry against a running server.
+</Accordion>
+
+<Accordion title="maintenance: vault maintenance is in progress; writes are paused">
+The runtime is draining for maintenance rather than shutdown. Writes are paused. A pool-level fence reached while leasing the vault reports the same wording with `try again shortly`.
+</Accordion>
+
+<Accordion title="forbidden: refusing to remember source outside the vault and watch roots: …">
+The path-shaped source resolved outside the vault root and outside every configured folder-watch root. This guard runs before any read, so a traversal attempt never pulls an out-of-tree file into the graph. It is normalized the same way the HTTP surface reports it.
+</Accordion>
+
+<Accordion title="ladybug_write_failed: ladybug write failed: …">
+The ingest itself failed at the store layer. The raw exception type is deliberately not leaked, matching the HTTP response.
+</Accordion>
+
+<Accordion title="integrity_fenced: …">
+A write-time integrity fence. Before the ingest, the runtime verifies the current graph generation; if the state is not verified, or the writer is fenced, the write is refused. The message carries the fence reason and recovery guidance.
+</Accordion>
+
+<Accordion title="sensitivity='local_only' refuses a hosted LLM provider; …">
+The vault's provider is hosted and the call asked for `local_only`. This raises `CompanionError`, not a prefixed `RuntimeError`. See [Sensitivity](#sensitivity).
+</Accordion>
+
+<Accordion title="vault <path> has no LLM model configured: …">
+The vault resolved to the built-in default provider with an empty model. This raises `CompanionError`, not a prefixed `RuntimeError`, and the message contains the vault's absolute path. See [No model configured](#no-model-configured).
+</Accordion>
+
+<Accordion title="vault <name> is unknown (pool error codes)">
+Vault resolution happens after the loopback gate, so an unknown vault name fails before anything is written. Pool error messages are sanitized before they reach an MCP client, because raw pool messages embed absolute vault paths. The machine-readable code prefix is preserved.
+</Accordion>
+</AccordionGroup>
+
+## No model configured
+
+A vault created on the built-in defaults inherits the default provider and `api_base` with an **empty** model. `remember` refuses such a vault before it builds the extractor, so there is no completion call, no ledger row and no misleading per-block "provider unavailable" failure:
+
+```text
+vault <path> has no LLM model configured: it resolved to provider=… api_base=… with an empty
+model, which matches the built-in defaults. Set llm.defaults.model in okto-neuron.yaml to a model
+the endpoint serves before ingesting.
+```
+
+Fix it by setting `llm.defaults.model` in the vault's `okto-neuron.yaml` to a model the endpoint actually serves, then call `remember` again. The guard only fires for the unconfigured-default shape. A vault that pinned its own provider or `api_base` is left alone, because an empty model there is a deliberate choice. `init_vault` returns the same warning as a hint on creation, since the vault is genuinely created but its first `remember` would be refused. See [LLM configuration](/config/llm-reference).
+
+## Progress notifications
+
+When the call arrives with an MCP context, `remember` installs a progress bridge and emits MCP progress notifications during ingest. Without an MCP context, for in-memory or HTTP callers, no bridge is installed.
+
+Notifications are driven by the ingest's own progress callback, which fires at each stage boundary and once per block in the per-block extraction loop. Stages advance monotonically: `parsing → extracting → embedding → dedup → committing`. The bridge dedupes on the exact `(stage, blocks_done)` pair, so a block whose extraction takes an alternate path does not produce duplicate notifications.
+
+Two details matter for a client:
+
+- During `parsing` the block count is not yet known, so no total is declared and a client computing a percentage must handle a missing denominator.
+- Delivery is fire-and-forget. The worker thread hands the coroutine to the event loop and never waits on it, and a delivery failure is swallowed and logged at debug level. The ingest does not wait on delivery, so a failed notification does not surface to the caller.
+
+`report_progress` no-ops when the client did not send a `progressToken`.
+
+<Note>
+The notification payload shape that reaches a given client was not verified for this page, so treat the fields above as what the server computes rather than as a wire contract.
+</Note>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Ingesting into a vault" href="/vault/ingesting">
+What ingest does to a source, and the other ways to feed a vault.
+</Card>
+<Card title="MCP security" href="/mcp/security">
+The read/write split and the loopback rules.
+</Card>
+<Card title="Vault tools" href="/mcp/tools/vaults">
+Discovering vault names to pass as `vault=`.
+</Card>
+<Card title="LLM configuration" href="/config/llm-reference">
+Setting `llm.defaults.model` and provider options.
+</Card>
+</CardGroup>

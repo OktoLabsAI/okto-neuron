@@ -1,0 +1,8 @@
+id: unknown-curie-prefix
+version: "0.1.0"
+compatRange: ">=0.0.1"
+types:
+  - name: Paper
+    kind_of: Asset
+    extends:
+      - nope:Thing

@@ -1,0 +1,62 @@
+{
+  "baseline": "quality_gate",
+  "meta": {
+    "dataset": "semantic-adversarial",
+    "embedding": "vault default (local fastembed)",
+    "gateway": "<private-lan-gateway>",
+    "model": "desktop/qwen3.6-35b-10-parallel",
+    "source_sha": "pre-0.3.0 history (not public)",
+    "tier0_workflow_edited": false
+  },
+  "metric_payload_sha256": "bcbd36a6a791fe027f8dedde105acd9a163d8f10332e36f5e1b1e520eeae31ca",
+  "metrics": {
+    "citation_byte_verification": {
+      "citation_floor_pass": true,
+      "citations_pass": 130,
+      "citations_verifiable": 130,
+      "rate": 1.0
+    },
+    "claim_coverage": {
+      "claim_present": 7,
+      "claim_total": 11,
+      "rate": 0.6364
+    },
+    "extraction_completeness": {
+      "gold_targets_present": 7,
+      "gold_targets_total": 11,
+      "rate": 0.6364
+    },
+    "hard_recall_at_k": {
+      "gold_targets_hit": 7,
+      "gold_targets_total": 11,
+      "rate": 0.6364
+    },
+    "must_contain": {
+      "all_present": 7,
+      "questions": 11,
+      "rate": 0.6364
+    },
+    "negative_control": {
+      "abstained": 1,
+      "questions": 2,
+      "rate": 0.5
+    }
+  },
+  "minted_at": "2026-07-28T20:34:58Z",
+  "minting_rule": "element-wise MINIMUM across the observed runs below \u2014 extraction is stochastic, so a single-run ceiling baseline would fail the next unchanged run",
+  "provisional": true,
+  "provisional_note": "PROVISIONAL. Minted before ADR 0040 adjudication closed. Re-mint from blessed runs once that adjudication lands; until then a pass means 'no regression vs a tree with known open findings', not 'quality proven'.",
+  "run_metric_payloads": [
+    "3bc8629dabfacd9eb1099e5b0bdf0b98138a0178b5a1eb786afc863850a9b182",
+    "3bc8629dabfacd9eb1099e5b0bdf0b98138a0178b5a1eb786afc863850a9b182",
+    "6cd819c09a5f91de9fcd3e2c1a4ee0e77da586607fb2f98db934e2e6c0e05f42",
+    "7348e17ea5a215dc2388be28daea96bd8c8018a1922b64b6932c62d3961dd5d8",
+    "ab7407a21ca4959d3ddd3c2775f3bcc243a3b0fc201a1ef3682a43f4e7dd5ed2",
+    "f35b1c1c9b2a0289d32d053901cf1d6148424a2bbf6f489b1d35828415b89894"
+  ],
+  "runs": 6,
+  "schema_version": "quality_gate_baseline.v1",
+  "scoring_schema": "quality_gate_must_contain.v2",
+  "source_sha": "pre-0.3.0 history (not public)",
+  "tier2_advisory_only": true
+}

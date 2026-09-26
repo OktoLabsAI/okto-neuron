@@ -1,0 +1,156 @@
+---
+title: "Vault layout and application home"
+description: "Every file Okto Neuron creates, where it lives, and what permission it carries."
+---
+
+Okto Neuron writes to two places: one application home shared by every vault, and each vault directory itself. This page lists both, file by file, with the mode each one is created at.
+
+<Note>
+Okto Neuron is prerelease. Paths and file names on this page describe version 0.3.0 and can change.
+</Note>
+
+## The application home
+
+The application home defaults to `~/.okto-neuron`.
+
+```python
+def default_app_home() -> Path:
+    return Path.home() / ".marginalia"
+```
+
+`ensure_global_layout()` creates the home and every configured vault root, then sets each to mode `0700`. It writes a default `okto-neuron.toml` only when none exists, so an existing config is never replaced.
+
+| Path | Mode | What it is |
+| --- | --- | --- |
+| `~/.okto-neuron/` | `0700` | The application home. |
+| `~/.okto-neuron/okto-neuron.toml` | created by `ensure_global_layout()` | Global config: vault roots, default vault. See [/config/overview](/config/overview). |
+| `~/.okto-neuron/vaults/` | `0700` | The default vault root. |
+| `~/.okto-neuron/env` | `0600` | Managed API keys. |
+| `~/.okto-neuron/daemon-<rest_port>.token` | `0600` | The daemon capability token for one REST port. |
+| `~/.okto-neuron/logs/okto-neuron-serve.log` | | Default log file for a daemonized server. |
+| `~/.okto-neuron/runtime/.marginalia/server.pid` | | The pid file the installer's daemon uses. |
+| `~/.okto-neuron/defaults.yaml` | `0600` | Application baseline for vault config, when present. |
+
+### okto-neuron.toml
+
+The global config lives at `~/.okto-neuron/okto-neuron.toml`. Absent any config, the vault root list defaults to a single entry, `~/.okto-neuron/vaults`, resolved non-strictly. `set_default_vault()` and `clear_default_vault()` edit only the `default_vault` line in place, leaving the rest of the file untouched.
+
+Only TOML version 1 is supported. A file without `marginalia_toml_version` is treated as version 1, with a warning emitted once per resolved path.
+
+### The env file
+
+API keys go in `~/.okto-neuron/env`, one `NAME=value` line per key. The file is created with a two-line header:
+
+```text
+# Okto Neuron local secrets. Loaded automatically by the okto-neuron CLI.
+# Values are never written to okto-neuron.yaml.
+```
+
+Set `OKTO_NEURON_ENV_FILE` to put the file somewhere else. When it is set, that path is expanded and resolved and used in place of the default.
+
+Writes are atomic: the new content goes to a temp file in the same directory, is flushed and fsynced, then replaced over the target. The parent directory is created at mode `0700` and chmodded to `0700` on every write. On platforms other than Windows the file itself is chmodded to `0600` after each write and each delete.
+
+<Warning>
+A rejected key is rejected loudly. An empty key, a key longer than 16384 characters, or a key containing `\r`, `\n` or NUL raises rather than being written.
+</Warning>
+
+### How key names are namespaced
+
+`default_api_key_env()` builds the variable name from the provider and, when the endpoint is non-standard, from the endpoint host. The name always starts `OKTO_NEURON_PROVIDER_` and always ends `_API_KEY`, so a UI-managed key never overwrites a provider variable you manage yourself.
+
+The provider string is uppercased and every run of non-alphanumeric characters becomes `_`. When an `api_base` is given and it differs from that provider preset's standard base, the host is appended (with `_<port>` if the URL carries an explicit port) followed by the first 8 uppercase hex characters of the SHA-256 of the normalized base. Two OpenAI-compatible services on different hosts therefore get different variable names.
+
+### Windows-protected values
+
+On Windows, a managed secret is protected with DPAPI under the implicit CurrentUser scope, base64url-encoded, and stored with the envelope prefix `dpapi-v1:`. Reading reverses it. A value without that prefix is returned as-is, for compatibility with values written before the protected backend existed. A `dpapi-v1:` value read on any other platform raises `OSError` rather than returning the envelope.
+
+<Note>
+This describes what the key-storage code does when `os.name == "nt"`. It is not a statement that Okto Neuron supports Windows.
+</Note>
+
+### The daemon token
+
+The capability token path is derived from the REST port alone:
+
+```python
+return Path.home() / ".marginalia" / f"daemon-{rest_port}.token"
+```
+
+The function still takes a `vault_path` argument for source compatibility with pre-ADR-0034 callers, and ignores it: selecting a vault never rotates or relocates the daemon credential. The file is opened with `O_WRONLY | O_CREAT | O_TRUNC` at `0600` and chmodded to `0600` afterwards, so only the owning user can read it. See [/mcp/security](/mcp/security).
+
+### defaults.yaml
+
+`VaultConfig.application_defaults_path()` resolves to `~/.okto-neuron/defaults.yaml`. `load_application_defaults()` reads it and falls back to code defaults on `FileNotFoundError`. A write path exists that dumps the merged config there and chmods the file to `0600`, dropping the `vault_id`, `inherits_application_defaults` and `storage` metadata keys before persisting.
+
+<Note>
+Nothing in the verified install or onboarding paths creates `defaults.yaml`. Treat it as a file that is read when present, not one a first run produces.
+</Note>
+
+## The uv tool directory
+
+The installer installs Okto Neuron as a uv tool with `uv tool install --python "${PY_VERSION}" "${SPEC}"`. It records `uv tool dir` as the tool root and `uv tool dir --bin` as the bin directory, falling back to `${HOME}/.local/bin` when uv reports no bin directory. If the executable is not found in that bin directory afterwards, the installer stops and tells you to run `uv tool update-shell`, restart your shell and re-run.
+
+Two console scripts are declared:
+
+```toml
+[project.scripts]
+okto-neuron = "okto_neuron.cli:app"
+kg = "okto_neuron.cli:kg_cli"
+# Pre-0.3.0 command name: same commands, prints a rename warning. Removed in 0.5.
+marginalia = "okto_neuron.cli:legacy_app"
+```
+
+The installer's own daemon uses `${HOME}/.okto-neuron/daemon-7777.token`, `${HOME}/.okto-neuron/runtime/.marginalia/server.pid` and `${HOME}/.okto-neuron/logs/okto-neuron-serve.log` (a machine upgraded from Marginalia also has the old files under `${HOME}/.marginalia`), with REST on `http://127.0.0.1:7777` and MCP on `http://127.0.0.1:8201/mcp`.
+
+## The vault directory
+
+`Vault.scaffold()` creates four directories and sets each to `0700`:
+
+```text
+<vault>/
+<vault>/notes/
+<vault>/refs/
+<vault>/.marginalia/
+```
+
+It then writes `okto-neuron.yaml`. If `okto-neuron.yaml` already exists, scaffolding refuses with `VaultAlreadyExistsError` after checking the requested backend against the pin. A directory counts as a vault when it is a directory containing a `okto-neuron.yaml` file. No other condition is checked.
+
+The graph sits beside those directories, named for the backend pinned in `okto-neuron.yaml`. On Grafx (the default for new vaults) it is the directory `<vault>/graph.grafx`; on Ladybug it is the file `<vault>/graph.lbug`. Rebuild, heal, reembed and rollback each build to a distinct sibling base name (`graph.rebuild`, `graph.heal`, `graph.reembed`, `graph.rollback`, each with the backend's own suffix), because `graph.lbug.tmp` is Ladybug's own scratch for the live handle and is deleted when that handle closes at swap time. See [/vault/rebuilding](/vault/rebuilding) and [/vault/snapshots](/vault/snapshots).
+
+### What is yours and what is derived
+
+`notes/` and `refs/` hold your markdown. `.marginalia/` holds derived state that the tooling writes and can regenerate. Back up the first two as you would any other directory of files; treat the third as a cache with bookkeeping in it.
+
+### Inside .marginalia/
+
+| Entry | What it holds |
+| --- | --- |
+| `managed-vault.json` | The managed-vault marker. |
+| `predicates/registry.json` | The governed predicate registry, with its lock sidecar `.registry.lock` in that same `predicates/` directory. |
+| `predicates/aliases.json` | Predicate aliases and inverse relationships, with its lock sidecar `.aliases.lock` in that same `predicates/` directory. |
+| `candidate-ledger.jsonl` | The candidate ledger, append-structured JSONL. |
+| `review_queue.json` | The consolidation review queue. |
+| `curation-jobs.json` | Durable job sidecar so jobs survive a restart. |
+| `ingest-history.json` | Ingest-worker sidecar history. |
+| `graph-integrity.json` | Live-write integrity state. |
+| `index/` | The default index corpus. |
+| `sources/` | Mirrored source files, under `<root-key>/<relpath>` when the source has a configured root, or flat as `<stem>-<hash8><suffix>` when it does not. |
+| `rebuild.state.json` | Rebuild and heal progress (both share this file). |
+| `reembed.state.json` | Reembed progress. |
+| `rollback.state.json` | Rollback progress. |
+| `server.pid` | The server pid file, at `<vault>/.marginalia/server.pid`. |
+| lock files | Sidecar locks in this directory: `.candidate-ledger.lock` and `.semantic-writer.lock`. |
+
+A `.graph-handle.lock` file sits at the vault root, next to `okto-neuron.yaml`.
+
+### The managed-vault marker
+
+A vault created by `vault create` gets `.marginalia/managed-vault.json`, written by `mark_managed_vault()`. The marker carries a `uuid4` id and the vault name, which must match the directory name. The file is written to a temp file in the same directory, chmodded `0600`, then replaced into place.
+
+The marker is what makes a vault deletable. `_vault_entry()` reports `managed=False` and `deletable=False` with a reason for any vault that has no marker, and `managed=True, deletable=True` for one that has it.
+
+<Warning>
+The marker is never inferred for an existing directory. Deletion is opt-in by construction: a vault you pointed Okto Neuron at yourself stays visible but cannot be removed by the application.
+</Warning>
+
+For what a vault is and why it is shaped this way, see [/concepts/what-is-a-vault](/concepts/what-is-a-vault).

@@ -1,0 +1,183 @@
+---
+title: "Merge duplicate entities"
+description: "A reversible off-graph path and one command that rewrites the graph for good."
+---
+
+Your vault has accumulated look-alike entities: the same person, project or system extracted under two or three slightly different names. Okto Neuron gives you two ways to deal with that, and the difference between them matters more than anything else on this page.
+
+<Note>
+Okto Neuron is prerelease (version 0.3.0). Command names and output shapes can change between versions.
+</Note>
+
+## Pick your path first
+
+**Option A, `propose` then `apply` then `review`.** This path is off-graph and reversible. It writes only side-data and never touches the graph itself. The reconcile command group says so directly: Option A writes only side-data, NEVER the graph.
+
+**Option B, `heal`.** This folds the confirmed aliases into a fresh graph and swaps that graph onto live. It is the point of no return for the graph file.
+
+Both paths read from the same place. `apply` and `review confirm` record equivalences in an off-graph authority index; `heal` is the only step that materialises those equivalences into graph topology.
+
+Start with Option A. Move to `heal` only when you have reviewed the queue and want the graph itself collapsed.
+
+## Option A: propose, apply, review
+
+<Steps>
+<Step title="See what would be merged">
+
+```bash
+okto-neuron kg reconcile propose
+```
+
+`propose` is read-only and writes nothing. It generates candidate clusters and asks the merge judge to adjudicate each one, then prints a line per cluster with the cluster id, node type, a `SAME` or `distinct` mark, the confidence, the corroboration count, the member count and the evidence lanes. With no candidates it prints `(no candidate clusters)`.
+
+<Warning>
+`propose` writes nothing, but it is not free. Every candidate cluster goes through the judge model configured for your vault, so a `propose` run on a large vault spends judge LLM calls. Scope it with `--type` when you only care about one node type.
+</Warning>
+
+Add `--json` if you want the clusters as structured records rather than the one-line-per-cluster summary.
+
+</Step>
+<Step title="Apply the confident merges off-graph">
+
+```bash
+okto-neuron kg reconcile apply
+```
+
+`apply` auto-merges the high-confidence clusters into the off-graph authority index and queues the rest for you. It writes only the two JSON side-files under the vault's `.marginalia/` directory, the `authority/` and `reconcile/` stores, and never the graph.
+
+It prints one summary line:
+
+```text
+reconcile apply: 3 auto-merged (off-graph), 2 queued, 1 skipped
+```
+
+Like `propose`, `apply` runs the judge, so it costs LLM calls too. `--type` and `--json` work the same way here.
+
+</Step>
+<Step title="Work the review queue">
+
+```bash
+okto-neuron kg reconcile review list
+```
+
+This lists the clusters `apply` queued instead of auto-merging, one line each with cluster id, type, confidence, corroboration and member count. An empty queue prints `(review queue empty)`. `--json` is available.
+
+Then decide, one cluster at a time:
+
+```bash
+okto-neuron kg reconcile review confirm ent-cluster-4f2a
+okto-neuron kg reconcile review reject ent-cluster-91bd
+```
+
+A confirm records the cluster in the off-graph authority index and removes it from the queue, printing `confirmed <id> → canonical '<name>' (off-graph)`. A reject drops the cluster from the queue and prints `rejected <id>`.
+
+</Step>
+</Steps>
+
+### The argument-order trap
+
+Every other reconcile command takes an optional vault path as its only positional argument. `confirm` and `reject` do not. They take `CLUSTER_ID` first, and the optional vault path second:
+
+```bash
+# correct
+okto-neuron kg reconcile review confirm ent-cluster-4f2a /path/to/vault
+
+# wrong: the vault path is read as the cluster id
+okto-neuron kg reconcile review confirm /path/to/vault ent-cluster-4f2a
+```
+
+Get the order wrong on `confirm` and Okto Neuron resolves `ent-cluster-4f2a` as a vault name, not a cluster id. It fails opening a vault that does not exist, before it ever looks at the review queue. Mistyping a real cluster id with the arguments in the right order is the case that prints `no queued cluster '<id>'` to stderr and exits 1.
+
+`review` is itself a subcommand group with explicit `list`, `confirm` and `reject` subcommands for this reason: a group-level optional vault argument would greedily swallow the subcommand name.
+
+## Option B: heal
+
+```bash
+okto-neuron kg reconcile heal
+```
+
+`heal` takes the confirmed off-graph equivalences and collapses them into the graph. It reads the live graph's nodes and edges, copies them into a fresh graph while dropping variant nodes that merge onto a canonical, remaps edge and claim references through the equivalence map, drops the self-loops the collapse creates, dedups edges by content-addressed id, then atomically swaps the fresh graph onto live. On success it prints:
+
+```text
+reconcile heal: collapsed equivalences into a fresh graph + swap
+```
+
+Two properties are worth holding on to.
+
+**It makes no LLM calls.** The entities are already extracted, so there is nothing for a model to decide. `heal` is a deterministic graph-to-fresh-graph copy.
+
+**It is re-runnable and idempotent.** A second heal on an already-collapsed graph is a verbatim copy.
+
+`heal` runs under the same cross-process lease that other graph swaps take. If a server currently owns the vault, the lease is refused rather than shared, so stop `okto-neuron serve` before you heal. See [graph lifecycle](/concepts/graph-lifecycle) for how swaps and generations fit together.
+
+Your off-graph authority records survive the heal and still describe the merges you applied. Your markdown remains the trust root, so a full re-derivation from markdown is always available through `kg rebuild`.
+
+## Take a snapshot before you heal
+
+`heal` rewrites the live graph. Dump a logical snapshot first. A snapshot loads into a fresh, empty vault, not back over this one, so treat it as a copy of the pre-heal state rather than an undo:
+
+<Steps>
+<Step title="Dump">
+
+```bash
+okto-neuron kg snapshot dump /path/to/vault /path/to/snapshot
+```
+
+Both arguments are required here: the vault, then the destination directory.
+
+</Step>
+<Step title="Verify">
+
+```bash
+okto-neuron kg snapshot verify /path/to/snapshot
+```
+
+This recomputes every checksum and count in the snapshot and reports problems. Do not trust a snapshot you have not verified.
+
+</Step>
+</Steps>
+
+`kg snapshot dump` also needs the vault offline: a held lease or a running server exits 1. `kg snapshot load` requires a new or empty vault directory. Full detail lives in [snapshots](/vault/snapshots).
+
+<Warning>
+`heal` swaps a new graph onto live. Snapshot and verify before you run it.
+</Warning>
+
+## A working order
+
+For a first pass on a vault you have not reconciled before:
+
+<Steps>
+<Step title="Propose, scoped">
+Run `kg reconcile propose --type <type>` on one node type and read the output. This costs judge calls but changes nothing, so it is the cheapest way to find out whether reconciliation has anything to say about your vault.
+</Step>
+<Step title="Apply">
+Run `kg reconcile apply`. Read the summary line. The auto-merged count is what the judge was confident about; the queued count is your homework.
+</Step>
+<Step title="Review">
+Work `review list` down to empty with `confirm` and `reject`. Everything so far is off-graph.
+</Step>
+<Step title="Live with it">
+Queries fold through the equivalence map already, so you can stop here indefinitely. Nothing about the graph file has changed.
+</Step>
+<Step title="Snapshot, then heal">
+When you want the graph topology itself collapsed, stop the server, dump and verify a snapshot, then run `kg reconcile heal`.
+</Step>
+</Steps>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="kg reconcile reference" href="/reference/cli/kg-reconcile">
+Every subcommand, flag and output field, exhaustively.
+</Card>
+<Card title="Snapshots" href="/vault/snapshots">
+Dump, verify and load a logical graph snapshot.
+</Card>
+<Card title="Predicates" href="/concepts/predicates">
+How edges are typed, and what alias resolution touches.
+</Card>
+<Card title="Graph lifecycle" href="/concepts/graph-lifecycle">
+Builds, swaps and generations.
+</Card>
+</CardGroup>

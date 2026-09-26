@@ -1,0 +1,60 @@
+---
+title: "What these docs leave out, and why"
+description: "Pages that do not exist on purpose, each with the reason, so an omission is auditable rather than mistaken for an oversight."
+---
+
+Everything listed on this page is a decision. Each missing page is missing because writing it would mean writing something nobody verified against the code. Genuine gaps, the places where behaviour exists but nobody has traced it yet, live on [/help/known-gaps](/help/known-gaps).
+
+## No REST API reference
+
+Okto Neuron has an HTTP server, and the CLI talks to it. The module that does the talking describes itself as a thin client over a small set of paths, with no auto-spawn, no retries and no fallback to opening the vault directly (`src/okto_neuron/cli/_client.py:1-7`). That is the whole of what is established: a default endpoint of `http://127.0.0.1:7777` (`src/okto_neuron/cli/_client.py:17`) and the routes the CLI happens to post to.
+
+There is no OpenAPI document in the repository and no schema anyone has agreed to keep. So these docs carry no API Reference tab and no generated endpoint catalogue. What you get instead is [/reference/http-endpoints](/reference/http-endpoints), which names the routes the shipped CLI calls and a small number of further routes traced in the server source, each described by what a caller sends and what comes back. Treat that list as a description of current behaviour, not a contract you can build a third-party client against.
+
+## No Web UI walkthrough
+
+The configuration survey covered the server's writable configuration surface: the blocks the web UI is permitted to write back are `embedding`, `llm`, `consolidation`, `upkeep`, `packs`, `folder_watch` and `ingest` (`src/okto_neuron/config/_vault.py:1625-1633`). That is a list of blocks, not a list of screens.
+
+Nobody verified a single button, field label, tab or click path. A walkthrough would therefore be invented, and an invented walkthrough is the kind of documentation that survives three releases after the screen changed. [/server/web-ui](/server/web-ui) states the address the UI is served from and what the server will accept a write to, and stops there.
+
+## No Neo4j how-to
+
+`neo4j` is a registered backend name. The registry maps it to a store class alongside `grafx` and `ladybug` (`src/okto_neuron/store/registry.py:36-40`), and resolution imports the target lazily and validates it against the store protocol before handing it back (`src/okto_neuron/store/registry.py:49-60`).
+
+That tells you the name resolves. It does not tell you that a vault configured against a Neo4j instance ingests, queries and survives a restart, because no 0.3.0 run has covered it. The Neo4j backend gate (the Neo4j contract tests and acceptance scenario 84 against a live `neo4j:5-community`) last ran for 0.2.0, as a local reproduction. It has not been run against 0.3.0. The configuration fields are enumerated on [/config/storage-backends](/config/storage-backends) because their existence is verifiable. A step-by-step procedure is not, so there is none.
+
+## No Homebrew page, no launchd page
+
+`packaging/brew/okto-neuron.rb` is a stub. The packaging notes say it is not published to a tap and that the `url`, `sha256` and `version` fields are placeholders to be filled in at release time, and then say plainly that the placeholder URL and checksum are deliberately invalid and the formula must not be run as an installer (`packaging/README.md:72-81`).
+
+The launchd template is in the same condition. It opens by declaring itself a template with `{{LOG_DIR}}` and `{{OKTO_NEURON_BIN}}` placeholders you must replace before loading (`packaging/macos/com.oktolabs.okto-neuron.plist:5-11`), and the directory it lives in is described as holding unsupported, opt-in templates that are not part of the public installer (`packaging/README.md:1-8`). Linux systemd units are called out as intentionally out of scope (`packaging/README.md:13-14`).
+
+Documenting either as an install method would hand you a procedure that fails at the first command. [/start/install](/start/install) covers the path that works.
+
+<Warning>
+  Do not run `packaging/brew/okto-neuron.rb` as an installer. Its URL and checksum are invalid on purpose (`packaging/README.md:78-80`).
+</Warning>
+
+## No unverified install command
+
+The one-line install on [Install Okto Neuron](/start/install) downloads the release wheel named in `release-manifest.json` and checks its SHA-256 before installing it. No page prints an install command that skips that check, such as a direct `pip install` of an unpinned URL.
+
+## No `pilot` page outside Contributing
+
+`okto-neuron pilot` runs a corpus pilot gate over one configured markdown vault, and its first act is to consult an internal laptop gate and exit 2 if the gate rejects the run (`src/okto_neuron/cli/__init__.py:2612-2620`). It is an evaluation gate for people working on the engine. Reading it as a health check would be a mistake, so it appears only under [/contributing/dev-commands](/contributing/dev-commands).
+
+## No `quality` group in the day-to-day surface
+
+`marginalia quality` is a group of maintainer evidence commands. Its group docstring reads `Read-only quality evidence and diagnostics.`, which holds for the graph and not for the filesystem: `quality acceptance-collect` requires `--output`, and all five subcommands take `--output` and `--force` to replace an existing file (`src/okto_neuron/cli/__init__.py:279-280`, `:490-501`, `:537-560`). What keeps the group out of the user-facing walkthroughs is audience. Its inputs are ADR 0040 bundles, pinned collections and semantic snapshots, and no user-facing Okto Neuron command emits any of them, so a reader following a how-to would have nothing to feed it. The flags are documented in full on [/reference/cli/quality-commands](/reference/cli/quality-commands).
+
+## No JSON-LD export how-to
+
+Export exists as one Python method on the vault object, taking a `jsonld` or `jsonld-star` format, an optional stream and an optional scope, and requiring `rdflib` from the `okto-neuron[jsonld]` extra (`src/okto_neuron/vault.py:574-591`). There is no CLI command, HTTP route or MCP tool that reaches it. A how-to would be a library snippet dressed as a product workflow, so it is absent.
+
+## No repository, package or community links
+
+The repository is private and no package is published. A GitHub link, a PyPI badge or a community invitation in the site chrome would each be a claim rendered as a link with no prose behind it, so the chrome carries none. There is no search-provider block and no site-verification key either.
+
+## The maintenance rule
+
+An entry leaves this page in the same change that adds the page replacing it. If Neo4j gets exercised, the how-to and the removal of the Neo4j entry ship together. If the formula gets published, the install page and the removal ship together. This page is never allowed to describe an absence that is no longer true, and no entry here carries a date or a commitment.

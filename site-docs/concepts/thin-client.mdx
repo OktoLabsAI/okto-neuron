@@ -1,0 +1,64 @@
+---
+title: Why the CLI is a thin client
+description: add, query and ask send one request to a running server. They never start one and never retry.
+---
+
+When you run `okto-neuron add`, `okto-neuron query`, `okto-neuron ask` or `okto-neuron detect-drift`, the CLI does one thing: it sends a single JSON request to a running Okto Neuron server and prints what comes back. It does not start a server for you and it does not retry. If the server is missing it fails, rather than quietly opening the vault on disk. That is a deliberate design choice, and it shapes how you script against Okto Neuron.
+
+<Note>
+Okto Neuron is prerelease software. The behavior described here is what the code does today, not a stability promise.
+</Note>
+
+## What "thin" actually means
+
+Each of those four commands builds a payload and hands it to one shared helper, which resolves the endpoint and posts once. There is no second attempt and no local execution path behind it. The module that owns this states the rule in its own docstring: "There is no auto-spawn, no retries, no fallback to opening the vault directly."
+
+That helper resolves the endpoint the same way for every client command; the precedence and the built-in default are on [/reference/cli/overview](/reference/cli/overview).
+
+## The two failure shapes
+
+There are two failure shapes the client translates for you. Other transport failures (for example a timeout after the connection was established) are not translated, and `add` can also fail locally before it sends anything, when it cannot read the file you named.
+
+**The server is not there.** A connection error or a connect timeout raises `ClientUnreachable`, the CLI prints the message to stderr and exits with code 2. The message is contract-stable, and the source comments warn against editing it because scripts and humans match on it:
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+**The server answered, but refused.** Any response with a status of 400 or above becomes a `ServerError`, printed to stderr in this form and exiting with code 1:
+
+```text
+server error 404: <detail>
+```
+
+The detail comes from the response body's `detail` field when the body is JSON, otherwise from the raw response text. A 2xx response whose body is not valid JSON is also reported as a server error.
+
+See [/reference/cli/exit-codes](/reference/cli/exit-codes) for the codes that have been traced, and [/reference/cli/client-commands](/reference/cli/client-commands) for the per-command flags.
+
+## Why not just open the vault?
+
+Because a daemon may already be writing to it. `okto-neuron serve` takes an OS-level lock on a PID file and refuses to start a second time while that lock is held by a live process, raising `Okto Neuron server already running (pid=..., pid_file=...)`.
+
+That lock root is application-scoped, not per-vault. The CLI helper that computes it explicitly discards any vault argument you pass it and returns `~/.okto-neuron/runtime`. One daemon per machine, not one per vault. Switching vaults happens inside the running server, which is also why [/server/running](/server/running) treats the daemon as a single long-lived process.
+
+If the CLI also opened your vault directly whenever the server looked unreachable, you would get two writers against the same graph with no coordination between them. The thin-client rule removes that possibility for the client commands entirely.
+
+## The commands that do open the vault
+
+Two commands are not thin clients. `okto-neuron watch` and `okto-neuron pilot` both call `Vault.open(root)` in the CLI process and work against the vault themselves. They take a vault path as a positional argument rather than an endpoint, and they never talk to the daemon.
+
+<Warning>
+Running `watch` or `pilot` against a vault that a daemon is also serving means two processes working on the same vault. The PID-file lock guards the daemon's own lifecycle, not that overlap. This combination has not been exercised, so treat it as unknown territory rather than a supported workflow. See [/help/known-gaps](/help/known-gaps).
+</Warning>
+
+## Credentials: REST versus MCP
+
+The client commands send no credentials. REST is loopback-only and deliberately credential-free: the server rejects any request whose `Host` header is not a loopback name (`server/http.py:459-464`). The middleware keeps an internal compatibility flag for isolated policy tests, but production startup always leaves it off, and `serve` refuses a non-loopback bind outright. Separately, the bearer-token middleware is installed only on the MCP application, never on REST. The source is explicit that "REST/UI deliberately does not install this middleware" and that query parameters, browser cookies and legacy alternate headers are never credentials.
+
+`OKTO_NEURON_AUTH_TOKEN` is read by a helper in the client module, but no command passes a token to the request function, so setting it changes nothing about what the CLI sends. Token-file discovery was removed. Do not plan around it. The bearer that matters is the MCP one, covered in [/mcp/security](/mcp/security).
+
+## What this buys you in a script
+
+A failure is always a failure. If `okto-neuron add` exits 2, nothing was written anywhere, by anything. There is no half-state where the server was down so the CLI wrote to the vault behind its back, and no retry loop turning one refused call into several. You can branch on exit code 2 to mean "start the daemon and try again" and on exit code 1 to mean "the server understood me and said no".
+
+The request surface those commands use is documented at [/reference/http-endpoints](/reference/http-endpoints).

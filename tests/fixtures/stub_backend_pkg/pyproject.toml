@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stub-backend-pkg"
+version = "0.0.1"
+description = "Standalone third-party GraphStore fixture proving marginalia.store.registry can resolve a backend it has never imported (M3 spec §2.11)."
+requires-python = ">=3.12"
+
+# Registers under the same entry-point group the real registry resolves
+# (marginalia.store.registry.GRAPH_BACKENDS_GROUP = "marginalia.graph_backends").
+# This package never appears in marginalia's own dependency graph — it is
+# pulled in only via the parent project's [tool.uv.sources] local-path entry
+# in the `dev` dependency group (root pyproject.toml, M3 spec §2.10/§2.11).
+[project.entry-points."marginalia.graph_backends"]
+stub = "stub_backend_pkg:StubGraphStore"
+
+[tool.hatch.build.targets.wheel]
+packages = ["stub_backend_pkg"]

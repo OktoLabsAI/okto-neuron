@@ -1,0 +1,144 @@
+---
+title: Nodes, edges and claims
+description: One generic node shape, five entity types, and claims that carry the actual knowledge.
+---
+
+Okto Neuron stores everything it knows in one graph. There are only two object shapes in it: a node and an edge. Every document you ingest, every entity pulled out of your text, and every fact asserted about those entities is a node. Everything that connects them is an edge.
+
+That sounds almost too simple to be useful. It works because the node shape carries a free-form `type` string and a free-form `facets` dictionary, so a new kind of thing does not need a new table.
+
+<Note>
+Okto Neuron is prerelease software (0.3.0, "2 - Pre-Alpha"). The shapes on this page are what the code writes today, and they can change.
+</Note>
+
+## The node shape
+
+Every node is the same pydantic model, whatever it represents:
+
+```python
+class Node(BaseModel):
+    id: str = Field(default_factory=_uid)
+    type: str
+    title: str = ""
+    content: str = ""
+    tags: list[str] = Field(default_factory=list)
+    facets: dict[str, Any] = Field(default_factory=dict)
+    embedding: Optional[list[float]] = None
+    created_at: datetime = Field(default_factory=_now)
+    provenance: Provenance = Field(default_factory=Provenance)
+```
+
+Only `type` has no default. An id is minted for you and `created_at` is stamped in UTC.
+
+`type` is a plain string, not an enum. `facets` is where type-specific data lives. A `Document` node stores its path there. A `Block` node stores its chunk size there. A `Claim` node stores its whole structured assertion there. Nothing about the node shape changes between them.
+
+`provenance` is its own small record: `source` (one of `user`, `ingest`, `llm`, `rule`), an optional `rule_id`, a `layer` (`deterministic`, `cognitive` or `fallback`) and a `confidence` float. Deterministic markdown ingest writes `source="ingest"` and `rule_id="deterministic-v1"` on every node it mints. See [/concepts/provenance](/concepts/provenance) for what that buys you.
+
+`embedding` is optional and often unset. A node is a valid node with no vector at all.
+
+## The edge shape
+
+```python
+class Edge(BaseModel):
+    id: str = Field(default_factory=_uid)
+    type: str
+    src: str  # node id
+    dst: str
+    weight: float = 1.0
+    provenance: Provenance = Field(default_factory=Provenance)
+```
+
+`src` and `dst` are node ids. `type` is again a plain string, which is how the same table holds `prov:wasDerivedFrom`, `rdf:subject` and `supersedes` without any schema change.
+
+Edge ids are deterministic where ingest mints them. The claim provenance wiring computes each edge id as `sha256_hex("edge", src, type, dst)`, hashing the parts with a separator between them. Mint the same edge twice and you get the same id twice, so re-ingesting a file does not duplicate its edges.
+
+`weight` exists on the model and is persisted. Do not read anything into it: nothing in Okto Neuron currently consumes it.
+
+## What ingest creates
+
+When you ingest a markdown file, deterministic parsing produces three structural node types.
+
+<Steps>
+  <Step title="Document">
+    One node per file, typed `Document`. Its title and content come from the parsed item, and its facets carry the parsed document record plus the file path and the frontmatter metadata.
+  </Step>
+  <Step title="Block">
+    One node per chunk, typed `Block`. Its title is the block kind plus the block index, its content is the chunk text, and its facets record the chunk size and overlap in bytes plus the source path.
+  </Step>
+  <Step title="Claim">
+    One node per extracted assertion, typed `Claim`, with the full claim record flattened into facets.
+  </Step>
+</Steps>
+
+Alongside those, ingest makes sure two system nodes exist: an `Agent` node titled `system`, and an `Activity` node titled `ExtractionActivity deterministic-v1`. Both are minted with the `infra` facet set to true.
+
+Those two are plumbing. A node carrying `infra: true` is provenance machinery, never content, and the code that decides this refuses to match on title or content so a document that happens to mention "system" is never mistaken for it. Infra nodes are excluded from the content views. You will see their effect in provenance trails, not in your results.
+
+A related but separate marker is `_salience: "low"`. It tags a real content node that exists mainly as an anchor, for example a heading claim. Ingest applies it to claims whose predicate is `has_heading`. Such a node stays a first-class graph node and stays in the dedup path, unlike infra plumbing, but the graph-native retrieval path curates it out.
+
+## The five entity types
+
+Structural nodes come from parsing. Entities come from extraction, where a language model reads a block and proposes candidates. Extraction may emit exactly five node types:
+
+<CardGroup cols={3}>
+  <Card title="Agent">A party that acts.</Card>
+  <Card title="Activity">Something that happened.</Card>
+  <Card title="InformationObject">A thing that carries information.</Card>
+  <Card title="Concept">An idea, topic or label.</Card>
+  <Card title="Place">A location.</Card>
+</CardGroup>
+
+The set is closed in code, as a frozen set. It is used twice: it becomes the `enum` for the `type` field in the JSON schema the model must answer with, and it is checked again when a candidate is parsed. A candidate whose type is not in the set is dropped rather than written. There is no runtime registration step that adds a sixth type.
+
+`Claim` is deliberately not in that set. Extraction never proposes a Claim-typed node directly; propositional facts travel a separate `claims[]` channel instead. The comment in the source is explicit that listing `Claim` there is what used to let a model mint a subjectless Claim-typed node.
+
+An extractor never writes to the graph itself. It proposes candidates, which then flow through resolution and a gate before anything commits.
+
+## What a claim actually is
+
+A claim names a subject, a predicate, and either an entity object (`O_id`) or a literal object (`O_literal`). It also carries a `confidence` and the id of the block it was read out of, which is the canonical anchor.
+
+The predicate has one reserved value: `kind_of` is rejected at field validation, because it is a composition operator rather than an assertion predicate. See [/concepts/predicates](/concepts/predicates).
+
+`confidence` is required, and the schema constrains it to the range `0.0 <= confidence <= 1.0`. A value outside that range fails validation.
+
+A model validator enforces that exactly one of `O_id` and `O_literal` is set. Both set raises. Neither set raises. That single rule is what keeps "who reports to whom" and "what the deadline is" in the same shape without a union type or a discriminator key.
+
+The full field list, with types and which are required, is in [/reference/graph-schema](/reference/graph-schema).
+
+<Warning>
+A claim's `confidence` is a number the extraction path assigned, not a verdict you should act on unread. Open the block it points at before you rely on it.
+</Warning>
+
+## Claims are nodes, not a table
+
+There is no claim table. A claim becomes a row in the same generic node table as everything else: `type="Claim"`, with the claim record dumped into `facets`, its title and content set from the parsed text, and the usual ingest provenance.
+
+That is why a claim is queryable, linkable and walkable with the same machinery as a document. It is also why a claim needs edges to say what it is about.
+
+## Bridge edges
+
+Right after a claim node is written, ingest wires it up. Three PROV edges always go out from the claim: `prov:wasDerivedFrom` to its block, `prov:wasGeneratedBy` to the extraction activity, and `prov:wasAttributedTo` to the system agent.
+
+Then two bridge edges connect the claim to the entities it talks about:
+
+- `rdf:subject`, from the claim to its subject entity. Minted for every claim, including claims whose object is a literal.
+- `rdf:object`, from the claim to its object entity. Minted only when the object is an entity, so a literal-object claim gets no `rdf:object` edge.
+
+Both bridges are skipped when the referent node is not in the store, because adding an edge with a missing endpoint raises. A dangling id therefore costs you an edge, not an ingest run.
+
+The result is a claim that sits between two entities rather than inside either of them, which is what lets you ask the graph about an entity and get back the assertions that reference it with their sources attached.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Graph schema" href="/reference/graph-schema">
+    The exhaustive field-by-field reference for stored nodes and edges.
+  </Card>
+  <Card title="Predicates" href="/concepts/predicates">
+    What goes in a claim's P, and which values are reserved.
+  </Card>
+  <Card title="Provenance" href="/concepts/provenance">
+    How a claim traces back to the bytes it came from.
+  </Card>
+</CardGroup>

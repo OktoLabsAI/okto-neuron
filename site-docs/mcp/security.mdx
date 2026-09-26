@@ -1,0 +1,100 @@
+---
+title: MCP security model
+description: Bearer-only auth on MCP, credential-free loopback REST, and writes gated twice.
+---
+
+Okto Neuron serves two ASGI apps from one daemon process. The REST/UI app runs on one port and the MCP app runs on another, and only one of them asks for a credential. This page describes those two surfaces and the gates the code applies to each.
+
+<Note>
+Okto Neuron is prerelease. The mechanisms on this page are the ones present in the code today, and nothing here is a guarantee beyond those mechanisms.
+</Note>
+
+## Two surfaces, one credential
+
+When the daemon starts, it builds the REST app and the MCP app separately, and wraps only the MCP app in `AuthTokenMiddleware` (`src/okto_neuron/server/runtime.py:1821-1829`). The comment at that mount site states the policy directly: REST/UI is credential-free on loopback, and MCP alone retains bearer authentication.
+
+The middleware's docstring records the asymmetry as policy (`src/okto_neuron/server/http.py:571-576`).
+
+The practical consequence for you: the bearer token is not a general "API key" for Okto Neuron. It gates the MCP port and nothing else. The REST port is protected by where it is bound, not by what the caller presents.
+
+## What counts as a credential
+
+`AuthTokenMiddleware` accepts exactly one thing: an `Authorization` header whose scheme is `Bearer`. The extractor lowercases the header names from the ASGI scope, reads `authorization`, and rejects anything whose first seven characters are not `bearer ` (`src/okto_neuron/server/http.py:553-568`). Query parameters, browser cookies, and alternate headers are never treated as credentials, which the class docstring states as policy (`src/okto_neuron/server/http.py:571-576`).
+
+Comparison uses `secrets.compare_digest` against the token held in server state (`src/okto_neuron/server/http.py:597`). On any failure the middleware returns 401 with `WWW-Authenticate: Bearer realm="okto-neuron-mcp"` and `Cache-Control: no-store` (`src/okto_neuron/server/http.py:600-616`).
+
+The body is a JSON object with three keys (`src/okto_neuron/server/http.py:601-607`):
+
+```json
+{
+  "error": "unauthorized",
+  "detail": "bearer token is not valid for this server",
+  "status": 401
+}
+```
+
+Match on `error`. It is the literal string `unauthorized` for all four failure cases, and the comment above the detail table in the source says clients are expected to key off it (`src/okto_neuron/server/http.py:539-541`). `status` repeats the HTTP status code. `detail` is the human-facing part: it names which mistake you made and never repeats any part of what you sent. The four cases are fixed strings (`src/okto_neuron/server/http.py:542-550`):
+
+| Situation | `detail` |
+| --- | --- |
+| No `Authorization` header | ``missing Authorization header; send `Authorization: Bearer <token>` `` |
+| `Bearer` with nothing after it | `Authorization header carried an empty bearer credential; the token placeholder likely expanded to nothing` |
+| Some other scheme | ``unsupported Authorization scheme; only `Bearer` is accepted`` |
+| Wrong token | `bearer token is not valid for this server` |
+
+You get this one when the `Authorization` header is exactly `bearer` with nothing usable after it, which is what a config placeholder that expanded to an empty string produces (`src/okto_neuron/server/http.py:563-567`).
+
+There is a fifth outcome. If reading `get_state().auth_token` raises for any reason, the middleware answers 503 with the same three keys and never calls the wrapped app: `error` is `unavailable`, `detail` is `server state unavailable`, and `status` is `503` (`src/okto_neuron/server/http.py:585-593`). The comment on that `except` says it fails closed if runtime wiring is incomplete. A half-started daemon refuses MCP traffic rather than serving it unauthenticated.
+
+The only value the middleware compares against is `get_state().auth_token` (`src/okto_neuron/server/http.py:586`). No environment variable is consulted at the check.
+
+## Where the token lives
+
+The token file is `~/.okto-neuron/daemon-<rest_port>.token` (`src/okto_neuron/server/runtime.py:340-347`). It is written by opening the file `O_CREAT | O_TRUNC` with mode `0600` and then calling `os.chmod` to `0o600` again, so only your own account can read it (`src/okto_neuron/server/runtime.py:350-365`).
+
+At startup the daemon reads an existing token and adopts it if it finds one, and writes a fresh one only when it does not (`src/okto_neuron/server/runtime.py:1836-1841`). The token therefore survives restarts, and your MCP client keeps working across them. To rotate it, delete the file and restart; the mount-site comment names deleting the file as the explicit rotation gesture.
+
+A token file from a pre-ADR-0034 release, stored at `<vault>/.marginalia/daemon.token`, is migrated once. The reader falls back to that path, and when it finds a usable value it writes it into the application-scoped path and stops consulting vault state on later boots (`src/okto_neuron/server/runtime.py:368-392`). A value only counts as usable if it is non-empty, contains no newline, and is at least 16 characters (`src/okto_neuron/server/runtime.py:374-378`).
+
+<Warning>
+The file is named after the **REST** port, not the MCP port. `auth_token_path` takes `rest_port` and interpolates it into the filename (`src/okto_neuron/server/runtime.py:340-347`). Changing only `--mcp-port` leaves you on the same token file. Changing `--port` sends you to a different file, and a daemon on a new REST port will mint a token your existing MCP client does not have.
+</Warning>
+
+The signature still accepts a `vault_path` argument, kept for source compatibility with older callers, but the docstring is explicit that selecting a vault must never rotate or relocate the daemon credential (`src/okto_neuron/server/runtime.py:341-346`). Switching vaults does not invalidate your MCP clients.
+
+## Writes are gated a second time
+
+Binding to loopback is the outer gate. Sensitive MCP writes carry their own inner one.
+
+`remember` calls `_mcp_kg_add_allowed()` before it resolves a vault or touches anything, and refuses with `forbidden: remember is restricted to loopback callers; tunnel (e.g. SSH) to write remotely` (`src/okto_neuron/server/runtime.py:1565-1569`). `init_vault` does the same, refusing with `forbidden: vault creation is restricted to loopback callers` (`src/okto_neuron/server/runtime.py:1718-1719`).
+
+That helper asks FastMCP for the current HTTP request and, when there is one, defers to `request_is_loopback` (`src/okto_neuron/server/runtime.py:988-1007`). It treats a missing HTTP context as local, which covers in-memory clients, and the comment is careful to note that only `RuntimeError` is caught so the gate cannot fail open on an unrelated bug. `request_is_loopback` parses the peer address and returns whether it is a loopback IP, treating a non-IP host such as the in-process test transport as local (`src/okto_neuron/server/http.py:386-400`).
+
+The ordering matters. In `remember`, vault resolution happens after the write gate, so a caller that is not on loopback is refused before the server acts on a vault name at all (`src/okto_neuron/server/runtime.py:1570-1573`).
+
+## What the MCP surface tells a caller
+
+`list_vaults` returns `{vaults: [{name, current, backend}, ...]}` (`src/okto_neuron/server/runtime.py:1674-1680`). It deliberately omits both `path` and `id`, and the comment says not to "fix" this by re-adding them or by switching to a payload that includes them, because both leak filesystem layout to every agent that can reach the MCP port (`src/okto_neuron/server/runtime.py:1653-1656`). A name is all a caller needs to pass `vault=`. See [the vaults tools](/mcp/tools/vaults) for the shape of that response.
+
+The surface is not uniformly path-free, though. `init_vault` returns `{"name": ..., "path": str(target)}`, where `target` is the resolved absolute vault path (`src/okto_neuron/server/runtime.py:1750, 1779`). Creating a vault over MCP discloses where it landed.
+
+## Remote access
+
+There is no supported way to bind this daemon to a non-loopback address. The startup path raises before opening anything when `allow_remote` is set or the host is not a loopback bind: `direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel` (`src/okto_neuron/server/runtime.py:1797-1801`). The state field for remote is kept only so isolated middleware policy tests can exercise it, and the comment notes that sensitive writes remain unconditionally loopback-only regardless (`src/okto_neuron/server/runtime.py:1802-1809`).
+
+An SSH tunnel is the answer, and it preserves the loopback property that both gates depend on: the daemon sees a loopback peer, so writes stay allowed. [Remote access](/server/remote-access) covers setting one up.
+
+<CardGroup cols={2}>
+  <Card title="MCP overview" href="/mcp/overview">
+    What the MCP surface exposes and how a client connects.
+  </Card>
+  <Card title="Remote access" href="/server/remote-access">
+    Reaching the daemon from another machine over a tunnel.
+  </Card>
+  <Card title="Thin client" href="/concepts/thin-client">
+    Why one daemon owns the graph and everything else talks to it.
+  </Card>
+  <Card title="Vault tools" href="/mcp/tools/vaults">
+    The vault-facing MCP tools and their payloads.
+  </Card>
+</CardGroup>

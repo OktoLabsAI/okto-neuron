@@ -1,0 +1,102 @@
+# _smoke golden Q&A — mirrors the 6 cases in tests/eval/golden.py (recall targets)
+# plus two extra tiers so the engine exercises ask + a negative/absent control.
+# These are fabricated-fixture answers; the point is engine correctness, not nuance.
+settings:
+  k: 10
+
+questions:
+  # ── T1 single-fact recall ────────────────────────────────────────────────
+  - id: t1-handoff-owner
+    tier: T1
+    question: "Who owns the invoice handoff?"
+    expected_answer: "agent:handoff-owner owns the fabricated invoice-flow handoff."
+    expected_source_paths: [handoff.md]
+    must_contain: ["agent:handoff-owner"]
+    gold_targets:
+      - source_path: handoff.md
+        quote: "owner: agent:handoff-owner"
+
+  - id: t1-sow-signer
+    tier: T1
+    question: "Who signed the Q1 2026 Statement of Work and when?"
+    expected_answer: "agent:alice signed the Q1 SOW on 2026-01-10."
+    expected_source_paths: [sows/sow-2026-q1.md]
+    must_contain: ["agent:alice", "2026-01-10"]
+    gold_targets:
+      - source_path: sows/sow-2026-q1.md
+        quote: "This fabricated Statement of Work was signed on 2026-01-10 by agent:alice for a synthetic planning exercise."
+
+  - id: t1-proposal-author
+    tier: T1
+    question: "Who authored the ACME 2026 proposal and on what date?"
+    expected_answer: "agent:bob-engineer authored the ACME 2026 proposal on 2026-02-03."
+    expected_source_paths: [proposals/proposal-acme-2026.md]
+    must_contain: ["agent:bob-engineer", "2026-02-03"]
+    gold_targets:
+      - source_path: proposals/proposal-acme-2026.md
+        quote: "This fabricated proposal was authored on 2026-02-03 by agent:bob-engineer."
+
+  # ── T2 single-doc synthesis ──────────────────────────────────────────────
+  - id: t2-ladybug-decision
+    tier: T2
+    question: "What did the ladybug kuzu decision conclude about the test store?"
+    expected_answer: "Use the JSON fallback store during tests and keep the graph
+      boundary behind the existing Vault API."
+    expected_source_paths: [decisions/ladybug-kuzu.md]
+    must_contain: ["json fallback", "Vault API"]
+    gold_targets:
+      - source_path: decisions/ladybug-kuzu.md
+        quote: |-
+          states that the local fixture should use the json fallback store during tests
+          and keep the graph boundary behind the existing Vault API.
+
+  - id: t2-overdue-commitment
+    tier: T2
+    question: "What overdue intake commitment did agent:alice make, and why is it stale?"
+    expected_answer: "agent:alice committed on 2026-01-15 to reconcile the vault intake
+      map by a 2026-02-15 due date; it is overdue with no closure record."
+    expected_source_paths: [drift_commitment.md]
+    must_contain: ["2026-02-15", "overdue"]
+    gold_targets:
+      - source_path: drift_commitment.md
+        quote: "The commitment was recorded on 2026-01-15T10:00:00Z with a due date of 2026-02-15."
+
+  - id: t2-provenance-concept
+    tier: T2
+    question: "What does provenance mean in this vault — who created a note and when?"
+    expected_answer: "The visible history of a note: who created it, when, and how it
+      relates to other notes; frontmatter is the first layer."
+    expected_source_paths: [concepts/concept-provenance.md]
+    must_contain: ["history", "created"]
+    gold_targets:
+      - source_path: concepts/concept-provenance.md
+        quote: "Provenance in this synthetic vault means the visible history of a note: who created it, when it was created, and what relationship it has to other notes."
+
+  # ── T3 multi-doc / multi-hop ─────────────────────────────────────────────
+  - id: t3-alice-artifacts
+    tier: T3
+    question: "Which artifacts did agent:alice produce or own across the vault?"
+    expected_answer: "agent:alice signed the Q1 SOW (sow-2026-q1), made the overdue
+      intake commitment (drift_commitment), and authored the provenance concept and
+      the ladybug-kuzu decision."
+    expected_source_paths: [sows/sow-2026-q1.md, drift_commitment.md, concepts/concept-provenance.md, decisions/ladybug-kuzu.md]
+    must_contain: ["agent:alice"]
+    gold_targets:
+      - source_path: sows/sow-2026-q1.md
+        quote: "This fabricated Statement of Work was signed on 2026-01-10 by agent:alice for a synthetic planning exercise."
+      - source_path: drift_commitment.md
+        quote: "The commitment was recorded on 2026-01-15T10:00:00Z with a due date of 2026-02-15."
+      - source_path: concepts/concept-provenance.md
+        quote: "agent: agent:alice"
+      - source_path: decisions/ladybug-kuzu.md
+        quote: "agent: agent:alice"
+
+  # ── T4 negative / absent ─────────────────────────────────────────────────
+  - id: t4-absent-budget
+    tier: T4
+    question: "What is the total dollar budget approved for the ACME 2026 engagement?"
+    expected_answer: "Not in the notes. The proposal describes a small fabricated scope
+      with no dollar budget; the system should decline rather than invent a figure."
+    expected_source_paths: []
+    must_contain: []
+    negative_control: true

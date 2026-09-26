@@ -1,0 +1,55 @@
+---
+title: Prerelease status
+description: "What 0.3.0 means for you: what is verified, what is not, and what may change without notice."
+---
+
+Okto Neuron is at version `0.3.0`, and the package declares itself `Development Status :: 2 - Pre-Alpha`. That classifier is the honest summary of everything below: the code runs, but nothing about its surface is settled yet.
+
+<Note>
+Treat every command, flag, default and file format on this site as something that can change in the next release.
+</Note>
+
+## What "pre-alpha" means in practice
+
+The version number tells you where to put your trust.
+
+- Flag names and their defaults can change.
+- The shape of files Okto Neuron writes can change.
+- Error strings and their wording can change.
+
+If you write a script, a CI job or an automation that shells out to Okto Neuron, pin an exact version. Reading output by matching on an error message is the first thing that will break for you.
+
+## Two executables, one of them explicitly a compatibility layer
+
+Okto Neuron installs two commands, `okto-neuron` and `kg`. The `kg` command describes itself as a "Compatibility CLI with graph commands flattened at the top level". It exists so graph commands sit at the top level instead of under a group, and it is the surface most likely to move. Write against `okto-neuron` when you have the choice.
+
+## Platforms
+
+The installer, `install.sh`, is a bash script. Its platform dispatch handles macOS (`Darwin`), MSYS/MinGW/Cygwin shells, and everything else through `xdg-open`. Nothing on this site has been verified on Windows, and no Windows lifecycle is claimed here. See [Known gaps](/help/known-gaps).
+
+See [Install](/start/install) for the routes that are actually supported.
+
+## How these docs were written
+
+Pages on this site are written from the source code. Where the code and the project's own prose disagree, the code is what these pages follow.
+
+That has two consequences you should know about:
+
+<CardGroup cols={2}>
+  <Card title="Known gaps" icon="circle-question" href="/help/known-gaps">
+    Behaviour that exists in the code but was not verified end to end. It is listed rather than described, so you never mistake a guess for a guarantee.
+  </Card>
+  <Card title="Deliberately absent" icon="circle-minus" href="/help/deliberately-absent">
+    Things Okto Neuron does not do, and flags or options that look like they do something and do not. Check here before you assume a capability exists.
+  </Card>
+</CardGroup>
+
+If a page here is silent about something, do not read that silence as confirmation. Check [Known gaps](/help/known-gaps) and [Deliberately absent](/help/deliberately-absent) first.
+
+<Warning>
+Nothing on this site promises when a gap will close. There is no schedule, no milestone and no target version for any of it.
+</Warning>
+
+## Where to go next
+
+Start at [the overview](/) if you want to know what Okto Neuron is for, or go straight to [Install](/start/install) if you are ready to set it up.

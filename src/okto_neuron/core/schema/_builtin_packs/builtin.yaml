@@ -1,0 +1,6 @@
+id: builtin
+version: 0.1.0
+compatRange: ">=0.0.1"
+types:
+  - name: BuiltinThing
+    kind_of: Concept

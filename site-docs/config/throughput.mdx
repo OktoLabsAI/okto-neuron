@@ -1,0 +1,134 @@
+---
+title: Tune ingest and curation concurrency
+description: Why raising concurrency usually does nothing, and the one declaration that unlocks it.
+---
+
+You raised `curation_max_concurrent` to 8, restarted, and the work still goes one call at a time. That is the designed behaviour. Okto Neuron clamps every LLM fan-out to one in-flight request unless the model behind it is listed in `llm.parallel_capable_models`.
+
+This page shows you how to make that declaration, what else you can turn, and which knobs cost you review coverage if you turn them the wrong way.
+
+<Note>
+Okto Neuron is prerelease. Config keys on this page are read from the vault's `okto-neuron.yaml`; see [/config/vault-yaml](/config/vault-yaml) for the file layout and which blocks you may edit.
+</Note>
+
+## Declare backend capacity first
+
+`llm.parallel_capable_models` is a list of model aliases you assert can serve more than one generation at a time. It is a declaration, not a detection. The LiteLLM Gateway adapter exposes `mode` and `supported_openai_params` only, with no verified parallel-slot field, so Okto Neuron will not guess from the model name.
+
+The list ships with a single placeholder entry (see [/config/llm-reference](/config/llm-reference) for its value). It does not mean your backend serves that alias. Replace it with the aliases your own backend serves in parallel.
+
+Any alias listed there may exceed one in-flight completion. Every other alias clamps to 1, for both extraction and curation.
+
+```yaml okto-neuron.yaml
+llm:
+  parallel_capable_models:
+    - your-provider/your-model
+```
+
+Alias matching ignores case and surrounding whitespace, so a hand-typed `Your-Provider/Your-Model` still matches.
+
+<Warning>
+Listing an alias whose backend does not actually have multiple generation slots does not create capacity. It only removes Okto Neuron's guard, and the extra requests land on a backend that cannot serve them. Declare a model only when you know the server behind it was started with more than one slot (for llama.cpp, that is `--parallel N` with N above 1).
+</Warning>
+
+## Raise the two fan-out bounds
+
+Okto Neuron runs two independent bounded fan-outs.
+
+`llm.extraction.max_concurrent` bounds how many chunks may have an extractor call outstanding. Its type, default and range are on [/config/llm-reference](/config/llm-reference).
+
+`consolidation.curation_max_concurrent` bounds how many candidate-curation calls may be in flight. Its type, default and range are on [/config/vault-yaml](/config/vault-yaml).
+
+Both are Okto Neuron orchestration policy, never model parameters, and neither is ever sent to the provider as a request field.
+
+```yaml okto-neuron.yaml
+llm:
+  parallel_capable_models:
+    - your-provider/your-model
+  defaults:
+    model: your-provider/your-model
+  extraction:
+    max_concurrent: 4
+consolidation:
+  curation_max_concurrent: 4
+```
+
+The alias each fan-out is gated on is the one the step will actually call: the step's own `model` override if it sets one, otherwise `llm.defaults.model`. A `provider_ref` never rewrites `model`, so pointing a step at a different provider profile does not change which alias is checked. See [/config/llm-reference](/config/llm-reference) for the full step and defaults resolution.
+
+### Curation is fail-closed across two steps
+
+The curation fan-out drives both the `curator` step and the `relation_curator` step, and those may resolve to different models. Effective curation concurrency exceeds one only when *every* step feeding the fan-out is parallel-capable. It is the minimum across the two, not the maximum.
+
+So if you point `relation_curator` at a second, single-slot model, curation drops back to 1 even though `curator` is declared. Extraction resolves from the single `extraction` step, so it has no such pairing.
+
+## Read configured versus effective
+
+The clamp is applied where the value is consumed, not at parse time. Okto Neuron never rewrites your stored config. That has three consequences you should expect:
+
+- The number in `okto-neuron.yaml` stays exactly what you wrote, so a vault carrying `4` keeps loading after you move it to a single-slot backend.
+- Configured and effective values differ, and both are reported.
+- The companion's mid-run config re-read cannot slip past the policy.
+
+When a configured bound is clamped, Okto Neuron emits a notice naming only the models that failed the allowlist, in this shape:
+
+```text
+configured concurrency 4 clamped to 1: mini/local-7b is not listed in
+llm.parallel_capable_models, so the backend is assumed to serve one request
+at a time
+```
+
+Only the offending alias is named. In a mixed curation setup, the parallel-capable step is deliberately left out of the message so you are not sent to fix the wrong line. Extraction logs its notice as a warning when a run starts.
+
+<Accordion title="Nothing changed after I edited the file">
+Check, in order: the alias in `parallel_capable_models` matches the alias the step resolves to (step `model` override first, then `llm.defaults.model`); for curation, that *both* `curator` and `relation_curator` resolve to declared aliases; and that the value you raised is above 1, since a value of 1, 0 or `null` normalizes to 1.
+</Accordion>
+
+## Other levers
+
+These change the shape of the work rather than how much of it runs at once. None of them is a recommended value for your hardware; Okto Neuron ships defaults and you measure your own setup.
+
+<Tabs>
+<Tab title="Curation batching">
+`consolidation.curation_batch_size` is off at its default, which is the per-candidate call path ([/config/vault-yaml](/config/vault-yaml) carries the value and range). Above 1, up to K same-block candidates are evaluated in a single LLM call with schema-constrained JSON output, and any candidate the batch reply does not cover falls back to its own single call. Verdicts stream out as each batch returns, so ledger rows land per batch rather than at phase end.
+</Tab>
+<Tab title="Embedding">
+`embedding.batch_size` and `embedding.max_concurrent_batches` bound embedding work; both values and ranges are on [/config/vault-yaml](/config/vault-yaml). These are execution policy only: they do not change vector semantics and are deliberately excluded from the fields that force a re-embed. Embedding is also out of scope for the `parallel_capable_models` clamp, so these two are not gated by that declaration.
+</Tab>
+<Tab title="Ingest windows">
+`ingest.chunk_size_bytes` and `ingest.chunk_overlap_bytes` set the byte window each Block is sliced into; both values and ranges are on [/config/vault-yaml](/config/vault-yaml). Overlap must be smaller than the chunk size, or the config fails to load. Stored Blocks record the policy they were written under, and a Block only belongs to the effective partition when its recorded size and overlap match the current config, so changing these affects sources you ingest or re-ingest afterwards. See [/vault/rebuilding](/vault/rebuilding).
+</Tab>
+</Tabs>
+
+## Cut work before it reaches the model
+
+`consolidation.prefilter` is a deterministic pre-filter for low-value candidates. It is the cost lever that does not touch concurrency at all.
+
+Turning it on with `consolidation.prefilter.enabled` starts predicate demotion and near-duplicate literal collapse. Low-signal node demotion needs one more thing: `min_mentions` raised to 2 or higher, because at its shipped value the rule does nothing. `demote_predicates` is the list of predicates treated as low-value, and `max_trivial_node_chars` is the length at or below which node text counts as trivial.
+
+`established_entity_fastpath` is gated independently of `enabled`. It fires only where the candidate would merge into an already-live store node with no novel content, so skipping the curator verdict cannot change graph content, only cost.
+
+Every `consolidation.prefilter` key, its type, its default and its range are on [/config/vault-yaml](/config/vault-yaml).
+
+Demotion always means *queue for review*. A demoted candidate goes to the existing review surface. It is never silently discarded.
+
+## The gate that decides what you review
+
+`consolidation.auto_commit_threshold` is the minimum confidence for a candidate to commit without review. Below it, the candidate routes to review with reason `low_confidence`. A contradicted candidate routes to review regardless of confidence while `consolidation.review_on_contradiction` is true. Both values and ranges are on [/config/vault-yaml](/config/vault-yaml).
+
+<Warning>
+Setting `auto_commit_threshold` to `0.0` means every candidate clears the confidence check and commits unreviewed. The only thing still holding candidates back is the contradiction rule, and turning off `review_on_contradiction` removes that too. Treat 0.0 as "commit everything the model proposed".
+</Warning>
+
+## Where to go next
+
+<CardGroup cols={2}>
+<Card title="LLM configuration reference" href="/config/llm-reference">
+Every step, how defaults resolve, and the full set of LLM keys.
+</Card>
+<Card title="okto-neuron.yaml" href="/config/vault-yaml">
+File layout, which blocks are writable, and validation rules.
+</Card>
+<Card title="Rebuilding a vault" href="/vault/rebuilding">
+What to run after changing policy that affects already-stored content.
+</Card>
+</CardGroup>

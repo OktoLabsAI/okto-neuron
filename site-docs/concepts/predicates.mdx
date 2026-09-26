@@ -1,0 +1,67 @@
+---
+title: How relationship names are governed
+description: Why the relationship vocabulary lives off the graph, and what that buys you.
+---
+
+Extraction invents relationship names. Left alone it will propose `uses`, `utilises`, `is_used_by` and `the` in the same run. Okto Neuron keeps the vocabulary under control by treating every relationship name as a record in a side-store, not as a change to the graph.
+
+<Note>
+Okto Neuron is prerelease. The lifecycle described here is the one the code implements today.
+</Note>
+
+## The vocabulary lives beside the graph
+
+Two JSON files under `.marginalia/predicates/` in your vault hold the whole vocabulary: `registry.json` for the predicates themselves, and `aliases.json` for the mapping decisions that fold one label into another.
+
+The registry module states its own boundary: it has no graph, LLM, planner or review-queue dependency, and so cannot change live graph semantics merely by being read or updated. Reading or editing the registry never rewrites a stored edge. What the registry changes is what future admission decisions do with a proposed label.
+
+```text
+<vault>/.marginalia/predicates/
+  registry.json   predicate records
+  aliases.json    SSSOM-shaped mapping decisions
+```
+
+Both stores take a cross-process file lock before they write, so two processes touching the same vault do not interleave.
+
+## Canonical and provisional
+
+Every predicate record carries a lifecycle of either `canonical` or `provisional`.
+
+Canonical records are the built-ins. Okto Neuron ships a fixed set of core definitions (`author_of`, `describes`, `requires`, `uses`, `has_value` and others), plus per-pack definitions such as the `sdlc` pack's `enables` and `mitigates`. Bootstrap seeds any missing built-in record without replacing a decision you already made.
+
+Provisional records are what a run mints when extraction proposes a label the registry has never seen. The minting gate is narrow. The curator has to commit the relation, mark the predicate supported, supply a one-line definition and a direction that is not `unknown`, and the admission decision has to be the "unregistered label" one. Miss any of those and no record appears. A freshly minted provisional record starts at `support_count` of 0.
+
+After that, each further relation that lands on the same label rewrites the record with `support_count` incremented by one, adds an evidence sample (claim id plus source block, capped at 20), and raises the stored confidence to the higher of the two. Support accumulates as evidence on the record. Nothing in the code today moves a record from `provisional` to `canonical`; `canonical` is only ever set when the built-in records are seeded.
+
+Writes of a planned record go through a compare-and-set: you pass the record you expect to find, and the store refuses if the file has moved on. Replaying the exact same post-state is safe. A planned record can never rename a predicate, and can never downgrade a canonical record back to provisional.
+
+## The deny-list
+
+Extraction proposes junk. The registry hard-codes a deny-list of labels it will not accept: filler words such as `the`, `of` and `and`, plus null-ish tokens such as `unknown` and `undefined`. The full list is on [/reference/predicates](/reference/predicates).
+
+The gate fires twice. Admission rejects a denied label as structural noise before it reaches the registry, and the record constructor raises if anyone tries to build a record with one anyway. Labels also have to be canonical `lower_snake_case`, and definitions have to be one line of at most 500 characters.
+
+## Aliases fold labels, reversibly
+
+When two labels mean the same thing, Okto Neuron does not rewrite the graph. It writes an SSSOM-shaped mapping record into `aliases.json`: which predicate maps to which, what kind of mapping it is, and the evidence and status behind the decision. The full field list and the mapping kinds are on [/reference/predicates](/reference/predicates).
+
+Only active exact-match records participate in the fold. Chains collapse into one root, and core aliases keep precedence over anything a vault adds locally.
+
+This is the same safety rule the vault uses for entity decisions: the durable decision lives beside the vault, not in the graph. Removing a mapping record reverses the fold, because no graph edges and no Claim facets were rewritten to create it. Deleting the record from `aliases.json` is the undo.
+
+<Warning>
+Editing `registry.json` or `aliases.json` by hand bypasses the validation and the file lock. Both files are validated on read, so a malformed edit will surface as an error rather than as silent corruption, but a concurrent write can still lose your change.
+</Warning>
+
+## Where the lists live
+
+This page is the reasoning. The exhaustive tables (every shipped label, its direction, the lifecycle values, the mapping kinds and the alias statuses) live on [/reference/predicates](/reference/predicates).
+
+<CardGroup cols={2}>
+  <Card title="The data model" href="/concepts/data-model">
+    What the nodes and edges these predicates name actually are.
+  </Card>
+  <Card title="Duplicate entities" href="/vault/duplicate-entities">
+    The same off-graph, reversible pattern applied to entities rather than relationship names.
+  </Card>
+</CardGroup>

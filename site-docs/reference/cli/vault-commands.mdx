@@ -1,0 +1,361 @@
+---
+title: "Vault commands: init, onboard, watch, vault"
+description: "Exhaustive reference for the vault lifecycle commands: init, onboard, watch, and the four vault subcommands."
+---
+
+<Note>
+Okto Neuron is prerelease. Flags, output lines and exit codes on this page describe the current source and can change.
+</Note>
+
+A vault is a directory that contains a `okto-neuron.yaml` file. Every command here creates, selects, inspects or feeds one. All of them run in the CLI process itself, and none opens the thin HTTP client, so none needs `okto-neuron serve` running. `init`, `onboard` and `watch` open the vault directly, so they can run against a vault a daemon already holds.
+
+## okto-neuron init
+
+Create a vault at an arbitrary path.
+
+```bash
+okto-neuron init ./my-vault
+```
+
+On success it prints:
+
+```text
+initialized vault at /abs/path/my-vault
+```
+
+Running `init` on a path that is already a vault does not create or reset anything. The existing vault is opened, its recorded backend pin is enforced, and the same `initialized vault at <path>` line prints. Use `--wipe` to reset an existing vault.
+
+### Flags
+
+<ParamField path="PATH" type="path" required>
+Directory to create the vault in. Positional argument.
+</ParamField>
+
+<ParamField path="--packs" type="string" default="core,research,personal">
+Comma-separated pack names. The value is split on commas, each entry is stripped, and empty entries are dropped.
+</ParamField>
+
+<ParamField path="--embedder" type="string" default="fastembed">
+Embedding provider written into the vault config. A plain string option with no `click.Choice`, so any value is accepted at parse time. The flag's help text reads `fastembed | stub`.
+</ParamField>
+
+<ParamField path="--backend" type="string" default="grafx">
+Graph backend to pin the new vault to. The name is validated against the backend registry, and if a vault already exists at `PATH` its recorded pin is enforced.
+</ParamField>
+
+<ParamField path="--wipe" type="boolean" default="false">
+Wipe an existing vault, then re-init. See [Wiping](#wiping-with-wipe).
+</ParamField>
+
+<ParamField path="--storage-uri" type="string" default="null">
+Storage endpoint URI for a non-Ladybug backend, for example `bolt://host:7687`.
+</ParamField>
+
+<ParamField path="--storage-credential-env" type="string" default="null">
+Name of the environment variable holding the storage backend's credential.
+</ParamField>
+
+<ParamField path="--storage-database" type="string" default="null">
+Database or keyspace name for a server-side backend.
+</ParamField>
+
+<ParamField path="--allow-remote-db" type="boolean" default="false">
+Confirm a non-loopback `--storage-uri`. This gates the graph backend's storage endpoint only. It is unrelated to `serve --allow-remote`, and it opens no listener of its own.
+</ParamField>
+
+<ParamField path="--accept-experimental" type="boolean" default="false">
+Accepted for compatibility with older scripts and unused by the command body.
+</ParamField>
+
+### Wiping with --wipe
+
+The wipe branch runs only when `PATH/okto-neuron.yaml` already exists. With `--wipe` on a path that is not a vault yet, the command falls through to a normal init and prints `initialized vault at <path>`.
+
+When the branch does run, the command reads the vault's pid file first. If a pid is recorded and that process is alive, it prints a line to stderr beginning `server is running (pid 4711); stop it first` (a stop hint follows on the same line) and exits 1.
+
+Otherwise it validates the `--backend` name, calls `wipe_vault`, and prints:
+
+```text
+wiped vault at /abs/path/my-vault
+```
+
+`wipe_vault` deletes the vault's graph storage for the pinned backend, then `.marginalia/`, `notes/` and `refs/`, and re-scaffolds an empty vault with a fresh empty graph.
+
+<Warning>
+`init --wipe` never prompts. It deletes `notes/`, `refs/`, `.marginalia/` and the graph outright.
+
+Passing `--packs`, `--embedder` or `--backend` explicitly on the command line flips `keep_config` to `False`, which **also deletes `okto-neuron.yaml`**. The command then reinitializes the vault from the flags you passed. Without those flags the existing `okto-neuron.yaml` is preserved untouched.
+
+Deletion is best effort: the removal helper passes `ignore_errors=True` to `shutil.rmtree` and swallows `OSError`, while the `wiped vault at <path>` line prints unconditionally. A printed success line does not by itself prove every file is gone.
+</Warning>
+
+Exit codes for this page's commands are listed on [/reference/cli/exit-codes](/reference/cli/exit-codes).
+
+## okto-neuron onboard
+
+Guided first-run setup for a vault and its LLM provider.
+
+The command calls `ensure_global_layout()` and then decides whether to prompt. It is interactive only when `--non-interactive` was not passed **and** both stdin and stdout are TTYs. Everything else it needs comes from flags.
+
+### Flags
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--vault` | `null` | Vault name or path to create or configure. |
+| `--provider` | `null` | Provider preset key. See [/config/llm-providers](/config/llm-providers) for the preset list. |
+| `--litellm-provider` | `null` | Deprecated. Any truthy value raises a `BadParameter`. |
+| `--api-base` | `null` | Provider base URL. |
+| `--api-key-env` | `null` | `OKTO_NEURON_*` environment variable name to store in the config. |
+| `--api-key` | `null` | API key to save into `~/.okto-neuron/env`. |
+| `--model` | `null` | Model id to write into `okto-neuron.yaml`. |
+| `--skip-model-discovery` | `false` | Do not call the provider's model-list endpoint. |
+| `--non-interactive` | `false` | Use defaults and options, never prompt. |
+| `--reconfigure` | `false` | Overwrite an existing explicit LLM config. |
+| `--yes` | `false` | Accept remote-egress confirmations. |
+| `--allow-remote-llm` | `false` | Allow a validated non-loopback LLM endpoint. |
+| `--dry-run` | `false` | Show what would change, write nothing. |
+| `--print-summary-json` | `false` | Emit a machine-readable summary after the human output. |
+| `--disable-llm` | `false` | Explicitly disable LLM-backed `ask` and `remember` for this vault. |
+| `--backend` | `grafx` | Graph backend to pin a new vault to. |
+| `--accept-experimental` | `false` | Accepted for compatibility, unused. |
+| `--storage-uri` | `null` | Storage endpoint URI for a non-Ladybug backend. |
+| `--storage-endpoint` | `null` | Alias of `--storage-uri` for endpoint-style backends. |
+| `--allow-remote-db` | `false` | Allow a validated non-loopback storage endpoint. Non-interactively, `onboard` also requires `--yes`; without it the command fails with `<uri> is <class>; pass --yes with --allow-remote-db to confirm`. `init` and `vault create` need only `--allow-remote-db`. |
+| `--storage-credential-env` | `null` | Environment variable name holding the storage credential. |
+| `--storage-database` | `null` | Database or keyspace name for a server-side backend. |
+
+### Parameter rules
+
+<AccordionGroup>
+<Accordion title="--litellm-provider always fails">
+Any truthy `--litellm-provider` value raises a `BadParameter` telling you to choose `--provider custom` for a generic OpenAI-compatible endpoint, or `--provider litellm_proxy` for a proxy.
+</Accordion>
+
+<Accordion title="--skip-model-discovery needs --model">
+`--skip-model-discovery` without `--model` raises a `BadParameter` reading `--skip-model-discovery requires --model unless provider is skip`. The guard does not fire when `--provider skip` is set, when `--provider` is omitted entirely, or when `--disable-llm` is set.
+</Accordion>
+
+<Accordion title="Reconfiguring an already-configured vault">
+When the vault's LLM state is already `configured` or `disabled`, and you pass neither `--reconfigure` nor `--disable-llm`, supplying any of `--provider`, `--api-base`, `--api-key-env`, `--api-key` or `--model` raises:
+
+```text
+this vault already has explicit LLM config; pass --reconfigure to change it
+```
+</Accordion>
+
+<Accordion title="Interactive backend prompt">
+When the run is interactive and `--backend` was not given on the command line, the command prompts for the backend instead of taking the default.
+</Accordion>
+</AccordionGroup>
+
+<Warning>
+`--api-key` puts a secret on the command line, where your shell writes it to history and other local processes can read it from the process table. The flag's own help text tells you to prefer the interactive prompt.
+</Warning>
+
+## okto-neuron watch
+
+Run the ambient companion over a vault's inbox at `.marginalia/incoming`.
+
+```bash
+okto-neuron watch ./my-vault
+okto-neuron watch ./my-vault --once
+```
+
+### Flags
+
+<ParamField path="VAULT_PATH" type="path" required>
+Vault directory. Positional argument. It is expanded and resolved before use.
+</ParamField>
+
+<ParamField path="--once" type="boolean" default="false">
+Drain the inbox a single time and exit.
+</ParamField>
+
+<ParamField path="--poll" type="float" default="5.0">
+Poll interval in seconds. When omitted, the runner's `DEFAULT_POLL_SECONDS` of `5.0` is used.
+</ParamField>
+
+### Exit-2 conditions
+
+Both checks run before the vault is opened, print to stderr, and exit 2:
+
+| Condition | Message |
+| --- | --- |
+| `VAULT_PATH` does not exist, or is not a directory | `vault not found: <resolved path>` |
+| The directory has no `okto-neuron.yaml` | `vault is missing okto-neuron.yaml: <resolved path>` |
+
+### Output
+
+With `--once`, the command drains the inbox once and prints a single line:
+
+```text
+processed 3 file(s)
+```
+
+Without `--once`, it prints the watch banner first, then one `processed N file(s)` line per poll that produced results:
+
+```text
+watching /abs/path/my-vault/.marginalia/incoming (poll 5.0s); ctrl-c to stop
+processed 1 file(s)
+```
+
+`KeyboardInterrupt` is caught and prints `stopped`. The vault is closed in a `finally` block either way.
+
+For the task-level guide, see [/vault/watching](/vault/watching).
+
+## The vault group
+
+`okto-neuron vault` has exactly four subcommands: `list`, `create`, `use` and `current`. They work against the global `okto-neuron.toml` and the filesystem.
+
+There is no subcommand to delete, remove, rename or forget a vault.
+
+### vault list
+
+```bash
+okto-neuron vault list
+okto-neuron vault list --json
+```
+
+Text output is one line per vault: `*` when the entry is current or a space when it is not, then a space, the name, a TAB, the backend in square brackets, a TAB, and the path. When no vaults are discovered it prints `(no vaults)`.
+
+```text
+* work	[grafx]	/Users/you/.marginalia/vaults/work
+  archive	[ladybug]	/Users/you/.marginalia/vaults/archive
+```
+
+`--json` prints an indented JSON object instead:
+
+<ResponseField name="status" type="string">
+Always `"ok"`.
+</ResponseField>
+
+<ResponseField name="current" type="object | null">
+The current vault's entry, or `null` when no listed entry is current.
+</ResponseField>
+
+<ResponseField name="vaults" type="array">
+Every discovered entry, sorted by lowercased name. Each element carries `id`, `name`, `path`, `current`, `managed`, `deletable`, `delete_reason` and `backend`.
+</ResponseField>
+
+The `backend` field falls back to `"ladybug"` when `okto-neuron.yaml` records no `storage.backend` key.
+
+<Note>
+`vault list` is not read-only. It calls `ensure_global_layout()` first, which creates the directory holding `okto-neuron.toml` and every configured vault root at mode `0700`, and writes a default `okto-neuron.toml` when none exists. `vault create` calls the same function.
+</Note>
+
+### vault create
+
+```bash
+okto-neuron vault create work
+```
+
+`NAME` is a bare name, not a path. It is validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$` and capped at 255 characters, then placed as exactly one path component under the first configured vault root. A name that fails validation becomes a `BadParameter` on the `name` argument.
+
+When a vault already exists at the target path the command prints `vault already exists: <path>` to stderr and exits 1.
+
+On success it scaffolds the vault (config and directories, without opening the graph), calls `mark_managed_vault` to record the vault's identity in `.marginalia/managed-vault.json`, and unless `--no-use` was passed calls `set_default_vault`. It prints:
+
+```text
+created vault work at /Users/you/.marginalia/vaults/work
+```
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `NAME` | required | Bare vault name, one path component under the first vault root. |
+| `--packs` | `core,research,personal` | Comma-separated packs. Split on commas, stripped, blanks dropped. |
+| `--embedder` | `fastembed` | Plain string, no `click.Choice`. Help text reads `fastembed \| stub`. |
+| `--backend` | `grafx` | Graph backend to pin the vault to. |
+| `--use` / `--no-use` | `--use` | Whether to set the new vault as the default. |
+| `--accept-experimental` | `false` | Accepted and explicitly unused by the command body. |
+| `--storage-uri` | `null` | Storage endpoint URI for a non-Ladybug backend. |
+| `--storage-credential-env` | `null` | Environment variable name holding the storage credential. |
+| `--storage-database` | `null` | Database or keyspace name for a server-side backend. |
+| `--allow-remote-db` | `false` | Confirm a non-loopback `--storage-uri`. |
+
+For the task-level guide, see [/vault/creating](/vault/creating).
+
+#### create versus init
+
+| | `vault create NAME` | `init PATH` |
+| --- | --- | --- |
+| Target | Bare validated NAME under the first vault root | Any path you give it |
+| Registers the vault | Yes, `mark_managed_vault` | No |
+| Sets the default vault | Yes, unless `--no-use` | No |
+| `--use` / `--no-use` | Yes | No |
+| `--wipe` | No | Yes |
+| Creation call | `Vault.scaffold`, which does not open the graph | `Vault.init`, which scaffolds then opens the store |
+| Success line | `created vault <name> at <path>` | `initialized vault at <path>` |
+
+Everything else matches: `--packs`, `--embedder`, `--backend`, `--accept-experimental`, `--storage-uri`, `--storage-credential-env`, `--storage-database` and `--allow-remote-db` carry the same defaults on both commands.
+
+### vault use
+
+```bash
+okto-neuron vault use work
+okto-neuron vault use ~/vaults/other
+```
+
+The argument is resolved as either a registered name or a path. A value starting with `~`, `.` or `/`, or containing a path separator, is treated as a path. Otherwise it is matched against the names of discovered vaults, and falls back to the first vault root joined with the name when exactly one or no discovered vault carries that name. When more than one does, see [/help/known-gaps](/help/known-gaps).
+
+If the resolved target has no `okto-neuron.yaml`, the command prints to stderr and exits 2:
+
+```text
+vault not found: /Users/you/.marginalia/vaults/work
+```
+
+<Note>
+This exit 2 means "vault not found". It is not the client's `EXIT_UNREACHABLE = 2`, which a daemon-backed command returns when it cannot reach `okto-neuron serve`. Nothing in the `vault` group contacts the daemon.
+</Note>
+
+Otherwise it writes `default_vault` into `okto-neuron.toml` and prints:
+
+```text
+current vault: /Users/you/.marginalia/vaults/work
+```
+
+### vault current
+
+```bash
+okto-neuron vault current
+```
+
+Takes no options, has no `--json`, and prints the resolved vault path on one line. When the resolved path has no `okto-neuron.yaml`, it prints `no current vault configured` to stderr and exits 1.
+
+Resolution order, first match wins:
+
+<Steps>
+<Step title="OKTO_NEURON_VAULT">
+When the environment variable is set and non-empty, its value is resolved as a vault reference, by the same resolution `vault use` applies to its argument.
+</Step>
+<Step title="default_vault in okto-neuron.toml">
+The configured default, resolved to an absolute path.
+</Step>
+<Step title="The current working directory">
+Used when the cwd is itself a vault.
+</Step>
+<Step title="The sole discovered vault">
+Used only when discovery returns exactly one vault.
+</Step>
+<Step title="A 'default' vault under the first vault root">
+The fallback is the first configured vault root joined with `default`. With no roots configured, that root is `~/.okto-neuron/vaults`, so the fallback path is `~/.okto-neuron/vaults/default`. This path is returned whether or not it exists, which is why `vault current` can still exit 1 here.
+</Step>
+</Steps>
+
+## kg vault
+
+The compatibility script `kg` also exposes `kg vault ...`. Every non-`kg` top-level command is copied onto that script at import time, so the `vault` group appears there as a byproduct. Prefer `okto-neuron vault`.
+
+<CardGroup cols={2}>
+<Card title="Create a vault" href="/vault/creating">
+The task-level path through `vault create` and `init`.
+</Card>
+<Card title="Watch a vault" href="/vault/watching">
+Running the companion over an inbox.
+</Card>
+<Card title="LLM providers" href="/config/llm-providers">
+The `--provider` preset keys and what each one configures.
+</Card>
+<Card title="Exit codes" href="/reference/cli/exit-codes">
+Which exit codes are traced and what they mean.
+</Card>
+</CardGroup>

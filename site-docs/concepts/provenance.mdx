@@ -1,0 +1,116 @@
+---
+title: Why every answer points at bytes
+description: What each hit carries, and how a claim's evidence chain is assembled.
+---
+
+Okto Neuron answers questions about your own files. An answer you cannot check is worth very little, so every hit a query returns carries the coordinates of the bytes it came from. You can open the file, seek to the offset, and read the same text the system read.
+
+<Note>
+Okto Neuron is prerelease. Shapes described here are what the code does today, not a frozen contract.
+</Note>
+
+## What a hit carries
+
+Every result is a `QueryHit`: the node that matched, a score, and a `provenance` record (`src/okto_neuron/models.py:65`). The provenance record is not optional and not nullable. Its fields are:
+
+<ParamField path="path" type="str">
+The file the content came from, as an absolute path. It is the empty string when the recorded path does not resolve under the vault root, which is blanked deliberately so out-of-vault provenance cannot reach a byte read (`src/okto_neuron/vault.py:993-997`).
+</ParamField>
+
+<ParamField path="byte_start" type="int">
+Offset where the block begins.
+</ParamField>
+
+<ParamField path="byte_end" type="int">
+Offset where the block ends.
+</ParamField>
+
+<ParamField path="content_hash" type="str">
+A `sha256:` prefix followed by 64 lowercase hex characters; the field is pattern-validated, so a malformed value cannot be constructed (`src/okto_neuron/models.py:41`). When the block carries a `content_hash` or `sha256` facet, this is the digest of that block. When it carries neither, the value is the SHA-256 of the node id instead, so it is not a digest of the bytes (`src/okto_neuron/vault.py:965-971`, `src/okto_neuron/query.py:698-703`).
+</ParamField>
+
+<ParamField path="extraction_activity_id" type="str">
+The activity that produced the content.
+</ParamField>
+
+<ParamField path="agent_id" type="str">
+The agent the content is attributed to.
+</ParamField>
+
+<ParamField path="document_id" type="str">
+The document the block belongs to.
+</ParamField>
+
+<ParamField path="block_id" type="str">
+The block itself.
+</ParamField>
+
+The fields are required by the model, but the id fields are the empty string when the source node carried no such facet (`src/okto_neuron/vault.py:1000-1007`).
+
+`QueryHit` exposes `path`, `byte_start`, `byte_end` and `content_hash` directly as properties, so you do not have to reach through `provenance` in everyday code. The `content_hash` property strips the `sha256:` prefix and hands you the bare digest. There is also a `claim_id` property, which returns the node id when the node's type is `Claim` and `None` otherwise.
+
+The digest and the byte offsets are recorded together, so you can re-read the bytes and compare the digest yourself.
+
+## The three edges on a claim
+
+When ingest extracts a claim, it wires three PROV-O edges from that claim (`src/okto_neuron/ingest/__init__.py:222`):
+
+- `prov:wasDerivedFrom` points at the Block the claim was read out of.
+- `prov:wasGeneratedBy` points at the extraction Activity that produced it.
+- `prov:wasAttributedTo` points at the Agent responsible.
+
+For deterministic extraction, the last two are fixed system nodes that ingest creates once: an Agent titled `system`, described as the deterministic extraction system agent, and an Activity titled `ExtractionActivity deterministic-v1`, which covers frontmatter, tag, wikilink and heading extraction.
+
+Each edge gets a deterministic id derived from the claim id, the edge type and the destination, so re-ingesting the same content produces the same edges instead of duplicates. Ingest also mints `rdf:subject` for every claim, and `rdf:object` when the claim's object is an entity rather than a literal. Both of those bridge edges are skipped when the node they would point at is absent, so a dangling id does not crash ingest.
+
+The edges are always three plus the bridges. Nothing in this path is best-effort or conditional on a model being available.
+
+## Source, layer and confidence
+
+Separately from the byte anchor, every node and edge carries a `Provenance` record that says how the object came to exist (`src/okto_neuron/core/schema/legacy.py:22`):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `source` | `user` | A plain string. The values the code writes include `user` (the default), `ingest` and `llm`; nothing validates it. |
+| `rule_id` | `None` | The rule that produced it, when a rule did. |
+| `layer` | `deterministic` | A plain string, default `deterministic`. The companion write path also writes `llm-extraction` (`src/okto_neuron/companion/__init__.py:3012`). Nothing validates it, so treat the set as open. |
+| `confidence` | `1.0` | A float. |
+
+The distinction that matters for trust is `deterministic` against anything produced by a model. A deterministic claim came from parsing structure that is literally present in your file: a frontmatter key, a tag, a wikilink, a heading. You can re-derive it yourself by reading the same bytes. A claim whose `source` is `llm` came from a model reading the block, and re-running it can produce something different.
+
+<Warning>
+Confidence is a plain float with a default of `1.0`. It is not calibrated, and values are not comparable across providers or across layers. Treat it as a local ordering hint inside one run, not as a probability.
+</Warning>
+
+## Inspecting one chain
+
+To look at a single claim's evidence, call `get_provenance` on an open vault (`src/okto_neuron/vault.py:630`):
+
+```python
+from okto_neuron.vault import Vault
+
+with Vault.open("/path/to/vault") as vault:
+    chain = vault.get_provenance(claim_id)
+```
+
+You get back a dictionary with three keys: `claim` (the claim node), `block` (the block named by the claim's `block_id` facet, or `None` when no such block is stored) and `edges` (every edge out of the claim whose type starts with `prov:`).
+
+The method checks the node's type first. If the id you pass is not a `Claim`, or the node does not exist, you get `None` rather than a partial answer. See [/reference/python-api](/reference/python-api) for the surrounding API.
+
+## Context around a hit
+
+A hit can also carry `context_spans`: neighbouring blocks from the same document, recovered at query time (`src/okto_neuron/models.py:48`). They are rebuilt at read time rather than stored, because storage is overlap-free. A retrieved block is expanded to its adjacent siblings on the same `path`, selected by identical `source_path` and neighbouring `block_index`.
+
+Each span carries `path`, `byte_start`, `byte_end`, `content_hash`, `block_id` and `block_index`. The design constraint is deliberate: a context span only ever uses byte coordinates already implied by the primary provenance's path, so it discloses no path the hit was not already anchored to.
+
+A hit also has a `drift` field, typed `Any | None` and `None` by default. It is filled only when a query is run with `with_drift` set, and then best-effort (`src/okto_neuron/vault.py:410`, `:528`). It has no documented shape, so do not build on its contents.
+
+## Provenance over MCP
+
+The [ask tool](/mcp/tools/ask) takes an `include_sources` flag, default false (`src/okto_neuron/server/runtime.py:1298`). When you set it, the response gains a `sources` list with one entry per hit, carrying `id`, `block_id`, `byte_start`, `byte_end` and `content_hash`, plus validity fields when the node is stale.
+
+The path in those entries is vault-relative, not the absolute path that `QueryHit.provenance.path` holds. When the path cannot be made relative to the vault root, the `path` key is omitted from the entry entirely. Leaving the flag unset leaves the payload unchanged.
+
+## Where this fits
+
+The byte anchor, the three edges and the source layer are three separate answers to three separate questions: where did this text live, what produced this claim, and how much of it is parsing versus inference. Read [/concepts/data-model](/concepts/data-model) for the node and edge types these records hang off.

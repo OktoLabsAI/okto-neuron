@@ -1,0 +1,193 @@
+---
+title: "When install goes wrong"
+description: "The failures the installer actually produces, and what to do about each."
+---
+
+<Note>
+Okto Neuron is prerelease. The package version is `0.3.0` and the packaging classifier is `Development Status :: 2 - Pre-Alpha`. Error text and remediation steps on this page track the installer in the repository you cloned. See [prerelease status](/start/prerelease-status).
+</Note>
+
+This page covers the failures `install.sh` reports. Each section quotes the message you will see and tells you what to do next. If the install finished but the daemon or Claude Code misbehaves afterwards, go to [runtime troubleshooting](/help/troubleshoot-runtime) instead. For the environment variables and flags named here, see the [installer reference](/reference/installer).
+
+## LLM variables set without a vault name
+
+Before anything else runs, the installer validates its preseed inputs. If `OKTO_NEURON_VAULT` is empty but any of `OKTO_NEURON_PACKS`, `OKTO_NEURON_LLM_PROVIDER`, `OKTO_NEURON_LLM_API_BASE`, `OKTO_NEURON_LLM_MODEL`, `OKTO_NEURON_LLM_API_KEY_ENV`, `OKTO_NEURON_LLM_SKIP_DISCOVERY`, `OKTO_NEURON_LLM_ALLOW_REMOTE`, `OKTO_NEURON_ALLOW_REMOTE_LLM` or `OKTO_NEURON_ONBOARD_NONINTERACTIVE` carries a value, it stops on the first one it finds:
+
+```text
+error: <NAME> requires OKTO_NEURON_VAULT; omit preseed settings and configure vaults in the Web UI, or set OKTO_NEURON_VAULT explicitly
+```
+
+This is a hard error, not a warning. Either clear the preseed variables from the environment and configure the vault after install, or set `OKTO_NEURON_VAULT` to the vault name you want seeded.
+
+## Unknown installer flag
+
+The script accepts exactly one flag. Anything else stops it:
+
+```text
+error: unknown install.sh flag: <arg> (supported: --no-onboard)
+```
+
+A typo is never read as an opt-out, so re-run with the exact flag.
+
+## uv installed but not on PATH
+
+The first step checks for `uv`, and installs it from `astral.sh` when it is missing. The script then adds `${HOME}/.local/bin` to `PATH` for the rest of its own run and re-checks. If `uv` is still not resolvable, it stops with:
+
+```text
+error: uv installed but not on PATH; restart your shell and re-run.
+```
+
+Restart your shell so your profile picks up the new directory, then run the installer again. You can confirm the fix before re-running:
+
+```bash
+command -v uv
+```
+
+## clone failed
+
+A released `install.sh` installs the wheel baked into it, so it only clones when you set `OKTO_NEURON_DEFAULT_WHEEL_URL` to an empty string, pass no `OKTO_NEURON_WHEEL` or `OKTO_NEURON_SRC`, and the script is not at the root of a clone. It then clones `https://github.com/OktoLabsAI/okto-neuron.git` (or `OKTO_NEURON_REPO`). A clone that fails stops the run:
+
+```text
+error: clone failed. Check OKTO_NEURON_REPO and your network, or pass OKTO_NEURON_SRC=<path> / OKTO_NEURON_WHEEL=<url>.
+```
+
+You have three ways out.
+
+<Steps>
+<Step title="Fix the clone">
+Check that `OKTO_NEURON_REPO`, if you set it, is a URL this machine can reach, then re-run the installer.
+</Step>
+<Step title="Point at a checkout you already have">
+`OKTO_NEURON_SRC=<path>` installs from a directory instead of cloning. The directory must contain a `pyproject.toml`, or the installer stops with `OKTO_NEURON_SRC has no pyproject.toml: <path>`.
+</Step>
+<Step title="Point at a wheel">
+`OKTO_NEURON_WHEEL=<url-or-path>` installs from a built wheel. A wheel candidate needs both an expected version and an expected digest before it is installed. Either set `OKTO_NEURON_MANIFEST=<path-or-url>`, which supplies both, or set `OKTO_NEURON_EXPECTED_VERSION` and `OKTO_NEURON_WHEEL_SHA256` together. Setting the digest alone stops the run with `wheel verification requires a manifest version or OKTO_NEURON_EXPECTED_VERSION`. See the [installer reference](/reference/installer) for both variables.
+</Step>
+</Steps>
+
+If `git` itself is absent, the message is different and arrives earlier: `git not found; install git or set OKTO_NEURON_SRC / OKTO_NEURON_WHEEL.`
+
+## Wheel verification refuses to proceed
+
+A wheel candidate is only installed after its SHA-256 is checked against an expected value. If you supplied an expected version but no manifest and no digest, the installer stops:
+
+```text
+error: wheel verification requires OKTO_NEURON_MANIFEST or OKTO_NEURON_WHEEL_SHA256
+```
+
+Supply the release manifest that belongs to the wheel with `OKTO_NEURON_MANIFEST=<path-or-url>`. The manifest must carry `version`, `wheel_url`, `wheel` and `sha256`; a manifest missing any of those is rejected with `release manifest is missing version, wheel_url, wheel, or sha256`. If you also set `OKTO_NEURON_WHEEL_SHA256` and it disagrees with the manifest, the installer stops rather than choosing one. Resolve the disagreement at the source. Do not treat the digest variable as a way to skip the check.
+
+## The daemon does not verify
+
+After installing the candidate, the installer starts it and compares the version the running server reports against the version it installed. Two failures land here.
+
+<AccordionGroup>
+<Accordion title="server did not become ready">
+The installer never got a version back from the local server and warns `server did not become ready within 60s`.
+</Accordion>
+<Accordion title="server reported a different version">
+The server answered, but with another version: `server reported version <X>; installed version is <Y>`. The installer does not report why the versions differ. Read the daemon log tail it printed, then run the diagnostic command it names.
+</Accordion>
+</AccordionGroup>
+
+In both cases the installer prints two more lines, the suggested diagnostic run and the path of the daemon log:
+
+```text
+ !! try 'okto-neuron serve --foreground --no-open'
+ !! daemon log: <path>
+```
+
+When that log file exists, the installer prints its last 20 lines before it stops. Read those lines first, then run the command the installer suggests.
+
+Verification failure is fatal for the install:
+
+```text
+error: candidate daemon verification failed; the previous installation will be restored
+```
+
+## Reading rollback messages
+
+The installer is transactional. Before it activates a candidate, it moves the previous tool environment and the `okto-neuron`, `kg` and `marginalia` launchers into a backup directory named `.okto-neuron-installer-backup-<pid>` under your uv tool directory. If activation does not reach its commit point, the exit handler puts them back and warns:
+
+```text
+ !! activation failed; restoring the previous Okto Neuron tool
+```
+
+When the previous install is Marginalia (0.2.0 or earlier), the line names Marginalia instead.
+
+What follows tells you how complete the restore was.
+
+| Message | What it means |
+| --- | --- |
+| `restored and restarted Okto Neuron <version>` | Previous tool and its daemon are back. |
+| `restored Okto Neuron <version>; daemon remains stopped` | Previous tool is back, but nothing was restarted. Start it yourself. |
+| `previous tool restoration could not be verified (expected <X>, got <Y>)` | The restored environment did not report the version it should. Inspect before relying on it. |
+| `rollback is incomplete; recovery backup retained at <path>` | The restore itself failed. Your previous install is still inside that directory. |
+
+<Warning>
+A retained recovery backup directory is the only copy of your previous tool environment. Do not delete it until you have a working install again. On a clean commit the installer removes the backup itself, and a successful rollback removes it too, so a directory that survives is a signal, not leftovers.
+</Warning>
+
+If a candidate daemon is still alive when rollback starts, the installer refuses to remove its environment and warns `candidate daemon is still live; refusing to remove its environment`. Stop that process, then re-run.
+
+## Claude Code wiring
+
+Wiring runs only after the candidate is committed, so problems here leave you with a working install and an unregistered MCP endpoint. See [connect Claude Code](/start/connect-claude-code) for what a correct registration looks like.
+
+### Claude Code CLI not found
+
+```text
+==> Claude Code CLI not found
+    install Claude Code, then re-run this installer to register Okto Neuron
+```
+
+This step is skipped and the install continues. Nothing is rolled back. Install Claude Code and run the installer again to pick up the registration.
+
+### Registration conflict
+
+If an `okto-neuron` entry already exists and does not match the connected user-scope endpoint, the installer refuses to replace it:
+
+```text
+ !! an existing 'okto-neuron' Claude MCP entry is not the connected user-scope endpoint http://127.0.0.1:8201/mcp
+error: Claude MCP registration conflict; resolve the existing entry and re-run this installer
+```
+
+Between those two lines it prints a remediation that depends on where the existing entry lives. When the detected scope is `local` or `project`, it gives you the removal command:
+
+```bash
+claude mcp remove okto-neuron --scope local
+```
+
+For any other scope it tells you to look first:
+
+```bash
+claude mcp get okto-neuron
+```
+
+Resolve the entry by hand, then re-run the installer. A registration that does match the connected endpoint is preserved as-is and reported with `preserved connected 'okto-neuron' user-scope registration`.
+
+### Wiring deferred or failed
+
+`Claude Code wiring deferred` means the installer found no daemon credential file to register. Start the daemon, then re-run the installer. `automatic Claude Code registration failed` is a warning: the install stands, the registration does not. You can set `OKTO_NEURON_NO_MCP=1` to have the installer skip this step entirely.
+
+## Missing optional dependencies
+
+The installer provisions the `serve` and `litellm` extras, so these two errors normally show up only in an environment where those extras were not installed.
+
+Running `okto-neuron serve` without the server dependencies reports:
+
+```text
+OptionalDependencyError: server dependencies are not installed; install okto-neuron[serve] to run `okto-neuron serve`
+```
+
+Running a graph command without the storage backend reports:
+
+```text
+OktoNeuronError: Ladybug storage is not installed; install okto-neuron[ladybug] to run graph commands
+```
+
+Install the named extra into whatever environment holds your `okto-neuron`. The two errors exit with different codes; see [exit codes](/reference/cli/exit-codes).
+
+## Starting over
+
+When you have read the message and fixed its cause, the recovery is the same in every case: run the installer again from your checkout. See [install](/start/install) for the invocation and what a clean run puts on your machine.

@@ -1,0 +1,100 @@
+name: eval-gate
+
+# DETERMINISTIC FLOOR — the P0 CI trust anchor for knowledge quality.
+#
+# THREE bit-reproducible signals, all NO-LLM and NO-DAEMON, gated in CI:
+#
+#   (1) PROVENANCE byte-hash (judge.py floor) — NO-VAULT. For every gold/distractor
+#       quote, re-slice it out of inputs/<source_path>, assert present + UNIQUE,
+#       record byte offsets + sha256. A pure function of the committed dataset
+#       files; two runs produce an identical floor_report.json.
+#
+#   (2) HARD-RECALL@k and (3) EXTRACTION-COMPLETENESS (recall_floor.py gate) — over
+#       a FROZEN, committed Ladybug vault (datasets/synthetic-ci/frozen-vault/), with
+#       NO daemon and NO LLM. (2) runs the SAME retrieval /recall runs
+#       (Vault.query -> _search -> query.search_claims) and asks if each gold
+#       target's source file is in the top-k. (3) asks if a Claim is anchored to the
+#       gold quote's bytes (retrieval-independent). Both were proven bit-reproducible
+#       (5 independent processes, byte-identical reports) — no ANN randomness,
+#       deterministic fastembed, LadybugStore `ORDER BY n.id` + stable sort. They are
+#       gated against a committed baseline (recall_floor_baseline.json): a drop in
+#       hit/present COUNT below baseline => exit 1.
+#
+#   WHY A FROZEN .lbug, not JSON: the faithful /recall ranking is LadybugStore's
+#   fused RRF; InMemoryStore.search_text is a different scorer, so a JSON probe would
+#   gate the wrong algorithm. The ~5 MB .lbug is the only faithful form. (force-added
+#   past .gitignore's *.lbug rule, with the 14 source copies extraction re-slices.)
+#
+#   The OLD objection that recall "saturates trivially" was about the NO-LLM vault
+#   (0 embeddings); over the LLM-ingested frozen graph both rates are NON-saturating
+#   (0.4688 / 0.5625) and discriminating — a usable regression floor.
+#
+# Branch protection is unavailable on the current private-repository plan. Release enforcement
+# therefore waits for "eval-gate / floor" to pass on the exact recorded source SHA; a red,
+# missing, cancelled, or skipped run blocks publication.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  floor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Deterministic floor — provenance byte-hash gate (synthetic-ci)
+        run: |
+          set -euo pipefail
+          uv run python tests/golden/bin/judge.py floor \
+            tests/golden/datasets/synthetic-ci \
+            --out floor_report.json
+          echo "----- floor_report.json (summary) -----"
+          uv run python -c "import json;d=json.load(open('floor_report.json'));print(json.dumps({k:d[k] for k in ('dataset','questions','gold_targets_total','gold_targets_resolved','distractors_total','distractors_resolved','provenance_gate_pass','recall_gated')},indent=2))"
+
+      - name: Recall/extraction floor — selftest (logic, no vault)
+        run: uv run python tests/golden/bin/recall_floor.py selftest
+
+      - name: Deterministic floor — hard-recall@k + extraction-completeness (frozen vault)
+        env:
+          # Anonymous Xet CAS intermittently returns 401 on hosted runners. The
+          # public Hub/LFS path serves the same pinned FastEmbed model files.
+          HF_HUB_DISABLE_XET: "1"
+        run: |
+          set -euo pipefail
+          # Runs the SHIPPED retrieval over the committed frozen graph.lbug (no
+          # daemon, no LLM); gates both rates vs the committed baseline. The
+          # [ladybug] extra is REQUIRED — Vault.open loads the .lbug store.
+          uv run --extra ladybug python tests/golden/bin/recall_floor.py gate \
+            --vault tests/golden/datasets/synthetic-ci/frozen-vault \
+            --questions tests/golden/datasets/synthetic-ci/questions.yaml \
+            --baseline tests/golden/datasets/synthetic-ci/recall_floor_baseline.json \
+            --k 10 \
+            --out recall_floor.json
+
+      - name: Run manifest — reproducibility pin (corpus-hash + embedder + git rev)
+        run: uv run python tests/golden/bin/judge.py manifest tests/golden/datasets/synthetic-ci --out run-manifest.json
+
+      - name: Upload floor_report.json + recall_floor.json + run-manifest.json
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: floor_report
+          path: |
+            floor_report.json
+            recall_floor.json
+            run-manifest.json

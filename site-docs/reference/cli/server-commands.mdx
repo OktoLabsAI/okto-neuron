@@ -1,0 +1,282 @@
+---
+title: "Server commands: serve, stop, status, ui"
+description: "Start, stop, inspect and open the daemon: flags, defaults, output lines and refusals."
+---
+
+<Note>
+Okto Neuron is prerelease software. Flags, output lines and defaults on this page describe version 0.3.0 and can change.
+</Note>
+
+These four commands own the local server process. `serve` starts it, `stop` ends it, `status` reports on it, and `ui` opens its web interface in your browser. For the task-shaped walkthroughs, see [/server/running](/server/running) and [/server/status-and-logs](/server/status-and-logs).
+
+## okto-neuron serve
+
+Starts the app server. The command's own summary line describes it as "REST/UI :7777 + FastMCP :8201".
+
+```bash
+okto-neuron serve [--vault PATH] [--host HOST] [--port PORT] [--mcp-port PORT] \
+                 [--daemon] [--open/--no-open] [--log-file PATH] \
+                 [--foreground/--no-foreground] [--allow-remote]
+```
+
+### Flags
+
+<ParamField path="--vault" type="path">
+Optional compatibility initial vault. The help text states selection normally happens in the app. The value is only resolved when you pass it on the command line.
+</ParamField>
+
+<ParamField path="--host" type="string" default="127.0.0.1">
+Bind host. Only `127.0.0.1`, `localhost` and `::1` are accepted; anything else is refused (see [Refusals](#refusals)).
+</ParamField>
+
+<ParamField path="--port" type="integer" default="7777">
+REST bind port.
+</ParamField>
+
+<ParamField path="--mcp-port" type="integer" default="8201">
+FastMCP bind port.
+</ParamField>
+
+<ParamField path="--daemon" type="boolean" default="false">
+Detach into the background. See [Daemon mode](#daemon-mode).
+</ParamField>
+
+<ParamField path="--open / --no-open" type="boolean" default="--open">
+Open the local UI once the server is ready.
+</ParamField>
+
+<ParamField path="--log-file" type="path">
+Write server logs to this file, size-rotated. With `--daemon` the default is `~/.okto-neuron/logs/okto-neuron-serve.log`; pass `/dev/null` to silence. Without `--daemon`, logs go to stdout unless you set this. Rotation defaults are 10 MiB per file with 3 backups; a character device such as `/dev/null` is written without rotation.
+</ParamField>
+
+<ParamField path="--foreground / --no-foreground" type="boolean" default="--foreground">
+Declared on the command and never read by the body. The help text says it is ignored when `--daemon` is set. Use `--daemon` to detach.
+</ParamField>
+
+<ParamField path="--allow-remote" type="boolean" default="false">
+Reserved compatibility flag. Passing it makes the command refuse and exit 2.
+</ParamField>
+
+### Refusals
+
+<Warning>
+Remote serving is disabled in this version. Both a non-loopback `--host` and `--allow-remote` refuse before anything starts.
+</Warning>
+
+The host check runs first, before any server import. If `--host` is outside `{127.0.0.1, localhost, ::1}`, or `--allow-remote` is set, the command writes to stderr and exits 2:
+
+```text
+refusing to bind to non-loopback host '0.0.0.0'.
+Direct remote serving, including --allow-remote, is currently disabled. Bind to 127.0.0.1 and use an SSH tunnel instead.
+```
+
+With a loopback host and `--allow-remote`, the first line reads `refusing --allow-remote because remote mode is disabled.` instead. The remainder is identical. The source comment gives the reason: remote serving is withdrawn until TLS, trusted-proxy identity and remote write/read capabilities have one tested contract. For the tunnel, see [/server/remote-access](/server/remote-access).
+
+Two more refusals follow:
+
+- **Missing server extras.** If importing `okto_neuron.server.runtime` fails on `ladybug`, `starlette` or `uvicorn`, the command raises `OptionalDependencyError` with the message "server dependencies are not installed; install okto-neuron[serve] to run `okto-neuron serve`". That error class carries exit code 2. A `ModuleNotFoundError` naming any other top-level module is re-raised unchanged.
+- **`--vault` that is not a vault.** When you pass `--vault` explicitly and the resolved path is not a vault, the command prints `vault not found: <path>` to stderr and exits 2. A `ValueError` from resolving the reference is printed the same way and also exits 2.
+
+See [/reference/cli/exit-codes](/reference/cli/exit-codes) for the codes this page refers to.
+
+### Lock root
+
+The lifecycle lock root is `~/.okto-neuron/runtime`, always. The helper that computes it discards both the `--vault` value and whether `--vault` was explicit, with the comment "application lifecycle is never vault-scoped". The PID file inside that root is what `stop` and the single-daemon check read.
+
+### Foreground start
+
+Without `--daemon`, `serve` configures logging, acquires the PID lock, and runs the server in your terminal. With `--open` in effect, a daemon thread named `okto-neuron-browser-launch` waits for readiness, then opens the browser, so startup is not blocked. That waiter polls `/health` and `/api/v1/status` until the reported `pid` matches the process holding the lock, with a 60-second budget.
+
+On a successful browser launch the command prints `Opened Okto Neuron at http://127.0.0.1:7777/`. If the launch fails, it writes `Browser did not open automatically; open http://127.0.0.1:7777/` to stderr.
+
+If the lock is already held by another live process, `PidFile` raises `StaleLockError`, whose message is `Okto Neuron server already running (pid=<pid>, pid_file=<path>)`. The command logs it with event `server.start_refused`, and with `--open` still set it probes health for 2 seconds and opens the browser if the existing server answers. It then writes the UI line to stderr and exits 1:
+
+```text
+UI: http://127.0.0.1:7777/
+```
+
+### Daemon mode
+
+With `--daemon`, `serve` does this in order:
+
+<Steps>
+<Step title="Default the log file">
+When `--log-file` was not given, it becomes `~/.okto-neuron/logs/okto-neuron-serve.log`.
+</Step>
+<Step title="Pre-flight the lock in the parent">
+The parent opens `PidFile` on the lock root with its own PID and releases it immediately, so a `StaleLockError` surfaces before any fork. On that error the parent prints the message to stderr, optionally probes health for 2 seconds and opens the browser, then prints `UI: <url>` and `Stop: okto-neuron stop` to stderr and exits 1.
+</Step>
+<Step title="Spawn the detached child">
+`daemonize` spawns the child with stdout and stderr both pointed at the log file, so uncaught tracebacks and third-party prints survive alongside the structured JSON log lines. On POSIX this is a `subprocess.Popen` fork+exec in a new session, deliberately not an in-process double `fork()`: the source records that a fork-without-exec child is flagged fork-unsafe on Darwin and aborted by the kernel fork guard the first time it touches a CoreFoundation/XPC facility, which killed ask and ingest with no Python traceback. The child re-runs `okto-neuron serve` in the foreground.
+</Step>
+<Step title="Wait for readiness">
+The parent waits up to 60 seconds for the endpoint to report `{"status": "ok"}` on `/health` and a `pid` on `/api/v1/status` equal to the spawned PID.
+</Step>
+</Steps>
+
+If readiness never arrives, the parent sends SIGTERM to the spawned PID through `send_stop` (swallowing `LifecycleError`) and raises a `ClickException`:
+
+```text
+daemon spawned from pid 41233 did not become ready; inspect /Users/you/.marginalia/logs/okto-neuron-serve.log
+```
+
+On success, with `--open` in effect the browser is opened first, then the summary prints to stdout:
+
+```text
+Okto Neuron is running in the background (pid=41234)
+  UI: http://127.0.0.1:7777/
+  Status: okto-neuron status --endpoint http://127.0.0.1:7777
+  Stop: okto-neuron stop
+  Logs: /Users/you/.marginalia/logs/okto-neuron-serve.log
+```
+
+The `Stop:` line is always the literal `okto-neuron stop`; the helper that builds it discards the vault arguments it is handed.
+
+## okto-neuron stop
+
+```bash
+okto-neuron stop [--vault PATH] [--timeout SECONDS]
+```
+
+<ParamField path="--vault" type="path">
+Legacy daemon lock root. The help text notes new application daemons do not require it.
+</ParamField>
+
+<ParamField path="--timeout" type="float" default="30.0">
+Seconds to wait for shutdown.
+</ParamField>
+
+### How the lock root is chosen
+
+1. If `~/.okto-neuron/runtime` has a readable PID file, that is the root, and `--vault` is never consulted.
+2. Otherwise, for pre-ADR-0034 vault-scoped locks: if you passed `--vault`, that reference is resolved and used.
+3. Otherwise `_discover_stop_root` runs.
+
+`_discover_stop_root` collects candidates (the application runtime root, the current vault reference if it is a vault, and every vault from `list_vaults`), resolves and de-duplicates them, and keeps the ones where `active_server_pid` returns a verified PID. Exactly one live root is returned. Zero live roots falls back to the application runtime root. More than one raises a `UsageError` listing each one:
+
+```text
+multiple Okto Neuron daemons were found; choose one explicitly:
+  okto-neuron stop --vault "/Users/you/vault-a"  # pid 41234
+  okto-neuron stop --vault "/Users/you/vault-b"  # pid 41250
+```
+
+Discovery ignores stale or unprovable PID metadata, so a dead legacy PID file does not make a bare `okto-neuron stop` claim that multiple daemons exist.
+
+### Output
+
+When the chosen root has a readable PID, `stop` announces itself before signalling:
+
+```text
+stopping okto-neuron server (pid=41234); waiting up to 30.0s for drain, then escalating automatically
+stopped okto-neuron server (pid=41234)
+```
+
+The final line prints the PID that `stop_server` returned.
+
+### Escalation and failure
+
+`stop_server` signals the verified owner with SIGTERM, then polls the PID record until it is gone or changed. Escalation fires once at `min(10.0, max(0.1, timeout / 2.0))` seconds after the start: a versioned daemon gets the same signal a second time, which the runtime treats as an explicit force request; a legacy target on POSIX gets SIGKILL. Transient, inconclusive identity reads keep the wait going rather than aborting it.
+
+New-format daemons are never signalled by raw PID: `send_stop` validates the random owner identity and the process-birth fingerprint, and the daemon signals itself.
+
+If the deadline passes, `stop_server` raises `LifecycleError`, which `stop` prints to stderr before exiting 1:
+
+```text
+server did not exit within 30.0s (pid=41234, pid_file=/Users/you/.marginalia/runtime/...)
+```
+
+`LifecycleError` from the initial signal attempt (for example, the owner is already gone) exits 1 the same way.
+
+## okto-neuron status
+
+```bash
+okto-neuron status [--endpoint URL] [--vault PATH] [--json] [--timeout SECONDS]
+```
+
+<ParamField path="--endpoint" type="string">
+Server endpoint URL. The precedence and the built-in default are on [/reference/cli/overview](/reference/cli/overview).
+</ParamField>
+
+<ParamField path="--vault" type="path">
+Sent verbatim to the server as the `X-Okto-Neuron-Vault` request header on the status call. The help text calls it an optional vault status context and says to omit it for the application aggregate.
+</ParamField>
+
+<ParamField path="--json" type="boolean" default="false">
+Emit the assembled payload as indented, key-sorted JSON and return without printing the human block.
+</ParamField>
+
+<ParamField path="--timeout" type="float">
+HTTP request timeout in seconds. The default is on [/reference/cli/overview](/reference/cli/overview).
+</ParamField>
+
+The command makes two GET requests: `/api/v1/status` (with the vault header when you passed `--vault`) and `/version`. If either connection fails, the shared client raises `ClientUnreachable`, which writes the shared unreachable message to stderr and exits 2. A non-2xx response prints `server error <code>: <detail>` and exits 1.
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+### Payload keys
+
+The assembled payload, which is exactly what `--json` prints, carries: `status`, `scope`, `endpoint`, `pid`, `vault_path`, `backend`, `active_vault`, `vault_count`, `vaults`, `uptime_s`, `queue_error_count`, `ingest`, `degraded_reasons`, `okto_neuron_version`, `marginalia_version` (the same value, kept for pre-0.3.0 readers), `api_version`. `scope` comes from the server when it is `application` or `vault`; otherwise the command derives it, choosing `vault` when `active_vault` is truthy and `application` when it is not.
+
+### Text output
+
+```text
+Okto Neuron 0.3.0 — ok
+  Endpoint: http://127.0.0.1:7777
+  PID:      41234
+  Scope:    application
+  Vaults:   3
+  Uptime:   182.4s
+  Ingest:   idle (12/12 terminal, 0 processing, 0 queued)
+  UI:       http://127.0.0.1:7777/
+  Stop:     okto-neuron stop
+```
+
+Line rules:
+
+- `PID:` prints `unknown` when the server did not report one.
+- Under `Scope: application`, `Vaults:` prints the count or `unknown` when it is not an integer. `Fallback:` prints `vault_path` only when it is set, and `Backend:` only inside that block and only when a backend is reported.
+- Under `Scope: vault`, the command prints `Vault:` with `vault_path` or `(unknown)`, then `Backend:` when a backend is reported.
+- `Uptime:` prints only when `uptime_s` is a number, to one decimal place.
+- `Ingest:` prints only when `ingest` is a mapping. The phase is `stopping` when `cancel_requested` is truthy, `active` when `active` is truthy, otherwise `idle`. The terminal count sums `done`, `error` and `cancelled` against `total`.
+- `Stop:` is the literal string `okto-neuron stop`.
+- Each entry in `degraded_reasons` prints as its own `Warning:` line at the end.
+
+For reading these lines against the log file, see [/server/status-and-logs](/server/status-and-logs).
+
+## okto-neuron ui
+
+```bash
+okto-neuron ui [--endpoint URL] [--vault PATH] [--open/--no-open]
+```
+
+<ParamField path="--endpoint" type="string">
+Resolved like every other client endpoint; see [/reference/cli/overview](/reference/cli/overview).
+</ParamField>
+
+<ParamField path="--vault" type="path">
+Deprecated compatibility option. The command body deletes the value before doing anything, and the help text states browser access is application-scoped.
+</ParamField>
+
+<ParamField path="--open / --no-open" type="boolean" default="--open">
+Open the local UI in the default browser.
+</ParamField>
+
+The command resolves the endpoint and health-checks it with a 2-second budget. On failure it writes the shared unreachable message to stderr and exits 2:
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+With `--no-open` and a reachable server, it prints one line and returns:
+
+```text
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+```
+
+Otherwise it launches the browser and prints `Opened Okto Neuron at http://127.0.0.1:7777/`, or, when the launch fails, writes `Browser did not open automatically; open http://127.0.0.1:7777/` to stderr.
+
+<Info>
+`ui` has no `--timeout`. The 2-second health budget is fixed in the command body.
+</Info>

@@ -1,0 +1,100 @@
+---
+title: "Reach a vault from another machine"
+description: "Remote binding is refused by design; an SSH tunnel is the supported path."
+---
+
+<Note>
+Okto Neuron 0.3.0 is a prerelease. Interfaces described here can change.
+</Note>
+
+The server binds to loopback and nothing else. There is no flag that opens it to the network, so to work with a vault from a second machine you forward the loopback ports over SSH and talk to the local end of the tunnel.
+
+## The server refuses to bind anywhere but loopback
+
+`okto-neuron serve` accepts `--host` only from the set `127.0.0.1`, `localhost` and `::1`. Any other value, or the `--allow-remote` flag, prints a refusal on stderr and exits with code 2 (`src/okto_neuron/cli/__init__.py:2708-2724`). The first line names which of the two conditions tripped. A non-loopback `--host` prints:
+
+```text
+refusing to bind to non-loopback host '0.0.0.0'.
+Direct remote serving, including --allow-remote, is currently disabled. Bind to 127.0.0.1 and use an SSH tunnel instead.
+```
+
+A loopback host together with `--allow-remote` prints:
+
+```text
+refusing --allow-remote because remote mode is disabled.
+Direct remote serving, including --allow-remote, is currently disabled. Bind to 127.0.0.1 and use an SSH tunnel instead.
+```
+
+`--allow-remote` exists only to produce its own refusal line for scripts written against an older release. Its help text calls it a reserved compatibility flag (`src/okto_neuron/cli/__init__.py:2664-2669`). The server runtime repeats the check independently: `_run_async` raises `RuntimeError("direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel")` when it is handed `allow_remote` or a non-loopback host (`src/okto_neuron/server/runtime.py:1797-1800`).
+
+## Forward the ports over SSH
+
+The daemon serves two listeners in one process: REST and the Web UI on port 7777, and FastMCP on port 8201 (`src/okto_neuron/server/runtime.py:56-57`).
+
+<Steps>
+<Step title="Start the server on the host machine">
+```bash
+okto-neuron serve --daemon
+```
+Leave `--host` alone. The default is `127.0.0.1` (`src/okto_neuron/cli/__init__.py:2662`).
+</Step>
+
+<Step title="Open the tunnel from your workstation">
+```bash
+ssh -N -L 7777:127.0.0.1:7777 -L 8201:127.0.0.1:8201 you@vault-host
+```
+Forward only the ports you need. 7777 covers the REST surface and the Web UI; 8201 covers MCP.
+</Step>
+
+<Step title="Point the CLI at the local end">
+```bash
+export OKTO_NEURON_ENDPOINT=http://127.0.0.1:7777
+okto-neuron status
+```
+`OKTO_NEURON_ENDPOINT` overrides the built-in default, and an explicit `--endpoint` flag overrides the variable (`src/okto_neuron/cli/_client.py:17-19`, `:47-55`). See [/config/environment-variables](/config/environment-variables).
+</Step>
+</Steps>
+
+If you forward to different local ports, put the local port in `OKTO_NEURON_ENDPOINT` and in your MCP client's URL, not the remote one.
+
+## Carry the daemon token on MCP requests
+
+The MCP listener requires a bearer credential on every HTTP request. `AuthTokenMiddleware` compares the presented token against the server's own and returns 401 otherwise (`src/okto_neuron/server/http.py:553-611`). The 401 detail tells you which part is wrong: a missing header, an empty credential, a non-`Bearer` scheme, or a token that does not match (`src/okto_neuron/server/http.py:542-550`).
+
+The server writes that credential to `~/.okto-neuron/daemon-<rest port>.token` on the machine it runs on, with mode 0600 (`src/okto_neuron/server/runtime.py:346`, `:350-361`). With the default port that is `~/.okto-neuron/daemon-7777.token`. That file exists only on the host machine, so read it there:
+
+```bash
+ssh you@vault-host 'cat ~/.okto-neuron/daemon-7777.token'
+```
+
+Put that value in your MCP client's `Authorization: Bearer <token>` header. Over the tunnel the URL is the local end, `http://127.0.0.1:8201/mcp`; the MCP endpoint path is `/mcp`. REST and the UI deliberately do not install this middleware, so ordinary REST calls over the tunnel carry no credential (`src/okto_neuron/server/http.py:555-557`).
+
+<Warning>
+The token file is created 0600 so only its owner can read it, and the server generates a fresh one unless an existing file is found at startup (`src/okto_neuron/server/runtime.py:350-361`, `:1835-1839`). Copy it over a channel you already trust, such as the same SSH session. Never put it in a URL.
+</Warning>
+
+## What the tunnel buys you, and what it does not
+
+Sensitive MCP writes are gated on the connecting peer's address on top of the loopback bind. `remember` refuses a non-loopback caller with:
+
+```text
+forbidden: remember is restricted to loopback callers; tunnel (e.g. SSH) to write remotely
+```
+
+(`src/okto_neuron/server/runtime.py:1565-1569`). `init_vault` uses the same gate and refuses with `forbidden: vault creation is restricted to loopback callers` (`src/okto_neuron/server/runtime.py:1718-1719`). Both go through `request_is_loopback`, which inspects the peer IP (`src/okto_neuron/server/http.py:386-400`). An SSH tunnel preserves that property: the daemon sees a connection from 127.0.0.1, which is why the code names a loopback-preserving tunnel such as SSH as the intended path (`src/okto_neuron/server/http.py:403-407`).
+
+The same rule governs vault selection. An absolute-path `?vault=` selector on the connection is accepted only from a loopback caller; anyone else gets `forbidden_path_selector` with `absolute-path vault selectors are restricted to loopback callers; use a registered vault name over a non-loopback connection` (`src/okto_neuron/server/runtime.py:738-745`). A per-call `vault` argument never accepts a path at all, loopback or not, and rejects path-shaped values with the same code (`src/okto_neuron/server/runtime.py:836-841`).
+
+Okto Neuron ships no reverse-proxy, TLS-termination or public-hosting recipe. Keep the listener on loopback and keep the tunnel authenticated.
+
+<CardGroup cols={2}>
+<Card title="Running the server" href="/server/running">
+Start, daemonize and stop the daemon.
+</Card>
+<Card title="MCP security" href="/mcp/security">
+The credential and the loopback write gate in detail.
+</Card>
+<Card title="Environment variables" href="/config/environment-variables">
+`OKTO_NEURON_ENDPOINT` and the rest.
+</Card>
+</CardGroup>

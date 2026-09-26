@@ -1,0 +1,308 @@
+---
+title: Predicate reference
+description: Every shipped predicate label, its direction, its pack, plus the record and alias schemas.
+---
+
+<Note>
+Okto Neuron is at version 0.3.0 and classified "2 - Pre-Alpha". The schemas on this page are versioned side-store formats and can change between releases.
+</Note>
+
+Predicate state lives in two files beside the vault: a registry of predicate records and a ledger of alias mappings. For why the vocabulary is governed this way, see [/concepts/predicates](/concepts/predicates).
+
+For how predicates sit inside claims and nodes, see [/concepts/data-model](/concepts/data-model) and [/reference/graph-schema](/reference/graph-schema).
+
+## On-disk locations
+
+Both files live beside the vault, under the `predicates` directory.
+
+| File | Path | Schema version |
+| --- | --- | --- |
+| Predicate registry | `.marginalia/predicates/registry.json` | `predicate_registry.v1` |
+| Alias ledger | `.marginalia/predicates/aliases.json` | `predicate_aliases.v1` |
+
+Each store takes an exclusive lock file in the same directory while writing (`.registry.lock` and `.aliases.lock`) and replaces its file atomically through a temporary file plus `fsync`.
+
+## Label form
+
+A predicate label must match `^[a-z][a-z0-9_]{0,79}$`: lower snake case, starting with a letter, at most 80 characters. A `PredicateRecord` additionally rejects any label that is not already in canonical form, meaning `normalize_predicate(label)` must return the label unchanged.
+
+## PredicateRecord
+
+One record per governed predicate in `registry.json`.
+
+<ParamField path="label" type="string" required>
+Canonical lower snake case label. Rejected if it normalizes to something else, or if it appears in the deny-list below.
+</ParamField>
+
+<ParamField path="lifecycle" type="canonical | provisional" required>
+`canonical` marks policy. `provisional` marks a predicate that exists but is not yet policy.
+</ParamField>
+
+<ParamField path="definition" type="string" required>
+One line, at most 500 characters. Newlines and carriage returns are rejected.
+</ParamField>
+
+<ParamField path="direction" type="subject_to_object | symmetric | unknown" required>
+The reading direction of the relation.
+</ParamField>
+
+<ParamField path="symmetric" type="boolean | null" required>
+Must agree with `direction`: `false` for `subject_to_object`, `true` for `symmetric`, `null` for `unknown`. Any other combination is rejected as inconsistent.
+</ParamField>
+
+<ParamField path="signatures" type="array of PredicateTypeSignature" required>
+Observed type pairs. Duplicate `(subject_type, object_type)` pairs are rejected, and the summed counts cannot exceed `support_count`. Stored sorted.
+</ParamField>
+
+<ParamField path="support_count" type="integer" required>
+Non-negative integer. It is the ceiling for both signature counts and distinct sample claim ids.
+</ParamField>
+
+<ParamField path="samples" type="array of PredicateEvidenceSample" required>
+At most 20 rows, deduplicated and stored sorted. The number of distinct `claim_id` values cannot exceed `support_count`.
+</ParamField>
+
+<ParamField path="confidence" type="number" required>
+A finite number in `[0, 1]`.
+</ParamField>
+
+<ParamField path="provenance" type="PredicateDecisionProvenance" required>
+Who decided this record, and under which policy fingerprint.
+</ParamField>
+
+Records reject unknown and missing fields on load: the field set must match exactly.
+
+### PredicateTypeSignature
+
+<ParamField path="subject_type" type="Agent | Activity | InformationObject | Concept | Place" required>
+A closed primitive type.
+</ParamField>
+
+<ParamField path="object_type" type="Agent | Activity | InformationObject | Concept | Place | literal" required>
+A closed primitive, or `literal` for a literal object.
+</ParamField>
+
+<ParamField path="count" type="integer" required>
+An integer of at least 1.
+</ParamField>
+
+### PredicateEvidenceSample
+
+<ParamField path="claim_id" type="string" required>
+Non-empty, trimmed.
+</ParamField>
+
+<ParamField path="source_id" type="string" required>
+Non-empty, trimmed.
+</ParamField>
+
+### PredicateDecisionProvenance
+
+<ParamField path="source" type="core | pack | human | model" required>
+Where the decision came from.
+</ParamField>
+
+<ParamField path="decision_id" type="string" required>
+Non-empty, trimmed. Built-in records use `{source}:{label}:v1`.
+</ParamField>
+
+<ParamField path="judge_model" type="string" required>
+May be empty, except when `source` is `model`.
+</ParamField>
+
+<ParamField path="prompt_version" type="string" required>
+May be empty, except when `source` is `model`.
+</ParamField>
+
+<ParamField path="semantic_policy_fingerprint" type="string" required>
+Non-empty. Built-in records use `builtin:predicate_registry.v1`.
+</ParamField>
+
+<ParamField path="created_at" type="string" required>
+ISO-8601 with a timezone. A naive timestamp is rejected. Built-in records carry `2026-07-16T00:00:00+00:00`.
+</ParamField>
+
+<Warning>
+Writing a predicate into `registry.json` by hand is not a supported way to add a predicate. The registry is a validated side-store with its own lock, exact-field checks and bootstrap logic; there is no documented hand-edit path, and this page does not describe one.
+</Warning>
+
+## Core pack predicates
+
+These 19 canonical records ship in every vault, with `source: "core"` in their provenance. Eighteen are `subject_to_object` with `symmetric` set to `false`; `contrasts_with` is `symmetric` with `symmetric` set to `true`.
+
+| Label | Direction | Definition |
+| --- | --- | --- |
+| `author_of` | `subject_to_object` | The subject agent authored the object work. |
+| `authored_by` | `subject_to_object` | The subject work was authored by the object agent. |
+| `compiled_by` | `subject_to_object` | The subject work was compiled by the object agent. |
+| `compiler_of` | `subject_to_object` | The subject agent compiled the object work. |
+| `constrains` | `subject_to_object` | The subject limits or bounds the object. |
+| `contrasts_with` | `symmetric` | The subject is explicitly contrasted with the object. |
+| `contributor_to` | `subject_to_object` | The subject agent contributed to the object work. |
+| `defines` | `subject_to_object` | The subject supplies the definition of the object. |
+| `describes` | `subject_to_object` | The subject describes the object. |
+| `edited_by` | `subject_to_object` | The subject work was edited by the object agent. |
+| `editor_of` | `subject_to_object` | The subject agent edited the object work. |
+| `example` | `subject_to_object` | The subject is presented as an example of the object. |
+| `has_value` | `subject_to_object` | The subject has the stated literal value. |
+| `includes` | `subject_to_object` | The subject includes the object as a member or part. |
+| `progresses_to` | `subject_to_object` | The subject stage progresses to the object stage. |
+| `recommended_approach` | `subject_to_object` | The subject recommends the object as an approach. |
+| `requires` | `subject_to_object` | The subject requires the object. |
+| `uses` | `subject_to_object` | The subject uses the object. |
+| `wrote_to` | `subject_to_object` | The subject agent wrote an addressed communication to the object. |
+
+## sdlc pack predicates
+
+Enabling the `sdlc` pack seeds five further canonical records, with `source: "pack"` in their provenance. Core definitions win: a pack label is only added if the label is not already defined.
+
+| Label | Direction | Definition |
+| --- | --- | --- |
+| `enables` | `subject_to_object` | The subject makes the object possible. |
+| `impact` | `subject_to_object` | The subject has the stated impact on the object. |
+| `mitigates` | `subject_to_object` | The subject reduces or counters the object risk. |
+| `risk` | `subject_to_object` | The subject presents the object as a risk. |
+| `validated_by` | `subject_to_object` | The subject is validated by the object. |
+
+The pack also contributes its alias mappings. Those are added with `setdefault`, so a core source mapping cannot be replaced by a pack.
+
+<Warning>
+Do not read a label out of a pack's edge-type list and assume it is a canonical predicate. `implements` is an sdlc alias source, and it folds to `includes`. So does `provides`. Other sdlc alias sources fold as follows: `has` to `includes`; `tested_via`, `verified_by` and `validated_via` to `validated_by`; `benefit` to `enables`; `failure_mode`, `fails_because`, `red_flag` and `identifies_danger` to `risk`; `reduces_loop_time_from` and `reduces_loop_time` to `impact`; `fix`, `counteracts` and `compensates_for` to `mitigates`.
+</Warning>
+
+## Deterministic ingest predicates
+
+Markdown ingest mints claims without a model, using three fixed predicates. All three take the document as subject and a literal as object.
+
+| Predicate | Subject | Object literal | Where it comes from |
+| --- | --- | --- | --- |
+| `has_tag` | the document | tag string | Frontmatter `tags`, plus inline `#tag` matches in block text. |
+| `has_heading` | the document | heading text | Headings found in block text. |
+| `links_to` | the document | link target | `[[wikilink]]` targets in block text. |
+
+Inline `#tag` matches and `[[wikilink]]` targets are deduplicated across the whole per-block scan, so one real mention mints exactly one claim even when overlapping chunk windows re-detect it. Frontmatter `tags` are minted separately against the frontmatter block and are not folded into that dedupe, so a tag declared in frontmatter and also written inline mints two `has_tag` claims. `has_heading` is deliberately excluded from the dedupe, because heading anchors are positional and repeats across blocks stay distinct.
+
+Claims with predicate `has_heading` carry a low-salience facet set at ingest time.
+
+## Denied labels
+
+A `PredicateRecord` refuses any of these labels outright, and predicate admission rejects a candidate that lands on one:
+
+`unknown`, `none`, `null`, `n_a`, `na`, `undefined`, `and`, `or`, `the`, `of`, `to`, `is`, `was`, `were`, `with`, `from`, `by`
+
+Note that `unknown` is a denied *label* even though `unknown` is a legal value of the `direction` field. The two namespaces are unrelated.
+
+## Alias ledger
+
+`aliases.json` holds SSSOM-shaped mapping decisions. The file declares `schema_version: "predicate_aliases.v1"` and `predicate: "skos:exactMatch"` at the top level, then an array of records. Duplicate record ids are rejected, as are missing or unknown top-level and record fields.
+
+<ParamField path="id" type="string" required>
+Non-empty, trimmed. Unique within the ledger.
+</ParamField>
+
+<ParamField path="subject_predicate" type="string" required>
+The predicate on the left of the mapping.
+</ParamField>
+
+<ParamField path="mapping" type="exact_match | sub_property_of | inverse_of | distinct" required>
+The mapping relation.
+</ParamField>
+
+<ParamField path="object_predicate" type="string" required>
+The predicate on the right of the mapping.
+</ParamField>
+
+<ParamField path="confidence" type="number" required>
+A finite number in `[0, 1]`.
+</ParamField>
+
+<ParamField path="justification" type="string" required>
+Free text. May be empty.
+</ParamField>
+
+<ParamField path="evidence" type="object" required>
+An object. A `counts` sub-object supplies the per-predicate evidence counts used to pick a canonical root.
+</ParamField>
+
+<ParamField path="judge_model" type="string" required>
+Free text. May be empty.
+</ParamField>
+
+<ParamField path="votes" type="object" required>
+An object.
+</ParamField>
+
+<ParamField path="status" type="auto | confirmed | rejected | queued" required>
+Only `auto` and `confirmed` are active. `rejected` and `queued` records sit in the file without effect on the fold map.
+</ParamField>
+
+<ParamField path="created_at" type="string" required>
+ISO-8601 with a timezone. Defaults to the current UTC time when the record is constructed.
+</ParamField>
+
+### How the fold map is computed
+
+`alias_map()` takes only records whose `status` is `auto` or `confirmed` and whose `mapping` is `exact_match`. It runs union-find over the subject and object predicates, collapsing alias chains into one component. Within a component, the root is the predicate with the highest evidence count, breaking ties by earliest first-seen and then by label. A predicate that is a core alias source keeps its core target and cannot be overwritten by a vault-local record.
+
+`inverse_map()` uses a stricter rule: only `confirmed` records with mapping `inverse_of` count, and a predicate mapped to more than one inverse raises a conflict rather than picking one.
+
+`sub_property_of` and `distinct` are accepted and stored as mapping values. Neither participates in `alias_map()` or `inverse_map()`.
+
+For how the same style of off-graph ledger applies to entities, see [/vault/duplicate-entities](/vault/duplicate-entities).
+
+## Core alias mappings
+
+These fold sources ship in every vault, regardless of pack. They are fixed policy and cannot be replaced by a vault-local alias record.
+
+| Folds to | Sources |
+| --- | --- |
+| `includes` | `includes_mechanism`, `includes_strategy`, `includes_phase`, `includes_stage`, `includes_competency`, `includes_principle`, `has_phase` |
+| `requires` | `has_condition`, `has_criterion`, `requires_competency` |
+| `defines` | `defined_as`, `is_defined_as`, `defines_score`, `defines_rule` |
+| `describes` | `described_as`, `describes_as`, `is_described_as`, `characterized_by`, `characteristic`, `rates` |
+| `recommended_approach` | `recommended_view`, `recommendation` |
+| `contrasts_with` | `contrasted_with`, `contrasts` |
+| `uses` | `uses_methodology`, `uses_framework`, `uses_tool`, `uses_workflow`, `uses_mindset` |
+| `example` | `uses_analogy`, `is_analogy`, `analogy` |
+| `progresses_to` | `advances_to`, `next_level`, `followed_by` |
+| `wrote_to` | `letter_to`, `wrote_letter_to`, `sent_letter_to`, `sent_to` |
+| `authored_by` | `written_by` |
+| `author_of` | `authored`, `written` |
+| `editor_of` | `edited` |
+| `edited_by` | `edited_by` |
+| `compiler_of` | `compiled` |
+| `compiled_by` | `compiled_by` |
+| `contributor_to` | `with_assistance_of`, `assisted_by`, `contributed_to` |
+| `constrains` | `constraint`, `is_constraint` |
+
+## Normalization order
+
+`normalize_predicate` resolves a raw label in this order:
+
+<Steps>
+  <Step title="Lexicalize the raw value">
+    The value is NFKC-normalized and rejected outright (an empty string is returned) if it contains any non-ASCII character. What remains is lowercased and trimmed, `-` and spaces become `_`, any other run of non `[a-z0-9_]` characters becomes `_`, repeated underscores collapse, and leading and trailing underscores are stripped. Every later step operates on this token, not on the value you passed.
+  </Step>
+  <Step title="Build the alias table">
+    Start from the core aliases. If the `sdlc` pack is enabled, layer the sdlc aliases on top.
+  </Step>
+  <Step title="Apply the built-in table">
+    If the lexicalized label is a key in that table, it becomes the mapped target.
+  </Step>
+  <Step title="Apply vault-local aliases">
+    A vault-supplied alias map is consulted only when the lexicalized label was not a key in the built-in table.
+  </Step>
+  <Step title="Validate the form">
+    If the result does not match `^[a-z][a-z0-9_]{0,79}$`, the function returns an empty string so the caller keeps the original predicate instead of inventing one.
+  </Step>
+</Steps>
+
+An empty or malformed suggestion returns `""` rather than a fabricated label.
+
+## Seeding and policy projection
+
+`seed_builtins(packs)` adds every missing core and pack record under the registry lock and leaves existing records alone, returning the labels it added. It must run before a run fingerprint is computed.
+
+`policy_projection(packs)` returns only the fields that can change admission semantics: `schema_version`, and per record `label`, `lifecycle`, `definition`, `direction` and `symmetric`. Evidence, samples, confidence and provenance stay out of the projection so that ordinary evidence growth does not invalidate an unrelated in-flight run. The projection includes the deterministic core and pack records even before seeding has materialized them on disk.
+
+`render_registry_block(records, cap=200)` renders the live registry as byte-stable prompt text, ordered canonical first, then by descending support, then by label. When the cap would truncate, every canonical record is retained and the highest-support provisionals fill the remaining rows, with a trailing line stating how many were dropped.

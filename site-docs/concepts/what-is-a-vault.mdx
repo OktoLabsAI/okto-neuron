@@ -1,0 +1,180 @@
+---
+title: What a vault is
+description: "A vault is a directory you own: config, your markdown, a graph file, and off-graph state you can inspect and reverse."
+---
+
+A vault is a directory on your disk. There is no account to attach, and no
+hosted service owns your content. With the file-backed backends the graph is a
+file or directory inside the vault; the `neo4j` backend is the exception, and it
+points at a database server you run
+(`src/okto_neuron/store/registry.py:36-40`). When Okto Neuron creates a vault it
+makes the directory, two folders for your documents, a `.marginalia/` folder for
+derived state, and writes `okto-neuron.yaml`
+(`src/okto_neuron/vault.py:325-328`).
+
+<Note>
+Okto Neuron is a prerelease. Layout and config details described here are what
+the current code does, and they can change between versions.
+</Note>
+
+## The trust root
+
+Your markdown is the truth. The graph is derived from it. The ingest path says
+so outright, and enforces it by refusing anything that is not text-like: only
+`.md`, `.markdown` and `.txt` files are ingestible
+(`src/okto_neuron/server/_ingest_queue.py:34`).
+
+Everything else in the vault, the graph included, exists because something read
+your markdown and wrote down what it found. If the derived side is wrong, you
+rebuild it from the documents. You do not rebuild your documents from it.
+
+## The four things inside
+
+Vault creation makes the root, `notes/`, `refs/` and `.marginalia/`, and writes
+`okto-neuron.yaml` (`src/okto_neuron/vault.py:325-333`).
+
+<Steps>
+  <Step title="okto-neuron.yaml">
+    The config file. Creation writes `marginalia_yaml_version`, `vault_id`,
+    `federation_opt_in`, `packs`, an `embedding` block and a `storage` block
+    (`src/okto_neuron/vault.py:719-727`). See [/config/vault-yaml](/config/vault-yaml)
+    for what each key means.
+  </Step>
+  <Step title="notes/ and refs/">
+    Your markdown. Two folders, created empty
+    (`src/okto_neuron/vault.py:325`). Nothing in the creation path puts content
+    in them; they are yours to fill.
+  </Step>
+  <Step title="The graph file">
+    The derived graph, stored by whichever backend the vault is pinned to. The
+    Ladybug backend keeps it in `graph.lbug`
+    (`src/okto_neuron/vault.py:205`); the Grafx backend uses a directory named
+    `graph.grafx` (`src/okto_neuron/store/grafx.py:167`). A vault pinned to the
+    `neo4j` backend keeps no graph file in the directory; its graph lives in the
+    Neo4j server the vault's `storage` block points at
+    (`src/okto_neuron/store/registry.py:36-40`). See
+    [/config/storage-backends](/config/storage-backends).
+  </Step>
+  <Step title=".marginalia/">
+    The off-graph state: decisions, ledgers, queues and durable copies that
+    sit beside the graph rather than inside it
+    (`src/okto_neuron/vault.py:325`).
+  </Step>
+</Steps>
+
+For the file-by-file inventory, see [/reference/vault-layout](/reference/vault-layout).
+
+## Why some things live off the graph
+
+`.marginalia/` holds more than derived cache state. Alongside the rebuildable
+index at `.marginalia/index/` (`src/okto_neuron/store/index/default.py:25`), it
+holds records that let you reverse a decision without rewriting the graph.
+
+<AccordionGroup>
+  <Accordion title="Predicate aliases and the predicate registry">
+    Predicate folds are recorded in `.marginalia/predicates/aliases.json`, and
+    the governed predicates themselves in
+    `.marginalia/predicates/registry.json`
+    (`src/okto_neuron/predicates/registry.py:541`,
+    `src/okto_neuron/predicates/index.py:24-25`). The alias ledger states the
+    rule directly: durable decisions live beside the vault, not in the graph,
+    and removing a record reverses the fold because no graph edges or Claim
+    facets were rewritten by the index
+    (`src/okto_neuron/predicates/index.py:1-6`). The registry is built the same
+    way: no graph, LLM, planner or review-queue dependency, so reading or
+    updating it cannot change live graph semantics
+    (`src/okto_neuron/predicates/registry.py:1-7`).
+  </Accordion>
+  <Accordion title="The candidate ledger">
+    `.marginalia/candidate-ledger.jsonl` records what extraction produced and
+    what was done with it, as append-only rows: ingest runs, extraction units,
+    candidates, comparisons, commit plans, operation receipts, commit records,
+    abandoned plans and integrity outcomes
+    (`src/okto_neuron/consolidate/ledger.py:33`,
+    `src/okto_neuron/consolidate/ledger.py:47-57`).
+  </Accordion>
+  <Accordion title="The review queue">
+    `.marginalia/review_queue.json` holds what was held back for a human
+    decision instead of being written into the graph
+    (`src/okto_neuron/consolidate/review_queue.py:8`,
+    `src/okto_neuron/consolidate/review_queue.py:60`).
+  </Accordion>
+  <Accordion title="Ingest history">
+    `.marginalia/ingest-history.json` is the sidecar that makes the ingest
+    queue survive a restart. It keeps every queued and processing item and
+    caps retained finished items (`src/okto_neuron/server/_ingest_queue.py:38-40`).
+  </Accordion>
+  <Accordion title="Durable source copies">
+    `.marginalia/sources/` is the vault's source-blob directory, fixed by
+    convention and used as the rewrite anchor when a snapshot is loaded back
+    (`src/okto_neuron/store/snapshot.py:58-63`).
+  </Accordion>
+</AccordionGroup>
+
+The curation code states the rule for its own off-graph stores: `AuthorityIndex`
+and `ReconcileQueue` are plain JSON under `<vault>/.marginalia/` and hold no
+store reference, so they cannot write the graph by construction
+(`src/okto_neuron/server/_curation.py:12-15`).
+
+That is the point. A decision recorded in a sidecar is a decision you can undo
+by deleting a record, because nothing in the graph was rewritten to make it
+true. See [/concepts/graph-lifecycle](/concepts/graph-lifecycle) for how the
+derived side gets built and rebuilt.
+
+## What creation puts in the config
+
+Two values are worth knowing because they surprise people.
+
+`vault_id` is written from the vault directory's own name, and `federation_opt_in`
+is written off (`src/okto_neuron/vault.py:720-721`). Both fields, with their
+declared types, defaults and what reads them, are on
+[/config/vault-yaml](/config/vault-yaml).
+
+Vault creation does not write an `llm:` block. The config it writes is
+`marginalia_yaml_version`, `vault_id`, `federation_opt_in`, `packs`,
+`embedding` and `storage`, plus `compat_allow_external_sources` when that
+legacy path is used (`src/okto_neuron/vault.py:719-731`). Anything to do with a
+model is added separately.
+
+## Permissions
+
+The vault root, `notes/`, `refs/` and `.marginalia/` are each created at mode
+`0700` (`src/okto_neuron/vault.py:325-327`), and the root is set to `0700` again
+after the graph opens (`src/okto_neuron/vault.py:299`). `okto-neuron.yaml`
+itself is written at `0644` (`src/okto_neuron/vault.py:733`).
+
+## The backend is pinned at creation
+
+The `storage` block in `okto-neuron.yaml` records which graph backend the vault
+was created with (`src/okto_neuron/vault.py:700`). That pin is checked on the create and init
+paths (`src/okto_neuron/vault.py:278`, `:323`): if the pinned backend does not match the
+one being asked for, Okto Neuron raises `VaultBackendMismatch` rather than
+touching the vault (`src/okto_neuron/vault.py:83-91`). A vault whose config has
+no `storage` key at all is treated as a legacy vault pinned to `ladybug`
+(`src/okto_neuron/vault.py:78-83`).
+
+<Warning>
+Editing the backend name in `okto-neuron.yaml` does not move a vault to another
+backend. The pin check only compares the config against the backend the caller
+asked for (`src/okto_neuron/vault.py:84-92`). If both say the same name, nothing
+refuses you, and nothing converts the existing graph either. `storage.backend` is
+not a user-writable block (`src/okto_neuron/config/_vault.py:1625`); to use a
+different backend, create a new vault with `--backend`.
+</Warning>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Create one" href="/vault/creating">
+    The steps for making a vault and what each choice commits you to.
+  </Card>
+  <Card title="Vault layout" href="/reference/vault-layout">
+    The exhaustive file-by-file inventory.
+  </Card>
+  <Card title="Graph lifecycle" href="/concepts/graph-lifecycle">
+    How the derived side is built, rebuilt and checked.
+  </Card>
+  <Card title="okto-neuron.yaml" href="/config/vault-yaml">
+    Every config key, its type and its default.
+  </Card>
+</CardGroup>

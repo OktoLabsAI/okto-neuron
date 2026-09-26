@@ -1,0 +1,174 @@
+---
+title: CLI reference
+description: The console scripts, global options, endpoint resolution, and the split between in-process and client commands.
+---
+
+<Note>
+Okto Neuron is a prerelease. Command names, flags and output shapes can change between versions. See [prerelease status](/start/prerelease-status).
+</Note>
+
+## Two console scripts
+
+Installing the package puts two executables on your PATH:
+
+```toml pyproject.toml
+[project.scripts]
+okto-neuron = "okto_neuron.cli:app"
+kg = "okto_neuron.cli:kg_cli"
+# Pre-0.3.0 command name: same commands, prints a rename warning. Removed in 0.5.
+marginalia = "okto_neuron.cli:legacy_app"
+```
+
+`okto-neuron` is the canonical entry point. `kg` is a compatibility entry point whose group help reads "Compatibility CLI with graph commands flattened at the top level". Use `okto-neuron` for anything new. See [the `kg` alias](#the-kg-compatibility-alias) below for what the alias does and does not carry over.
+
+`app` and `kg_cli` are Click groups declared with `cls=OktoNeuronGroup`, and the `marginalia` script prints a rename warning and then runs `app` (`src/okto_neuron/cli/__init__.py:147-150`). `OktoNeuronGroup.main` wraps the whole dispatch in one try/except, so the error handling and the exit codes are identical under either script. The full list of traced codes lives on [exit codes](/reference/cli/exit-codes).
+
+## Group options
+
+These options sit on the group itself, before the subcommand name.
+
+| Option | Effect |
+| --- | --- |
+| `--debug` | Eager flag. Prints chained tracebacks when a command fails. |
+| `--version` | Prints the program name and the installed version, from the template `%(prog)s %(version)s`. |
+| `-h`, `--help` | Help. Both spellings work, via `help_option_names`. |
+
+`--debug` is detected twice. Click parses it as a normal eager flag and stores it on the context, and `OktoNeuronGroup.main` separately scans the raw argument tokens for the literal string `--debug` before dispatch, so it can decide whether to chain tracebacks for an exception that escapes the callback. That scan is a plain membership test on the token list, so the flag has to appear as its own bare token in the argument vector.
+
+When a `OktoNeuronError` escapes, the group prints `exc.user_message()` to stderr and exits with that error class's own exit code. With `--debug` it also prints the chained cause traceback under the line `Chained cause traceback:`. Click's own exceptions are re-raised unchanged, so a usage error keeps Click's handling. An ambiguous vault name is caught separately: the group prints `Error: <message>` to stderr and exits 2. Any remaining exception prints a traceback and exits 1, with the chained cause included only under `--debug`.
+
+<Tip>
+`--debug` belongs to the group, so it goes before the subcommand: `okto-neuron --debug query "..."`.
+</Tip>
+
+## Environment file loading
+
+`load_user_env_file()` is the first statement of both group callbacks, the one for `okto-neuron` and the one for `kg`. It runs before any subcommand body, so values it loads are already in the process environment by the time a subcommand reads them. Nothing in a subcommand has to opt in.
+
+It reads `~/.okto-neuron/env`, the user-owned env file written by onboarding. `OKTO_NEURON_ENV_FILE` overrides that path. The parser is deliberately narrow: it takes simple `KEY=value` lines, strips a leading `export `, skips blanks and `#` comments, ignores any name that does not start with `OKTO_NEURON_`, and never evaluates shell. A name already present in the environment wins, so an exported variable is not overwritten. A missing or unreadable file is not an error; the function returns quietly.
+
+For the variables that are actually consumed, see [environment variables](/config/environment-variables).
+
+## `version` versus `--version`
+
+There are two ways to ask for the version and they are not the same code path.
+
+- The group-level `--version` uses Click's `version_option` with the message template `%(prog)s %(version)s` followed by a second line, `Okto Neuron by Okto Labs`, so the first token is whatever program name Click resolved for the invocation.
+- The `version` subcommand prints `okto-neuron <version>` and then `Okto Neuron by Okto Labs`, or, with `--json`, a sorted JSON object carrying the version under both `okto_neuron_version` and the pre-0.3.0 `marginalia_version`.
+
+```bash
+okto-neuron version --json
+```
+
+Use the subcommand when a script needs to parse the result.
+
+## In-process, client, and daemon-touching commands
+
+Commands fall into three mechanisms. Only the HTTP ones resolve an endpoint.
+
+| Command | Mechanism | Needs a running daemon |
+| --- | --- | --- |
+| `add` | HTTP POST `/add` | Yes |
+| `query` | HTTP POST `/query` | Yes |
+| `ask` | HTTP POST `/api/v1/ask` | Yes |
+| `detect-drift` | HTTP POST `/detect-drift` | Yes |
+| `status` | HTTP GET `/api/v1/status` and `/version` | Yes |
+| `ui` | HTTP health probe, then opens a browser | Yes |
+| `stop` | Reads the server pidfile and stops that process | Yes |
+| `serve` | Starts the server process | No, it is the daemon |
+| `init` | In-process, scaffolds a vault on disk | No |
+| `vault` group | In-process | No |
+| `kg` group | In-process, opens the vault directly | No |
+| `watch` | In-process, opens the vault directly | No |
+| `onboard` | In-process configuration writer | No |
+| `version` | In-process | No |
+
+`stop` and `ui` need a daemon without being HTTP POST clients: `stop` works through the lifecycle pidfile, and `ui` only probes `/health` before launching a browser.
+
+The reasoning behind the client split is on [the thin client](/concepts/thin-client).
+
+## Endpoint resolution
+
+Every client command takes `--endpoint`, and they all resolve it through the same function. The precedence is:
+
+<Steps>
+  <Step title="--endpoint">
+    An explicit non-empty flag value wins.
+  </Step>
+  <Step title="OKTO_NEURON_ENDPOINT">
+    Otherwise, a non-empty `OKTO_NEURON_ENDPOINT` environment variable.
+  </Step>
+  <Step title="http://127.0.0.1:7777">
+    Otherwise the built-in default, `DEFAULT_ENDPOINT`.
+  </Step>
+</Steps>
+
+Client commands also take `--timeout`, a float in seconds whose default is `DEFAULT_TIMEOUT_SECONDS`, 30.0.
+
+## The two client error contracts
+
+There is no auto-spawn, no retry and no fallback to opening the vault directly. When the server cannot be reached, the command prints this message to stderr and exits with `EXIT_UNREACHABLE`, which is 2:
+
+```text
+no okto-neuron server reachable at {url} — start with `okto-neuron serve`
+```
+
+`{url}` is the resolved endpoint. The source marks this string as contract-stable and warns against editing it, because scripts and humans match on it.
+
+When the server answers with a non-2xx status, the command prints this to stderr and exits 1:
+
+```text
+server error <status>: <detail>
+```
+
+<Warning>
+Both messages go to stderr, not stdout. A pipeline that only captures stdout will see an empty result and a non-zero status.
+</Warning>
+
+## The `kg` compatibility alias
+
+`_install_kg_compat_commands()` runs at import time and builds the `kg` script's command set in two passes:
+
+1. Every command registered on the `okto-neuron` group except the `kg` group itself is copied onto `kg` under the same name.
+2. Then each subcommand of the `okto-neuron kg` group is added, but only if that name is not already taken by the first pass.
+
+The `kg` script therefore carries the whole `okto-neuron` surface plus whichever graph subcommands survived the name check.
+
+<Warning>
+The second pass is where `init` collides. The top-level `okto-neuron init` is copied over first, so `kg init` resolves to the vault-scaffolding command, not to the `okto-neuron kg init` graph command. If you mean the graph command, spell it `okto-neuron kg init`.
+</Warning>
+
+`init` is the only collision between the two sets in this version. The graph subcommands that do reach the alias flattened are `rebuild`, `reembed`, `reindex`, `reconcile` and `snapshot`. Treat any longer list as unverified.
+
+## Command index
+
+| Command | Documented on |
+| --- | --- |
+| `init` | [Creating a vault](/vault/creating) |
+| `vault list`, `vault create`, `vault use`, `vault current` | [Vault commands](/reference/cli/vault-commands) |
+| `serve`, `stop` | [Server commands](/reference/cli/server-commands) |
+| `add`, `query`, `ask`, `detect-drift`, `status`, `ui` | [Client commands](/reference/cli/client-commands) |
+| `kg init`, `kg rebuild`, `kg reembed`, `kg reindex` | [Graph lifecycle](/reference/cli/kg-lifecycle) |
+| `kg reconcile` | [kg reconcile](/reference/cli/kg-reconcile) |
+| `kg snapshot` | [kg snapshot](/reference/cli/kg-snapshot) |
+| `kg` group as a whole | [kg overview](/reference/cli/kg-overview) |
+| `watch`, `watch-folder` | [Watching a folder](/vault/watching) |
+| `onboard` | [LLM providers](/config/llm-providers) |
+| `version` | This page |
+| `quality ledger`, `quality churn`, `quality acceptance`, `quality acceptance-status`, `quality acceptance-collect` | [Quality commands](/reference/cli/quality-commands) |
+| `dev`, `models`, `pilot` | [Developer commands](/contributing/dev-commands) |
+
+The `quality` group is maintainer evidence tooling. Its subcommands read ADR 0040 evidence files you supply rather than a vault, and no user-facing command emits those files, so it is documented separately on [quality commands](/reference/cli/quality-commands) rather than in the surface a reader works through day to day.
+
+## Groups this page names but does not document
+
+<AccordionGroup>
+  <Accordion title="vault">
+    The `vault` group holds four in-process subcommands, documented on [vault commands](/reference/cli/vault-commands).
+  </Accordion>
+  <Accordion title="dev, models, pilot">
+    `dev` runs a local dev server that rebuilds the UI on source changes, `models` manages local model artifacts and caches, and `pilot` runs a corpus pilot gate. They are contributor tooling and live under [developer commands](/contributing/dev-commands).
+  </Accordion>
+</AccordionGroup>
+
+Behaviour this page could not verify is listed on [known gaps](/help/known-gaps).

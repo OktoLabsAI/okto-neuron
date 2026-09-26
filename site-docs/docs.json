@@ -1,0 +1,202 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Okto Neuron Documentation",
+  "description": "Okto Neuron, a local-first knowledge vault. Your markdown stays the trust root; the graph is derived, byte-anchored and disposable. Prerelease (0.3.0).",
+  "colors": {
+    "primary": "#f5b942",
+    "light": "#ffd166",
+    "dark": "#c98a12"
+  },
+  "font": {
+    "headings": {
+      "family": "IBM Plex Sans",
+      "weight": 600
+    },
+    "body": {
+      "family": "IBM Plex Sans"
+    }
+  },
+  "head": [
+    {
+      "tag": "link",
+      "attributes": {
+        "rel": "preconnect",
+        "href": "https://fonts.googleapis.com"
+      }
+    },
+    {
+      "tag": "link",
+      "attributes": {
+        "rel": "preconnect",
+        "href": "https://fonts.gstatic.com",
+        "crossorigin": ""
+      }
+    },
+    {
+      "tag": "link",
+      "attributes": {
+        "rel": "stylesheet",
+        "href": "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap"
+      }
+    }
+  ],
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/OktoLabsAI/okto-neuron"
+      },
+      {
+        "label": "Issues",
+        "href": "https://github.com/OktoLabsAI/okto-neuron/issues"
+      }
+    ]
+  },
+  "seo": {
+    "indexing": "navigable",
+    "metatags": {
+      "og:site_name": "Okto Neuron Docs",
+      "twitter:card": "summary_large_image"
+    }
+  },
+  "metadata": {
+    "timestamp": true
+  },
+  "search": {
+    "prompt": "Search Okto Neuron docs..."
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "start/what-is-okto-neuron",
+              "start/install",
+              "start/prerelease-status",
+              "start/first-run",
+              "start/first-questions",
+              "start/query-vs-ask",
+              "start/connect-claude-code"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/surfaces",
+              "concepts/what-is-a-vault",
+              "concepts/from-file-to-graph",
+              "concepts/data-model",
+              "concepts/provenance",
+              "concepts/supersession",
+              "concepts/predicates",
+              "concepts/subgraph-answers",
+              "concepts/graph-lifecycle",
+              "concepts/thin-client"
+            ]
+          },
+          {
+            "group": "The server",
+            "pages": [
+              "server/running",
+              "server/web-ui",
+              "server/remote-access",
+              "server/status-and-logs"
+            ]
+          },
+          {
+            "group": "Working with a vault",
+            "pages": [
+              "vault/creating",
+              "vault/ingesting",
+              "vault/watching",
+              "vault/asking",
+              "vault/drift",
+              "vault/rebuilding",
+              "vault/duplicate-entities",
+              "vault/snapshots",
+              "vault/destructive-operations"
+            ]
+          },
+          {
+            "group": "Agents and MCP",
+            "pages": [
+              "mcp/overview",
+              "mcp/connect-an-agent",
+              "mcp/vault-selection",
+              "mcp/security",
+              "mcp/tools/ask",
+              "mcp/tools/explore",
+              "mcp/tools/remember",
+              "mcp/tools/vaults"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "config/overview",
+              "config/llm-providers",
+              "config/llm-reference",
+              "config/vault-yaml",
+              "config/okto-neuron-toml",
+              "config/providers-yaml",
+              "config/shared-defaults",
+              "config/environment-variables",
+              "config/storage-backends",
+              "config/embedding-model",
+              "config/throughput",
+              "config/guardrails"
+            ]
+          },
+          {
+            "group": "CLI reference",
+            "pages": [
+              "reference/cli/overview",
+              "reference/cli/vault-commands",
+              "reference/cli/server-commands",
+              "reference/cli/client-commands",
+              "reference/cli/kg-overview",
+              "reference/cli/kg-lifecycle",
+              "reference/cli/kg-reconcile",
+              "reference/cli/kg-snapshot",
+              "reference/cli/quality-commands",
+              "reference/cli/exit-codes"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/vault-layout",
+              "reference/graph-schema",
+              "reference/predicates",
+              "reference/http-endpoints",
+              "reference/python-api",
+              "reference/installer"
+            ]
+          },
+          {
+            "group": "Help",
+            "pages": [
+              "help/troubleshoot-install",
+              "help/troubleshoot-runtime",
+              "help/known-gaps",
+              "help/deliberately-absent"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "contributing/dev-install",
+              "contributing/dev-commands",
+              "contributing/docs-authoring"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

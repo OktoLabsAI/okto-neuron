@@ -1,0 +1,48 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+/vault/
+!tests/vault/
+!tests/vault/*.py
+*.lbug
+*.lbug.wal
+.marginalia/
+# The committed synthetic CI frozen vault must stay tracked (and in the sdist,
+# which honours this file) even though vault state and graph files are ignored.
+!tests/golden/datasets/synthetic-ci/frozen-vault/.marginalia/
+tests/golden/datasets/synthetic-ci/frozen-vault/.marginalia/*
+!tests/golden/datasets/synthetic-ci/frozen-vault/.marginalia/sources/
+!tests/golden/datasets/synthetic-ci/frozen-vault/*.lbug
+docs/private-corpus-pilot-log.*.json
+
+# OS / editor cruft
+.DS_Store
+
+# agent / session working artifacts
+.claude/settings.local.json
+.agents/
+.codex/
+.orchestrator-mode.state
+.scratchpad/
+.kg-codex-logs/
+.kg-independent-e2e-evidence.json
+.card-*-context.json
+claude-full-debug.log
+latest
+undefined/
+
+# golden harness run outputs
+tests/golden/results/
+# golden harness persistent named vaults (--serve; large derived artifacts)
+tests/golden/vaults/
+
+# Internal tooling, research and benchmark data live in a separate private
+# repository. Local copies must never be committed here.
+/.claude/
+/benchmarks/
+/research/

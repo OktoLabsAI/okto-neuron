@@ -1,0 +1,281 @@
+---
+title: "Installer reference"
+description: "Every environment variable install.sh reads, the resolution order, and the rollback transaction."
+---
+
+`install.sh` takes a machine from nothing to an installed `okto-neuron` tool, an optionally running daemon, and an optional Claude Code MCP registration. Everything it does is driven by environment variables read once, at the start of the run.
+
+<Note>
+Okto Neuron is prerelease. The installer's behaviour, variable names and defaults can change between versions. Verify against the script in the version you are installing.
+</Note>
+
+For the narrative walkthrough, see [/start/install](/start/install). For failures, see [/help/troubleshoot-install](/help/troubleshoot-install). For vault and daemon configuration after install, see [/config/environment-variables](/config/environment-variables).
+
+## Invocation and flags
+
+The script accepts exactly one flag.
+
+| Flag | Effect |
+| --- | --- |
+| `--no-onboard` | Skips the greenfield first-run onboarding prompt. |
+
+Any other argument is fatal: the script calls `die "unknown install.sh flag: ..."`. Flag parsing only runs when the script is executed or piped, not when another script sources it.
+
+```bash
+bash install.sh --no-onboard
+```
+
+<Warning>
+Each release bakes three defaults into `install.sh`: `OKTO_NEURON_DEFAULT_WHEEL_URL` (the wheel attached to the release's GitHub Release), `OKTO_NEURON_DEFAULT_MANIFEST_URL` (`release-manifest.json` on `main`) and `OKTO_NEURON_EXPECTED_VERSION`. The one-line install downloads that wheel and refuses it unless it matches the manifest's version, file name, URL and SHA-256. Setting any of the three variables overrides the baked value.
+</Warning>
+
+## Environment variables
+
+All of these are read by `install.sh` itself. They are consumed once during the install run.
+
+### Candidate selection
+
+<ParamField path="OKTO_NEURON_WHEEL" type="string">
+Path or URL to a built wheel. Highest-priority candidate; skips clone and source build.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_SRC" type="string">
+Path to an existing checkout. The script requires `pyproject.toml` at that path and dies without it.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_EXPECTED_VERSION" type="string">
+Required version when you override the wheel. Compared against the manifest version and against the staged package version; a mismatch is fatal.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_MANIFEST" type="string">
+Path or URL to `release-manifest.json`, used for wheel verification.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_WHEEL_SHA256" type="string">
+Required SHA-256 for a custom wheel installed without a manifest.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_REPO" type="string" default="https://github.com/OktoLabsAI/okto-neuron.git">
+Git URL for the clone fallback.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_REF" type="string">
+Git ref to check out. Empty by default, which leaves the clone on the repository's default branch.
+</ParamField>
+
+### Preseed and onboarding
+
+<ParamField path="OKTO_NEURON_VAULT" type="string">
+Vault name to preseed before the app opens. Empty by default. When set, the vault directory is `~/.okto-neuron/vaults/<name>`.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_PACKS" type="string" default="core,research,personal">
+Type packs passed to `okto-neuron vault create --packs`.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_LLM_PROVIDER" type="string">
+Passed to `okto-neuron onboard --provider`. With no provider, `OKTO_NEURON_LLM_API_BASE` or `OKTO_NEURON_LLM_MODEL` set, a non-interactive run appends `--provider skip`, so the vault is created with no LLM configured.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_LLM_API_BASE" type="string">
+Passed as `--api-base`. Setting `OKTO_NEURON_LLM_API_BASE` or `OKTO_NEURON_LLM_MODEL` without `OKTO_NEURON_LLM_PROVIDER` selects `--provider custom`.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_LLM_MODEL" type="string">
+Passed as `--model`, and always adds `--skip-model-discovery` alongside it. Setting it without `OKTO_NEURON_LLM_PROVIDER` selects `--provider custom`.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_LLM_SKIP_DISCOVERY" type="string">
+When set to `1`, adds `--skip-model-discovery`. Honoured only when `OKTO_NEURON_LLM_MODEL` is unset, because setting a model already adds that flag.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_LLM_API_KEY_ENV" type="string">
+Name of the `OKTO_NEURON_*` environment variable holding the API key; passed as `--api-key-env`.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_LLM_ALLOW_REMOTE" type="string">
+When set to `1`, adds `--allow-remote-llm --yes` to the onboard call, opting in to a non-loopback LLM endpoint.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_ALLOW_REMOTE_LLM" type="string">
+Undocumented fallback alias, consulted only when `OKTO_NEURON_LLM_ALLOW_REMOTE` is unset. It appears in the preseed guard list but not in the script's header comment block. Use `OKTO_NEURON_LLM_ALLOW_REMOTE`.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_ONBOARD_NONINTERACTIVE" type="string">
+When set to `1`, adds `--non-interactive` to the onboard call. The script also sets non-interactive mode on its own when no terminal is attached.
+</ParamField>
+
+### Run-stage switches
+
+<ParamField path="OKTO_NEURON_NO_SERVE" type="string">
+`1` installs and configures without starting the daemon.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_NO_OPEN" type="string">
+`1` suppresses the browser open of the verified UI. It also makes the greenfield first-run prompt return silently.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_NO_MCP" type="string">
+`1` skips the `claude mcp add` step. This is read once during the install run and affects nothing in a daemon that is already running.
+</ParamField>
+
+<ParamField path="OKTO_NEURON_NO_UPDATE_SHELL" type="string">
+The shell-profile update (`uv tool update-shell`) runs unless this is exactly `1`.
+</ParamField>
+
+## The preseed guard
+
+If you set any preseed variable without `OKTO_NEURON_VAULT`, the script dies before doing anything else. The guarded names are `OKTO_NEURON_PACKS`, `OKTO_NEURON_LLM_PROVIDER`, `OKTO_NEURON_LLM_API_BASE`, `OKTO_NEURON_LLM_MODEL`, `OKTO_NEURON_LLM_API_KEY_ENV`, `OKTO_NEURON_LLM_SKIP_DISCOVERY`, `OKTO_NEURON_LLM_ALLOW_REMOTE`, `OKTO_NEURON_ALLOW_REMOTE_LLM` and `OKTO_NEURON_ONBOARD_NONINTERACTIVE`.
+
+The error names the offending variable:
+
+```text
+error: OKTO_NEURON_LLM_MODEL requires OKTO_NEURON_VAULT; omit preseed settings and configure vaults in the Web UI, or set OKTO_NEURON_VAULT explicitly
+```
+
+## Candidate resolution order
+
+The script picks exactly one candidate, in this order:
+
+<Steps>
+  <Step title="OKTO_NEURON_WHEEL">
+    A wheel path or URL, used as-is.
+  </Step>
+  <Step title="OKTO_NEURON_SRC">
+    A checkout containing `pyproject.toml`.
+  </Step>
+  <Step title="A detected clone">
+    If the script's own directory holds a `pyproject.toml` whose name line is `name = "okto-neuron"` (you ran `install.sh` from the root of a clone), that directory is the source.
+  </Step>
+  <Step title="DEFAULT_WHEEL_URL">
+    The release wheel baked into the script. It is always set in a released `install.sh`, so the clone below is reached only when you set `OKTO_NEURON_DEFAULT_WHEEL_URL` to an empty string.
+  </Step>
+  <Step title="A shallow git clone">
+    `git clone --depth 1` of `OKTO_NEURON_REPO`. The default repo URL is the public HTTPS clone URL. The failure message points you at `OKTO_NEURON_SRC` or `OKTO_NEURON_WHEEL`.
+  </Step>
+</Steps>
+
+## Wheel verification
+
+A wheel candidate is never installed unverified.
+
+- When a manifest is available (`OKTO_NEURON_MANIFEST`, or `DEFAULT_MANIFEST_URL` for the default wheel), the script requires `version`, `wheel_url`, `wheel` and `sha256` in it and dies if any is missing.
+- The manifest's `wheel` must be a bare filename, not a path.
+- If `OKTO_NEURON_EXPECTED_VERSION` is set and disagrees with the manifest version, the run dies.
+- An `http://` or `https://` wheel source must equal the manifest's `wheel_url`; a local source's basename must equal the manifest's `wheel`.
+- A version is mandatory: without a manifest version or `OKTO_NEURON_EXPECTED_VERSION`, the run dies.
+- A SHA-256 is mandatory: without `OKTO_NEURON_MANIFEST` or `OKTO_NEURON_WHEEL_SHA256`, the run dies.
+- If both are present and disagree, the run dies.
+- The expected SHA must be exactly 64 hexadecimal characters.
+- The downloaded file's SHA-256 is computed and compared case-insensitively; a mismatch is fatal.
+- The filename must end in `.whl`.
+
+## Python, extras and staging
+
+The script installs `uv` from `astral.sh` if it is missing, then installs and resolves Python 3.12 through uv.
+
+The install spec always appends `EXTRAS="serve,litellm"`. The installer names no other extra. `okto-grafx` and `ladybug` are base dependencies (`pyproject.toml:29-30`) and `serve` already carries `fastembed` and `numpy` (`pyproject.toml:46`), so the `grafx`, `ladybug` and `embeddings` extras add nothing an installed tool does not already have. The `neo4j`, `jsonld`, `bedrock`, `sentence-transformers` and `dev` extras (`pyproject.toml:43-50`) are not installed; `jsonld`'s `rdflib>=7,<8` (`pyproject.toml:44`) is not named by the install spec.
+
+Every declared extra (`pyproject.toml:39-50`):
+
+| Extra | What it supplies |
+| --- | --- |
+| `embeddings` | `fastembed==0.8.0`, `numpy` |
+| `ladybug` | `ladybug` |
+| `grafx` | `okto-grafx`, `ladybug` |
+| `neo4j` | `neo4j`, `ladybug` |
+| `jsonld` | `rdflib` |
+| `mcp` | `ladybug`, `fastmcp`, `starlette`, `uvicorn`, `fastembed`, `numpy` |
+| `serve` | `ladybug`, `fastmcp`, `starlette`, `uvicorn`, `fastembed`, `numpy` |
+| `litellm` | `litellm` |
+| `bedrock` | `litellm`, `boto3` |
+| `sentence-transformers` | `sentence-transformers` |
+| `dev` | `pytest`, `pytest-asyncio`, `ruff`, `hypothesis`, `psutil`, `httpx2` |
+
+`mcp` is an identical list to `serve`, kept as a compatibility alias for earlier install guidance.
+
+The candidate is first installed into a throwaway venv at `$WORK_TMP/stage` while the current daemon and tool stay untouched. The staged package version must match `OKTO_NEURON_EXPECTED_VERSION` when set, the staged `okto-neuron` command must exist and answer `--help`, and `marginalia --version` must print `marginalia <version>`.
+
+Activation then runs `uv tool install --python 3.12 "$SPEC"`.
+
+## Update-mode detection
+
+Before activation, the script decides whether this machine is already set up.
+
+| Condition | Result |
+| --- | --- |
+| Verified daemon status available (CLI `status --json` or `GET /api/v1/status` reporting a pid) | Update mode, daemon treated as running |
+| No status, but an application PID file at `~/.okto-neuron/runtime/.marginalia/server.pid` names a live process | Fatal; you are told to run `okto-neuron stop` |
+| Port 7777 in use with no verified status | Fatal |
+| A prior tool environment or any `~/.okto-neuron/vaults/*/okto-neuron.yaml` exists | Update mode, daemon treated as stopped |
+
+A live daemon whose endpoint is neither `http://127.0.0.1:7777` nor `http://localhost:7777` aborts the update before shutdown, because the installer cannot preserve custom ports.
+
+In update mode the script prints its update banner, then skips vault creation, default-vault selection and the onboarding prompt entirely.
+
+```text
+Update mode — leaving your vaults, default, and LLM config untouched
+```
+
+Vault and provider configuration live outside the tool directory and are never replaced by the transaction. If the daemon was stopped before the update, it stays stopped.
+
+## Readiness verification
+
+When the daemon is started, the script runs `okto-neuron serve --daemon --no-open`, then polls up to 60 times with a one-second sleep, comparing the daemon's reported `marginalia_version` to the installed version. The version comes from `status --json --timeout 2`, falling back to `GET /version`.
+
+On a version mismatch or a timeout, the script warns, suggests `okto-neuron serve --foreground --no-open`, names the daemon log at `~/.okto-neuron/logs/okto-neuron-serve.log`, prints its last 20 lines, and dies with "candidate daemon verification failed; the previous installation will be restored".
+
+Only after this check passes does the script mark the activation committed and delete the backup.
+
+## The rollback transaction
+
+Activation renames the prior environment rather than deleting it. The previous `uv` tool directory moves to `$TOOL_ROOT/.okto-neuron-installer-backup-$$/tool` and the `okto-neuron`, `kg` and `marginalia` launchers move to that backup's `bin/`.
+
+An `EXIT` trap runs `installer_exit`. If activation started and was never committed, it restores the previous install:
+
+<Steps>
+  <Step title="Stop the candidate daemon">
+    If the candidate daemon was started, it is stopped. If it is still live, or either port is still bound, restoration refuses to remove its environment.
+  </Step>
+  <Step title="Remove the candidate">
+    The new tool directory and the `okto-neuron` and `kg` launchers are deleted.
+  </Step>
+  <Step title="Restore the backup">
+    The backed-up tool directory and launchers are moved back into place.
+  </Step>
+  <Step title="Verify the restoration">
+    The restored environment's reported package version must equal the recorded previous version, or restoration fails.
+  </Step>
+  <Step title="Restart the previous daemon">
+    If the daemon was running before, it is restarted and polled up to 30 times at one-second intervals until it reports a version; an unverified restart is a warning and a failure.
+  </Step>
+</Steps>
+
+<Warning>
+If any of those steps fails, the exit code becomes 1 and the script prints "rollback is incomplete; recovery backup retained at &lt;path&gt;". A retained backup directory means the machine is in a partial state: the backup still holds your previous tool environment and launchers, and nothing else will clean it up. On a successful run, committed or rolled back, the backup is removed.
+</Warning>
+
+The script also restarts the previous daemon when it requested a shutdown but never began activation. Temporary work and clone directories are always removed on exit.
+
+## Non-interactive provisioning
+
+A full preseed run that creates a vault, configures a provider, starts the daemon, and leaves both the browser and Claude Code alone:
+
+```bash
+OKTO_NEURON_SRC=/opt/src/okto_neuron \
+OKTO_NEURON_VAULT=team \
+OKTO_NEURON_PACKS=core,research \
+OKTO_NEURON_LLM_PROVIDER=custom \
+OKTO_NEURON_LLM_API_BASE=http://127.0.0.1:11434/v1 \
+OKTO_NEURON_LLM_MODEL=qwen3 \
+OKTO_NEURON_ONBOARD_NONINTERACTIVE=1 \
+OKTO_NEURON_NO_OPEN=1 \
+OKTO_NEURON_NO_MCP=1 \
+bash /opt/src/okto_neuron/install.sh --no-onboard
+```
+
+That run resolves the candidate from `OKTO_NEURON_SRC`, creates `~/.okto-neuron/vaults/team` with the named packs, calls `okto-neuron onboard --vault team --provider custom --api-base ... --model qwen3 --skip-model-discovery --non-interactive`, starts the daemon and verifies its version, skips the `claude mcp add` step, and skips the browser open.
+
+To install without starting anything, add `OKTO_NEURON_NO_SERVE=1`.
+
+Anything not stated on this page was not verified against the script. See [/help/known-gaps](/help/known-gaps).

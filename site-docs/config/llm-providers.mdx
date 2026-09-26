@@ -1,0 +1,257 @@
+---
+title: "Set up an LLM provider"
+description: "Pick a provider, verify it before anything is written, and change your mind later."
+---
+
+Okto Neuron points at one LLM provider per vault. You choose it with `okto-neuron onboard`, which asks a
+short series of questions, checks the endpoint, and only then writes anything to disk.
+
+<Note>
+Okto Neuron is prerelease software. Flags and prompts on this page describe the current code and can change.
+</Note>
+
+## Run the setup
+
+<Steps>
+  <Step title="Start onboarding">
+    ```bash
+    okto-neuron onboard
+    ```
+
+    The command guides first-run vault and LLM provider setup. If you have not created a vault yet, see
+    [/start/first-run](/start/first-run).
+  </Step>
+  <Step title="Choose a provider from the menu">
+    The prompt prints `Choose a provider:` with `0. Skip LLM setup` followed by the numbered presets.
+    You can answer with the number or by typing the provider key.
+  </Step>
+  <Step title="Confirm the base URL">
+    For presets that have an endpoint, onboarding prompts `Base URL` with the preset's default filled in.
+    Press Enter to accept it or type your own.
+  </Step>
+  <Step title="Enter the API key when asked">
+    The prompt is `API key (...)` and it hides what you type.
+  </Step>
+  <Step title="Pick a model">
+    Onboarding asks the provider for its model list and lets you pick one. If the call fails, it prints
+    `model discovery failed (...); enter a model manually`. If the list is empty, it prints nothing.
+    Either way you land on a `Model` prompt prefilled with the preset's default model, and you type or
+    accept a model id there.
+  </Step>
+  <Step title="Let the pre-save verify run">
+    One real minimal completion runs against the endpoint you chose, before anything is saved.
+  </Step>
+</Steps>
+
+## The presets
+
+Thirteen presets exist, in this order.
+
+| Key | Label | Base URL | API key env var |
+| --- | --- | --- | --- |
+| `auto` | Auto-detect local runtime | none | `OKTO_NEURON_LOCAL_LLM_KEY` |
+| `skip` | Skip LLM setup | none | none |
+| `lm_studio` | LM Studio | `http://127.0.0.1:1234/v1` | `OKTO_NEURON_LM_STUDIO_API_KEY` |
+| `ollama` | Ollama | `http://127.0.0.1:11434/v1` | `OKTO_NEURON_OLLAMA_API_KEY` |
+| `litellm_proxy` | LiteLLM Proxy | `http://127.0.0.1:4000` | `OKTO_NEURON_LITELLM_PROXY_API_KEY` |
+| `openrouter` | OpenRouter | `https://openrouter.ai/api/v1` | `OKTO_NEURON_OPENROUTER_API_KEY` |
+| `openai` | OpenAI | `https://api.openai.com/v1` | `OKTO_NEURON_OPENAI_API_KEY` |
+| `gemini` | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `OKTO_NEURON_GEMINI_API_KEY` |
+| `anthropic` | Anthropic | `https://api.anthropic.com/v1` | `OKTO_NEURON_ANTHROPIC_API_KEY` |
+| `pi_cli` | pi CLI (local multi-provider) | none | none |
+| `codex_cli` | Codex CLI (subscription) | none | none |
+| `custom` | Custom OpenAI-compatible endpoint | `http://127.0.0.1:8123/v1` | `OKTO_NEURON_CUSTOM_LLM_KEY` |
+| `local` | Local OpenAI-compatible (legacy) | `http://127.0.0.1:8123/v1` | `OKTO_NEURON_LOCAL_LLM_KEY` |
+
+`custom` and `local` both prefill `http://127.0.0.1:8123/v1`. Type your own endpoint at the `Base URL`
+prompt to override it.
+
+`local` carries `menu=False`, so it never appears in the interactive list. You can still select it with
+`--provider local`.
+
+`auto` probes LM Studio, Ollama and LiteLLM Proxy on loopback only. When exactly one runtime answers,
+onboarding prints `Found <label> at <base url>.` and continues with that preset. When several answer, it
+lists them and asks which one you want, with a final entry for choosing another provider. When none answer,
+it prints `No local LM Studio, Ollama, or LiteLLM Proxy runtime was detected.` and falls back to the menu.
+
+`auto` and `skip` are menu entries, not provider values. Trying to write either one as the provider raises
+`'<key>' is not a concrete provider config`.
+
+For the field names and defaults these presets end up writing, see
+[/config/llm-reference](/config/llm-reference). For providers you define yourself outside onboarding, see
+[/config/providers-yaml](/config/providers-yaml).
+
+## Where the API key goes
+
+Onboarding writes the key into `~/.okto-neuron/env`, owner-only, and puts only the env var *name* into
+`okto-neuron.yaml`. The file header says so: `Values are never written to okto-neuron.yaml.`
+
+You can pass `--api-key` on the command line, but its own help text says to prefer the interactive
+prompt. The prompt hides what you type.
+
+For a hosted preset, leaving the prompt blank with nothing exported prints
+`no key saved; set <VAR> before using this hosted provider`.
+
+## Remote endpoints need explicit confirmation
+
+A loopback base URL goes through with no extra question. Anything else does not.
+
+<Warning>
+When you point Okto Neuron at a non-loopback endpoint, vault-derived context can leave your machine.
+Onboarding says exactly that before it proceeds.
+</Warning>
+
+Interactively, it prints the provider label and the endpoint, then asks `Allow this endpoint?` with the
+default set to no. Declining aborts the command.
+
+Non-interactively there are two gates:
+
+- Without `--allow-remote-llm`: `<url> is not loopback; pass --allow-remote-llm --yes to confirm remote egress`.
+- With `--allow-remote-llm` but no `--yes`: `<url> is <class>; pass --yes with --allow-remote-llm to confirm`.
+
+Related guardrails live in [/config/guardrails](/config/guardrails).
+
+## Nothing is written until a real completion succeeds
+
+After you pick a model, onboarding sends one minimal completion through the same endpoint the runtime will
+use. Model discovery only proves a list endpoint answered; a completion proves the endpoint works.
+
+If that call fails, onboarding prints
+
+```text
+verify failed — nothing was saved:
+  <error>
+```
+
+and exits with `onboarding aborted; re-check the base URL and model`. No config patch and no env secret are
+written on that path. The API key is persisted only after the verify succeeds.
+
+The verify is skipped for `--dry-run` (nothing would be saved anyway) and for presets with no HTTP endpoint.
+
+## The CLI-subscription providers
+
+`pi_cli` and `codex_cli` do not speak HTTP to a provider. They run a local binary. A third provider,
+`claude_cli`, shares the same base class but has no onboarding preset, so `okto-neuron onboard` cannot select
+it; you reach it by setting `llm.defaults.provider` to `claude_cli` (the aliases `claude-code` and
+`claude_code` resolve to it) or through the server's provider-test endpoint.
+
+All three descend from `CliShellProvider`, which:
+
+- locates the executable with `shutil.which`, and raises an `LLMProviderError` with category `unavailable`
+  when it is missing (`pi CLI not found on PATH`, and the same shape for the others),
+- runs every call in its own process session with `cwd` set to the system temp directory,
+- ignores the sampling knobs. Temperature, top_p, top_k, min_p, presence_penalty and enable_thinking
+  have no effect on a CLI provider, because the CLIs expose no such surface
+  (`src/okto_neuron/llm/_cli_provider.py:184`).
+
+Okto Neuron sends no API key and no base URL to these providers. `pi_cli` and `codex_cli` carry
+`api_base=''`, `api_key_env=''`, `api_key_required=False` and `default_model=''`, which makes onboarding skip
+URL prompting, the remote-egress gate, api-key-env normalization and the pre-save verify. The config block it
+writes has no `api_base` key at all and pins `allow_remote` to `false`. Neither provider is part of
+`MANAGED_API_KEY_PROVIDERS`, so Okto Neuron never stores a credential for them; they use whatever login the
+binary already has.
+
+<Note>
+`anthropic` and `claude_cli` are not the same thing. The `anthropic` preset sends an API key over HTTP to
+`https://api.anthropic.com/v1`. `claude_cli` sends nothing over HTTP and shells out to the local `claude`
+binary.
+</Note>
+
+### Model discovery for the CLI providers
+
+<Tabs>
+  <Tab title="pi_cli">
+    Discovery runs `pi --list-models` and parses the plain-text table, taking only the first two
+    whitespace-separated tokens of each data row and joining them as `provider/model`. If the binary is
+    missing you get `pi CLI not found on PATH`.
+  </Tab>
+  <Tab title="codex_cli">
+    Discovery runs `codex --version` only, to confirm the binary works, and always returns an empty model
+    list on purpose. Type the model id yourself: the preset's note asks for a plain OpenAI-style model id,
+    for example `gpt-5.5`.
+  </Tab>
+</Tabs>
+
+### Structured output
+
+`claude_cli` and `codex_cli` use `NativeSchemaStrategy`, passing the schema to the binary. `pi` has no
+`--json-schema` flag, so `pi_cli` uses `BestEffortJsonStrategy`: the schema is embedded into the prompt and
+the response is repaired (fence-stripping, balanced-brace extraction) and schema-validated by the shared
+reask loop.
+
+## Running without an LLM
+
+Choosing `skip` removes any explicit LLM block and prints
+
+```text
+explore works without an LLM; run 'okto-neuron onboard --reconfigure' to enable ask/remember.
+```
+
+The preset's own note says the same: `explore works now; ask and remember stay disabled until reconfigured.`
+`query` returns provenance-bearing hits from the running server, while `ask` synthesises a single answer, so
+`query` is what you still have. See [/start/query-vs-ask](/start/query-vs-ask).
+
+To disable the LLM outright on a vault that already has config, use `--disable-llm`.
+
+## Changing your mind later
+
+Run `okto-neuron onboard` again on a vault that already has explicit config and it prints
+`This vault already has explicit LLM config (<state>).` followed by four choices:
+
+1. Keep existing config
+2. Test current config
+3. Reconfigure provider/model
+4. Disable LLM setup
+
+Option 2 prints a no-write validation summary. Option 3 takes you back through the provider flow, and
+option 4 writes the disabled block.
+
+If you pass configuration flags (`--provider`, `--api-base`, `--api-key-env`, `--api-key`, `--model`) at a
+vault that already has explicit config without `--reconfigure`, the command refuses:
+`this vault already has explicit LLM config; pass --reconfigure to change it`.
+
+## Scripting it
+
+<CodeGroup>
+```bash preview
+okto-neuron onboard --non-interactive --provider ollama --model llama3.1 --dry-run --print-summary-json
+```
+
+```bash apply
+okto-neuron onboard --non-interactive --provider ollama --model llama3.1
+```
+</CodeGroup>
+
+`--dry-run` shows what would change and writes nothing. `--print-summary-json` emits a machine-readable
+summary after the human-readable output. Use them together to review a scripted change before you run it
+for real.
+
+Two rules apply when you are not on a terminal:
+
+- `--provider` is required in `--non-interactive` mode unless existing config is kept.
+- `--skip-model-discovery` requires `--model` unless the provider is `skip`.
+
+<Warning>
+`--litellm-provider` no longer works. Passing it fails with a message pointing you at `--provider custom`
+for a generic OpenAI-compatible endpoint, or `--provider litellm_proxy` for a proxy.
+</Warning>
+
+Raw LiteLLM driver names are not onboarding presets either. If you pass one as `--provider`, the error
+names it. For an OpenAI-compatible driver it points you at `--provider custom` or
+`--provider litellm_proxy`; for any other driver it points you at the Config UI or a named provider entry (see
+[/config/providers-yaml](/config/providers-yaml)).
+
+<CardGroup cols={2}>
+  <Card title="LLM configuration fields" href="/config/llm-reference">
+    Every `llm.*` field, with its default.
+  </Card>
+  <Card title="Named providers" href="/config/providers-yaml">
+    Define provider entries outside the onboarding presets.
+  </Card>
+  <Card title="Guardrails" href="/config/guardrails">
+    What Okto Neuron refuses to do without confirmation.
+  </Card>
+  <Card title="query vs ask" href="/start/query-vs-ask">
+    Which one needs an LLM and which one does not.
+  </Card>
+</CardGroup>

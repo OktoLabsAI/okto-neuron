@@ -1,0 +1,464 @@
+# Golden dataset questions - synthetic-ci (deterministic CI eval gate)
+#
+# Consumed by the DETERMINISTIC-ONLY gate: provenance byte-hash + hard recall@k
+# + extraction-completeness. No LLM judge required for this set.
+#
+# Schema per question:
+#   id:               stable identifier
+#   category:         one of point_in_time | timeline | quantitative |
+#                     entity_resolution | supersedence | multi_hop |
+#                     simple_lookup | negative_control
+#   tier:             T1 | T2 | T3   (T1 single-fact, T2 single-doc synthesis,
+#                     T3 multi-doc / multi-hop)
+#   question:         natural-language query
+#   expected_answer:  gold answer text
+#   must_contain:     substrings that MUST appear in a correct answer
+#   gold_targets:     [{source_path, quote, quote_hash, node_id}] - quote is a
+#                     VERBATIM substring of source_path that contains/supports the
+#                     answer. Hard recall@k requires the gold_targets' files to be
+#                     retrieved.
+#                     quote_hash = "sha256:" + sha256(located quote bytes); the
+#                     SAME byte hash judge.py's gold-span self-check verifies
+#                     (sha256(file_bytes[byte_start:byte_end])) and equal to the
+#                     floor's freshly-computed content_hash, so the optional
+#                     quote_hash self-check actively validates these targets.
+#                     node_id = the covering Claim node id in
+#                     frozen-vault/graph.lbug (resolved by recall_floor.py's
+#                     extraction leg), or null when no single Claim covers the
+#                     quote in the frozen vault.
+#   distractors:      [{source_path, quote}] - near-duplicate, similar-but-WRONG
+#                     passages a naive matcher could retrieve instead. Verbatim.
+#   negative_control: true => answer is absent; system must decline, not invent.
+#
+# Every gold/distractor quote is a verbatim substring of its file (grep -F
+# verified, 0 mismatches). Fully synthetic world; safe to commit.
+
+settings:
+  k: 10
+
+questions:
+  # -- simple_lookup ---------------------------------------------------------
+  - id: sl_founding_director
+    category: simple_lookup
+    tier: T1
+    question: "Who was the founding director of the Halverson Tidewater Collective?"
+    expected_answer: "Marisol Quintero was the founding director of HTC."
+    must_contain: ["Marisol Quintero"]
+    gold_targets:
+      - source_path: 00-charter.md
+        quote: "The founding director of HTC was Marisol Quintero."
+        quote_hash: "sha256:41a4dc8e92db8fa94c6f7508d6e7ca2c93fc29a98f3263d1070125cb6dabcb9e"
+        node_id: "064ea047828604ba127dce68a81e0eca75aef52076cf41d8895c1a82836cfe12"
+    distractors:
+      - source_path: 01-people.md
+        quote: "**Greta Sandoval** - second director of HTC, from 2023."
+    negative_control: false
+
+  - id: sl_headquarters
+    category: simple_lookup
+    tier: T1
+    question: "Where is HTC headquartered?"
+    expected_answer: "HTC is headquartered in Brackish Harbor."
+    must_contain: ["Brackish Harbor"]
+    gold_targets:
+      - source_path: 00-charter.md
+        quote: "HTC is headquartered in the town of Brackish Harbor."
+        quote_hash: "sha256:508fd26d868df7471d33a07754bfcddf258579074cb6f0d4a3b039a094d08040"
+        node_id: "064ea047828604ba127dce68a81e0eca75aef52076cf41d8895c1a82836cfe12"
+    distractors:
+      - source_path: 12-cape-verriden.md
+        quote: "Cape Verriden is a satellite office, not the headquarters."
+    negative_control: false
+
+  - id: sl_licence_short_code
+    category: simple_lookup
+    tier: T1
+    question: "What is the short code for the licence covering the Tidewater Index?"
+    expected_answer: "The licence is the Brackish Open Data Licence, short code BODL."
+    must_contain: ["BODL"]
+    gold_targets:
+      - source_path: 05-licence.md
+        quote: "published under the Brackish Open Data Licence, known by\nthe short code BODL."
+        quote_hash: "sha256:a0e18206742e50863895cea321cf1a72709f82352f91b6289a505fb14083f898"
+        node_id: "115beec3b526062ae5eba7caa434b4d05877fb4376d78f3c9e870124d0640e5e"
+    distractors: []
+    negative_control: false
+
+  # -- point_in_time ---------------------------------------------------------
+  - id: pit_director_2022
+    category: point_in_time
+    tier: T2
+    question: "Who was the director of HTC during 2022?"
+    expected_answer: "Marisol Quintero. She was founding director from 2019 until stepping down on 2023-01-09, so she held the role through all of 2022."
+    must_contain: ["Marisol Quintero"]
+    gold_targets:
+      - source_path: 02-timeline.md
+        quote: "**2023-01-09** - Marisol Quintero steps down as director; Greta Sandoval becomes the second director."
+        quote_hash: "sha256:04bff10d6d65a394729fb4d7c1b8a4ca4ef1d55f6b23fbb3660f9e60cc3bc246"
+        node_id: null  # no covering Claim in frozen vault
+      - source_path: 01-people.md
+        quote: "**Marisol Quintero** - founding director (2019-2023)."
+        quote_hash: "sha256:1a0bb68a79f0c8cf7aeda8c80ad27311f2d0dd660cf11304ddb03ef300716bb9"
+        node_id: "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3"
+    distractors:
+      - source_path: 08-handover-2023.md
+        quote: "Greta Sandoval is the current director as of this record."
+    negative_control: false
+
+  - id: pit_salinity_unit_v1
+    category: point_in_time
+    tier: T2
+    question: "What unit did the Tidewater Index report salinity in at version 1, before any later change?"
+    expected_answer: "Tidewater Index v1 reported salinity in parts per thousand (ppt)."
+    must_contain: ["ppt"]
+    gold_targets:
+      - source_path: 13-schema-changelog.md
+        quote: "Salinity field reported in parts per thousand (ppt)."
+        quote_hash: "sha256:be38948d28a62ff993694222a679e150833260d406e71f0319d287be6efb474c"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 13-schema-changelog.md
+        quote: "Salinity field changed to practical salinity units (PSU)."
+    negative_control: false
+
+  - id: pit_active_director_after_handover
+    category: point_in_time
+    tier: T1
+    question: "As of the 2023 handover note, who is the current HTC director?"
+    expected_answer: "Greta Sandoval is the current director as of the handover record."
+    must_contain: ["Greta Sandoval"]
+    gold_targets:
+      - source_path: 08-handover-2023.md
+        quote: "Greta Sandoval is the current director as of this record."
+        quote_hash: "sha256:86c4ce0198f5a52a9a87927c629e723341e5c3c8286f1b8a41bfb25f99195946"
+        node_id: "06c5afa19e5c83e61070af5bfa9866814758f4923a564ffea45c800ebf9d34a2"
+    distractors:
+      - source_path: 08-handover-2023.md
+        quote: "Marisol Quintero (founding director since 2019) stepped down effective\n2023-01-09."
+    negative_control: false
+
+  # -- timeline --------------------------------------------------------------
+  - id: tl_first_buoys_date
+    category: timeline
+    tier: T1
+    question: "When were the first three buoys deployed in the Maro Strait?"
+    expected_answer: "On 2019-09-01 (buoys MS-1, MS-2, MS-3)."
+    must_contain: ["2019-09-01"]
+    gold_targets:
+      - source_path: 02-timeline.md
+        quote: "**2019-09-01** - First three buoys deployed in the Maro Strait (buoys MS-1, MS-2, MS-3)."
+        quote_hash: "sha256:7d7fd19d437674c08d0324f9dde5b6117bbfed67b4ea3261d074bb1f8b7aad7f"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 02-timeline.md
+        quote: "**2023-08-18** - Buoy MS-2 lost in a storm and decommissioned; replacement buoy MS-7 deployed."
+    negative_control: false
+
+  - id: tl_licence_upgrade_date
+    category: timeline
+    tier: T1
+    question: "On what date was the Brackish Open Data Licence upgraded from v1 to v2?"
+    expected_answer: "On 2022-04-22."
+    must_contain: ["2022-04-22"]
+    gold_targets:
+      - source_path: 02-timeline.md
+        quote: "**2022-04-22** - Brackish Open Data Licence upgraded from v1 to v2."
+        quote_hash: "sha256:e7448d0f42c92aefdc061592af0dd922607698e17ea70ac3cdb753bc22b3d6ce"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 02-timeline.md
+        quote: "**2020-06-15** - Tidewater Index v1 published under the Brackish Open Data Licence v1."
+    negative_control: false
+
+  - id: tl_order_office_vs_index
+    category: timeline
+    tier: T2
+    question: "Which happened first: the Cape Verriden office opening or the publication of Tidewater Index v1?"
+    expected_answer: "Tidewater Index v1 was published on 2020-06-15, before the Cape Verriden office opened on 2021-11-30."
+    must_contain: ["2020-06-15", "2021-11-30"]
+    gold_targets:
+      - source_path: 02-timeline.md
+        quote: "**2020-06-15** - Tidewater Index v1 published under the Brackish Open Data Licence v1."
+        quote_hash: "sha256:f4abc8d9a7e092459e4607f772f3c7277f7e1603c9e87f7f68307eb3d8389f7e"
+        node_id: null  # no covering Claim in frozen vault
+      - source_path: 02-timeline.md
+        quote: "**2021-11-30** - Cape Verriden field office opened; Rashid Farouk appointed vessel liaison."
+        quote_hash: "sha256:0731fec4b83166ba71263edc54b2d8717463a09057ee7d70cea695e75b1f41ee"
+        node_id: null  # no covering Claim in frozen vault
+    distractors: []
+    negative_control: false
+
+  # -- quantitative ----------------------------------------------------------
+  - id: qt_active_buoys
+    category: quantitative
+    tier: T1
+    question: "How many active buoys are in the fleet as of the 2024 register?"
+    expected_answer: "Three active buoys (MS-1, MS-3, MS-7)."
+    must_contain: ["3 active buoys"]
+    gold_targets:
+      - source_path: 03-buoys.md
+        quote: "As of the 2024 register, the fleet has **3 active buoys**."
+        quote_hash: "sha256:579d73901d803817981d8c2b2c38339d748c9301314e45e8ce7449255ce2a737"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 10-membership.md
+        quote: "As of the 2024 roster, HTC has **142 active member vessels**."
+    negative_control: false
+
+  - id: qt_largest_grant
+    category: quantitative
+    tier: T2
+    question: "What is the single largest grant HTC has received, and how much was it?"
+    expected_answer: "The Mariner Resilience Grant, 90,000 credits, awarded in 2023."
+    must_contain: ["Mariner Resilience Grant", "90,000"]
+    gold_targets:
+      - source_path: 06-grants.md
+        quote: "The single largest grant HTC has received is the Mariner Resilience Grant at\n90,000 credits, awarded in 2023"
+        quote_hash: "sha256:2f1e794ddbab795bb93572d02a78eeff511fb866fef6f034d9835ad8758b8b92"
+        node_id: "012d974f58c7e05cb6668c1d4452be2c59bd0ee1851c5a22cbe26a01e8137c89"
+    distractors:
+      - source_path: 06-grants.md
+        quote: "Total grant funding across all four grants is 233,000 credits."
+    negative_control: false
+
+  - id: qt_ms7_interval
+    category: quantitative
+    tier: T1
+    question: "What is buoy MS-7's sampling interval?"
+    expected_answer: "MS-7 samples every 5 minutes."
+    must_contain: ["5 minute"]
+    gold_targets:
+      - source_path: 03-buoys.md
+        quote: "Buoy MS-7 replaced the\nlost MS-2 and samples three times more often, at a 5-minute interval."
+        quote_hash: "sha256:9a591ab296ef29196d4f91f1f26324f5a28127426b70d28396868a010533038b"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 03-buoys.md
+        quote: "| MS-1 | 2019-09-01 | active | 15 minutes |"
+    negative_control: false
+
+  - id: qt_readings_per_day
+    category: quantitative
+    tier: T2
+    question: "Roughly how many readings per day does the data pipeline ingest from the active fleet?"
+    expected_answer: "About 2,880 readings per day."
+    must_contain: ["2,880"]
+    gold_targets:
+      - source_path: 04-data-platform.md
+        quote: "The pipeline ingests roughly **2,880 readings per day** from the active fleet."
+        quote_hash: "sha256:d4fa1c198a1bdef9470770e935bccd71bde06e1ae0e770e02d27de3ccf6eeabc"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 03-buoys.md
+        quote: "A single reading packet is\n512 bytes."
+    negative_control: false
+
+  # -- entity_resolution -----------------------------------------------------
+  - id: er_mari_is_marisol
+    category: entity_resolution
+    tier: T2
+    question: "Who is 'Mari' in the 2019 assembly minutes?"
+    expected_answer: "'Mari' is Marisol Quintero, the founding director; the early minutes use the short form."
+    must_contain: ["Marisol Quintero"]
+    gold_targets:
+      - source_path: 07-assembly-2019.md
+        quote: "(Mari is Marisol Quintero; the early minutes use the short form\nthroughout.)"
+        quote_hash: "sha256:c3b2432a7f7d2003fb08bff2e8b72d549ded0a52389a4e56a0d06dab92c51b76"
+        node_id: null  # no covering Claim in frozen vault
+      - source_path: 01-people.md
+        quote: "Often referred to simply\n  as \"Mari\" in early meeting notes."
+        quote_hash: "sha256:34c8535864ff4695deedbd5190cf6d214b66caae94b7aee55eddf22271bb89cd"
+        node_id: "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3"
+    distractors: []
+    negative_control: false
+
+  - id: er_priya_rao_anand
+    category: entity_resolution
+    tier: T2
+    question: "Is Priya Rao the same person as Priya Anand?"
+    expected_answer: "Yes. Priya Rao is the pre-2021 maiden name of Priya Anand, the data platform lead."
+    must_contain: ["Priya Anand"]
+    gold_targets:
+      - source_path: 01-people.md
+        quote: "Maiden name\n  Priya Rao appears in pre-2021 records."
+        quote_hash: "sha256:84d1e7f04a0c2509eec2aff8430caabd5b216222340ff34f1856529fb595d5ab"
+        node_id: "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3"
+      - source_path: 07-assembly-2019.md
+        quote: "Priya Rao\nlater publishes under the name Priya Anand."
+        quote_hash: "sha256:45024f45973cb6687cf1ed2ab4943773d877458eaae3583556aeab13793deff5"
+        node_id: null  # no covering Claim in frozen vault
+    distractors: []
+    negative_control: false
+
+  - id: er_dev_is_devran
+    category: entity_resolution
+    tier: T1
+    question: "Who is 'Dev' in the buoy field logs?"
+    expected_answer: "'Dev' is Devran Oksuz, the buoy operations lead."
+    must_contain: ["Devran Oksuz"]
+    gold_targets:
+      - source_path: 01-people.md
+        quote: "**Devran Oksuz** - buoy operations lead. Goes by \"Dev\" in field logs."
+        quote_hash: "sha256:a0e7a0245872977974c644892ebbe397494b80a91c9226c2701bcc2aef31d7db"
+        node_id: "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3"
+    distractors: []
+    negative_control: false
+
+  # -- supersedence ----------------------------------------------------------
+  - id: sup_current_licence_version
+    category: supersedence
+    tier: T2
+    question: "Which licence version currently covers the Tidewater Index?"
+    expected_answer: "Brackish Open Data Licence v2; it supersedes v1, and there is no v3."
+    must_contain: ["BODL v2"]
+    gold_targets:
+      - source_path: 05-licence.md
+        quote: "The current licence covering the Tidewater Index is BODL v2. There is no BODL v3."
+        quote_hash: "sha256:cc466d35bf89a3c34fafed6253fc38a0d6efbe80a5f2803cbd65a0a193b9a242"
+        node_id: "115beec3b526062ae5eba7caa434b4d05877fb4376d78f3c9e870124d0640e5e"
+      - source_path: 05-licence.md
+        quote: "BODL v2 supersedes BODL v1."
+        quote_hash: "sha256:e7b689316370936cae387b8defc58caef0de05de609e58cc730efebd08028f25"
+        node_id: "115beec3b526062ae5eba7caa434b4d05877fb4376d78f3c9e870124d0640e5e"
+    distractors:
+      - source_path: 05-licence.md
+        quote: "**BODL v1** - effective 2020-06-15."
+    negative_control: false
+
+  - id: sup_current_salinity_unit
+    category: supersedence
+    tier: T2
+    question: "What salinity unit should a consumer of the live Tidewater Index read today?"
+    expected_answer: "Practical salinity units (PSU). The v2 schema superseded the v1 ppt unit; ppt is no longer published."
+    must_contain: ["PSU"]
+    gold_targets:
+      - source_path: 13-schema-changelog.md
+        quote: "Anyone consuming salinity from the live\nTidewater Index should read it as PSU, not ppt."
+        quote_hash: "sha256:93153582afaaeefe09410189ded92cd8b0145213630dddb1ac233d46588c42a1"
+        node_id: null  # no covering Claim in frozen vault
+      - source_path: 04-data-platform.md
+        quote: "Starting with\nTidewater Index v2, salinity is reported in practical salinity units (PSU)."
+        quote_hash: "sha256:9dbc203de8c519908bd072fbf0d2a0149b86518c146e2f0f4ba16e8dc94711d7"
+        node_id: null  # no covering Claim in frozen vault
+    distractors:
+      - source_path: 04-data-platform.md
+        quote: "Tidewater Index v1 reported salinity in parts per thousand (ppt)."
+    negative_control: false
+
+  - id: sup_ms2_replacement
+    category: supersedence
+    tier: T2
+    question: "Which buoy replaced MS-2, and why was MS-2 retired?"
+    expected_answer: "MS-7 replaced MS-2. MS-2 was lost in a storm on 2023-08-18 and decommissioned the same day."
+    must_contain: ["MS-7", "MS-2"]
+    gold_targets:
+      - source_path: 09-storm-report-2023.md
+        quote: "Buoy MS-2, deployed since\n2019-09-01, broke its mooring and was lost. MS-2 was formally decommissioned the\nsame day."
+        quote_hash: "sha256:531a10fc8fcd509118247ba38151d69170c6fd8806c3d3508a4becf595c03883"
+        node_id: "46defe92231e14868c05df53d23f02719a07821c02b8b86c5ea50164e5d3d698"
+      - source_path: 09-storm-report-2023.md
+        quote: "A replacement buoy, MS-7, was deployed on 2023-08-18 to restore coverage."
+        quote_hash: "sha256:bedc8058f6c37306100f12cdd50f6f29158618eb545214ee2d5601eacc3d1b1d"
+        node_id: "46defe92231e14868c05df53d23f02719a07821c02b8b86c5ea50164e5d3d698"
+    distractors:
+      - source_path: 03-buoys.md
+        quote: "| MS-2 | 2019-09-01 | decommissioned 2023-08-18 | 15 minutes |"
+    negative_control: false
+
+  # -- multi_hop (each draws from >= 2 files) ---------------------------------
+  - id: mh_grant_funded_replacement
+    category: multi_hop
+    tier: T3
+    question: "Which grant funded the buoy that replaced the one lost in the 2023 storm?"
+    expected_answer: "The Mariner Resilience Grant funded MS-7, which replaced MS-2 (lost in the 2023-08-18 storm)."
+    must_contain: ["Mariner Resilience Grant", "MS-7"]
+    gold_targets:
+      - source_path: 09-storm-report-2023.md
+        quote: "A replacement buoy, MS-7, was deployed on 2023-08-18 to restore coverage. MS-7\nsamples every 5 minutes"
+        quote_hash: "sha256:9d2089c2474c1e14e4041a391cc5ee1f3f85c32e83e25668ec20b939bb23b7db"
+        node_id: "46defe92231e14868c05df53d23f02719a07821c02b8b86c5ea50164e5d3d698"
+      - source_path: 06-grants.md
+        quote: "The Mariner Resilience Grant directly funded the deployment of replacement buoy\nMS-7."
+        quote_hash: "sha256:3b163cc98f196028c1e245ca30e3e429c1d5a26ccc03342e30cb71f4f4ad7ff3"
+        node_id: "012d974f58c7e05cb6668c1d4452be2c59bd0ee1851c5a22cbe26a01e8137c89"
+    distractors:
+      - source_path: 06-grants.md
+        quote: "The Verriden Expansion Grant paid for the field office where Rashid Farouk\nserves as vessel liaison."
+    negative_control: false
+
+  - id: mh_schema_authors_roles
+    category: multi_hop
+    tier: T3
+    question: "Who co-authored the original Tidewater Index schema, and what programs do they each lead now?"
+    expected_answer: "Devran Oksuz (buoy operations lead) and Priya Anand (data platform lead) co-authored the original schema."
+    must_contain: ["Devran Oksuz", "Priya Anand"]
+    gold_targets:
+      - source_path: 04-data-platform.md
+        quote: "The original Tidewater Index schema was co-authored by Devran Oksuz and Priya\nAnand."
+        quote_hash: "sha256:ecea26de043a11e26df1f7052dc74cb4810037725a7a89ab0e3db2443c3034c1"
+        node_id: null  # no covering Claim in frozen vault
+      - source_path: 01-people.md
+        quote: "**Priya Anand** - data platform engineer; later platform lead."
+        quote_hash: "sha256:1867f2f5ad6edf35f53c71ae21af79fdca427b147598a69477841602bbd8f82b"
+        node_id: "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3"
+    distractors:
+      - source_path: 13-schema-changelog.md
+        quote: "Schema co-authored by Devran Oksuz and Priya Rao (now Priya Anand)."
+    negative_control: false
+
+  - id: mh_calibrator_reports_to
+    category: multi_hop
+    tier: T3
+    question: "Who calibrates the salinity probes, and who is that person's manager?"
+    expected_answer: "Nadia Belmonte calibrates the probes and reports to the buoy operations lead, Devran Oksuz."
+    must_contain: ["Nadia Belmonte", "Devran Oksuz"]
+    gold_targets:
+      - source_path: 11-calibration-log.md
+        quote: "Nadia Belmonte reports to the buoy operations lead, Devran Oksuz."
+        quote_hash: "sha256:78d4c3219cf75b15a1a665f8fbfee11cda378f7a60ba1bf07f9caef1be1196f2"
+        node_id: "20a98eac48a0f454a34d8a475e40c44b8741cc354d5d85dccbcb5b0d92465ed8"
+      - source_path: 01-people.md
+        quote: "**Devran Oksuz** - buoy operations lead."
+        quote_hash: "sha256:15150ed9d0126dd307457193e809e1798efff4e7afa88b5c4200130039e2f99f"
+        node_id: "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3"
+    distractors:
+      - source_path: 03-buoys.md
+        quote: "The salinity\nprobes are calibrated by Nadia Belmonte every six months."
+    negative_control: false
+
+  # -- negative_control (~3) --------------------------------------------------
+  - id: nc_bodl_v3
+    category: negative_control
+    tier: T2
+    question: "What new permissions does Brackish Open Data Licence v3 add over v2?"
+    expected_answer: "Not in the notes. There is no BODL v3; the current licence is v2. The system should decline rather than invent a v3."
+    must_contain: []
+    gold_targets: []
+    distractors:
+      - source_path: 05-licence.md
+        quote: "The current licence covering the Tidewater Index is BODL v2. There is no BODL v3."
+    negative_control: true
+
+  - id: nc_third_director
+    category: negative_control
+    tier: T2
+    question: "Who became the third director of HTC after Greta Sandoval?"
+    expected_answer: "Not in the notes. Greta Sandoval is the current (second) director and there is no recorded third director."
+    must_contain: []
+    gold_targets: []
+    distractors:
+      - source_path: 08-handover-2023.md
+        quote: "There is no further\ndirectorship change after 2023."
+    negative_control: true
+
+  - id: nc_membership_fee
+    category: negative_control
+    tier: T1
+    question: "What is the annual membership fee in credits for HTC?"
+    expected_answer: "Not in the notes. Membership requires no fee - only one tide reading per quarter."
+    must_contain: []
+    gold_targets: []
+    distractors:
+      - source_path: 10-membership.md
+        quote: "Membership does not require a fee."
+    negative_control: true

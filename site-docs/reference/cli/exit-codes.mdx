@@ -1,0 +1,192 @@
+---
+title: "Exit codes and error messages"
+description: "What each exit code means, which are overloaded, and the error strings safe to match in scripts."
+---
+
+<Note>
+Okto Neuron is prerelease (0.3.0). Codes and messages can change between versions. Pin the version you script against.
+</Note>
+
+## How a failure reaches your shell
+
+Every command runs under `OktoNeuronGroup.main`, which classifies the exception before the process exits (`src/okto_neuron/cli/__init__.py:60-93`):
+
+- A `OktoNeuronError` prints `exc.user_message()` to stderr and exits with that class's `EXIT_CODE`.
+- An `AmbiguousVaultNameError` prints `Error: <message>` and exits 2.
+- A Click usage error or an explicit `Exit` propagates to Click, which picks its own status.
+- Anything else prints a traceback to stderr and exits 1.
+
+So the shape of stderr tells you which branch you hit. A line that starts with `ClassName: ` is a typed failure. A Python traceback is an untyped one.
+
+## The stderr line format
+
+`OktoNeuronError.user_message()` builds one line (`src/okto_neuron/errors.py:56-69`):
+
+```text
+<ClassName>: <message>[; file: <abs path>[: line N]][; vault: <abs path>][; cause: <one-line cause>]
+```
+
+`file:` appears only when the error carries a file path, and the `: line N` suffix only when the class also sets `line` (`ConfigParseError` does, `src/okto_neuron/errors.py:136-148`). `vault:` appears only when a vault path was passed. `cause:` appears only when a wrapped exception was passed, collapsed to a single line. Both paths are expanded and resolved to absolute form before printing (`src/okto_neuron/errors.py:13-17`).
+
+Match the class name at the head of the line. It is more specific than the code, because several classes share a code.
+
+## Code table
+
+Each row names the class, its default message and one place it is raised or defined.
+
+| Code | Class | Default message | Source |
+| --- | --- | --- | --- |
+| 0 | (none) | success | (none) |
+| 1 | `OktoNeuronError` (base) | `Okto Neuron operation failed` | `errors.py:34-38` |
+| 2 | `OptionalDependencyError` | `optional feature dependencies are not installed` | `errors.py:72` |
+| 2 | `VaultPathNotADirectory` | `vault path is a file, not a directory` | `errors.py:79` |
+| 2 | `VaultPathNotWritable` | `vault parent directory is not writable` | `errors.py:93` |
+| 2 | `ConfigNotFound` | `configuration file was not found` | `errors.py:122` |
+| 3 | `ConfigParseError` | `configuration file is malformed` | `errors.py:136` |
+| 4 | `ConfigVersionUnsupported` | `configuration version is unsupported` | `errors.py:152` |
+| 5 | `VaultLockHeld` | `ladybug file lock is held` | `errors.py:175` |
+| 11 | `VaultError` and subclasses | `vault operation failed` | `errors.py:193-243` |
+| 17 | (none, `EXIT_ASK_DEGRADED`) | `answer degraded: <synthesis_status> (<reason>)` on stderr | `cli/_client.py` |
+| 130 | `RebuildInterrupted` | `kg rebuild was interrupted` | `errors.py:461` |
+
+Paths are relative to `src/okto_neuron/`. The numbers are labels assigned per class. Do not read an ordering, a severity or a family into them.
+
+### Codes that are declared but not traced
+
+These classes declare `EXIT_CODE` values 6, 7, 8, 9, 10, 14, 15 and 16 in `src/okto_neuron/errors.py`. They have raise sites, but no command has been traced end to end to a shell exit carrying one of those numbers, and a failure raised inside the daemon reaches a client command as `server error <status>` and exit 1 instead. Do not script against these numbers.
+
+The classes are `VaultCorrupted`, `BootstrapPartial`, `IngestError`, `FileNotUnderVaultError`, `RebuildSwapFailed`, `SchemaVersionMismatch`, `EmbeddingDimMismatch`, `RebuildAuditFailed` and `GraphBackendError`. [/help/known-gaps](/help/known-gaps) is the home for their raise sites.
+
+Exit 12 (`QueryError`, `errors.py:299-302`) and exit 13 (`ExportError`, `errors.py:305-308`) are different: neither name appears anywhere under `src/okto_neuron/cli`, so no CLI command can emit them. They are library and server codes. [/help/known-gaps](/help/known-gaps) carries the detail.
+
+`NoVaultSpecified` also declares exit 2 (`errors.py:107`), but nothing constructs it, so it is not a failure you will see.
+
+`FAILURE_TAXONOMY` in `errors.py:479-500` is not the authoritative table. It has fourteen rows, lists `ConfigParseError` twice, includes the unraised `NoVaultSpecified`, and omits `OptionalDependencyError`, `ConfigNotFound`, `VaultError`, `QueryError`, `ExportError`, `EmbeddingDimMismatch` and `GraphBackendError`. The table above is built from the classes themselves.
+
+`GRAPH_LOCK_HELD_MESSAGE` and `GRAPH_WRITE_FAILED_CODE` (`errors.py:503-511`) are REST wire strings, not exit codes.
+
+## Exit 2 identifies nothing on its own
+
+<Warning>
+Exit 2 is the most overloaded code in the CLI. Reaching it tells you a command failed early, not why.
+</Warning>
+
+Exit 2 covers:
+
+- Four typed classes: `OptionalDependencyError`, `VaultPathNotADirectory`, `VaultPathNotWritable`, `ConfigNotFound` (`errors.py:72`, `:79`, `:93`, `:122`).
+- `EXIT_UNREACHABLE = 2`, used when the HTTP client cannot reach the daemon (`src/okto_neuron/cli/_client.py:28`; exits at `cli/__init__.py:2283`, `:2306`, `:2344`, `:3142`).
+- The `AmbiguousVaultNameError` branch (`cli/__init__.py:72-76`).
+- The remote-binding refusal in `serve`, which prints the refusal and raises `Exit(2)` (`cli/__init__.py:2708-2724`).
+- Click's own usage errors, such as an unknown flag.
+
+Branch on the class name or the message, never on the bare 2.
+
+## Exit 1 is not only a crash
+
+Exit 1 is the base `OktoNeuronError.EXIT_CODE` (`errors.py:34`), and several typed classes defined outside `errors.py` inherit it without overriding:
+
+- `LLMProviderError` (`src/okto_neuron/llm/__init__.py:136`)
+- `EmbeddingProviderError` (`src/okto_neuron/embed/__init__.py:33`)
+- `VaultPoolError` (`src/okto_neuron/server/_vault_pool.py:28`)
+- `NoSuchBackendError` (`src/okto_neuron/store/registry.py:43`)
+- `Neo4jWriteExhausted` (`src/okto_neuron/store/neo4j.py:97`)
+- `GrafxWriteExhausted` (`src/okto_neuron/store/grafx.py:132`)
+- `NoSuchIndexBackendError` (`src/okto_neuron/store/index/registry.py:35`)
+- `CompanionError` (`src/okto_neuron/companion/__init__.py:1586`)
+
+A non-2xx HTTP response from the daemon also exits 1 (`cli/__init__.py:2307-2309`, `:2345-2347`).
+
+To tell a typed exit 1 from an untyped one, read stderr: a `ClassName: message` line came through the typed branch, a traceback came through the catch-all (`cli/__init__.py:77-93`).
+
+## Exit 11 groups the whole vault family
+
+`VaultError` sets `EXIT_CODE = 11` and its subclasses inherit it: `VaultNotFoundError`, `VaultLockedError`, `VaultAlreadyExistsError`, `VaultClosedError`, `InvalidVaultConfigError` (`errors.py:193-243`) and `VaultBackendMismatch` (`src/okto_neuron/vault.py:52`). A missing vault, a locked vault and a backend pin mismatch all exit 11. Only the class name separates them.
+
+## EmbeddingDimMismatch names its own remedy
+
+`EmbeddingDimMismatch` builds its message from the two widths and appends the fix (`errors.py:386-416`):
+
+```text
+embedding dimension <configured> does not match the stored graph width <stored>; run `kg reembed` to rebuild vectors at the configured width
+```
+
+The class carries `stored_dim` and `configured_dim`. The embedding column is fixed width, so changing the model or the configured dimension cannot be applied in place. See [/config/embedding-model](/config/embedding-model) and [/vault/rebuilding](/vault/rebuilding).
+
+## Exit 17 means the answer is degraded
+
+Only `okto-neuron ask` exits 17. The request succeeded, but the server marked the answer `degraded`: no LLM is configured for the vault (`no_llm`), the provider failed (`provider_error`), the answer was cut off (`truncated`), the model stopped for another reason (`abnormal_stop`), or the text is empty (`empty`). The command still prints the output first, in either format. Read `retrieval.synthesis_status` in `--format json` output to tell the cases apart. See [/reference/cli/client-commands](/reference/cli/client-commands#degraded-answers-exit-17).
+
+## Exit 130 comes only from rebuild
+
+`RebuildInterrupted` is the only class with code 130, and every instance is built by `_make_rebuild_interrupted` in the rebuild path, which sets the message to `<signal name> during rebuild step <n>` (`src/okto_neuron/cli/kg.py:1921-1931`, called at `:599`). A `Ctrl-C` during any other command is an ordinary `KeyboardInterrupt` and does not travel through this class.
+
+## Messages you can match
+
+One string is declared contract-stable. The comment at `_client.py:22-23` says scripts and humans match on the unreachable template, and the module docstring (`:1-7`) restates it. The non-2xx text `server error <status>: <detail>` is built in `ServerError.__init__` (`_client.py:39-45`) with no stability annotation, so treat it as changeable.
+
+The unreachable template (`_client.py:24-26`), printed to stderr before exit 2:
+
+```text
+no okto-neuron server reachable at {url} — start with `okto-neuron serve`
+```
+
+The non-2xx text (`_client.py:45`, re-emitted at `cli/__init__.py:2308`), printed to stderr before exit 1. Nothing in source declares it stable:
+
+```text
+server error <status>: <detail>
+```
+
+No other message is declared stable. Default messages on the error classes can change; match the class name instead.
+
+## --debug
+
+`--debug` is read by `_debug_requested`, which scans the raw argv tokens for the literal string `--debug` before Click parses anything (`cli/__init__.py:3331-3338`, called at `:66`). Pass it as a bare token, not as part of `--debug=1` or a quoted bundle.
+
+Pass `--debug` before the subcommand: `okto-neuron --debug status`. It is a group-level option (`cli/__init__.py:102` for `okto-neuron`, `:116` for `kg`), so `okto-neuron status --debug` is a Click usage error and exits 2 before the command runs. A few commands, such as `kg init`, also declare their own `--debug` (`:630`).
+
+What it changes (typed branch `cli/__init__.py:77-83`, catch-all `:84-93`, printer `:3341-3347`):
+
+- On a typed error with no `__cause__`, it prints that exception's traceback after the one-line message.
+- On a typed error with a cause, it prints `Chained cause traceback:` and then the cause's traceback.
+- On an untyped error, it sets `chain=True` on the traceback print, so the full chain appears.
+
+It never changes the exit code.
+
+Some commands render a typed failure themselves through `handle_marginalia_error` (`cli/__init__.py:3192-3197`), which prints the same line and exits with the same `EXIT_CODE`.
+
+## Scripting recipe
+
+Branch on zero versus non-zero, and read structured output rather than prose. Many commands accept `--json` (for example `cli/__init__.py:129`, `:144`, `:725`).
+
+```bash
+set -o pipefail
+
+if out=$(okto-neuron status --json 2>err.txt); then
+  printf '%s' "$out" | jq .
+else
+  code=$?
+  case $(head -n1 err.txt) in
+    "no okto-neuron server reachable at"*) echo "daemon is down" ;;
+    EmbeddingDimMismatch:*)                echo "run kg reembed" ;;
+    *)                                     echo "unhandled failure (exit $code)" ;;
+  esac
+  exit "$code"
+fi
+```
+
+Match on the class name at the head of a stderr line, and on success versus failure. Neither is declared stable in source, so pin the version you script against. The numeric code on its own identifies less than it appears to.
+
+<CardGroup cols={2}>
+  <Card title="Thin client" href="/concepts/thin-client">
+    Why client commands need a running daemon and never open the vault themselves.
+  </Card>
+  <Card title="CLI overview" href="/reference/cli/overview">
+    The command surface and the global flags.
+  </Card>
+  <Card title="Client commands" href="/reference/cli/client-commands">
+    The commands that talk to the daemon over HTTP.
+  </Card>
+  <Card title="Runtime troubleshooting" href="/help/troubleshoot-runtime">
+    What to do when a command fails at runtime.
+  </Card>
+</CardGroup>

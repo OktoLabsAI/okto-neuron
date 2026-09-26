@@ -1,0 +1,654 @@
+name: release-artifact-gate
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    env:
+      OKTO_NEURON_NO_OPEN: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Check source installer
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          shellcheck install.sh
+          # The only registration the installer removes is the pre-0.3.0
+          # `marginalia` entry, after `okto-neuron` verified as connected.
+          REMOVALS="$(grep -Ec \
+            '^[[:space:]]*(if[[:space:]]+(![[:space:]]+)?|elif[[:space:]]+|![[:space:]]+)?claude mcp remove' \
+            install.sh || true)"
+          test "$REMOVALS" = 1
+          # shellcheck disable=SC2016  # literal ${LEGACY_CLI}, not an expansion
+          grep -Fq 'if ! claude mcp remove "${LEGACY_CLI}" --scope "${scope}"' install.sh
+          grep -Fq 'claude_mcp_registration_matches' install.sh
+          # shellcheck disable=SC2016  # a literal ${scope}, not an expansion
+          grep -Fq 'claude mcp add --scope "${scope}"' install.sh
+          grep -Fq 'if register_mcp user' install.sh
+
+      - name: Verify installer transaction failure paths
+        run: |
+          set -euo pipefail
+          TEST_ROOT="$(mktemp -d)"
+          LIVE_PID=""
+          cleanup() {
+            if [ -n "$LIVE_PID" ]; then
+              kill "$LIVE_PID" >/dev/null 2>&1 || true
+              wait "$LIVE_PID" 2>/dev/null || true
+            fi
+            rm -rf "$TEST_ROOT"
+          }
+          trap cleanup EXIT
+          awk '/^trap installer_exit EXIT/{exit} {print}' install.sh > "$TEST_ROOT/helpers.sh"
+          # shellcheck source=/dev/null
+          source "$TEST_ROOT/helpers.sh"
+          # State below is consumed by functions loaded from helpers.sh.
+          # shellcheck disable=SC2034
+          {
+            VERIFY_PYTHON="$(command -v python3)"
+            TOOL_ROOT="$TEST_ROOT/tools"
+            TOOL_BIN="$TEST_ROOT/bin"
+            HOME_ROOT="$TEST_ROOT/home/.okto-neuron"
+            DAEMON_RUNTIME_ROOT="$HOME_ROOT/runtime"
+            DAEMON_PID_FILE="$DAEMON_RUNTIME_ROOT/.marginalia/server.pid"
+            DAEMON_TOKEN_FILE="$HOME_ROOT/daemon-7777.token"
+            PREVIOUS_VERSION="old-version"
+            PREVIOUS_COMMAND="$TOOL_BIN/okto-neuron"
+            WAS_RUNNING=1
+            SHUTDOWN_REQUESTED=1
+            ACTIVATION_STARTED=""
+            OLD_PID=99999999
+          }
+          mkdir -p "$TOOL_BIN" "$(dirname "$DAEMON_PID_FILE")"
+          cat > "$TOOL_BIN/okto-neuron" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            serve) : > "$RESTART_MARKER" ;;
+            status) printf '%s\n' '{"marginalia_version":"old-version"}' ;;
+          esac
+          SH
+          chmod +x "$TOOL_BIN/okto-neuron"
+          export RESTART_MARKER="$TEST_ROOT/restarted"
+          set +e
+          (set +e; false; installer_exit) >"$TEST_ROOT/preactivation.out" 2>&1
+          PREACTIVATION_RC=$?
+          set -e
+          test "$PREACTIVATION_RC" -ne 0
+          test -f "$RESTART_MARKER"
+          grep -Fq 'restored and restarted Okto Neuron old-version' \
+            "$TEST_ROOT/preactivation.out"
+
+          # State below is consumed by functions loaded from helpers.sh.
+          # shellcheck disable=SC2034
+          {
+            BACKUP_ROOT="$TOOL_ROOT/.okto-neuron-installer-backup-test"
+            WORK_TMP="$TEST_ROOT/work"
+            PREVIOUS_VERSION="old-version"
+            ACTIVATION_STARTED=1
+            ACTIVATION_COMMITTED=""
+            CANDIDATE_DAEMON_STARTED=1
+            WAS_RUNNING=""
+          }
+          mkdir -p "$TOOL_ROOT/okto-neuron" "$BACKUP_ROOT/tool" \
+            "$BACKUP_ROOT/bin" "$WORK_TMP"
+          printf '%s\n' candidate > "$TOOL_ROOT/okto-neuron/marker"
+          printf '%s\n' previous > "$BACKUP_ROOT/tool/marker"
+          printf '#!/bin/sh\nexit 1\n' > "$TOOL_BIN/okto-neuron"
+          chmod +x "$TOOL_BIN/okto-neuron"
+          sleep 300 &
+          LIVE_PID=$!
+          printf '%s\n' "$LIVE_PID" > "$DAEMON_PID_FILE"
+          port_in_use() { return 1; }
+          mcp_port_in_use() { return 1; }
+          if (installer_exit) >"$TEST_ROOT/rollback.out" 2>&1; then
+            echo "incomplete rollback unexpectedly succeeded" >&2
+            exit 1
+          fi
+          test "$(cat "$TOOL_ROOT/okto-neuron/marker")" = candidate
+          test "$(cat "$BACKUP_ROOT/tool/marker")" = previous
+          grep -Fq 'candidate daemon is still live; refusing to remove its environment' \
+            "$TEST_ROOT/rollback.out"
+          grep -Fq "recovery backup retained at $BACKUP_ROOT" "$TEST_ROOT/rollback.out"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("install.sh").read_text()
+          status = source.index('STATUS_JSON="$(discover_daemon_status)"')
+          armed = source.index('SHUTDOWN_REQUESTED="1"', status)
+          stop = source.index('"${STAGE_CLI}" stop --timeout 30', armed)
+          activation = source.index('ACTIVATION_STARTED="1"', status)
+          assert status < armed < stop < activation
+          PY
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Typecheck and build the shipped web UI
+        run: |
+          set -euo pipefail
+          npm --prefix frontend ci
+          npm --prefix frontend audit --audit-level=moderate
+          npm --prefix frontend run typecheck
+          npm --prefix frontend run build
+          git diff --exit-code -- frontend_dist
+          UNTRACKED="$(git ls-files --others --exclude-standard -- frontend_dist)"
+          if [ -n "$UNTRACKED" ]; then
+            echo "::error::frontend build produced untracked wheel assets"
+            printf '%s\n' "$UNTRACKED"
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Build and inspect the exact wheel
+        env:
+          WHEEL_DIR: ${{ runner.temp }}/okto-neuron-wheel
+        run: |
+          set -euo pipefail
+          uv build --wheel --out-dir "$WHEEL_DIR" --clear
+          WHEEL_COUNT="$(find "$WHEEL_DIR" -maxdepth 1 -type f -name 'okto_neuron-*.whl' | wc -l | tr -d ' ')"
+          test "$WHEEL_COUNT" = 1
+          WHEEL="$(find "$WHEEL_DIR" -maxdepth 1 -name 'okto_neuron-*.whl' -print -quit)"
+          uv run python - "$WHEEL" <<'PY'
+          import email
+          import re
+          import sys
+          import tomllib
+          import zipfile
+          from pathlib import Path
+          from packaging.utils import canonicalize_name, parse_wheel_filename
+
+          wheel = Path(sys.argv[1])
+          expected = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          source = Path("src/okto_neuron/__init__.py").read_text()
+          match = re.search(r'^__version__ = "([^"]+)"$', source, re.MULTILINE)
+          assert match and match.group(1) == expected
+          distribution, wheel_version, _build, _tags = parse_wheel_filename(wheel.name)
+          assert canonicalize_name(distribution) == "okto-neuron"
+          assert str(wheel_version) == expected
+
+          with zipfile.ZipFile(wheel) as archive:
+              assert "okto_neuron/marginalia.config.yaml" not in archive.namelist()
+              metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+              metadata = email.message_from_bytes(archive.read(metadata_name))
+              assert metadata["Version"] == expected
+              index = archive.read("okto_neuron/_webui/index.html").decode()
+              asset = re.search(r'src="/assets/([^"]+\.js)"', index)
+              assert asset, "built UI index has no JavaScript asset"
+              assert f"okto_neuron/_webui/assets/{asset.group(1)}" in archive.namelist()
+          print(f"wheel metadata/UI verified: {wheel.name} ({expected})")
+          PY
+          printf 'WHEEL=%s\n' "$WHEEL" >> "$GITHUB_ENV"
+
+      - name: Verify installer source regressions
+        run: uv run pytest tests/test_public_install_sh.py -q
+
+      - name: Verify the base wheel dependency contract
+        run: |
+          set -euo pipefail
+          OKTO_NEURON_WHEEL="$WHEEL" uv run pytest tests/test_dependency_contract.py -q
+
+      - name: Verify advertised extras and feature imports resolve independently
+        env:
+          EXTRA_ROOT: ${{ runner.temp }}/okto-neuron-extra-venvs
+        run: |
+          set -euo pipefail
+          for spec in \
+            embeddings:fastembed,numpy \
+            ladybug:ladybug \
+            jsonld:rdflib \
+            mcp:okto_neuron.server.http,okto_neuron.server.runtime \
+            serve:okto_neuron.server.http,okto_neuron.server.runtime \
+            litellm:litellm \
+            bedrock:boto3,litellm \
+            sentence-transformers:sentence_transformers
+          do
+            extra="${spec%%:*}"
+            modules="${spec#*:}"
+            venv="$EXTRA_ROOT/$extra"
+            uv venv "$venv" --python 3.12
+            uv pip install --python "$venv/bin/python" "${WHEEL}[$extra]"
+            "$venv/bin/python" - "$modules" <<'PY'
+          import importlib
+          import sys
+
+          for module in sys.argv[1].split(","):
+              importlib.import_module(module)
+          PY
+            printf 'exact wheel extra verified: %s (%s)\n' "$extra" "$modules"
+          done
+
+      - name: Refuse unverified live PID records before activation
+        env:
+          GUARD_HOME: ${{ runner.temp }}/okto-neuron-live-pid-guard-home
+          GUARD_TOOL_DIR: ${{ runner.temp }}/okto-neuron-live-pid-guard-tools
+          GUARD_TOOL_BIN: ${{ runner.temp }}/okto-neuron-live-pid-guard-bin
+          GUARD_PYTHON: ${{ runner.temp }}/okto-neuron-extra-venvs/serve/bin/python
+        run: |
+          set -euo pipefail
+          export HOME="$GUARD_HOME"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          export UV_TOOL_DIR="$GUARD_TOOL_DIR"
+          export UV_TOOL_BIN_DIR="$GUARD_TOOL_BIN"
+          export UV_CACHE_DIR="$HOME/.cache/uv"
+          export OKTO_NEURON_NO_SERVE=1
+          export OKTO_NEURON_NO_MCP=1
+          export OKTO_NEURON_NO_UPDATE_SHELL=1
+          RUNTIME_ROOT="$HOME/.okto-neuron/runtime"
+          PID_FILE="$RUNTIME_ROOT/.marginalia/server.pid"
+          READY_FILE="$HOME/pid-owner.ready"
+          OUTPUT="$HOME/installer.out"
+          mkdir -p "$(dirname "$PID_FILE")" "$UV_TOOL_BIN_DIR"
+          test -x "$GUARD_PYTHON"
+          GUARD_PID=""
+          cleanup_guard() {
+            local pid="${GUARD_PID:-}"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              for _ in $(seq 1 50); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+              done
+              kill -KILL "$pid" 2>/dev/null || true
+            fi
+            if [ -n "$pid" ]; then
+              wait "$pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_guard EXIT
+          rm -f "$READY_FILE" "$PID_FILE"
+
+          "$GUARD_PYTHON" - "$RUNTIME_ROOT" "$READY_FILE" <<'PY' &
+          import os
+          import signal
+          import sys
+          import threading
+          from pathlib import Path
+
+          from okto_neuron.server.lifecycle import PidFile
+
+          root = Path(sys.argv[1])
+          ready = Path(sys.argv[2])
+          stopping = threading.Event()
+
+          def request_stop(_signum: int, _frame: object) -> None:
+              stopping.set()
+
+          signal.signal(signal.SIGTERM, request_stop)
+          signal.signal(signal.SIGINT, request_stop)
+          with PidFile(root):
+              temporary = ready.with_suffix(".tmp")
+              temporary.write_text(f"{os.getpid()}\n", encoding="ascii")
+              os.replace(temporary, ready)
+              stopping.wait()
+          PY
+          GUARD_PID=$!
+
+          for _ in $(seq 1 100); do
+            if [ -s "$READY_FILE" ] && [ -s "$PID_FILE" ]; then break; fi
+            if ! kill -0 "$GUARD_PID" 2>/dev/null; then
+              wait "$GUARD_PID" 2>/dev/null || true
+              echo "exact-wheel lifecycle fixture exited before readiness" >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+          test -s "$READY_FILE"
+          test -s "$PID_FILE"
+          test "$(cat "$READY_FILE")" = "$GUARD_PID"
+
+          validate_guard_record() {
+            "$GUARD_PYTHON" - "$PID_FILE" "$GUARD_PID" <<'PY'
+          import json
+          import string
+          import sys
+          from pathlib import Path
+
+          from okto_neuron.server import lifecycle
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_pid = int(sys.argv[2])
+          assert set(payload) == {"version", "pid", "start_token", "owner_id"}
+          assert payload["version"] == lifecycle.PID_RECORD_VERSION
+          assert payload["pid"] == expected_pid
+          current_token = lifecycle._process_start_token(expected_pid)
+          assert current_token is not None
+          assert payload["start_token"] == current_token
+          owner_id = payload["owner_id"]
+          assert isinstance(owner_id, str) and len(owner_id) == 32
+          assert all(char in string.hexdigits for char in owner_id)
+          PY
+          }
+          validate_guard_record
+          EXPECTED="$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          SHA256="$(sha256sum "$WHEEL" | awk '{print $1}')"
+
+          if OKTO_NEURON_WHEEL="$WHEEL" \
+             OKTO_NEURON_WHEEL_SHA256="$SHA256" \
+             OKTO_NEURON_EXPECTED_VERSION="$EXPECTED" \
+             bash install.sh >"$OUTPUT" 2>&1; then
+            echo "installer replaced the tool despite an unverified live PID record" >&2
+            exit 1
+          fi
+          grep -F "live Okto Neuron daemon (pid $GUARD_PID)" "$OUTPUT"
+          grep -F "okto-neuron stop" "$OUTPUT"
+          kill -0 "$GUARD_PID"
+          validate_guard_record
+          test ! -e "$UV_TOOL_DIR/okto-neuron"
+          kill "$GUARD_PID"
+          wait "$GUARD_PID"
+          GUARD_PID=""
+          test ! -e "$PID_FILE"
+          rm -f "$READY_FILE"
+          trap - EXIT
+          printf 'unverified live app PID guard verified for %s\n' "$RUNTIME_ROOT"
+
+      - name: Enforce warmed runtime footprint ceiling
+        run: |
+          set -euo pipefail
+          OKTO_NEURON_WHEEL="$WHEEL" uv run pytest \
+            tests/footprint/test_install_footprint.py::test_install_footprint_ceiling -q
+
+      - name: Install the exact wheel and verify server version
+        env:
+          TEST_HOME: ${{ runner.temp }}/okto-neuron-wheel-home
+          TEST_VENV: ${{ runner.temp }}/okto-neuron-wheel-venv
+        run: |
+          set -euo pipefail
+          export HOME="$TEST_HOME"
+          export XDG_CONFIG_HOME="$HOME/.config"
+          export XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_CACHE_HOME="$HOME/.cache"
+          mkdir -p "$HOME"
+          uv venv "$TEST_VENV" --python 3.12
+          PYTHON="$TEST_VENV/bin/python"
+          MARGINALIA="$TEST_VENV/bin/okto-neuron"
+          LEGACY_ALIAS="$TEST_VENV/bin/marginalia"
+          KG="$TEST_VENV/bin/kg"
+          uv pip install --python "$PYTHON" \
+            "${WHEEL}[bedrock,jsonld,litellm,sentence-transformers,serve]"
+
+          EXPECTED="$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          "$PYTHON" - "$EXPECTED" <<'PY'
+          import importlib.metadata
+          import sys
+          import okto_neuron
+
+          expected = sys.argv[1]
+          assert importlib.metadata.version("okto-neuron") == expected
+          assert okto_neuron.__version__ == expected
+          PY
+          test "$("$MARGINALIA" --version | head -n 1)" = "okto-neuron $EXPECTED"
+          test "$("$MARGINALIA" --version | sed -n 2p)" = "Okto Neuron by Okto Labs"
+          test "$("$MARGINALIA" version | head -n 1)" = "okto-neuron $EXPECTED"
+          test "$("$LEGACY_ALIAS" --version 2>/dev/null | head -n 1)" = "marginalia $EXPECTED"
+          "$LEGACY_ALIAS" --version 2>&1 >/dev/null | grep -Fq "the 'marginalia' command is now 'okto-neuron'"
+          "$MARGINALIA" --help >/dev/null
+          "$KG" rebuild --help >/dev/null
+          "$MARGINALIA" vault create artifact-gate --use >/dev/null
+          trap '"$MARGINALIA" stop --timeout 10 >/dev/null 2>&1 || true' EXIT
+          "$MARGINALIA" serve --daemon --no-open >/dev/null
+          SERVER_VERSION="$(curl -fsS http://127.0.0.1:7777/version | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["okto_neuron_version"])')"
+          test "$SERVER_VERSION" = "$EXPECTED"
+          "$MARGINALIA" stop --timeout 10 >/dev/null
+          trap - EXIT
+          printf 'exact wheel installed and served version %s\n' "$SERVER_VERSION"
+
+      - name: Run the exact-wheel browser release smoke
+        env:
+          OKTO_NEURON_BROWSER_SMOKE_CLI: ${{ runner.temp }}/okto-neuron-wheel-venv/bin/okto-neuron
+        run: |
+          set -euo pipefail
+          npx --prefix frontend playwright install --with-deps chromium
+          npm --prefix frontend run test:release-browser
+
+  windows-managed-credentials:
+    name: windows-managed-credentials
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Run focused managed-credential tests
+        run: |
+          uv run --frozen --no-default-groups --group dev --group serve `
+            python -m pytest -q -p no:cacheprovider tests/test_onboarding.py `
+            -k "user_env or managed_secret or default_api_key_env"
+          uv run --frozen --no-default-groups --group dev --group serve `
+            python -m pytest -q -p no:cacheprovider tests/test_server_api_v1.py `
+            -k "credential"
+
+      - name: Verify exact-wheel DPAPI round-trip in fresh processes
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wheelDir = Join-Path $env:RUNNER_TEMP "okto-neuron-windows-wheel"
+          $venv = Join-Path $env:RUNNER_TEMP "okto-neuron-windows-wheel-venv"
+          $credentialRoot = Join-Path $env:RUNNER_TEMP "okto-neuron-dpapi-roundtrip"
+          Remove-Item $wheelDir, $venv, $credentialRoot -Recurse -Force `
+            -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $wheelDir, $credentialRoot | Out-Null
+
+          uv build --wheel --out-dir $wheelDir --clear
+          $wheels = @(Get-ChildItem -Path $wheelDir -Filter "okto_neuron-*.whl" -File)
+          if ($wheels.Count -ne 1) {
+            throw "expected exactly one Okto Neuron wheel, found $($wheels.Count)"
+          }
+          $wheel = $wheels[0].FullName
+          uv venv $venv --python 3.12
+          $python = Join-Path $venv "Scripts\python.exe"
+          uv pip install --python $python $wheel
+
+          $env:OKTO_NEURON_ENV_FILE = Join-Path $credentialRoot "env"
+          Remove-Item Env:PYTHONHOME, Env:PYTHONPATH -ErrorAction SilentlyContinue
+          $envName = "OKTO_NEURON_PROVIDER_ARTIFACT_GATE_API_KEY"
+          $secret = "fictional-windows-dpapi-artifact-secret"
+          Remove-Item "Env:$envName" -ErrorAction SilentlyContinue
+          if (Test-Path "Env:$envName") {
+            throw "could not remove the inherited artifact-gate credential"
+          }
+
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & $python -c `
+              "from okto_neuron.onboarding import write_user_env_secret; write_user_env_secret('$envName', '$secret')"
+            if ($LASTEXITCODE -ne 0) {
+              throw "fresh writer process failed"
+            }
+
+            $stored = [IO.File]::ReadAllText($env:OKTO_NEURON_ENV_FILE)
+            if (-not $stored.Contains("$envName=dpapi-v1:")) {
+              throw "exact wheel did not write a DPAPI CurrentUser envelope"
+            }
+            if ($stored.Contains($secret)) {
+              throw "exact wheel persisted the managed credential in plaintext"
+            }
+
+            if (Test-Path "Env:$envName") {
+              throw "writer child unexpectedly changed the parent process environment"
+            }
+            & $python -c `
+              "import os; from okto_neuron.onboarding import load_user_env_file; load_user_env_file(); assert os.environ['$envName'] == '$secret'"
+            if ($LASTEXITCODE -ne 0) {
+              throw "fresh reader process failed to recover the DPAPI credential"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Verify exact-wheel Windows daemon lifecycle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wheelDir = Join-Path $env:RUNNER_TEMP "okto-neuron-windows-daemon-wheel"
+          $venv = Join-Path $env:RUNNER_TEMP "okto-neuron-windows-daemon-venv"
+          $testHome = Join-Path $env:RUNNER_TEMP "okto-neuron-windows-daemon-home"
+          Remove-Item $wheelDir, $venv, $testHome -Recurse -Force `
+            -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $wheelDir, $testHome | Out-Null
+
+          uv build --wheel --out-dir $wheelDir --clear
+          $wheels = @(Get-ChildItem -Path $wheelDir -Filter "okto_neuron-*.whl" -File)
+          if ($wheels.Count -ne 1) {
+            throw "expected exactly one Okto Neuron wheel, found $($wheels.Count)"
+          }
+          uv venv $venv --python 3.12
+          $python = Join-Path $venv "Scripts\python.exe"
+          $marginalia = Join-Path $venv "Scripts\okto-neuron.exe"
+          uv pip install --python $python "$($wheels[0].FullName)[serve]"
+
+          $env:HOME = $testHome
+          $env:USERPROFILE = $testHome
+          $env:APPDATA = Join-Path $testHome "AppData\Roaming"
+          $env:LOCALAPPDATA = Join-Path $testHome "AppData\Local"
+          $env:OKTO_NEURON_NO_MCP = "1"
+          $env:OKTO_NEURON_NO_OPEN = "1"
+          New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+
+          $started = $false
+          $stopped = $false
+          try {
+            & $okto-neuron serve --daemon --no-open
+            $started = $true
+            if ($LASTEXITCODE -ne 0) {
+              throw "exact-wheel Windows daemon failed to start"
+            }
+            $status = (& $okto-neuron status --json --timeout 30 | Out-String) |
+              ConvertFrom-Json
+            if ([int]$status.pid -le 0) {
+              throw "exact-wheel Windows status returned no live PID"
+            }
+            & $okto-neuron stop --timeout 30
+            if ($LASTEXITCODE -ne 0) {
+              throw "exact-wheel Windows daemon failed to stop"
+            }
+            $stopped = $true
+          }
+          finally {
+            if ($started -and -not $stopped) {
+              try { & $okto-neuron stop --timeout 10 2>$null | Out-Null } catch {}
+            }
+            $global:LASTEXITCODE = 0
+          }
+
+  neo4j-backend-gate:
+    # M5 spec §5 Gate 6 (D-15 wall-clock decision): the [neo4j]-extra
+    # contract suite measured ~6.5 minutes on its own (tests/store
+    # tests/curation tests/cli tests/config tests/test_server_http.py
+    # tests/test_server_api_v1.py tests/reconcile tests/server
+    # tests/test_dependency_contract.py against a local neo4j:5-community
+    # container), already over the spec's <= 6 min bar for every-PR
+    # placement in model-free-tests.yml -- so this job lives here instead,
+    # pre-tag only (`refs/tags/v*`), mirroring how `wheel`'s heavier
+    # exact-artifact jobs are gated in this same file. Also runs the
+    # `84_neo4j_backend_selection.sh` acceptance scenario against this same
+    # service container -- the metadata-singleton/UNWIND-key defects that
+    # scenario used to reproduce (`Neo4jStaging.commit`/`restore`'s
+    # metadata-row lookup unscoped by `_generation`, and
+    # `_write_node_batch`/`_write_edge_batch`'s UNWIND rows keying
+    # `row._generation` against Cypher that reads `row.generation`) are
+    # fixed at the root (`store/staging.py`, `store/neo4j.py`); the
+    # `test_neo4j_generation.py` regression cases no longer carry
+    # `xfail(strict=False)`.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    services:
+      neo4j:
+        image: neo4j:5-community
+        env:
+          NEO4J_AUTH: neo4j/testpassword
+        ports:
+          - 7687:7687
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Wait for Neo4j Bolt readiness
+        # No native GHA healthcheck for Bolt (M5 spec §8 OQ6) -- a short
+        # shell polling loop is the whole fix.
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/7687) 2>/dev/null; then
+              exec 3<&- 3>&-
+              echo "neo4j bolt port is accepting connections"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "neo4j bolt port never became ready" >&2
+          exit 1
+
+      - name: Run neo4j-extra contract suite (timed)
+        env:
+          OKTO_NEURON_TEST_NEO4J_URI: "bolt://127.0.0.1:7687"
+          OKTO_NEURON_TEST_NEO4J_CREDENTIAL_ENV: "OKTO_NEURON_TEST_NEO4J_PASSWORD"
+          OKTO_NEURON_TEST_NEO4J_PASSWORD: "testpassword"
+        run: |
+          set -euo pipefail
+          echo "gate6_start=$(date +%s)" >> "$GITHUB_ENV"
+          uv run --extra neo4j python -m pytest \
+            tests/store tests/curation tests/cli tests/config \
+            tests/test_server_http.py tests/test_server_api_v1.py \
+            tests/reconcile tests/server tests/test_dependency_contract.py \
+            -q -p no:cacheprovider
+
+      - name: Record D-15 wall-clock delta
+        if: always()
+        run: |
+          set -euo pipefail
+          start="${gate6_start:-0}"
+          now="$(date +%s)"
+          if [ "$start" != "0" ]; then
+            echo "neo4j contract suite wall-clock: $((now - start))s (D-15 measurement, this run)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run acceptance scenario 84 (neo4j backend selection)
+        env:
+          OKTO_NEURON_ACCEPTANCE_NEO4J_URI: "bolt://127.0.0.1:7687"
+          OKTO_NEURON_ACCEPTANCE_NEO4J_CREDENTIAL_ENV: "OKTO_NEURON_ACCEPTANCE_NEO4J_PASSWORD"
+          OKTO_NEURON_ACCEPTANCE_NEO4J_PASSWORD: "testpassword"
+        run: |
+          set -euo pipefail
+          ./bin/acceptance.sh --backend neo4j 84

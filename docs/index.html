@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Okto Neuron — Docs</title>
+<style>
+:root{--bg:#0b0e14;--panel:#11151f;--panel2:#161b29;--ink:#e6e9f0;--dim:#8b93a7;
+--line:#222a3d;--accent:#7aa2f7;--green:#9ece6a;--amber:#e0af68;--red:#f7768e;
+--purple:#bb9af7;--cyan:#7dcfff;--mono:'SFMono-Regular',ui-monospace,Menlo,Consolas,monospace;}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--ink);line-height:1.65;
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background-image:radial-gradient(900px 600px at 88% -5%,#161d31 0%,transparent 60%),
+radial-gradient(800px 700px at -10% 35%,#141a2b 0%,transparent 55%);}
+code,.mono{font-family:var(--mono)}
+nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:18px;
+padding:14px 28px;border-bottom:1px solid var(--line);background:rgba(11,14,20,.85);backdrop-filter:blur(10px)}
+.logo{font-weight:700;font-size:17px}.logo .dot{color:var(--accent)}
+.sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
+.navlinks{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.navlinks a{text-decoration:none;color:var(--dim);font-size:13px;padding:7px 15px;border-radius:999px;
+border:1px solid var(--line);background:var(--panel);transition:.2s}
+.navlinks a:hover{color:#fff;border-color:var(--accent)}
+.navlinks a.cta{color:#fff;border-color:var(--accent);background:linear-gradient(180deg,#1b2540,#141a2b)}
+.navprog{position:absolute;left:0;bottom:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--purple));width:0}
+
+.wrap{max-width:1040px;margin:0 auto;padding:0 28px}
+.hero{padding:84px 0 30px;text-align:center}
+.hero .emoji{font-size:54px;margin-bottom:14px}
+.hero h1{font-size:44px;font-weight:700;max-width:840px;margin:0 auto 16px;line-height:1.12}
+.hero h1 .hl{color:var(--accent)}
+.hero p{color:var(--dim);font-size:18px;max-width:680px;margin:0 auto}
+.hero p b{color:var(--ink)}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:18px;padding:50px 0}
+@media(max-width:760px){.cards{grid-template-columns:1fr}}
+.card{display:block;text-decoration:none;color:inherit;padding:26px;border-radius:16px;border:1px solid var(--line);
+background:linear-gradient(180deg,var(--panel2),var(--panel));transition:.22s}
+.card:hover{border-color:var(--accent);transform:translateY(-3px);box-shadow:0 14px 40px rgba(0,0,0,.35)}
+.card .ic{font-size:30px}
+.card h3{font-size:19px;margin:12px 0 6px;font-weight:680}
+.card h3 .hl{color:var(--accent)}
+.card p{color:var(--dim);font-size:14px}
+.card .go{margin-top:14px;font-family:var(--mono);font-size:12px;color:var(--accent)}
+.card.wide{grid-column:1 / -1}
+.meta{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;padding-bottom:40px}
+.pill{display:inline-block;padding:5px 13px;border-radius:8px;font-family:var(--mono);font-size:12px;border:1px solid var(--line);background:var(--panel2);color:var(--dim)}
+footer{padding:40px 0 80px;text-align:center;color:var(--dim);font-size:13px;border-top:1px solid var(--line)}
+footer .mono{color:var(--accent)}
+</style></head><body>
+<nav><div><div class="logo">Okto Neuron<span class="dot">.</span></div><div class="sub">documentation hub</div></div><div class="navlinks"><a class="cta" href="roadmap.html">🗺️ Roadmap</a><a class="cta" href="understanding/index.html">🧠 Understanding</a><a class="cta" href="knowledge-base/index.html">📚 Knowledge Base</a><a href="rfc.html">📜 RFC</a><a href="https://github.com/OktoLabsAI/okto-neuron" target="_blank" rel="noopener">GitHub ↗</a></div><div class="navprog" id="navprog"></div></nav>
+<div class="wrap">
+  <div class="hero">
+    <div class="emoji">🪶</div>
+    <h1>Okto Neuron <span class="hl">documentation</span></h1>
+    <p>A standalone, local-first knowledge graph — usable as a Python library, CLI, and MCP server. This is the single entry point to how it's understood and everything it's built on.</p>
+  </div>
+  <div class="cards">
+    <a class="card" href="understanding/index.html">
+      <div class="ic">🧠</div>
+      <h3>Understanding <span class="hl">→</span></h3>
+      <p>The mental model in two tabs — <b>Conceptual</b> (what it is) and <b>Mechanical</b> (how the remember() loop works), verified against the live code.</p>
+      <div class="go">Conceptual · Mechanical</div>
+    </a>
+    <a class="card" href="knowledge-base/index.html">
+      <div class="ic">📚</div>
+      <h3>Knowledge Base <span class="hl">→</span></h3>
+      <p>Every registered durable product doc, plan, research note, subsystem guide, and ADR — rendered inline, grouped by theme, plus curated external references.</p>
+      <div class="go">67 sources · 9 themes · external refs</div>
+    </a>
+    <a class="card" href="roadmap.html">
+      <div class="ic">🗺️</div>
+      <h3>Roadmap <span class="hl">→</span></h3>
+      <p>The high-level view — milestone arc, what we're building <b>now</b>, and what's <b>next</b>. The headline features, not a task tracker.</p>
+      <div class="go">now · next · shipped · later</div>
+    </a>
+    <a class="card wide" href="rfc.html">
+      <div class="ic">📜</div>
+      <h3>RFC — the design bible <span class="hl">→</span></h3>
+      <p>The authoritative design: motivation, the locked 5-primitive schema, and positioning against Basic Memory / Anytype. Everything else serves this document. <b>Rendered, not raw.</b></p>
+      <div class="go">rendered · RFC.md</div>
+    </a>
+  </div>
+  <div class="meta">
+    <span class="pill">local-first</span><span class="pill">5 primitives · closed schema</span>
+    <span class="pill">library · CLI · MCP</span><span class="pill">OktoLabsAI/okto-neuron</span>
+  </div>
+  <footer><div>Built from the design docs + an Explore pass over the live code · verified vs code · 2026-07-13</div>
+  <div class="mono">docs/index.html</div></footer>
+</div>
+</body></html>

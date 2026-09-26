@@ -1,0 +1,124 @@
+---
+title: "What happens when your notes change"
+description: "Why editing a note mints a new claim instead of overwriting one, and the difference between superseded and detached."
+---
+
+Your notes change. You fix a date, drop a tag, delete a paragraph you no longer
+believe. Okto Neuron has to decide what that edit means for everything it already
+recorded about that file. This page explains the rules it follows, so the
+results stop looking arbitrary.
+
+<Note>
+Okto Neuron is prerelease. The behavior here is what the code does today, and
+the details can move between versions.
+</Note>
+
+## Identity comes from content, not from a slot
+
+Okto Neuron does not keep a mutable row per fact that an edit overwrites. It
+gives every piece of the graph an id derived from a SHA-256 hash of what that
+piece says.
+
+A block's id hashes the file path, the block's content hash and its index. A
+claim's id hashes the block's content hash together with its subject, predicate
+and object literal. Both go through the same plain SHA-256 helper.
+
+Two consequences follow from that, and they drive everything else on this page.
+
+First, editing a line changes its content hash, which changes the block id,
+which changes the id of every claim anchored to it. The new text arrives as a
+new claim. The old claim is not overwritten, because nothing addressed it.
+
+Second, re-ingesting a file you did not change is idempotent. Same bytes, same
+hashes, same ids, so the same rows are written again and no duplicate appears.
+
+The document node is the exception, and deliberately so: its id hashes the
+string `"document"` and the resolved path, so a file keeps one stable document
+identity across all of its edits.
+
+See [how a file becomes a graph](/concepts/from-file-to-graph) for the parsing
+step that produces these blocks and claims.
+
+## Superseded: the old statement is now false
+
+A superseded claim is one a later claim replaced. Okto Neuron stamps the old
+claim with the facet `_superseded` set to true plus a `valid_until` date, and
+recall filters it out through `is_superseded()`. The search path applies that
+filter when it assembles results.
+
+Superseded claims are filtered, never deleted. The row stays in the graph with
+its history intact.
+
+Two different code paths mark a claim superseded, and they behave differently.
+
+### The deterministic retirement pass
+
+Every `vault.add()` runs `ingest_document`, and every `ingest_document` ends by
+retiring the document's stale deterministic claims. It looks at exactly three
+predicates: `has_tag`, `has_heading` and `links_to`.
+
+The pass walks the `rdf:subject` edges pointing at this document, and for each
+claim with one of those three predicates and the `deterministic-v1` rule id,
+checks whether the current parse produced it again. A claim that is absent from
+the fresh set gets `_superseded` and today's UTC date as `valid_until`.
+
+The reasoning: once a document no longer carries a tag, heading or wikilink,
+`has_tag: X` is definitively false about it rather than merely unconfirmed. So
+this pass supersedes rather than detaches.
+
+It writes no `supersedes` edge. A pure removal is not a correction, because
+there is no new claim standing in for the old one.
+
+The pass runs unconditionally on every add, independent of the incremental
+ingest flags.
+
+### Corrections through the companion path
+
+The other route is a correction: you changed a fact's value and a new claim
+carries the new value. Here Okto Neuron dates the old claim the same way, and
+also writes a `supersedes` edge from the new claim to the old one so the
+history stays walkable.
+
+That correction path is scoped, not a vault-wide sweep. Candidates are limited
+to claims whose prior source evidence was removed by this exact edit. A
+confirmed correction is applied automatically only when it stays inside the
+document being edited or
+the two claims share a resolved subject id; anything else is returned as a
+deferred cross-document proposal rather than applied.
+
+The pass also handles the case where the incoming claim is the historically
+older assertion. When both claims carry an explicit source timestamp and the
+existing one is newer, Okto Neuron supersedes the incoming claim instead, so the
+newer statement stays live.
+
+## Detached: the source line is gone, the fact might still hold
+
+Detached is a different mechanism with a different outcome. A claim is detached
+when the lines it was anchored to disappeared from the file and nothing
+replaced them.
+
+Okto Neuron stamps that claim with `_detached` plus a `valid_as_of` date and
+leaves it in recall. Deleting a line does not make the fact false, so the knowledge is not erased,
+only marked source-absent.
+
+The pass is careful about what counts as a removal. It skips claims still
+corroborated by a block that is currently present, skips claims whose anchored
+lines survived a re-chunk, narrows to the lines that actually carry the claim's
+object literal, and keeps the claim when any attributed line survived. It only
+handles claims carrying a `model_id`; deterministic claims never reach it,
+because the retirement pass already dealt with them.
+
+So the short version: superseded means Okto Neuron believes the old statement is
+wrong, and hides it. Detached means Okto Neuron lost the evidence but not the
+belief, and keeps it.
+
+## Where you see this
+
+<CardGroup cols={2}>
+  <Card title="Drift" href="/vault/drift">
+    What the vault reports when notes and graph diverge.
+  </Card>
+  <Card title="Rebuilding" href="/vault/rebuilding">
+    Re-ingesting a whole vault, and what stays stable when you do.
+  </Card>
+</CardGroup>

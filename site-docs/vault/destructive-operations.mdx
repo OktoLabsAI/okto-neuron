@@ -1,0 +1,85 @@
+---
+title: "Destructive operations"
+description: "Every Okto Neuron operation that destroys data, what each one takes with it, and which page owns the detail."
+---
+
+This page is an index. Each row states a blast radius in one sentence and points at the page that owns the full behaviour, the flags, the guards and the error codes.
+
+<Warning>
+Nothing in the first table can be undone by an Okto Neuron command. Your own copy of the vault directory, or a snapshot you took yourself, is the only general way back. See [snapshots](/vault/snapshots).
+</Warning>
+
+## User content and whole vaults
+
+| Operation | What it destroys | What survives | Reversible? | Owner page |
+| --- | --- | --- | --- | --- |
+| `okto-neuron init PATH --wipe` | `notes/`, `refs/`, everything under `.marginalia/` and the backend's graph storage, then re-scaffolds an empty vault (`src/okto_neuron/store/vault.py:237-249`) | `okto-neuron.yaml`, so your embedder, packs and LLM settings carry into the empty vault, unless flags on the command line make the wipe drop and re-create it (`src/okto_neuron/store/vault.py:241-248`, `src/okto_neuron/cli/__init__.py:1004-1021`) | No | [Create, reset or wipe a vault](/vault/creating) |
+| `POST /api/v1/reset` | The graph, vault-local derived state and your content in the vault the server has open, then reopens it empty (`src/okto_neuron/server/http.py:4712-4765`) | `okto-neuron.yaml`, because the handler calls the same wipe with `keep_config=True` (`src/okto_neuron/server/http.py:4752`) | No | [HTTP endpoint reference](/reference/http-endpoints) |
+| `DELETE /api/v1/vaults/{vault_id}` | The whole vault directory, removed with `shutil.rmtree`, `okto-neuron.yaml` included (`src/okto_neuron/server/http.py:1547`) | Nothing inside the directory. The default-vault setting is cleared before the removal and restored only if the removal fails (`src/okto_neuron/server/http.py:1536-1553`) | No | [HTTP endpoint reference](/reference/http-endpoints) |
+
+`kg init` has no `--wipe` option. The flag belongs to the top-level `okto-neuron init` command only (`src/okto_neuron/cli/__init__.py:930-935`, `src/okto_neuron/cli/__init__.py:594-640`).
+
+Both HTTP routes are loopback-only and the delete needs a name confirmation in its body; the status codes and guards are on [the HTTP endpoint reference](/reference/http-endpoints).
+
+## Graph swaps
+
+These replace the live graph. Your markdown is untouched, so a full re-derivation from `notes/` stays available.
+
+| Operation | What it destroys | What survives | Reversible? | Owner page |
+| --- | --- | --- | --- | --- |
+| `okto-neuron kg rebuild` | The live graph, replaced by one built from markdown at swap time (`src/okto_neuron/cli/kg.py:728-742`) | Markdown. The previous graph is kept as a rollback checkpoint at the `backup_path` recorded in `.marginalia/rebuild.state.json` (`src/okto_neuron/cli/kg.py:2300-2313`, `:766-780`) | Through the checkpoint, while the live generation still matches it | [Rebuilding the graph](/vault/rebuilding) |
+| A rebuild that lands on `post_swap_validation_failed` | The previous live graph is no longer live: the swap landed and the post-swap audit did not pass (`src/okto_neuron/cli/kg.py:745-755`) | The previous graph bytes at `backup_path`. Do not delete that path | Through the checkpoint only | [Rebuilding the graph](/vault/rebuilding#after-a-failed-post-swap-audit) |
+| `okto-neuron kg reembed` | The live graph, replaced by a fresh graph at the configured embedding width with every vector recomputed (`src/okto_neuron/cli/kg.py:1629-1640`) | Markdown, and the previous graph as a `.bak` sibling (`src/okto_neuron/curation/orchestrate.py:598-608`). Re-embed runs the swap tail with no post-swap audit and no generation publish, so it writes no `post_swap_validation_failed` state (`src/okto_neuron/cli/kg.py:1774-1780`) | Only where the backend counts a `.bak` sibling as a rollback candidate (`src/okto_neuron/curation/orchestrate.py:693-760`) | [Rebuilding the graph](/vault/rebuilding) |
+| `okto-neuron kg reconcile heal` | The live graph, replaced by a copy with variant nodes collapsed onto their canonicals (`src/okto_neuron/reconcile/heal.py:44`) | Markdown, the authority records that describe the applied merges, and the previous graph as a `.bak` sibling (`src/okto_neuron/curation/orchestrate.py:500-511`) | Only where the backend counts a `.bak` sibling as a rollback candidate (`src/okto_neuron/curation/orchestrate.py:693-760`) | [kg reconcile](/reference/cli/kg-reconcile) |
+| `POST /api/v1/curation/rollback` | The current graph generation, replaced by the checkpoint the live generation selects (`src/okto_neuron/server/_curation.py:2095-2105`) | The markdown, and the checkpoint's own graph | It is itself the reverse move, and it is refused when no verified checkpoint matches | [Rebuilding the graph](/vault/rebuilding#after-a-failed-post-swap-audit) |
+
+What counts as a rollback candidate differs by backend: on Ladybug it is the current generation's rebuild-artifact checkpoint, which only a rebuild writes, while on Grafx it is the newest `.bak` or `.rebuild` sibling of the live graph, which a heal or a reembed also leaves (`src/okto_neuron/curation/orchestrate.py:693-760`).
+
+<Warning>
+On Ladybug a rollback checkpoint is keyed to the current graph generation. Running another rebuild, heal or reembed moves the generation on and the old checkpoint stops being a rollback candidate. Decide what to do before you re-run anything. The rule and its source are on [Rebuilding the graph](/vault/rebuilding#after-a-failed-post-swap-audit).
+</Warning>
+
+## Operations that look destructive and are not
+
+| Operation | What it destroys | What survives | Reversible? | Owner page |
+| --- | --- | --- | --- | --- |
+| `okto-neuron kg snapshot load SRC VAULT` into a non-empty path | Nothing. The command prints `error: <path> exists and is not empty` and returns 1 (`src/okto_neuron/cli/kg.py:3278-3280`) | Everything at that path | Not applicable | [Snapshots](/vault/snapshots) |
+| A `kg snapshot load` that fails part way | The target directory, but only when this command is the one that created it. A directory that already existed, empty, is left in place (`src/okto_neuron/cli/kg.py:3281-3284`, `:3312-3313`) | The snapshot at `SRC`, which is read only | Re-run the load | [Snapshots](/vault/snapshots) |
+| `okto-neuron init PATH --wipe` on a path with no `okto-neuron.yaml` | Nothing. The wipe branch is not taken, and the wipe itself refuses a directory that is not a vault (`src/okto_neuron/store/vault.py:213-218`) | Everything at that path | Not applicable | [Create, reset or wipe a vault](/vault/creating) |
+| `okto-neuron watch-folder remove` | Nothing on disk. It sends a `DELETE` for the root and leaves the manifest sidecar in place (`src/okto_neuron/cli/__init__.py:3167-3189`) | The folder, its files and the sidecar | Re-add the root | [Watching folders](/vault/watching) |
+| Re-running `okto-neuron init` on an existing vault | Nothing. An existing `okto-neuron.yaml` sends the call down the reopen path (`src/okto_neuron/vault.py:276-281`) | Notes, config and graph | Not applicable | [Create, reset or wipe a vault](/vault/creating) |
+
+## Before you run any of these
+
+<Steps>
+  <Step title="Stop the server that owns the vault">
+    `init --wipe` refuses while a server process holds the vault, and the graph swap commands run under a cross-process lease that raises while a server is running. Both name the owning pid.
+  </Step>
+  <Step title="Take a snapshot, or copy the directory">
+    A snapshot is the one recovery path that does not depend on a daemon, on the live generation, or on a checkpoint surviving the next rebuild. See [snapshots](/vault/snapshots).
+  </Step>
+  <Step title="Check what the operation keeps">
+    The tables above say what survives. `okto-neuron.yaml` surviving a reset is the difference between an empty usable vault and an unconfigured one.
+  </Step>
+</Steps>
+
+<Note>
+The HTTP surface also registers `DELETE /api/v1/ingest-queue/{item_id}` and `DELETE /api/v1/credentials/{credential_id}`. Both are listed in the [HTTP endpoint reference](/reference/http-endpoints), and the ingest-queue route has no shipped caller, which [known gaps](/help/known-gaps) records.
+</Note>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Create, reset or wipe a vault" href="/vault/creating">
+What `init`, `onboard` and `--wipe` each do to a vault directory.
+</Card>
+<Card title="Rebuilding the graph" href="/vault/rebuilding">
+Rebuild, reembed, reindex, rebuild phases and the rollback path.
+</Card>
+<Card title="Snapshots" href="/vault/snapshots">
+Dump, verify and load a portable copy of a graph.
+</Card>
+<Card title="HTTP endpoint reference" href="/reference/http-endpoints">
+Status codes, guards and bodies for the destructive routes.
+</Card>
+</CardGroup>

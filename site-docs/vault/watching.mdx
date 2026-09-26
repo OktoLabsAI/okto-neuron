@@ -1,0 +1,182 @@
+---
+title: Watch folders for changes
+description: "watch-folder is daemon-driven; watch is not. Two features, confusingly similar names."
+---
+
+<Warning>
+  `okto-neuron watch-folder` and `okto-neuron watch` share a name prefix. Everything else about them differs.
+
+  `watch-folder` manages the roots that the **running daemon** polls. Every subcommand talks to the daemon over HTTP and does nothing on its own.
+
+  `watch` runs the inbox companion **in-process**, against a vault directory on disk, with no server involved.
+
+  They run in different processes and act on different targets. Read the table below before you type either one.
+</Warning>
+
+## Which one you probably want
+
+| You want to | Use |
+| --- | --- |
+| Continuously ingest a project folder as files change | `okto-neuron watch-folder add <path>` |
+| Drain files dropped into a vault's inbox, with no daemon running | `okto-neuron watch <vault-path>` |
+
+<Note>
+  Okto Neuron is prerelease. Command names, flags and output lines can still change between versions.
+</Note>
+
+## Watch a project folder with the daemon
+
+### Register a root
+
+<Steps>
+  <Step title="Start the daemon">
+    All three `watch-folder` subcommands are HTTP clients. They resolve an endpoint and issue a request, so the daemon has to be running. When it is not reachable, the command prints the client error and exits with code 2.
+
+    ```bash
+    okto-neuron serve
+    ```
+  </Step>
+  <Step title="Add the folder">
+    ```bash
+    okto-neuron watch-folder add ~/projects/handbook
+    ```
+
+    The command resolves the path, refuses anything that is not an existing directory with exit code 1, then posts the root to `/api/v1/folder-watch/roots` for the selected vault and prints the registration line.
+
+    ```text
+    registered: /Users/you/projects/handbook
+    ```
+  </Step>
+  <Step title="Let the initial ingest run">
+    Unless you pass `--no-initial-ingest`, `add` follows the registration with a `POST /api/v1/ingest-folder` and reports the counts it got back:
+
+    ```text
+    initial ingest: 42 file(s) queued, 3 already queued (refreshed), 5 non-text skipped
+    ```
+
+    The `refreshed` and `non-text skipped` clauses only appear when those counts are non-zero.
+  </Step>
+</Steps>
+
+If the registration succeeds but the ingest call fails, the root stays registered and the command says so before exiting: `root was registered, but initial ingest failed: ...`.
+
+Pick the vault explicitly with `--vault` when more than one exists and no default is configured. Without a resolvable vault the command exits 2 with `vault not found: ...; pass --vault when multiple vaults exist and no default is configured`.
+
+### See what is registered
+
+```bash
+okto-neuron watch-folder list
+```
+
+`list` reads `/api/v1/config` and prints the vault, the enabled flag, and one indented line per root:
+
+```text
+vault: /Users/you/vaults/work
+folder_watch.enabled: True
+  /Users/you/projects/handbook
+```
+
+With no roots configured it prints `no watched roots configured` instead of the list.
+
+### Stop watching a root
+
+```bash
+okto-neuron watch-folder remove ~/projects/handbook
+```
+
+The command sends `DELETE /api/v1/folder-watch/roots` for the selected vault and prints `removed: <path>`.
+
+Removing a root deliberately leaves the manifest sidecar in place. Nothing deletes the sidecar for you. Remove it yourself if you do not want the stored hashes.
+
+## How the polling loop sees your folder
+
+The `serve` process runs one global polling loop for folder watching. The loop is vault-aware: it iterates every vault that declares `roots`, not just the active one.
+
+Folder watching ships off by default. `folder_watch.enabled` is `False` on a fresh vault, so the loop stays inert until something sets it. Registering a root with `watch-folder add` is one of the things that sets it: the route writes `enabled: true` alongside the new root (`src/okto_neuron/cli/__init__.py:3117`, `src/okto_neuron/server/http.py:5051-5058`). Every knob and its default lives on [/config/vault-yaml](/config/vault-yaml).
+
+### What keeps junk out of the graph
+
+`ignore_dir_globs` is the setting that matters most for a real project folder. Matching is `fnmatch` on each **path component**, and a matching directory is pruned before descent, so its entire subtree is skipped without being stat-walked.
+
+The shipped patterns are what keeps `.git/`, `.state/`, `.remember/` and dependency trees out of the graph entirely. They are listed on [/config/vault-yaml](/config/vault-yaml).
+
+Two related settings sit next to it:
+
+<AccordionGroup>
+  <Accordion title="ignore_globs">
+    File-name patterns for editor temp and swap files, skipped without hashing.
+  </Accordion>
+  <Accordion title="recursive">
+    Whether the walk descends into subdirectories. `add` reads this back from the registration response and passes it to the initial ingest.
+  </Accordion>
+</AccordionGroup>
+
+Roots are stored in each selected vault's `okto-neuron.yaml` under `folder_watch.roots`. You can add them with `watch-folder add` or by editing the file directly.
+
+## Drain a vault inbox without a daemon
+
+`okto-neuron watch` is the other feature. It opens a vault directly and runs the ambient companion over that vault's inbox at `<vault>/.marginalia/incoming`.
+
+```bash
+okto-neuron watch ~/vaults/work
+okto-neuron watch ~/vaults/work --once
+okto-neuron watch ~/vaults/work --poll 15
+```
+
+Every flag and its default is on [/reference/cli/vault-commands](/reference/cli/vault-commands).
+
+With `--once` the command drains the inbox once and prints the count:
+
+```text
+processed 3 file(s)
+```
+
+Without `--once` it announces the inbox it is polling, then prints the same `processed N file(s)` line after any cycle that did work. Ctrl-C prints `stopped`.
+
+```text
+watching /Users/you/vaults/work/.marginalia/incoming (poll 5.0s); ctrl-c to stop
+```
+
+### Failure modes
+
+| Condition | Result |
+| --- | --- |
+| Path missing or not a directory | `vault not found: <path>`, exit 2 |
+| Directory has no `okto-neuron.yaml` | `vault is missing okto-neuron.yaml: <path>`, exit 2 |
+
+### What happens to each file
+
+Only `*.md` files are drained, oldest first by modification time. Other dropped files are left untouched.
+
+Each file is moved into `.marginalia/processed/` **before** the companion reads it, so the committed source path anchors to the file's permanent location. A second drain finds an empty inbox and is a no-op.
+
+The confidence gate inside `remember` decides what lands where: high-confidence candidates auto-commit, and everything else is parked on the review queue. The runner never bypasses that gate.
+
+When a file fails, the outcome depends on why:
+
+<AccordionGroup>
+  <Accordion title="The LLM is unavailable">
+    Treated as retryable. The file is moved back into `incoming/` so the next poll picks it up once the LLM recovers.
+  </Accordion>
+  <Accordion title="Any other Okto Neuron or OS error">
+    The file is relocated to `.marginalia/failed/` so the drain makes forward progress instead of looping on it.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+  `watch` calls `Vault.open` on the directory you name. If a daemon already holds that vault, both processes want the same vault. This combination has not been exercised, so treat it as unsupported: stop the daemon before running `watch` against the same vault.
+</Warning>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Ingest documents" href="/vault/ingesting">
+    One-shot ingestion, and what the inbox drop is an alternative to.
+  </Card>
+  <Card title="Vault command reference" href="/reference/cli/vault-commands">
+    Exhaustive flags for every vault-scoped command.
+  </Card>
+  <Card title="okto-neuron.yaml" href="/config/vault-yaml">
+    Every `folder_watch` key and its default.
+  </Card>
+</CardGroup>

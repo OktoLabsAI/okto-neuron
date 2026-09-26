@@ -1,0 +1,99 @@
+---
+title: okto-neuron.toml reference
+description: The global file that says where vaults live and which one is the default.
+---
+
+<Note>
+Okto Neuron is prerelease. Keys and defaults on this page can change between versions.
+</Note>
+
+`okto-neuron.toml` is the global configuration file. It holds two things you care about: the roots Okto Neuron scans for vaults, and which vault is the default. Per-vault settings live elsewhere; see [/config/overview](/config/overview).
+
+## Where the file is read from
+
+Okto Neuron builds a candidate list and takes the first path that exists:
+
+1. An explicit path passed to the loader as an argument.
+2. The `OKTO_NEURON_CONFIG` environment variable.
+3. `~/.okto-neuron/okto-neuron.toml`.
+
+If none of the candidates exists, no file is loaded and the code defaults below apply. You do not need a `okto-neuron.toml` to run Okto Neuron.
+
+<Note>
+Pointing `OKTO_NEURON_CONFIG` at a file that does not exist is not an error on load. That candidate is skipped, and the search continues to `~/.okto-neuron/okto-neuron.toml`. See [/config/environment-variables](/config/environment-variables).
+</Note>
+
+Each candidate path is expanded (`~`) and resolved without requiring the target to exist.
+
+## Keys
+
+<ParamField path="marginalia_toml_version" type="integer" default="1">
+  Schema version. Only `1` is supported; any other value raises a version-unsupported error. If the key is missing, Okto Neuron emits a warning once per resolved path and treats the file as version 1.
+</ParamField>
+
+<ParamField path="vault_roots" type="array of paths" default="[~/.okto-neuron/vaults]">
+  Directories scanned for vaults. Every entry is expanded and resolved when the config loads. The first entry is the root under which a vault named on the command line is created, and the fallback path when a name matches no existing vault. Looking a vault up by name searches every configured root (plus `default_vault` and the current directory when those are vaults); when two of them hold a vault with the same name the command fails as ambiguous.
+</ParamField>
+
+<ParamField path="default_vault" type="path">
+  Absent by default. When present it is expanded and resolved on load. It is consulted after `OKTO_NEURON_VAULT` and before the check for "the current directory is itself a vault".
+</ParamField>
+
+<ParamField path="strict_acl" type="boolean" default="false">
+  Parsed into the config model. Nothing in the code consumes it, so setting it changes nothing that has been confirmed.
+</ParamField>
+
+<ParamField path="default_directory_mode" type="integer" default="0o755">
+  Parsed into the config model. Nothing in the code consumes it. Directories created by `ensure_global_layout` are chmodded to `0o700` regardless of this value.
+</ParamField>
+
+Unknown keys are allowed. The model is configured with `extra="allow"`, so a key Okto Neuron does not recognize is kept on the loaded object rather than rejected.
+
+## A complete file
+
+```toml
+marginalia_toml_version = 1
+vault_roots = ["/Users/you/.marginalia/vaults", "/Volumes/work/vaults"]
+default_vault = "/Users/you/.marginalia/vaults/notes"
+```
+
+That is also the shape Okto Neuron writes for you: when it creates the file itself, it writes `marginalia_toml_version = 1`, then `vault_roots`, then `default_vault` if one is known.
+
+## How vault_roots drives discovery
+
+Listing vaults works like this:
+
+1. Each configured root is listed, its direct children sorted case-insensitively by name.
+2. A child counts as a vault when it is a directory containing a `okto-neuron.yaml` file.
+3. `default_vault` and the resolved current path are then added if they are vaults themselves, even when they sit outside every root.
+4. Entries are keyed by resolved path, so duplicates collapse.
+5. The final list is sorted case-insensitively by name.
+
+A root that cannot be listed (it does not exist, or the OS refuses) is skipped silently rather than failing the command.
+
+## What rewrites default_vault
+
+<Warning>
+`vault create` and `vault use` edit `okto-neuron.toml` in place. `vault create` writes the file when it is absent.
+</Warning>
+
+`vault create` sets the new vault as the default unless you pass `--no-use`. `vault use` sets the default to the vault you name. Both go through the same writer:
+
+- If no config file exists yet, Okto Neuron writes a fresh one containing the version, the current `vault_roots`, and the new `default_vault`.
+- If the file exists, the first line whose stripped text starts with `default_vault` is replaced. If there is no such line, the assignment is appended, after adding a trailing newline when the file lacked one.
+
+The rewrite is line-based, not a TOML round-trip. Comments and other keys survive, but a `default_vault` written inside a table section would be matched by that same prefix check.
+
+Clearing the default removes every line starting with `default_vault` from the file. See [/vault/creating](/vault/creating).
+
+## Errors
+
+| Condition | Result |
+| --- | --- |
+| Malformed TOML | A config-parse error naming the file, with the line number when the TOML decoder reports one |
+| File unreadable (OS error) | A config-parse error naming the file, without a line number |
+| A candidate path that cannot even be tested for existence | A config-parse error naming that candidate |
+| Values that fail validation | A config-parse error naming the file |
+| `marginalia_toml_version` not in the supported set | A version-unsupported error naming the file and the value found |
+
+Config-parse errors exit with code `3`; version-unsupported errors exit with code `4`. See [/config/overview](/config/overview).

@@ -1,0 +1,190 @@
+---
+title: Named provider connections
+description: Define a connection once in providers.yaml and point several vaults at it with provider_ref.
+---
+
+<Note>
+Okto Neuron 0.3.0 is a prerelease. File shapes and field names on this page can change between versions.
+</Note>
+
+A named provider connection is a driver, an endpoint, and an optional credential, stored once outside any vault. A vault then names it with `provider_ref` instead of repeating the connection fields in `okto-neuron.yaml`.
+
+## File location
+
+The registry lives at `providers.yaml` inside the Okto Neuron application home, which is `~/.okto-neuron`.
+
+```text
+~/.okto-neuron/providers.yaml
+```
+
+If the file does not exist, the registry loads as an empty document: no credentials, no providers. A read error or invalid YAML raises `could not read provider registry`, and content that fails validation raises `invalid provider registry`.
+
+When Okto Neuron writes the file it creates the parent directory with mode `0700`, writes to a temporary file in the same directory, sets mode `0600`, and replaces the target atomically. Keys are written in declaration order and fields whose value is `None` are omitted.
+
+No `okto-neuron` CLI command reads or writes this registry; nothing under `src/okto_neuron/cli/` references `ProviderRegistry`. The loopback HTTP surface does write it (`/api/v1/credentials` and `/api/v1/providers`, see [HTTP endpoints](/reference/http-endpoints)), and those writes are refused for non-loopback callers. You can also edit the file yourself.
+
+## File shape
+
+```yaml providers.yaml
+version: 1
+credentials:
+  - id: work-openai
+    name: Work OpenAI
+    env_name: OKTO_NEURON_CREDENTIAL_WORK_OPENAI
+    created_at: "2026-01-04T10:12:00+00:00"
+    updated_at: "2026-01-04T10:12:00+00:00"
+providers:
+  - id: work-openai
+    name: Work OpenAI
+    driver: openai
+    api_base: https://api.example.com/v1
+    allow_remote: true
+    credential_id: work-openai
+    parameter_mode: safe
+    request_timeout_s: 120
+    created_at: "2026-01-04T10:12:00+00:00"
+    updated_at: "2026-01-04T10:12:00+00:00"
+```
+
+The top-level document rejects unknown keys, and so do the credential and provider entries.
+
+<ParamField path="version" type="int" default="1">
+Document version.
+</ParamField>
+
+<ParamField path="credentials" type="list" default="[]">
+Named credential records. A record holds only the name of an environment variable, never a secret value.
+</ParamField>
+
+<ParamField path="providers" type="list" default="[]">
+Named provider connections.
+</ParamField>
+
+## Credential records
+
+<ParamField path="id" type="string" required>
+Identifier referenced by a provider's `credential_id`. Must not be blank after stripping whitespace.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+Human-readable label. Must not be blank.
+</ParamField>
+
+<ParamField path="env_name" type="string" required>
+The environment variable that carries the API key. When Okto Neuron creates a record itself it slugifies the name and builds `OKTO_NEURON_CREDENTIAL_<SLUG>` with the slug uppercased and hyphens turned into underscores.
+</ParamField>
+
+<ParamField path="created_at" type="string">
+UTC ISO-8601 timestamp, defaulted on creation.
+</ParamField>
+
+<ParamField path="updated_at" type="string">
+UTC ISO-8601 timestamp, defaulted on creation.
+</ParamField>
+
+A credential cannot be removed while any provider still references it.
+
+## Provider profiles
+
+<ParamField path="id" type="string" required>
+Identifier used as `provider_ref` in a vault config. Must not be blank. Ids must be unique inside the file.
+</ParamField>
+
+<ParamField path="name" type="string" required>
+Human-readable label. Must not be blank.
+</ParamField>
+
+<ParamField path="driver" type="string" required>
+The provider name Okto Neuron passes downstream. It must appear in the LLM provider set, the embedding provider set, or both. A driver in neither set fails validation with `unknown provider driver`. Which set it lands in decides what the profile can be referenced from: see [LLM configuration](/config/llm-reference) and [embedding configuration](/config/embedding-model) for the provider names each side accepts.
+</ParamField>
+
+<ParamField path="api_base" type="string | null" default="null">
+The endpoint URL. `null` means the driver supplies its own. When a profile is created or updated through Okto Neuron's own helpers and the driver is one of the OpenAI `/v1` drivers, the URL is canonicalized to server root plus `/v1` before it is stored. Loading an existing file does not rewrite the value.
+</ParamField>
+
+<ParamField path="allow_remote" type="boolean" default="true">
+Whether a non-loopback `api_base` is permitted for this profile. See the section on remote endpoints below.
+</ParamField>
+
+<ParamField path="credential_id" type="string | null" default="null">
+Id of a credential in the same file. A reference to a missing credential fails validation.
+</ParamField>
+
+<ParamField path="parameter_mode" type='"safe" | "local_extended"' default='"safe"'>
+Which sampler parameters the connection may carry. `local_extended` is restricted, see below.
+</ParamField>
+
+<ParamField path="request_timeout_s" type="float | null" default="null">
+Must be greater than zero when set. `null` means Okto Neuron adds no deadline of its own.
+</ParamField>
+
+<ParamField path="created_at" type="string">
+UTC ISO-8601 timestamp, defaulted on creation.
+</ParamField>
+
+<ParamField path="updated_at" type="string">
+UTC ISO-8601 timestamp, defaulted on creation.
+</ParamField>
+
+### parameter_mode local_extended
+
+`local_extended` exists for direct local inference endpoints that accept raw sampler fields. Validation refuses it in two cases:
+
+- The driver is not one of the direct local inference drivers (`custom`, `custom_openai`, `hosted_vllm`, `llamafile`, `lm_studio`, `ollama`, `ollama_chat`, `oobabooga`, `openai`, `openai_like`, `text-completion-openai`, `triton`, `vllm`). The error is `local_extended is only valid for a direct local inference driver`. Generic proxy drivers are deliberately excluded because they can route to a hosted backend.
+- The profile's `api_base` does not classify as loopback or private, including the case where `api_base` is unset. The error is `local_extended requires a loopback or private provider endpoint`.
+
+## How provider_ref rewrites a config block
+
+`provider_ref` is a field on the vault's `embedding` block and on the `llm` block's `defaults` and per-step overrides. The two sides resolve differently.
+
+<Tabs>
+<Tab title="embedding">
+Resolution loads the registry, checks that the driver's uses include `embedding`, and otherwise raises `provider <id> does not support embeddings`. On success it overwrites four fields on the block:
+
+| Block field | Taken from |
+| --- | --- |
+| `provider` | `driver` |
+| `api_base` | `api_base` (including `null`) |
+| `api_key_env` | the referenced credential's `env_name`, or `null` when `credential_id` is unset |
+| `allow_remote` | `allow_remote` |
+
+The overwrite is unconditional, so a profile with no `api_base` clears an `api_base` you set inline.
+</Tab>
+<Tab title="llm">
+Resolution loads the registry, checks that the driver's uses include `llm`, and otherwise raises `provider <id> does not support LLM calls`. On success it overwrites five fields on the merged connection:
+
+| Merged field | Taken from |
+| --- | --- |
+| `provider` | `driver` |
+| `api_base` | `api_base`, falling back to the merged inline `api_base` when the profile's is `null` |
+| `api_key_env` | the referenced credential's `env_name`, or `null` when `credential_id` is unset |
+| `parameter_mode` | `parameter_mode` |
+| `request_timeout_s` | `request_timeout_s` |
+
+When no `provider_ref` is present, the resolved `parameter_mode` is `auto` instead.
+
+A step whose own `provider` or `api_base` differs from the defaults counts as an endpoint change. If that step does not set its own `provider_ref`, the merged `provider_ref` is dropped, so the step resolves as an inline connection.
+</Tab>
+</Tabs>
+
+## allow_remote defaults to true
+
+`ProviderProfile.allow_remote` defaults to `true`. The inline `embedding.allow_remote` and `llm.allow_remote` fields both default to `false`.
+
+<Warning>
+A `provider_ref` satisfies the non-loopback endpoint gate on its own. The `llm` block validates each resolved `api_base` with `self.allow_remote or provider_ref is not None`, so a reference passes the check whether or not you set `llm.allow_remote`. On the embedding side the profile's `allow_remote` replaces the block's value before the endpoint check runs. Pointing a vault at a named provider can therefore send text to a remote endpoint from a config whose own `allow_remote` still reads `false`.
+</Warning>
+
+To keep a named provider local-only, set `allow_remote: false` on the profile. Validation then refuses any `api_base` that does not classify as loopback, at write time and on every load. Public endpoints must use `https` regardless of `allow_remote`. Related gates are described in [guardrails](/config/guardrails).
+
+## request_timeout_s makes the environment timeout inert
+
+The LLM call path reads `OKTO_NEURON_LLM_REQUEST_TIMEOUT` only when the resolved `request_timeout_s` is `null` **and** the resolved `provider_ref` is `null`. A connection that names a provider never consults it, even when the profile leaves `request_timeout_s` unset. The environment variable remains a compatibility override for inline connections only. See [environment variables](/config/environment-variables).
+
+An invalid or non-positive value of that variable is logged and ignored.
+
+## Changing embedding.provider_ref requires a re-embed
+
+`embedding.provider_ref` is listed in `REEMBED_FIELDS`, alongside `embedding.provider`, `embedding.model` and `embedding.dimension`. Changing it means the stored vectors were produced by a different connection, so a vectors-only re-embed is required before search results are comparable again. The transport-only fields (`api_base`, `api_key_env`, `allow_remote`) are deliberately not in that list and take effect live.
+
+The `llm` block has no equivalent list.

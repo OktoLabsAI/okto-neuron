@@ -1,0 +1,5 @@
+id: self-import
+version: "0.1.0"
+compatRange: ">=0.0.1"
+imports:
+  - self-import

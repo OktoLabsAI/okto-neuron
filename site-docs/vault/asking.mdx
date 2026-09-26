@@ -1,0 +1,169 @@
+---
+title: "Search and answer questions"
+description: "Run query and ask against a vault, read their output, and script them."
+---
+
+You have a vault with content in it and a server running. This page is how you get answers out of it with `okto-neuron query` and `okto-neuron ask`, how to read what they print, and how to wire them into a script.
+
+If you are still unsure which of the two you want, read [/start/query-vs-ask](/start/query-vs-ask) once and come back. This page assumes the choice is made.
+
+<Note>
+Okto Neuron 0.3.0 is prerelease. What follows is what the current code does, not a frozen contract.
+</Note>
+
+## Find the blocks that match
+
+`query` posts your text to the running server and prints the hits it got back.
+
+```bash
+okto-neuron query "retention policy"
+```
+
+It retrieves a fixed number of notes by default; raise or lower that with `--k`, whose default is on [/reference/cli/client-commands](/reference/cli/client-commands):
+
+```bash
+okto-neuron query "retention policy" --k 25
+```
+
+Each hit prints as one line: the score, the document id, the path, and the snippet column.
+
+```text
+ 0.81 doc-1f3a notes/policies/retention.md Retention policy
+```
+
+Read it left to right. The score is what the retriever assigned to that block. The document id is the handle the rest of the system uses for the file. The path tells you which file to open. The snippet column is the node's title, empty when the node has none. When nothing matches, `query` prints `(no hits)` and stops.
+
+If you want the results in a different vault than the one the server picked, pass `--vault` with a vault name or path.
+
+```bash
+okto-neuron query "retention policy" --vault work-notes
+```
+
+## Ask a question and get an answer
+
+`ask` posts your question to the answering endpoint and prints written text, then the citations behind it.
+
+```bash
+okto-neuron ask "what is our retention policy?"
+```
+
+It retrieves more notes than `query` by default, because it gets one pass and no chance to re-query. Override with `--k`, whose default is on [/reference/cli/client-commands](/reference/cli/client-commands):
+
+```bash
+okto-neuron ask "what is our retention policy?" --k 40
+```
+
+The output has two parts. First the answer text. If the response carries no text at all, you get `(no answer)` instead. Then, when there are citations, a blank line, the word `Citations:`, and one indented line per citation. Each citation is the node id of a retrieval seed, not a file path:
+
+```text
+Records are kept for the period set in the policy note.
+
+Citations:
+  - claim:9f2c1a...
+  - claim:41be07...
+```
+
+Each citation line is two spaces, a dash, a space, then the node id. The citations are the retrieval seeds. In a vault that has subgraph retrieval turned on, the answer is grounded in a wider neighbourhood than those seeds alone, and a separate set of evidence ids covers that. See [/concepts/subgraph-answers](/concepts/subgraph-answers).
+
+## Widen the graph neighbourhood with --hops
+
+`ask` takes `--hops`, described in its help text as graph neighbourhood depth 1-5, to raise when an answer needs more connected context.
+
+```bash
+okto-neuron ask "how did the retention rule change?" --hops 3
+```
+
+Two things are worth knowing before you reach for it.
+
+<AccordionGroup>
+<Accordion title="It is only sent when it differs from the default">
+The CLI builds the request with your question and `k`. It attaches a `retrieval_policy` carrying `hops` only when the value you passed is not the default ([/reference/cli/client-commands](/reference/cli/client-commands) carries that value). Passing the default sends the same request as passing nothing.
+</Accordion>
+
+<Accordion title="It only matters when subgraph retrieval is enabled">
+Over MCP the server clamps the value into 1-5. Over the CLI it does not: the REST endpoint validates `hops` as 1-5 and rejects anything outside that range with a 400, which the CLI prints as `server error 400: invalid retrieval_policy.hops: ...` and exits 1. Either way the vault's configured retrieval mode decides whether `hops` does anything. The default block-dump mode ignores it entirely. In subgraph mode the `retrieval` block reports the hops value that was applied. In the default block mode the response carries no `hops` key, so `jq -r '.retrieval.hops'` printing nothing tells you the flag did not apply.
+</Accordion>
+</AccordionGroup>
+
+The CLI takes `--hops` as a plain integer and does not check the range itself, but the server does: anything outside 1-5 comes back as a 400 and the command exits 1.
+
+## Script either one with --format json
+
+Both commands take `--format json`, and they do not print the same shape.
+
+<CodeGroup>
+```bash query
+okto-neuron query "retention policy" --format json
+```
+
+```bash ask
+okto-neuron ask "what is our retention policy?" --format json
+```
+</CodeGroup>
+
+`query --format json` prints just the results array, indented. `ask --format json` prints the whole response body, indented, which includes the answer text, the citations and the `retrieval` block. That difference matters when you pipe into `jq`:
+
+```bash
+okto-neuron query "retention policy" --format json | jq -r '.[].path'
+okto-neuron ask "what is our retention policy?" --format json | jq -r '.text'
+```
+
+`--format` is a plain string option. Anything that is not exactly `json` falls through to the text render, with no error. Spell it carefully in scripts.
+
+## ask needs an LLM, query does not
+
+`query` runs on retrieval. `ask` has to write prose, so it needs an answering model configured for the vault.
+
+If you onboarded with `okto-neuron onboard --disable-llm`, the command wrote `llm.enabled = false` into that vault's config. Choosing the disable action when onboarding a vault that already has LLM config does the same. If you chose skip at the provider prompt instead, onboarding removed any explicit `llm` config and reported the vault as `not_configured`. Neither state answers. Re-run onboarding with `--reconfigure` to set a provider up.
+
+```bash
+okto-neuron onboard --reconfigure
+```
+
+## When the answer comes back empty or thin
+
+An empty `ask` answer does not mean the vault knows nothing. The top-level `status` is `degraded` whenever synthesis did not produce a clean answer, the text output prints an `answer degraded: ...` line to stderr, and the command exits 17 in either format. The Web UI shows a degraded notice with the reason above the answer. The response always carries `retrieval.synthesis_status`, and it tells you which of several very different things happened. Read it before you conclude anything:
+
+```bash
+okto-neuron ask "what is our retention policy?" --format json | jq -r '.retrieval.synthesis_status'
+```
+
+<ResponseField name="ok" type="string">
+Synthesis succeeded.
+</ResponseField>
+
+<ResponseField name="no_llm" type="string">
+The vault has no usable LLM (no model set, or `llm.enabled: false`), so no model was called. The citations are still the retrieval hits. `retrieval.no_llm_reason` says what to set.
+</ResponseField>
+
+<ResponseField name="provider_error" type="string">
+The answering model was unreachable and the answer degraded to empty text. A short summary sits in `retrieval.provider_error`. This is a provider problem, not a vault problem. Fix the provider and retry.
+</ResponseField>
+
+<ResponseField name="truncated" type="string">
+The provider hit the token budget (normalized finish reason `length`), so the text is cut off mid-answer.
+</ResponseField>
+
+<ResponseField name="abnormal_stop" type="string">
+The provider stopped for some other reason that was not a clean stop.
+</ResponseField>
+
+<ResponseField name="empty" type="string">
+The provider replied with nothing.
+</ResponseField>
+
+For `truncated` and `abnormal_stop`, `retrieval.finish_reason` carries the normalized reason, and `retrieval.native_finish_reason` carries the provider's raw value when it was normalized away.
+
+<Warning>
+The field is always present, including on success. A status you never read is a failure you will misdiagnose as an empty vault.
+</Warning>
+
+If neither command reaches the server at all, the CLI prints the transport error to stderr and exits 2. Start there, not at the answer quality. [/help/troubleshoot-runtime](/help/troubleshoot-runtime) walks the rest.
+
+## The same two moves for an agent
+
+An agent talking to Okto Neuron over MCP does not shell out to these commands. It calls the MCP tools instead. `ask` over MCP takes the same question, the same `k` default of 20 and the same `hops`, and returns `status`, `text`, `citations`, `subgraph_evidence_ids` and the `retrieval` block with `synthesis_status` in it. The retrieval-only counterpart is `explore`, which returns structured graph and makes no LLM call, so it has no `synthesis_status` at all. See [/mcp/tools/ask](/mcp/tools/ask).
+
+## Where the flags are written down
+
+This page covers the flags you reach for on the way to an answer. The exhaustive list for `query` and `ask`, with every default, lives in [/reference/cli/client-commands](/reference/cli/client-commands).

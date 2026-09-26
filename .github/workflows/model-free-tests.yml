@@ -1,0 +1,103 @@
+name: model-free-tests
+
+# Fast, LLM-free regression net. Runs the model-free pytest subset on every
+# push/PR so a broken import, contract, or logic regression is caught in CI
+# without needing an explicitly configured live LLM backend or the laptop-only corpora.
+#
+# The marker expression DESELECTS the tests that need a real model, a live
+# judge, long wall-clock, perf timing, install-footprint, or the laptop-only
+# external private corpus:
+#   not slow            — long-running tests
+#   not realmodel       — full quality bar vs the explicitly configured live model
+#   not perf            — performance-regression timing
+#   not footprint       — install-size / disk checks (opt-in)
+#   not acceptance_private_corpus — laptop-only external-corpus gate (never CI)
+#   not acceptance_judge  — ADR 0010 Tier B live-judge band gate (never CI)
+# Everything left runs against StubLLM / InMemory+Ladybug stores and fastembed,
+# so it is deterministic and offline. `CI` + `GITHUB_ACTIONS` (set by Actions)
+# also trip the acceptance conftest laptop-gate for belt-and-suspenders.
+#
+# `--extra ladybug` loads the real LadybugStore tests, `--extra litellm`
+# supplies the provider capability registry exercised by tests/llm, and
+# `--extra grafx` loads the experimental GrafxStore backend's own model-free
+# contract/parity tests (guarded by `pytest.importorskip("okto_grafx")`
+# inside those tests, so nothing here changes for a checkout that lacks the
+# extra). Hypothesis and psutil live in the locked dev group, so collection
+# uses one reproducible environment rather than ad-hoc command-line
+# dependencies.
+#
+# The `acceptance` job runs the complete deterministic, model-free, non-private,
+# no-mock shell suite on every candidate and nightly. Live-model scenario 56 and
+# external private-corpus scenarios 90/91 remain excluded unless explicitly selected.
+#
+# Branch protection is unavailable on the current private-repository plan. Release enforcement
+# therefore waits for both named jobs on the exact recorded source SHA; a red, missing,
+# cancelled, or skipped run blocks publication.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # 07:17 UTC daily — nightly CI-safe acceptance run.
+    - cron: "17 7 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # Model-free subset on every push/PR (not on the nightly schedule).
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Install Go for actionlint
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.25.0"
+          cache: false
+
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+
+      - name: Run Ruff
+        run: uv run ruff check src tests
+
+      - name: Run model-free pytest subset
+        run: |
+          set -euo pipefail
+          uv run --extra ladybug --extra litellm --extra grafx python -m pytest \
+            -m 'not slow and not realmodel and not perf and not footprint and not acceptance_private_corpus and not acceptance_judge' \
+            -q -p no:cacheprovider
+
+  acceptance:
+    # CI-safe synthetic acceptance scenarios — every candidate plus nightly.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Run complete deterministic no-mock acceptance suite
+        run: |
+          set -euo pipefail
+          ./bin/acceptance.sh

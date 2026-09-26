@@ -1,0 +1,158 @@
+name: docs-gate
+
+# Server-side docs checks. A local `git commit --no-verify` cannot suppress this
+# workflow, but branch protection is unavailable on the current private-repo
+# plan. Release enforcement therefore waits for this run on the exact source SHA.
+# Enforces:
+#   1. Generated-docs freshness — regenerate from sources; fail on any diff.
+#   2. Src-needs-docs — any src/okto_neuron/** change must be accompanied by a docs/** change.
+#   3. Durable-source registration, generated local links, and focused semantic invariants.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for diff range)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed files
+        id: diff
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+            # First push / new branch: before is all-zeros — fall back to last commit.
+            # A repository whose first commit is HEAD has no HEAD~1; --verify --quiet
+            # prints nothing then, so BASE falls back to HEAD (an empty diff).
+            if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+              BASE="$(git rev-parse --verify --quiet "$HEAD~1^{commit}" || echo "$HEAD")"
+            fi
+          fi
+          echo "comparing $BASE..$HEAD"
+          export BASE HEAD
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          base = os.environ["BASE"]
+          head = os.environ["HEAD"]
+          changed_raw = subprocess.check_output(
+              ["git", "diff", "--no-renames", "--name-only", "-z", base, head]
+          )
+          changed = [
+              os.fsdecode(path)
+              for path in changed_raw.split(b"\0")
+              if path
+          ]
+
+          version_line = re.compile(br'(?m)^__version__ = "[^"\r\n]+"$')
+
+          def package_init_is_version_only_change():
+              before = subprocess.check_output(
+                  ["git", "show", f"{base}:src/okto_neuron/__init__.py"]
+              )
+              after = subprocess.check_output(
+                  ["git", "show", f"{head}:src/okto_neuron/__init__.py"]
+              )
+              if len(version_line.findall(before)) != 1 or len(version_line.findall(after)) != 1:
+                  return False
+              marker = b'__version__ = "<version>"'
+              return version_line.sub(marker, before) == version_line.sub(marker, after)
+
+          def is_docs_source(path):
+              if path in {
+                  "README.md",
+                  "RFC.md",
+                  "frontend/README.md",
+                  "packaging/README.md",
+                  "docs/understanding/index.html",
+              }:
+                  return True
+              return (
+                  (path.startswith("docs/plans/") and path.endswith(".md"))
+                  or (path.startswith("docs/backends/") and path.endswith(".md"))
+                  or (
+                      path.startswith("docs/")
+                      and path.endswith((".md", ".json", ".py"))
+                  )
+              )
+
+          src_paths = [path for path in changed if path.startswith("src/okto_neuron/")]
+          if src_paths == ["src/okto_neuron/__init__.py"]:
+              try:
+                  if package_init_is_version_only_change():
+                      src_paths = []
+              except subprocess.CalledProcessError:
+                  pass
+
+          docs_changed = any(is_docs_source(path) for path in changed)
+          print("Changed paths (escaped):")
+          for path in changed:
+              print(repr(path))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"src_changed={str(bool(src_paths)).lower()}\n")
+              output.write(f"docs_changed={str(docs_changed).lower()}\n")
+          PY
+
+      - name: 1) Src-needs-docs
+        env:
+          SRC_CHANGED: ${{ steps.diff.outputs.src_changed }}
+          DOCS_CHANGED: ${{ steps.diff.outputs.docs_changed }}
+        run: |
+          set -euo pipefail
+          if [ "$SRC_CHANGED" = true ] && [ "$DOCS_CHANGED" != true ]; then
+            echo "::error::src/okto_neuron/ changed with NO docs/ update. Run /sync-docs and stage the docs into this change."
+            exit 1
+          fi
+          echo "OK: docs accompany the source change (or no source changed)."
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: 2) Generated-docs freshness
+        run: |
+          set -euo pipefail
+          uv run python docs/build_knowledge_base.py
+          GENERATED=(
+            docs/index.html
+            docs/knowledge-base/index.html
+            docs/rfc.html
+            docs/roadmap.html
+          )
+          for path in "${GENERATED[@]}"; do
+            git ls-files --error-unmatch "$path" >/dev/null || {
+              echo "::error::$path must remain tracked"
+              exit 1
+            }
+          done
+          DRIFT="$(git status --porcelain=v1 --untracked-files=all -- "${GENERATED[@]}")"
+          if [ -n "$DRIFT" ]; then
+            echo "::error::Generated docs are STALE — regenerating produced changes. Run 'uv run python docs/build_knowledge_base.py' and commit the result."
+            printf '%s\n' "$DRIFT"
+            exit 1
+          fi
+          echo "OK: generated docs match their sources."
+
+      - name: 3) Documentation semantic integrity
+        run: uv run pytest -q tests/test_docs_integrity.py tests/test_readme_docs_gate.py

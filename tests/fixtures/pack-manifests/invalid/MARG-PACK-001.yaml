@@ -1,0 +1,4 @@
+id: duplicate-key-a
+id: duplicate-key-b
+version: "0.1.0"
+compatRange: ">=0.0.1"

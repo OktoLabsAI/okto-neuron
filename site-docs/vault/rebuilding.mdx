@@ -1,0 +1,304 @@
+---
+title: "Rebuild, re-embed or re-index"
+description: "Three operations that look similar and cost wildly different amounts. Pick the right one."
+---
+
+Okto Neuron derives its graph and its search index from your markdown. When something upstream
+changes, you re-derive the part that actually went stale. Three commands do that, and they are
+not interchangeable.
+
+<Note>
+Okto Neuron is prerelease (version 0.3.0, classified "2 - Pre-Alpha"). Command names, output and
+on-disk state files can change between versions.
+</Note>
+
+## Pick the operation
+
+Start here, then read only the section you need.
+
+| What changed | Run | What it does |
+| --- | --- | --- |
+| Your markdown, or extraction / materialization settings | `okto-neuron kg rebuild` | Re-extracts every source file through the full ingest pipeline into a brand-new graph, then swaps it onto live |
+| `embedding.provider_ref`, `embedding.provider`, `embedding.model` or `embedding.dimension` | `okto-neuron kg reembed` | Replays the existing graph's stored text through the configured embedder at the configured width, no re-extraction |
+| The search index looks stale, or you want to confirm it is current | `okto-neuron kg reindex` | Reads text and vectors straight off the graph into the index, no model calls |
+
+Those four embedding keys are the exact set Okto Neuron treats as requiring a re-embed
+(`VaultConfig.REEMBED_FIELDS`). The transport keys in the same block (`api_base`, `api_key_env`,
+`allow_remote`) change only where the embedder runs, so they take effect without a re-embed. See
+[embedding configuration](/config/embedding-model) for the full block.
+
+`consolidation.type_adjudication_enabled` and `consolidation.relation_curator_enabled` are
+different again: saving them is allowed, but existing sources need a rebuild before the stored
+graph reflects the new policy (`SEMANTIC_REBUILD_FIELDS`).
+
+For why the three cost such different amounts, read
+[graph lifecycle](/concepts/graph-lifecycle). For every flag and argument, read the
+[kg lifecycle reference](/reference/cli/kg-lifecycle).
+
+## What all three have in common
+
+Your markdown is never written. Rebuild treats the vault's markdown (`notes/`, `refs/` and
+`.marginalia/sources/`) as the canonical trust root and the graph as derived, so it reads your
+files and writes a graph.
+
+Rebuild and re-embed each build a fresh graph in a staged location and swap it onto the live path
+once it validates, so partial topology never becomes visible. Re-index is different: it clears the
+index and rewrites `corpus.jsonl` and `meta.json` in place, so an interrupted re-index can leave
+the index incomplete. Re-run it (or run it with `--force`) if one is interrupted.
+
+All three need exclusive ownership of the vault. Stop the server first.
+
+```bash
+okto-neuron stop
+```
+
+`okto-neuron stop` stops the application daemon, not one vault's share of it. If that daemon is
+serving other vaults, they go down too.
+
+## Stop `okto-neuron serve` first
+
+Each of the three refuses to run while a running server holds live handles on the vault.
+
+Re-index prints this exact line on standard error and exits with status 1:
+
+```text
+vault is open by another process; stop serve first
+```
+
+Rebuild and re-embed go through the shared rebuild lock, which refuses with a message naming the
+owning process:
+
+```text
+cannot rebuild while the Okto Neuron server is running for this vault (pid 12345); stop the server first
+```
+
+The operation word in that message is the operation you asked for, so re-embed says
+`cannot reembed ...`.
+
+<Warning>
+Do not work around the lock by killing the daemon mid-write. Stop it with `okto-neuron stop`, which
+waits for drain before escalating.
+</Warning>
+
+## Take a snapshot before a rebuild
+
+A rebuild replaces the live graph. Before you start one, dump a snapshot you can restore from.
+
+<Steps>
+  <Step title="Dump">
+    ```bash
+    okto-neuron kg snapshot dump ~/vault ~/backups/vault-snapshot
+    ```
+    The snapshot directory holds `manifest.json`, `nodes.jsonl`, `edges.jsonl`,
+    `embeddings.jsonl`, `sources/` and `CHECKSUMS.sha256`.
+  </Step>
+  <Step title="Verify it before you trust it">
+    ```bash
+    okto-neuron kg snapshot verify ~/backups/vault-snapshot
+    ```
+    This recomputes every checksum and count in the snapshot and reports problems.
+  </Step>
+  <Step title="Rebuild">
+    ```bash
+    okto-neuron kg rebuild ~/vault
+    ```
+  </Step>
+</Steps>
+
+A snapshot loads into a fresh vault, not over a populated one: `okto-neuron kg snapshot load SRC VAULT`
+targets a fresh vault. See [snapshots](/vault/snapshots).
+
+Rebuild also keeps a rollback copy of the previous graph. Where it lands depends on the vault's
+graph backend: a Ladybug vault gets `previous-graph.lbug` in a per-generation directory under
+`.marginalia/rebuild-artifacts/`, alongside `previous-graph-integrity.json` when an integrity
+sidecar exists; other backends record the backup under their own staging naming. The state file's
+`backup_path` field is the authoritative location. Either way it is a safety net for the swap, not
+a substitute for a snapshot you control.
+
+## Run a rebuild
+
+```bash
+okto-neuron kg rebuild ~/vault
+```
+
+Rebuild re-extracts every source file through the same pipeline live ingest uses, which includes
+model-driven entity and relationship extraction, into a fresh empty graph. It swaps only when the
+build verified.
+
+### Interrupting a rebuild
+
+Rebuild installs its own handlers for `SIGINT` and `SIGTERM` for the duration of the build, and
+restores the previous handlers when the build ends. Pressing Ctrl-C does not kill the process at
+an arbitrary point. The handler records the interrupt, the build raises at its next checkpoint,
+and the live graph is left alone because nothing has been swapped yet.
+
+Progress lives in `.marginalia/rebuild.state.json`. The `phase` field tells you where the run
+stopped:
+
+<AccordionGroup>
+  <Accordion title="in_progress">
+    The build is running or was killed without its handlers getting a turn. The file carries
+    `files_done`, `current_file` and `started_at`.
+  </Accordion>
+  <Accordion title="interrupted">
+    A signal arrived and the build unwound. The file carries `files_done`, `current_file`,
+    `last_file_done`, `started_at` and `interrupted_at`.
+  </Accordion>
+  <Accordion title="staged / validation_failed">
+    The build finished and either cleared its audits (`staged`) or did not (`validation_failed`).
+  </Accordion>
+  <Accordion title="post_swap_validation_failed">
+    The swap landed and the post-swap audit did not pass. The new graph is live and the previous
+    one is kept at the path the state file records as `backup_path`. Do not delete that path. See
+    [after a failed post-swap audit](#after-a-failed-post-swap-audit) for what you can do next.
+  </Accordion>
+  <Accordion title="complete">
+    The swap landed and the post-swap audit passed.
+  </Accordion>
+</AccordionGroup>
+
+An interrupted rebuild leaves your markdown and your live graph as they were. Re-run the command
+when you are ready.
+
+### After a failed post-swap audit
+
+No `okto-neuron` command restores the previous graph. Rollback has no offline CLI owner
+(`src/okto_neuron/curation/orchestrate.py:15-18`), and there is no MCP tool for it either. Two moves
+are open to you.
+
+The first is the daemon. A running server exposes `POST /api/v1/curation/rollback`
+(`src/okto_neuron/server/http.py:7007`). The handler takes no filesystem path: the live graph's
+current generation selects the checkpoint, and the request is refused when the backend has no
+verified checkpoint for that generation. On Ladybug the checkpoint counts as verified only when
+`previous-graph.lbug`, `previous-semantic-materialization.json` and `previous-semantic-policy.json`
+all sit in `.marginalia/rebuild-artifacts/<generation>/`; on Grafx it is the newest
+`graph.grafx.rebuild` or `graph.grafx.bak` directory beside the live graph
+(`src/okto_neuron/curation/orchestrate.py:693-760`). Accepting the request submits a job. Progress
+goes to `.marginalia/rollback.state.json` and the Ladybug restore stages through
+`graph.rollback.lbug` beside the live graph (`src/okto_neuron/server/_curation.py:1905`).
+
+You stopped the server to run the rebuild, so start it again before you can send anything.
+
+<Steps>
+  <Step title="Start the server again">
+    ```bash
+    okto-neuron serve --daemon
+    ```
+    Flags and defaults are in [server commands](/reference/cli/server-commands).
+  </Step>
+  <Step title="Submit the rollback">
+    ```bash
+    curl -X POST http://127.0.0.1:7777/api/v1/curation/rollback \
+      -H 'X-Okto-Neuron-Vault: /absolute/path/to/vault'
+    ```
+    The handler reads no request body, so a bare POST is the whole request. The header names the
+    vault, for the reason given below. The refusals and the response envelope are on
+    [HTTP endpoints](/reference/http-endpoints#post-apiv1curationrollback).
+  </Step>
+  <Step title="Watch it finish">
+    The response says the job was accepted, not that the graph was restored. The work runs in the
+    background. Poll:
+    ```bash
+    curl 'http://127.0.0.1:7777/api/v1/curation/rebuild/status?kind=rollback' \
+      -H 'X-Okto-Neuron-Vault: /absolute/path/to/vault'
+    ```
+    With `kind=rollback` the response's `phase` field carries the contents of
+    `.marginalia/rollback.state.json`, and `last_rollback` carries the job record
+    (`src/okto_neuron/server/http.py:6747-6793`). You can read that state file directly instead.
+  </Step>
+</Steps>
+
+A finished rollback writes `"phase": "complete"` with `"swapped": true`, the restored
+`graph_generation`, the new `sha256`, and `displaced_graph`, which records where the graph you
+rolled back from was kept for incident recovery
+(`src/okto_neuron/server/_curation.py:1866-1868`, `2124-2135`). A failed one writes
+`"phase": "failed"` with an `error` string naming the exception
+(`src/okto_neuron/server/_curation.py:2140-2147`).
+
+The route is vault-scoped. The handler's `get_state()` returns the runtime the middleware bound for
+that request (`src/okto_neuron/server/state.py:788-791`), and it takes the live generation from that
+runtime (`src/okto_neuron/server/http.py:6703-6704`). A request without an `X-Okto-Neuron-Vault` header
+resolves to the daemon's fallback vault, and restoring a checkpoint replaces that vault's live graph. If one daemon is serving several vaults, send the header
+naming the vault whose rebuild failed. See
+[which routes are vault-scoped](/reference/http-endpoints#which-routes-are-vault-scoped).
+
+The runner re-checks two things and raises rather than swapping if either fails. If the live
+generation moved between submission and execution it raises `rollback target changed before
+execution` (`src/okto_neuron/server/_curation.py:1908-1913`). If the vault's effective semantic
+configuration no longer matches the checkpoint's it raises `current semantic configuration does not
+match the rollback checkpoint; restore the prior configuration before restoring its graph
+generation` (`src/okto_neuron/server/_curation.py:1943-1950`). Put the prior configuration back first,
+then resubmit.
+
+The second move is a snapshot you took yourself. It is the one that does not depend on a daemon, on
+the live generation, or on the checkpoint surviving the next rebuild. A snapshot loads into a fresh
+vault, not over the failed one. See [snapshots](/vault/snapshots).
+
+<Warning>
+The checkpoint under `backup_path` is keyed to the current generation. Running another rebuild,
+heal or reembed moves the generation on and the old checkpoint stops being a rollback candidate
+(`src/okto_neuron/curation/orchestrate.py:726-747`). Decide what to do before you re-run anything.
+</Warning>
+
+## Run a re-embed
+
+```bash
+okto-neuron kg reembed ~/vault
+```
+
+Re-embed is vectors only. It reads the live graph, bootstraps a fresh graph at the configured
+width, copies nodes while recomputing their vectors, then copies edges, health-checks the result
+and swaps. It makes no extraction calls. The rebuild path is what re-extracts.
+
+The reason it cannot patch vectors in place is the fixed-width vector column: a model or dimension
+change needs a new graph at the new width. `embedding.dimension` is baked into the graph at
+bootstrap.
+
+Re-embed writes its progress to `.marginalia/reembed.state.json`, with `phase` moving through
+`reading`, `embedding` (carrying `nodes_done` and `nodes_total`), then `complete` (carrying
+`completed_at`, `sha256` and `embedding_dim`) or `failed`.
+
+<Warning>
+Re-embed does not install the rebuild's signal handlers. Interrupting it is not an exercised path.
+</Warning>
+
+## Run a re-index
+
+```bash
+okto-neuron kg reindex ~/vault
+```
+
+Re-index reads each node's stored text and embedding straight off the graph. No model calls, no
+re-embedding.
+
+Without `--force` it is a no-op when the index's generation stamp already matches the graph's
+current content, which is the same staleness check the vault runs on open. In that case you get:
+
+```text
+index up to date (generation <first 12 chars of the stamp>)
+```
+
+The stamp is printed truncated to its first 12 characters.
+
+When it does rebuild the index, it prints one summary line:
+
+```text
+doc_count=<n> embedded_count=<n> elapsed=<seconds>s generation=<first 12 chars>
+```
+
+To rebuild the index even when the stamp matches, add `--force`:
+
+```bash
+okto-neuron kg reindex ~/vault --force
+```
+
+If the store raises while re-indexing, the command prints `error: <message>` on standard error and
+exits 1.
+
+## After any of the three
+
+Start the server again and confirm the vault opens.
+
+```bash
+okto-neuron serve
+```

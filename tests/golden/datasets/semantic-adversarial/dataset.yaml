@@ -1,0 +1,7 @@
+name: semantic-adversarial
+description: >-
+  Privacy-safe fictional corpus for ADR 0040 semantic identity, predicate,
+  direction, literal/topology, grounding, usefulness, and Unicode evaluation.
+
+settings:
+  embedder: configured

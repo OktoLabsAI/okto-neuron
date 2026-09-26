@@ -1,0 +1,22 @@
+id: research
+version: "0.1.0"
+compatRange: ">=0.0.1"
+prefixes:
+  ex: "https://example.test/vocab/"
+types:
+  - name: Paper
+    kind_of: Asset
+    extends:
+      - bibo:Document
+    labels:
+      - scholarly paper
+  - name: Researcher
+    kind_of: Agent
+    extends:
+      - foaf:Person
+edge_types:
+  - name: cites
+    domain: Asset
+    range: Asset
+    extends:
+      - cito:cites

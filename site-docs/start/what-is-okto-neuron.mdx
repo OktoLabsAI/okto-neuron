@@ -1,0 +1,70 @@
+---
+title: "What Okto Neuron is for"
+description: "Why a local graph over your own markdown, before you install anything."
+---
+
+You already have the notes. Meeting write-ups, decision records, half-finished research, a directory of markdown that grew for two years. The answer to the question you are about to ask is in there, split across four files you do not remember the names of.
+
+Grep finds the word. You still have to open each file and work out which one answers the question. The usual fix is to upload the whole directory to a hosted assistant, which means the notes leave your machine. Okto Neuron exists for people who will not do that.
+
+## What you actually get
+
+Two things that live side by side.
+
+The first is a directory of markdown, plus a config file. When you create a vault, Okto Neuron makes the directory, a `notes/` folder, a `refs/` folder, a `.marginalia/` folder and a `okto-neuron.yaml`. The four directories are created owner-only.
+
+The second is a graph derived from those files. Okto Neuron reads your markdown, splits it into blocks, and records what it found as nodes and relationships. You never edit the graph by hand.
+
+The payoff is in what a search result carries. Every hit comes back with a provenance record holding the file path, a byte start, a byte end, and a SHA-256 hash of exactly those bytes. A hit points into your own file, precise to the byte, with a hash you can check against what is on disk right now.
+
+<Note>
+Okto Neuron is version 0.3.0 and pre-alpha. Commands, config keys and output shapes change between releases. See [/start/prerelease-status](/start/prerelease-status) before you build anything on top of it.
+</Note>
+
+## Markdown is the truth, the graph is derived
+
+This is the one idea worth holding onto.
+
+Your markdown files are the source of truth. The graph is a projection of them, and it is disposable. If the graph goes wrong, you throw it away and build it again from the files, which is what `okto-neuron kg rebuild` does.
+
+That direction only runs one way. Nothing Okto Neuron derives edits your notes. You write markdown the way you always did, in whatever editor you like, and the graph catches up.
+
+It also means the byte ranges and hashes in a result mean something. They point at bytes you own and can open, so you can check any answer against the file it came from instead of trusting the tool.
+
+[What a vault is](/concepts/what-is-a-vault) goes into the layout in detail.
+
+## Who this is not for, right now
+
+Stated flatly, so you do not find out later.
+
+- **One person, one machine.** There are no accounts, no roles and no shared vaults.
+- **No cloud, no sync.** Okto Neuron stores and reads everything on your machine. The one thing that can leave is the question and context you send to an LLM provider you configure yourself. See [An LLM provider is optional](#an-llm-provider-is-optional).
+- **No remote access.** The server binds to loopback only and refuses to serve remotely. See [/server/remote-access](/server/remote-access).
+
+That refusal is deliberate. Remote serving is disabled in this release, and the message points you at an SSH tunnel.
+
+## An LLM provider is optional
+
+Two different things are going on, and only one of them needs a model.
+
+Retrieval is local. Text and vectors are read straight off the nodes in your graph, and rebuilding the search index from the graph makes no LLM calls (`okto-neuron kg reindex`). The default embedder runs on your machine through FastEmbed.
+
+Synthesised answers are the part that needs a model. `okto-neuron ask` sends your question to a service endpoint that calls the configured provider and returns generated text plus citations. When the answering model is unreachable, the answer comes back empty with a status saying the provider failed.
+
+You can decline to configure a provider during setup, and Okto Neuron records the vault as having no LLM configured. See [/config/llm-providers](/config/llm-providers). Search still works. Synthesised answers do not, until you come back and configure one.
+
+## Where the next three pages take you
+
+<Steps>
+  <Step title="Install">
+    Get the `okto-neuron` command onto your machine. See [/start/install](/start/install).
+  </Step>
+  <Step title="Create a vault and put notes in it">
+    A directory, a config file, and your markdown. See [/concepts/what-is-a-vault](/concepts/what-is-a-vault).
+  </Step>
+  <Step title="Run the local server and ask one question">
+    A daemon bound to loopback, and one answer with a path and a byte range under it.
+  </Step>
+</Steps>
+
+If that is the shape you want, start at [/start/install](/start/install). If you want the honest list of what is unfinished first, read [/start/prerelease-status](/start/prerelease-status). The [documentation home](/index) has the rest.

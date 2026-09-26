@@ -1,0 +1,316 @@
+---
+title: LLM configuration reference
+description: llm.defaults, the five pipeline steps, the merge rules, and every sampler field.
+---
+
+This page is the exhaustive reference for the `llm:` block of a vault's configuration. It covers every field, its type, its default, its validated range, and the rules that turn `llm.defaults` plus a step override into the settings one call actually uses.
+
+For choosing and wiring up a backend, see [/config/llm-providers](/config/llm-providers). For where the `llm:` block sits inside the vault file, see [/config/vault-yaml](/config/vault-yaml). For named provider connections and `provider_ref`, see [/config/providers-yaml](/config/providers-yaml).
+
+<Note>
+Okto Neuron 0.3.0 is a prerelease. Field names, defaults and validation in this block can change between versions.
+</Note>
+
+## Shape of the block
+
+```yaml
+llm:
+  enabled: true
+  allow_remote: false
+  parallel_capable_models: ["desktop/qwen3.6-35b-10-parallel"]
+  defaults: {}
+  extraction: {}
+  judge: {}
+  curator: {}
+  relation_curator: {}
+  ask: {}
+```
+
+`defaults` is the baseline. `extraction`, `judge`, `curator`, `relation_curator` and `ask` are the five per-step override blocks, one per orchestrator moment. The step names are fixed (`src/okto_neuron/config/_vault.py:647`), and each is its own optional block (`src/okto_neuron/config/_vault.py:1228`).
+
+Every model in this block forbids unknown keys. A typo in a field name is a load error, not a silently ignored line.
+
+## Vault-level fields
+
+<ParamField path="llm.enabled" type="boolean" default="true">
+Master switch for the LLM block (`src/okto_neuron/config/_vault.py:1213`).
+
+Validation of `api_base` values is skipped entirely when this is false: the validator returns before any endpoint check runs (`src/okto_neuron/config/_vault.py:1300-1302`). An endpoint that would normally be refused, for example a non-loopback host without `allow_remote`, sits in the file unflagged while `enabled` is false and is only checked once you turn the block back on.
+</ParamField>
+
+<ParamField path="llm.allow_remote" type="boolean" default="false">
+Opt-in for a non-loopback completion endpoint (`src/okto_neuron/config/_vault.py:1214`).
+
+Loopback endpoints are always allowed. Any resolved `api_base` that is not loopback, whether it comes from `defaults` or from a step, is refused unless this is true (`src/okto_neuron/config/_vault.py:818-833`). Addresses that resolve to unspecified, link-local, multicast or reserved ranges are refused regardless of this flag (`src/okto_neuron/config/_vault.py:882-890`), and a public endpoint must use `https` (`src/okto_neuron/config/_vault.py:834-837`).
+
+This flag widens where the server may POST prompt content. It does not widen who may write config: config writes stay loopback-only at the API layer regardless of this setting (`src/okto_neuron/config/_vault.py:1206-1209`).
+</ParamField>
+
+<ParamField path="llm.parallel_capable_models" type="list of strings" default='["desktop/qwen3.6-35b-10-parallel"]'>
+The aliases declared to serve more than one generation at a time (`src/okto_neuron/config/_vault.py:1224`, default value at `src/okto_neuron/config/_capacity.py:54`).
+
+This is a declaration you make, not something Okto Neuron detects. The LiteLLM Gateway's `/model_group/info` carries mode and supported parameters only, with no verified parallel-slot field, so capacity is declared configuration (`src/okto_neuron/config/_capacity.py:12-18`).
+
+An alias not listed here clamps every in-flight bound to 1. The clamp happens where the value is consumed, never by rewriting stored config, so the file keeps what you wrote and the configured-versus-effective pair stays visible (`src/okto_neuron/config/_capacity.py:22-27`, `src/okto_neuron/config/_capacity.py:94-116`). Alias matching strips whitespace and ignores case (`src/okto_neuron/config/_capacity.py:60-75`).
+
+Curation's fan-out drives both the `curator` and `relation_curator` steps, and it exceeds one only when every step feeding it is parallel-capable (`src/okto_neuron/config/_capacity.py:29-35`, `src/okto_neuron/config/_capacity.py:131-133`). Extraction resolves from the `extraction` step alone (`src/okto_neuron/config/_capacity.py:128-130`). See [/config/throughput](/config/throughput).
+</ParamField>
+
+## llm.defaults: connection fields
+
+These four fields, plus `provider_ref`, are the connection. Every step inherits them unless it sets its own.
+
+<ParamField path="llm.defaults.provider" type="string" default="openai">
+The driver name (`src/okto_neuron/config/_vault.py:978`). Validated against a fixed set of LiteLLM driver names; an unknown value raises with the sorted list of accepted ones (`src/okto_neuron/config/_vault.py:662-670`).
+
+Several spellings are canonicalized before validation (`src/okto_neuron/config/_vault.py:454-463`):
+
+| You write | Stored as |
+| --- | --- |
+| `claude-code` | `claude_cli` |
+| `claude_code` | `claude_cli` |
+| `codex` | `codex_cli` |
+| `openai-compat` | `openai` |
+| `omlx` | `openai` |
+| `local` | `openai` |
+| `pi` | `pi_cli` |
+| `together` | `together_ai` |
+
+The alias is resolved at write time, so the saved file shows the canonical name, not what you typed.
+</ParamField>
+
+<ParamField path="llm.defaults.api_base" type="string" default="http://127.0.0.1:8123/v1">
+The completion base URL (`src/okto_neuron/config/_vault.py:979`).
+
+For drivers whose HTTP contract is the plain OpenAI one under `/v1`, the base is rewritten to the server root plus `/v1` regardless of the form you type, so `http://host:port` and `http://host:port/v1` are the same configuration (`src/okto_neuron/config/_vault.py:686-708`). That set is `custom`, `custom_openai`, `hosted_vllm`, `llamafile`, `lm_studio`, `openai`, `openai_like`, `text-completion-openai` and `vllm` (`src/okto_neuron/providers.py:97-109`). Any other driver, for example Anthropic with `/v1/messages` or Triton with `/v2`, is left exactly as written (`src/okto_neuron/providers.py:95-96`).
+
+Canonicalization runs both at write time and at merge time (`src/okto_neuron/config/_vault.py:1035-1040`, `src/okto_neuron/config/_vault.py:961-968`). A base the resolver cannot parse is returned unchanged and fails later in endpoint validation with its own message (`src/okto_neuron/config/_vault.py:705-708`).
+</ParamField>
+
+<ParamField path="llm.defaults.model" type="string" default="">
+The model alias to call (`src/okto_neuron/config/_vault.py:984`).
+
+The empty default is deliberate. An empty baseline never claims a model the configured endpoint may not serve; onboarding and the Config UI start from model discovery against the chosen endpoint and fall back to manual entry (`src/okto_neuron/config/_vault.py:980-983`).
+</ParamField>
+
+<ParamField path="llm.defaults.api_key_env" type="string | null" default="null">
+The name of the environment variable holding the API key (`src/okto_neuron/config/_vault.py:985`). The value is never stored, only the name.
+
+The name must match `^OKTO_NEURON_[A-Z0-9_]+$` (`src/okto_neuron/config/_vault.py:471`, enforced at `src/okto_neuron/config/_vault.py:673-683`). Without that allowlist a config write could point `api_key_env` at any server environment variable and, combined with `allow_remote` and an attacker-controlled `api_base`, send it out on the next call (`src/okto_neuron/config/_vault.py:465-470`). See [/config/guardrails](/config/guardrails).
+</ParamField>
+
+<ParamField path="llm.defaults.provider_ref" type="string | null" default="null">
+A reference to a named provider connection (`src/okto_neuron/config/_vault.py:977`). When set, resolution loads that profile and overwrites `provider`, `api_base` and `api_key_env` from it, and also carries the profile's `parameter_mode` and `request_timeout_s` (`src/okto_neuron/config/_vault.py:1243-1256`). A profile whose driver does not declare LLM use raises (`src/okto_neuron/config/_vault.py:1250-1251`). With no `provider_ref`, `parameter_mode` resolves to `auto` (`src/okto_neuron/config/_vault.py:1257-1258`).
+
+A `provider_ref` also satisfies the remote-endpoint gate on its own, the same as `allow_remote` (`src/okto_neuron/config/_vault.py:1304-1312`). See [/config/providers-yaml](/config/providers-yaml).
+</ParamField>
+
+## Sampler fields
+
+Every sampler field below exists on both `llm.defaults` and on each of the five steps, with identical types and ranges. All default to `null`, meaning Okto Neuron sends nothing for them and the backend's own default applies.
+
+| Field | Type | Default | Validated range | Source |
+| --- | --- | --- | --- | --- |
+| `max_tokens` | integer | `null` | greater than 0 | `_vault.py:986` |
+| `temperature` | float | `null` | 0.0 to 2.0 | `_vault.py:987` |
+| `top_p` | float | `null` | 0.0 to 1.0 | `_vault.py:988` |
+| `top_k` | integer | `null` | 0 or greater | `_vault.py:989` |
+| `min_p` | float | `null` | 0.0 to 1.0 | `_vault.py:990` |
+| `presence_penalty` | float | `null` | -2.0 to 2.0 | `_vault.py:991` |
+| `enable_thinking` | boolean | `null` | none | `_vault.py:992` |
+| `repeat_penalty` | float | `null` | 0.0 or greater | `_vault.py:1004` |
+| `reasoning_effort` | string | `null` | none | `_vault.py:1005` |
+| `preserve_thinking` | boolean | `null` | none | `_vault.py:1006` |
+
+Paths are relative to `src/okto_neuron/config/`. The step-level copies sit at `src/okto_neuron/config/_vault.py:1056-1068`.
+
+Three of these, `repeat_penalty`, `reasoning_effort` and `preserve_thinking`, have no field of their own on the merged result. They are folded into the generic parameters map at resolution time and read off it by the provider adapter, the same as any other provider-specific sampler (`src/okto_neuron/config/_vault.py:520`, `src/okto_neuron/config/_vault.py:1235-1242`). `repeat_penalty` reaches the wire through the same self-hosted `extra_body` escape hatch as `top_k` and `min_p`; `reasoning_effort` and `preserve_thinking` are written into `extra_body.chat_template_kwargs` alongside `enable_thinking` (`src/okto_neuron/config/_vault.py:999-1002`).
+
+<Note>
+There is no `llm.defaults.parameters` map. The free-form user-writable parameters surface was removed; the merged result still carries a `parameters` dict internally, populated only from those three typed fields and by the non-persisted test-completion probe (`src/okto_neuron/config/_vault.py:516-520`, `src/okto_neuron/config/_vault.py:926-937`).
+</Note>
+
+## sampling_payload
+
+`sampling_payload` is the raw escape hatch for a self-hosted backend. It exists on `llm.defaults` as a dict defaulting to `{}` (`src/okto_neuron/config/_vault.py:1016`) and on each step as a dict defaulting to `null` (`src/okto_neuron/config/_vault.py:1078`).
+
+What it does:
+
+- Its keys are sent untouched instead of the capability-filtered typed-field path, when it is non-empty (`src/okto_neuron/config/_vault.py:938-944`).
+- It is not validated against any sampler schema. Only the reserved-key check below runs.
+- It is inherited and replaced whole. A step that leaves it `null` inherits the default's dict in full. Any concrete dict on a step, including an explicit `{}`, replaces the default's dict outright. There is no per-key merge and no tombstone (`src/okto_neuron/config/_vault.py:1069-1077`).
+
+<Warning>
+Because substitution is wholesale, a step with its own `sampling_payload` can never be changed by editing `llm.defaults.sampling_payload` later. Edit the step.
+</Warning>
+
+Ten keys are refused outright (`src/okto_neuron/config/_vault.py:571-576`, checked at `src/okto_neuron/config/_vault.py:580-596`):
+
+<Tabs>
+<Tab title="Owned by the connection">
+`api_base`, `api_key`, `drop_params`, `messages`, `model`, `timeout`.
+
+These belong to the connection config. Setting one here raises at load time.
+</Tab>
+<Tab title="Owned by the response shape">
+`extra_body`, `n`, `stream`, `tools`.
+
+These control the response shape and belong to Okto Neuron's request handling rather than to sampling. Setting one here raises at load time.
+</Tab>
+</Tabs>
+
+## How a step resolves
+
+A call site does not read `llm.defaults` or a step block directly. It reads the merge of the two.
+
+<Steps>
+<Step title="Per-field substitution">
+For every field on `llm.defaults`, the step's value wins if it is not `null`, otherwise the default's value is used (`src/okto_neuron/config/_vault.py:1280-1283`). This is whole-value substitution per field, which is also exactly the rule `sampling_payload` needs.
+</Step>
+<Step title="Credential drop">
+If the step sets its own `provider` and it differs from the default's, or sets its own `api_base` and it differs from the default's, the endpoint has changed. When the endpoint changed and the step did not set its own `api_key_env`, the inherited key is dropped to `null`; the inherited `provider_ref` is dropped the same way when the step did not set one (`src/okto_neuron/config/_vault.py:1288-1294`).
+
+The reason is stated in the code: credentials are coupled to their endpoint, and inheriting the default key could send it to a different service (`src/okto_neuron/config/_vault.py:1284-1287`).
+</Step>
+<Step title="Provider reference and canonicalization">
+Any `provider_ref` on the merged result is resolved into concrete connection fields, then the base URL is canonicalized against the now-concrete driver (`src/okto_neuron/config/_vault.py:1243-1259`, `src/okto_neuron/config/_vault.py:961-968`).
+</Step>
+</Steps>
+
+<Warning>
+A step that points at a different endpoint and still needs a key must name `api_key_env` itself. Leaving it out does not inherit the default key; it sends the call with no key.
+</Warning>
+
+On load, the merged `api_base` of all five steps is validated, plus the bare defaults, so a setup where every step overrides the base is still fully checked (`src/okto_neuron/config/_vault.py:1298-1313`).
+
+## Fields that are not part of the merge
+
+The merge iterates the fields of `llm.defaults` only. Any field that exists on a step but not on the defaults is dropped by the merge and must be read directly off its step. These are the step-only fields.
+
+### system_prompt
+
+`system_prompt` is a string defaulting to `null`, present on every step (`src/okto_neuron/config/_vault.py:1079`). It is deliberately not part of the merged result: it is read step-level only, falling back to the call site's own code default (`src/okto_neuron/config/_vault.py:899-903`). Read sites include extraction (`src/okto_neuron/companion/__init__.py:2558`), the judge (`src/okto_neuron/predicates/judge.py:230`) and the curators (`src/okto_neuron/curator.py:623`, `src/okto_neuron/curator.py:728`).
+
+`llm.ask` additionally carries `system_prompt_graph`, a string defaulting to `null` that overrides the graph-native system prompt and is consulted only when `enable_subgraph` is true (`src/okto_neuron/config/_vault.py:1158-1161`).
+
+### llm.extraction only
+
+<ParamField path="llm.extraction.mode" type="string | null" default="null">
+One of `baseline`, `enumerate` or `auto`; anything else raises (`src/okto_neuron/config/_vault.py:1112`, validated at `src/okto_neuron/config/_vault.py:1136-1143`).
+
+- `baseline` runs the single-pass extract.
+- `enumerate` enumerates handles over a cached prefix, then describes handles in batches.
+- `auto` runs the baseline single pass and re-runs only the blocks the model truncated (`finish_reason` of `length`) through the enumerate pipeline.
+
+The field default stays `null` so non-extraction steps are unaffected and the explicit values remain selectable. When unset, the effective extraction default is `auto`, resolved at the extraction read site (`src/okto_neuron/config/_vault.py:1101-1110`). This field is read step-direct and is only consulted for the extraction step.
+</ParamField>
+
+<ParamField path="llm.extraction.enumerate_max_handles" type="integer | null" default="null">
+Ceiling on enumerated handles per block, greater than 0 (`src/okto_neuron/config/_vault.py:1116`). Unset falls back to a code constant (`src/okto_neuron/semantic_fingerprint.py:667`).
+</ParamField>
+
+<ParamField path="llm.extraction.enumerate_describe_batch" type="integer | null" default="null">
+Describe-batch size, greater than 0 (`src/okto_neuron/config/_vault.py:1117`). Unset falls back to a code constant (`src/okto_neuron/semantic_fingerprint.py:668`).
+</ParamField>
+
+<ParamField path="llm.extraction.enumerate_max_describe_batches" type="integer | null" default="null">
+Ceiling on describe batches, greater than 0 (`src/okto_neuron/config/_vault.py:1118`). Unset falls back to a code constant (`src/okto_neuron/semantic_fingerprint.py:669-671`). The three caps exist so one pathological block with hundreds of handles cannot stall a whole-vault reingest (`src/okto_neuron/config/_vault.py:1113-1115`).
+</ParamField>
+
+<ParamField path="llm.extraction.samples" type="integer | null" default="null">
+Independent extractor draws per block, greater than 0 (`src/okto_neuron/config/_vault.py:1128`). Candidate sets from the draws are unioned and deduped before curation. `null` means 1, the single-pass extract. This is only meaningful above temperature 0: at temperature 0 the draws are identical and the union is a deliberate no-op (`src/okto_neuron/config/_vault.py:1119-1127`).
+</ParamField>
+
+<ParamField path="llm.extraction.max_concurrent" type="integer | null" default="null">
+Maximum independent chunks with an extractor call in flight, between 1 and 32 (`src/okto_neuron/config/_vault.py:1134`). This is Okto Neuron orchestration policy, not a model parameter, so it is read step-direct and never included in request kwargs; `null` means 1, the sequential path (`src/okto_neuron/config/_vault.py:1129-1133`).
+
+The stored value is clamped at consumption by `parallel_capable_models`, so configured and effective can differ (`src/okto_neuron/config/_capacity.py:128-130`). See [/config/throughput](/config/throughput).
+</ParamField>
+
+### llm.ask only
+
+All of these are read step-direct off the `ask` step, never through the merge, which drops step-only fields (`src/okto_neuron/config/_vault.py:1145-1150`). Every one defaults to `null` in the config schema. The numeric knobs fall back to their code constant only when unset (`null`): the integer and float reads take the first value that is not `None`, so a configured `0` is honoured rather than treated as unset (`src/okto_neuron/companion/__init__.py:1917-1928`, `src/okto_neuron/companion/__init__.py:8122-8125`). Where a code-default fallback is named below, it is the constant in `src/okto_neuron/companion/__init__.py`.
+
+| Field | Type | Range | Code default when unset |
+| --- | --- | --- | --- |
+| `enable_subgraph` | boolean | none | `false` (`companion/__init__.py:1712-1713`) |
+| `max_degree_per_seed` | integer | greater than 0 | `8` (`companion/__init__.py:1714`) |
+| `neighbour_budget_tokens` | integer | greater than 0 | `2000` (`companion/__init__.py:1715`) |
+| `hops` | integer | 1 to 5 | `2` (`companion/__init__.py:1722`) |
+| `coverage_threshold` | float | 0.0 to 1.0 | `0.4` (`companion/__init__.py:1723`) |
+| `render_format` | string | none | `typed_nodes` (`companion/__init__.py:1724`) |
+| `min_claim_confidence` | float | 0.0 to 1.0 | `0.0` (`companion/__init__.py:1823`) |
+| `coverage_threshold_graph` | float | 0.0 to 1.0 | `0.0` (`companion/__init__.py:1708`) |
+| `seed_diversity` | boolean | none | follows `enable_subgraph` (`companion/__init__.py:1961-1972`) |
+| `seed_subject_cap` | integer | greater than 0 | `3` (`query.py:50`) |
+| `seed_entity_min` | integer | 0 or greater | `6` (`query.py:51`) |
+| `seed_rel_min` | integer | 0 or greater | `4` (`query.py:52`) |
+| `seed_scalar_max` | integer | 0 or greater | `10` (`query.py:53`) |
+| `source_block_budget_tokens` | integer | greater than 0 | `6000` (`companion/__init__.py:1841`) |
+
+Field declarations are at `src/okto_neuron/config/_vault.py:1151-1183`. These knobs have no generation semantics and no meaning for the extraction or judge steps (`src/okto_neuron/config/_vault.py:1146-1148`).
+
+Notes on a few of them:
+
+<AccordionGroup>
+<Accordion title="enable_subgraph">
+Off by default so the default ask path stays identical to the block-dump behaviour (`src/okto_neuron/companion/__init__.py:1712-1713`). `system_prompt_graph` and `coverage_threshold_graph` are only consulted when it is on (`src/okto_neuron/config/_vault.py:1159-1160`, `src/okto_neuron/config/_vault.py:1162-1166`).
+</Accordion>
+<Accordion title="coverage_threshold_graph">
+The graph-native density floor. When the subgraph render falls below it, the graph-native path short-circuits to the raw-block fallback. `0.0` disables it, which is the code default (`src/okto_neuron/companion/__init__.py:1700-1708`).
+</Accordion>
+<Accordion title="seed_diversity">
+`null` means the effective default follows `enable_subgraph`: diversified seeds ride the subgraph path only, so default recall is unchanged (`src/okto_neuron/config/_vault.py:1168-1172`, `src/okto_neuron/companion/__init__.py:1961-1972`). The four quota knobs override the seed constants in `src/okto_neuron/query.py`.
+</Accordion>
+<Accordion title="source_block_budget_tokens">
+Token budget for the source-block excerpt blended into a subgraph answer context. On the subgraph path this is always an integer, never unbounded (`src/okto_neuron/companion/__init__.py:1836-1841`). An answer that abstains may retry once with the budget raised by at most a factor of 2 (`src/okto_neuron/companion/__init__.py:1842-1845`).
+</Accordion>
+</AccordionGroup>
+
+## Worked example
+
+```yaml
+llm:
+  enabled: true
+  allow_remote: false
+  defaults:
+    provider: openai
+    api_base: http://127.0.0.1:8123
+    model: my-local-alias
+    temperature: 0.7
+  extraction:
+    max_concurrent: 4
+    mode: auto
+  ask:
+    model: my-smaller-alias
+    hops: 3
+```
+
+What this resolves to:
+
+- `defaults.api_base` is stored as `http://127.0.0.1:8123/v1`, because `openai` is an OpenAI-`/v1` driver (`src/okto_neuron/providers.py:97-109`, `src/okto_neuron/config/_vault.py:686-708`).
+- `extraction` inherits provider, base, model and `temperature: 0.7` (`src/okto_neuron/config/_vault.py:1280-1283`).
+- `extraction.max_concurrent: 4` clamps to 1 unless `my-local-alias` is listed in `parallel_capable_models` (`src/okto_neuron/config/_capacity.py:94-116`).
+- `extraction.mode: auto` is read step-direct, not through the merge (`src/okto_neuron/config/_vault.py:1101-1103`).
+- `ask` keeps the default provider, base and temperature, and uses `my-smaller-alias`. The endpoint did not change, so no credential is dropped (`src/okto_neuron/config/_vault.py:1288-1294`).
+- `ask.hops: 3` is read step-direct (`src/okto_neuron/config/_vault.py:1145-1150`).
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Choosing a provider" href="/config/llm-providers">
+Which backends Okto Neuron can drive and how to wire one up.
+</Card>
+<Card title="The vault file" href="/config/vault-yaml">
+Where the `llm:` block sits and what else lives beside it.
+</Card>
+<Card title="Named provider connections" href="/config/providers-yaml">
+`provider_ref`, driver profiles and credential environment names.
+</Card>
+<Card title="Throughput and concurrency" href="/config/throughput">
+How `parallel_capable_models` clamps the extraction and curation fan-outs.
+</Card>
+<Card title="Guardrails" href="/config/guardrails">
+Endpoint classification, the credential allowlist and what they refuse.
+</Card>
+</CardGroup>

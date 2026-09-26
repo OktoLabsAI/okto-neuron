@@ -1,0 +1,194 @@
+---
+title: "MCP tools: list_vaults and init_vault"
+description: "Discover which vaults a daemon serves, and create a new application-managed one."
+---
+
+Okto Neuron's MCP server exposes two vault-management tools. `list_vaults` tells you what a daemon can reach and which vault your connection is bound to. `init_vault` creates a new application-managed vault under the global vault root.
+
+<Note>
+Okto Neuron is prerelease (version 0.3.0). Tool names, arguments and payload shapes can change.
+</Note>
+
+## list_vaults
+
+Synchronous. Takes no parameters.
+
+### Return shape
+
+<ResponseField name="vaults" type="array">
+  One object per vault the server can reach, sorted by name (case-insensitive).
+</ResponseField>
+
+<ResponseField name="vaults[].name" type="string">
+  The vault name. This is the value you pass as the `vault=` argument to `ask`, `explore` and `remember`, or as the `?vault=` query selector on the MCP connection.
+</ResponseField>
+
+<ResponseField name="vaults[].current" type="boolean">
+  `true` for the vault this connection resolves to.
+</ResponseField>
+
+<ResponseField name="vaults[].backend" type="string">
+  The vault's pinned graph backend, read from its `okto-neuron.yaml`. A vault whose config has no pinned key reports `ladybug`.
+</ResponseField>
+
+```json Example response
+{
+  "vaults": [
+    { "name": "default", "current": true, "backend": "grafx" },
+    { "name": "research", "current": false, "backend": "ladybug" }
+  ]
+}
+```
+
+### No path, no id
+
+The payload carries names only. There is no `path` field and no `id` field. The id is derived from the vault path, so returning either would disclose filesystem layout to any agent that can reach the MCP port. A name is all a caller needs in order to pass `vault=`.
+
+`init_vault` returns an absolute path for the vault it creates. `list_vaults` returns no path.
+
+### What `current` means
+
+`current` marks the vault that *this connection* would read from, not the vault the daemon booted with.
+
+The tool first takes the server-level vault path as a starting point, then re-derives `current` from the connection's own `?vault=` selector and its loopback status. The daemon can run with no vault selected; `current` is still computed from the connection's selector.
+
+So an `ask` or `explore` issued on this connection without an explicit `vault=` argument reads the entry flagged `current`.
+
+See [/mcp/vault-selection](/mcp/vault-selection) for how the selector is resolved.
+
+### Unresolvable selectors still list
+
+On a multi-vault server with no configured default, selector resolution raises `vault_selector_required`. `list_vaults` does not propagate it; it falls back to the server-level vault for `current` and returns the full list.
+
+### Errors
+
+| Code | Message | Cause |
+| --- | --- | --- |
+| `shutting_down` | `shutting_down: server is shutting down` | Raised before any work when the server state is shutting down. It is the only error `list_vaults` raises on its own. |
+
+## init_vault
+
+Async. Creates one application-managed named vault and does **not** select it.
+
+### Parameters
+
+<ParamField body="name" type="string" required>
+  The vault name. It is stripped of surrounding whitespace and must be a valid vault name.
+</ParamField>
+
+<ParamField body="packs" type="string" default="core">
+  A comma-separated pack list. The MCP default is the single pack `core`. The CLI's `init --packs` default differs; see [/vault/creating](/vault/creating). To use that set over MCP, pass it explicitly.
+</ParamField>
+
+<ParamField body="backend" type="string | null" default="null">
+  Pins the vault's graph backend. When omitted or blank, the product default `grafx` is used. The name is resolved through the graph-backend registry before anything is created, so an unregistered name fails early.
+</ParamField>
+
+<ParamField body="storage_uri" type="string | null" default="null">
+  Connection URI for a server-side backend. It reaches vault creation only when you also set `backend` to a value other than `grafx`. With `backend` omitted, the URI is still classified and still subject to the `allow_remote_db` refusal, then discarded: the created vault uses the default backend and no storage URI.
+</ParamField>
+
+<ParamField body="storage_credential_env" type="string | null" default="null">
+  The *name* of the environment variable holding the credential, not the credential itself. Like `storage_uri`, it reaches vault creation only when `backend` is set to a value other than `grafx`.
+</ParamField>
+
+<ParamField body="storage_database" type="string | null" default="null">
+  Database or keyspace name for a server-side backend. It reaches vault creation only when `backend` is set to a value other than `grafx`.
+</ParamField>
+
+<ParamField body="allow_remote_db" type="boolean" default="false">
+  Required to confirm remote storage egress when `storage_uri` does not classify as loopback. The refusal applies whatever `backend` is, but the value itself reaches vault creation only when `backend` is set to a value other than `grafx`.
+</ParamField>
+
+<Warning>
+Nothing validates pack *names*. The parser splits the string on commas, strips each piece and keeps the non-empty ones. It rejects a value that is neither a string nor a list of non-empty strings, and nothing more. A misspelled pack name passes this check.
+
+A `packs` string with no non-empty pieces (`""` or `",,"`) is rejected by the parser with the message `packs must be a comma-separated string or string array`. That rejection is an internal `_BadRequest`, which derives from `Exception` and not from `ValueError`, so `init_vault`'s `except ValueError` does not catch it and no `bad_vault_name` code is attached to it.
+</Warning>
+
+<Note>
+The server-side storage parameters reach vault creation only when `backend` names a backend other than `grafx` (see the parameter notes). This documentation does not claim a verified Neo4j deployment. Treat that path as unverified.
+</Note>
+
+### What it does
+
+<Steps>
+  <Step title="Checks drain and loopback state">
+    A draining server raises `maintenance` (or `shutting_down` if it is also shutting down). A non-loopback caller is refused.
+  </Step>
+  <Step title="Resolves the backend and classifies storage">
+    The backend name is resolved through the registry. A `storage_uri` is classified without DNS resolution, and a non-loopback endpoint without `allow_remote_db=True` is refused here, before creation.
+  </Step>
+  <Step title="Parses packs, ensures the global layout, computes the target path">
+    The vault path is one name component under the first configured vault root, which is `~/.okto-neuron/vaults/<name>` when no vault root is configured. If a vault already exists there, creation stops.
+  </Step>
+  <Step title="Creates the vault under the application mutation lock">
+    Creation runs on a worker thread while the server's config lock is held. The embedding provider is hardcoded to `fastembed`; it is not a parameter of this tool. The new vault's config extends the application defaults.
+  </Step>
+  <Step title="Writes the ownership marker">
+    The vault is marked as managed under the given name. The docstring states this is what makes the vault deletable through the application after exact confirmation.
+  </Step>
+  <Step title="Adopts the vault into the runtime pool">
+    A lightweight runtime is registered for the new path with rehydration, so a follow-up `?vault=<name>` connection finds it already in the pool.
+  </Step>
+</Steps>
+
+### What it does not do
+
+It does not change your connection. Existing browser tabs, request selectors and the configured fallback are all unchanged, per the tool's own docstring. To use the new vault, open a connection with `?vault=<name>` or pass `vault=<name>` on the call.
+
+### Return shape
+
+<ResponseField name="name" type="string">
+  The stripped vault name.
+</ResponseField>
+
+<ResponseField name="path" type="string">
+  The absolute path of the created vault. This field is present only on creation; `list_vaults` never returns a path.
+</ResponseField>
+
+<ResponseField name="hint" type="string">
+  Present only when the new vault has no usable LLM model. The text is: `no LLM model configured: this vault resolved to the built-in defaults with an empty model, so remember() will refuse. Set llm.defaults.model in okto-neuron.yaml to a model the endpoint serves.`
+
+  Creation genuinely succeeded. The hint exists because a vault created from the application defaults inherits provider and API base but an empty model, so its first [`remember`](/mcp/tools/remember) is refused. The hint is omitted when the vault has a usable model, and also when the config cannot be read at all, so absence of a hint is not proof of a working model.
+</ResponseField>
+
+```json Example response
+{
+  "name": "research",
+  "path": "/Users/you/.marginalia/vaults/research",
+  "hint": "no LLM model configured: this vault resolved to the built-in defaults with an empty model, so remember() will refuse. Set llm.defaults.model in okto-neuron.yaml to a model the endpoint serves."
+}
+```
+
+### Errors
+
+Every error is raised as a `RuntimeError` whose message begins with a code.
+
+| Code | Message | Cause |
+| --- | --- | --- |
+| `shutting_down` | `shutting_down: server is shutting down` | The server is draining and shutting down. |
+| `maintenance` | `maintenance: vault maintenance is in progress; writes are paused` | The server is draining but not shutting down. |
+| `forbidden` | `forbidden: vault creation is restricted to loopback callers` | The request did not come from a loopback client. |
+| `bad_request` | `bad_request: <backend resolution error>` | The `backend` name did not resolve in the graph-backend registry. |
+| `bad_request` | `bad_request: <storage URI classification error>` | `storage_uri` could not be classified. |
+| `bad_request` | `bad_request: storage_uri '<uri>' is not loopback; set allow_remote_db=True to confirm remote storage egress` | A remote `storage_uri` without `allow_remote_db`. |
+| `bad_vault_name` | `bad_vault_name: vault name must start with a letter or number and contain only letters, numbers, '.', '_' or '-'` (or the length rule) | The vault name failed validation while computing the target path. |
+| `vault_exists` | `vault_exists: vault already exists at <path>` | A vault already exists at the target path. Raised both by the pre-check and by a `FileExistsError` from the creation worker. |
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Selecting a vault" href="/mcp/vault-selection">
+    How a connection resolves which vault it reads.
+  </Card>
+  <Card title="Creating a vault" href="/vault/creating">
+    The CLI path, including its different pack default.
+  </Card>
+  <Card title="Storage backends" href="/config/storage-backends">
+    What the `backend` pin means.
+  </Card>
+  <Card title="remember" href="/mcp/tools/remember">
+    The tool that refuses without a configured model.
+  </Card>
+</CardGroup>

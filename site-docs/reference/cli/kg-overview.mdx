@@ -1,0 +1,169 @@
+---
+title: The kg command group
+description: Thirteen graph-maintenance commands in three families, and the traps in how they are invoked.
+---
+
+<Note>
+Okto Neuron is prerelease. Command names, flags and output can change between versions.
+</Note>
+
+`okto-neuron kg` groups the commands that maintain a vault's knowledge graph. The group is declared as a subgroup of the top-level CLI and its help text is "Knowledge graph operations" (`src/okto_neuron/cli/__init__.py:273-275`).
+
+Thirteen leaf commands sit under it, in three families.
+
+## The command table
+
+| Command | Family | Positional arguments |
+| --- | --- | --- |
+| `okto-neuron kg init` | lifecycle | `VAULT` (required) |
+| `okto-neuron kg rebuild` | lifecycle | `VAULT` (optional) |
+| `okto-neuron kg reembed` | lifecycle | `VAULT` (optional) |
+| `okto-neuron kg reindex` | lifecycle | `VAULT` (optional) |
+| `okto-neuron kg reconcile propose` | reconcile | `VAULT` (optional) |
+| `okto-neuron kg reconcile apply` | reconcile | `VAULT` (optional) |
+| `okto-neuron kg reconcile review list` | reconcile | `VAULT` (optional) |
+| `okto-neuron kg reconcile review confirm` | reconcile | `CLUSTER_ID`, `VAULT` (optional) |
+| `okto-neuron kg reconcile review reject` | reconcile | `CLUSTER_ID`, `VAULT` (optional) |
+| `okto-neuron kg reconcile heal` | reconcile | `VAULT` (optional) |
+| `okto-neuron kg snapshot dump` | snapshot | `VAULT`, `DEST` (both required) |
+| `okto-neuron kg snapshot verify` | snapshot | `SRC` (required) |
+| `okto-neuron kg snapshot load` | snapshot | `SRC`, `VAULT` (both required) |
+
+Each family has its own reference page with the full flag tables:
+
+<CardGroup cols={3}>
+  <Card title="Lifecycle" href="/reference/cli/kg-lifecycle">
+    init, rebuild, reembed, reindex.
+  </Card>
+  <Card title="Reconcile" href="/reference/cli/kg-reconcile">
+    propose, apply, review, heal.
+  </Card>
+  <Card title="Snapshot" href="/reference/cli/kg-snapshot">
+    dump, verify, load.
+  </Card>
+</CardGroup>
+
+## Lifecycle
+
+`kg init` initializes a vault graph. It is the only lifecycle or reconcile command whose `VAULT` positional is required (`src/okto_neuron/cli/__init__.py:595-596`); `snapshot dump` and `snapshot load` require theirs as well (`:837-838`, `:854-856`). Its backend and remote-storage options are listed on [Lifecycle](/reference/cli/kg-lifecycle). It also takes `--accept-experimental`, whose help text reads "Deprecated, no longer required; kept for compatibility" (`src/okto_neuron/cli/__init__.py:597-628`). When `--storage-uri` is given, the command runs a remote-endpoint confirmation before dispatching (`src/okto_neuron/cli/__init__.py:651-654`).
+
+`kg rebuild` rebuilds a vault graph (`src/okto_neuron/cli/__init__.py:668-674`).
+
+`kg reembed` recomputes every vector at the configured embedding width without re-extracting. Its docstring states it replays the existing graph's stored text through the configured embedder and rebuilds at the configured width, and points you at it after changing `embedding.provider`, `embedding.model` or `embedding.dimension` (`src/okto_neuron/cli/__init__.py:676-687`).
+
+`kg reindex` rebuilds the search index from the graph. Without [`--force`](/reference/cli/kg-lifecycle) it rebuilds only when the index's generation stamp does not match the graph's current content, and it makes no LLM calls because text and vectors are read straight off each node (`src/okto_neuron/cli/__init__.py:690-703`, `src/okto_neuron/cli/kg.py:1570-1578`).
+
+## Reconcile
+
+The `reconcile` subgroup handles retroactive entity reconciliation. Its group help describes two options: propose/apply is off-graph and reversible and "writes only side-data, NEVER the graph", while `heal` folds aliases into a fresh graph (`src/okto_neuron/cli/__init__.py:705-712`).
+
+- `propose` is read-only: "emit candidate clusters + verdicts. Writes NOTHING" (`src/okto_neuron/cli/__init__.py:715-745`).
+- `apply` auto-merges high-confidence clusters off-graph and queues the rest (`src/okto_neuron/cli/__init__.py:746-775`).
+- `review list`, `review confirm`, `review reject` operate on the queue. `confirm` takes the cluster id first, then the optional vault (`src/okto_neuron/cli/__init__.py:787-816`).
+- `heal` materializes confirmed equivalences. The implementation calls `heal_via_copy` and, on success, prints `reconcile heal: collapsed equivalences into a fresh graph + swap` (`src/okto_neuron/cli/kg.py:3070-3079`).
+
+`review` exists as an explicit subgroup with named subcommands on purpose. The source notes that a group-level optional `VAULT` argument "would greedily swallow the subcommand name" (`src/okto_neuron/cli/__init__.py:777-785`).
+
+<Warning>
+`apply`, `review confirm`, `review reject` and `heal` change vault state. `propose` and `review list` do not.
+</Warning>
+
+## Snapshot
+
+The `snapshot` subgroup dumps, verifies and loads a backend-agnostic logical graph snapshot. A snapshot directory holds `manifest.json`, `nodes.jsonl`, `edges.jsonl`, `embeddings.jsonl`, `sources/` and `CHECKSUMS.sha256` (`src/okto_neuron/cli/__init__.py:826-835`).
+
+`snapshot dump` reads the raw graph, the graph identity, and the embedding and packs settings from `okto-neuron.yaml`. The manifest never records the vault's absolute path (`src/okto_neuron/cli/kg.py:3082-3091`).
+
+`snapshot verify` recomputes every checksum and count in the snapshot at `SRC` and reports problems (`src/okto_neuron/cli/__init__.py:846-852`).
+
+`snapshot load` loads the snapshot at `SRC` into a fresh vault at `VAULT` (`src/okto_neuron/cli/__init__.py:854-912`). Its flags are listed on [Snapshot](/reference/cli/kg-snapshot).
+
+## Exclusive vault ownership
+
+`kg reindex` and `kg snapshot dump` both ask for an offline graph swap before doing any work. If the lease is held, they catch `VaultLockHeld`, print this to stderr and return exit code 1:
+
+```text
+vault is open by another process; stop serve first
+```
+
+That is verbatim from `src/okto_neuron/cli/kg.py:1585` (reindex) and `src/okto_neuron/cli/kg.py:3099` (snapshot dump). Both catch every `VaultLockHeld`, including the server-owned case, so contention and a running server collapse into that one message and exit 1.
+
+`kg rebuild` and `kg reembed` take the same kind of exclusive ownership, through `acquire_rebuild_lock` (`src/okto_neuron/cli/kg.py:463`, `:1566`), but they do not catch `VaultLockHeld`, so their contention output is not that message.
+
+Because `rebuild` and `reembed` do not catch, they surface the guard's own message, which names the owning pid, in the form `cannot <operation> while the Okto Neuron server is running for this vault (pid <pid>); stop the server first` (`src/okto_neuron/cli/kg.py:432-451`). `acquire_rebuild_lock` mirrors that check and message (`src/okto_neuron/store/rebuild_lock.py:79-89`).
+
+<Warning>
+Stop the vault's server before running graph-swapping commands. See [the server reference](/reference/cli/overview) for the stop path.
+</Warning>
+
+## The ladybug extra
+
+Every command in this group dispatches through `_run_kg_command`, which imports `okto_neuron.cli.kg` lazily. If that import fails with a `ModuleNotFoundError` naming `ladybug`, the CLI raises:
+
+```text
+Ladybug storage is not installed; install okto-neuron[ladybug] to run graph commands
+```
+
+Source: `src/okto_neuron/cli/__init__.py:580-592`. The failure is lazy: it happens at first use of a graph command, not at CLI start.
+
+`ladybug` is an unconditional base dependency of the package (`pyproject.toml:30`), and the `[ladybug]` extra (`pyproject.toml:41`) restates it for older install guidance. Seeing this error means the environment is partial, not that a normal install is missing a step.
+
+## How the vault argument resolves
+
+Everything except `kg init`, `snapshot dump`, `snapshot verify` and `snapshot load` takes `VAULT` as an optional positional (`required=False` in the source, for example `src/okto_neuron/cli/__init__.py:669`). When you omit it, the command calls `_resolve_rebuild_vault`, which is a direct call to `resolve_vault_reference` (`src/okto_neuron/cli/kg.py:1853-1854`).
+
+Resolution order for a missing reference (`src/okto_neuron/vault_registry.py:148-160`):
+
+<Steps>
+  <Step title="OKTO_NEURON_VAULT">
+    If the environment variable is set, it is resolved as the reference.
+  </Step>
+  <Step title="Configured default vault">
+    Otherwise the configured default vault is used, resolved non-strictly.
+  </Step>
+  <Step title="Current directory">
+    Otherwise the current working directory, if it is itself a vault.
+  </Step>
+  <Step title="A single discovered vault">
+    Otherwise, if exactly one vault is discovered, that one.
+  </Step>
+  <Step title="The conventional default path">
+    Otherwise the conventional path for the vault named `default`.
+  </Step>
+</Steps>
+
+The docstring adds that callers needing an existing vault should validate `okto-neuron.yaml` before opening, so a resolved path is not proof that a vault is there (`src/okto_neuron/vault_registry.py:143-145`).
+
+## The standalone kg executable
+
+The package installs three console scripts: `okto-neuron = "okto_neuron.cli:app"`, `kg = "okto_neuron.cli:kg_cli"` and the pre-0.3.0 `marginalia = "okto_neuron.cli:legacy_app"`, which prints a rename warning and then runs `app` (`pyproject.toml:95-99`). `kg_cli` is a separate Click group whose help reads "Compatibility CLI with graph commands flattened at the top level" (`src/okto_neuron/cli/__init__.py:111-118`).
+
+`_install_kg_compat_commands` builds it in two passes (`src/okto_neuron/cli/__init__.py:3349-3357`):
+
+1. Every top-level command of `app` except the one named `kg` is added to `kg_cli` under its own name.
+2. Then each subcommand of the `kg` group is added, but only `if name not in kg_cli.commands`.
+
+<Warning>
+`kg init` on the standalone executable is not `okto-neuron kg init`. The top-level `init` command (`src/okto_neuron/cli/__init__.py:921`) is installed in pass 1, so by pass 2 the name `init` is already taken and the graph-group `init` is skipped. Running `kg init` runs the top-level vault-creating `init`, not the vault-graph initializer. Use `okto-neuron kg init` when you mean the graph one.
+</Warning>
+
+From pass 1, the `kg` executable carries these top-level names: `version`, `init`, `onboard`, `ui`, `status`, `add`, `query`, `ask`, `detect-drift`, `pilot`, `serve`, `dev`, `stop`, `watch` (`src/okto_neuron/cli/__init__.py:128, 921, 1045, 2262, 2350, 2447, 2467, 2507, 2558, 2612, 2656, 2877, 2936, 2967`), the groups `vault`, `quality`, `watch-folder` (`:138`, `:278`, `:3019`) and `models`, added by `app.add_command(models_app, name="models")` (`:126`). From pass 2 it gains `rebuild`, `reembed`, `reindex`, `reconcile` and `snapshot`, flattened to the top level.
+
+## What is not here
+
+There is no `kg migrate` group. A comment in the source records that `kg migrate bridge-edges` was removed, and that the structural bridge-edge repair it performed now routes through `kg rebuild`, so the derived topology is verified in a fresh generation before one atomic swap (`src/okto_neuron/cli/__init__.py:913-917`). This is separate from `kg reconcile heal`, which calls `heal_via_copy`.
+
+<Note>
+`src/okto_neuron/cli/kg.py` holds the implementation functions that `_run_kg_command` looks up by name. It declares no Click commands itself, so its docstrings describe behavior, not a separate command surface.
+</Note>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="CLI overview" href="/reference/cli/overview">
+    The whole command surface.
+  </Card>
+  <Card title="Graph lifecycle" href="/concepts/graph-lifecycle">
+    Why rebuild, reembed and reindex are separate.
+  </Card>
+</CardGroup>

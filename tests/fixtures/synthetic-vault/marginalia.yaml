@@ -1,0 +1,13 @@
+marginalia_yaml_version: 1
+embedding:
+  model: stub
+  provider: stub
+federation_opt_in: false
+packs:
+  - core
+  - research
+  - personal
+storage:
+  backend: ladybug
+  reason: synthetic fixture
+vault_id: synthetic-vault

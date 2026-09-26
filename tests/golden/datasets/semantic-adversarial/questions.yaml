@@ -1,0 +1,129 @@
+settings:
+  k: 10
+
+questions:
+  - id: alias-maren
+    tier: T1
+    question: "Who does M. Vale refer to in the harbor logs?"
+    expected_answer: "M. Vale refers to Dr. Maren Vale."
+    expected_source_paths: [00-maren-registry.md]
+    must_contain: ["Dr. Maren Vale"]
+    gold_targets:
+      - source_path: 00-maren-registry.md
+        quote: "Older harbor logs use the short name M. Vale for the same\nperson; M. Vale and Dr. Maren Vale are one person, not two people."
+
+  - id: inverse-birthplace
+    tier: T2
+    question: "Where was Dr. Maren Vale born?"
+    expected_answer: "Dr. Maren Vale was born in Rivermark."
+    expected_source_paths: [00-maren-registry.md]
+    must_contain: ["Rivermark"]
+    gold_targets:
+      - source_path: 00-maren-registry.md
+        quote: "Rivermark is the birthplace of Dr. Maren Vale."
+
+  - id: literal-role
+    tier: T2
+    question: "What role does Dr. Maren Vale have?"
+    expected_answer: "Her role is harbor cartographer."
+    expected_source_paths: [00-maren-registry.md]
+    must_contain: ["harbor cartographer"]
+    gold_targets:
+      - source_path: 00-maren-registry.md
+        quote: "The phrase \"harbor cartographer\" is Maren's role. It is a literal role description, not a second\nperson, organization, place, or graph endpoint."
+
+  - id: namesake-types
+    tier: T2
+    question: "Are Joram and Captain Joram the same entity?"
+    expected_answer: "No. Joram is a place; Captain Joram is a distinct person."
+    expected_source_paths: [01-joram-namesakes.md]
+    must_contain: ["distinct"]
+    gold_targets:
+      - source_path: 01-joram-namesakes.md
+        quote: "The town Joram and Captain Joram have the same name by coincidence; they are distinct senses and\nmust never be merged."
+
+  - id: namesake-visit
+    tier: T1
+    question: "Which namesake visited the town of Joram?"
+    expected_answer: "Captain Joram visited the town of Joram."
+    expected_source_paths: [01-joram-namesakes.md]
+    must_contain: ["Captain Joram"]
+    gold_targets:
+      - source_path: 01-joram-namesakes.md
+        quote: "Captain Joram visited the town of Joram during the winter survey."
+
+  - id: lantern-manual
+    tier: T1
+    question: "What kind of thing is The Lantern in the archive?"
+    expected_answer: "It is a written navigation manual and an information object."
+    expected_source_paths: [02-lantern-senses.md]
+    must_contain: ["navigation manual"]
+    gold_targets:
+      - source_path: 02-lantern-senses.md
+        quote: "In the archive, The Lantern is a written navigation manual. This manual is an information object."
+
+  - id: lantern-doctrine
+    tier: T2
+    question: "What does The Lantern mean in the academy's doctrine class?"
+    expected_answer: "It means the abstract doctrine of checking evidence before acting."
+    expected_source_paths: [02-lantern-senses.md]
+    must_contain: ["checking evidence before acting"]
+    gold_targets:
+      - source_path: 02-lantern-senses.md
+        quote: "In the academy's doctrine class, The Lantern is the abstract doctrine of checking evidence before\nacting. This doctrine is a concept, not the written manual."
+
+  - id: council-activity-place
+    tier: T2
+    question: "What was the Cobalt Council, and where was it held?"
+    expected_answer: "It was a meeting activity held in Rivermark."
+    expected_source_paths: [03-cobalt-council.md]
+    must_contain: ["meeting", "Rivermark"]
+    gold_targets:
+      - source_path: 03-cobalt-council.md
+        quote: "The Cobalt Council was a meeting held in Rivermark on 2026-03-04. The meeting is an activity."
+
+  - id: grounded-protects
+    tier: T1
+    question: "Who protected Ivo Ren during the Cobalt Council?"
+    expected_answer: "Dr. Maren Vale protected Ivo Ren."
+    expected_source_paths: [03-cobalt-council.md]
+    must_contain: ["Dr. Maren Vale"]
+    gold_targets:
+      - source_path: 03-cobalt-council.md
+        quote: "During the Cobalt Council, Dr. Maren Vale protected the courier Ivo Ren from falling rigging. The\nrecord explicitly states that Maren protected Ivo Ren."
+
+  - id: unicode-alias
+    tier: T2
+    question: "Do Zoë D'Ávila and Zoe D'Avila refer to the same person?"
+    expected_answer: "Yes. They are two spellings for the same agent."
+    expected_source_paths: [04-unicode-log.md]
+    must_contain: ["one agent"]
+    gold_targets:
+      - source_path: 04-unicode-log.md
+        quote: "The older ASCII index spells the same\nperson's name as Zoe D'Avila; both spellings refer to one agent, while the accented source spelling\nmust remain preserved."
+
+  - id: provisional-predicate
+    tier: T2
+    question: "What specific dawn action did Zoë D'Ávila perform?"
+    expected_answer: "She calibrated Beacon N-7 at dawn on Águeda Shoal."
+    expected_source_paths: [04-unicode-log.md]
+    must_contain: ["calibrated Beacon N-7 at dawn"]
+    gold_targets:
+      - source_path: 04-unicode-log.md
+        quote: "Zoë D'Ávila calibrated Beacon N-7 at dawn on Águeda Shoal."
+
+  - id: negative-mystical-knowledge
+    tier: T4
+    question: "Does any source establish that Maren mystically knows The Lantern doctrine?"
+    expected_answer: "No. The rumor is explicitly unsupported."
+    expected_source_paths: []
+    must_contain: []
+    negative_control: true
+
+  - id: negative-authorship
+    tier: T4
+    question: "Who says that Maren authored The Lantern manual?"
+    expected_answer: "No source says that Maren authored it."
+    expected_source_paths: []
+    must_contain: []
+    negative_control: true

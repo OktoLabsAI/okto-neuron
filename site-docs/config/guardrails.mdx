@@ -1,0 +1,72 @@
+---
+title: "Why Okto Neuron refuses some settings"
+description: "Endpoint classification, the credential namespace allowlist, and the parameters you may never override."
+---
+
+Some config values are rejected at validation time, before the vault ever loads. This page explains the reasoning behind each refusal, so that when a write comes back with an error you can tell what the check was protecting.
+
+<Note>
+Okto Neuron is prerelease. The checks described here are the ones present in the code today, and the names and messages can still change.
+</Note>
+
+## Endpoints are classified, not pattern-matched
+
+Every LLM `api_base` goes through `classify_api_base`, which returns one of three classes: `loopback`, `private` or `public` (`src/okto_neuron/config/_vault.py:710`).
+
+Before it classifies anything, it rejects three shapes outright:
+
+- **A scheme that is not `http` or `https`.** The error reads `llm api_base scheme must be http or https` (`_vault.py:719-720`).
+- **Userinfo in the URL.** A URL carrying a username or password is refused with `llm api_base must not include username or password` (`_vault.py:722`). Credentials belong in the environment, not in a config file that gets read, diffed and copied.
+- **A missing host.** `llm api_base must include a host` (`_vault.py:725`).
+
+What remains is a hostname. `127.0.0.1`, `localhost` and `::1` are matched directly and classified `loopback` (`_vault.py:346`, `:728`). Anything else is parsed as an IP literal, and if that succeeds the address itself decides the class.
+
+## Address classes that are always refused
+
+`_classify_ip_address` first unwraps an IPv4-mapped IPv6 address, so `::ffff:127.0.0.1` is classified as the IPv4 address it actually carries rather than as an opaque v6 host (`_vault.py:875-879`). Then:
+
+- A loopback address returns `loopback` (`_vault.py:880`).
+- An address that is unspecified, link-local, multicast or reserved raises `resolves to disallowed address`, and it does so regardless of `allow_remote` (`_vault.py:882-891`). There is no flag that turns these back on.
+- A private address, or an IPv4 address inside the CGNAT range `100.64.0.0/10`, returns `private` (`_vault.py:892-893`, `:348`).
+- Everything else returns `public` (`_vault.py:894`).
+
+A hostname that is not an IP literal but *looks* like an encoded one gets its own refusal. `_looks_like_encoded_ip_host` matches a bare decimal or `0x`-prefixed hex label, or a dotted string whose every label is one of those, and the URL is rejected with `looks like an encoded IP literal` (`_vault.py:848-854`, `:733-737`). This closes the decimal- and hex-encoded forms of an address that `ipaddress.ip_address` would not parse but a permissive HTTP client might still dial.
+
+## DNS resolution is opt-in, and only where it is needed
+
+`classify_api_base` takes a `resolve` keyword that defaults to `False`, with the reason stated in its own docstring: config loading should not depend on DNS (`_vault.py:713-717`). With `resolve=False`, an unrecognized hostname is simply classified `public`.
+
+`_check_api_base` turns resolution on for exactly one case: a non-loopback `http://` endpoint (`_vault.py:827`). Those are the ones where an opaque name could otherwise smuggle a plaintext public endpoint past the https requirement. When resolution runs, every address the host resolves to is classified and the set is collapsed: all-loopback counts as `loopback`, a mix of loopback and private counts as `private`, and anything else counts as `public` (`_vault.py:741-751`). A host that resolves to nothing raises `did not resolve` (`_vault.py:746`, `:863`).
+
+`_check_api_base` refuses a non-loopback class unless its caller passes remote consent (`_vault.py:830-834`). For a vault config, that consent is `llm.allow_remote: true` **or** the block resolving through a `provider_ref`: `LLMConfig._validate_api_bases` passes `self.allow_remote or resolved.provider_ref is not None` for the defaults and for every step (`_vault.py:1305-1314`). A provider entry therefore carries its own remote consent. A `public` class requires the `https` scheme, and that requirement has no flag behind it (`_vault.py:835-838`).
+
+## Storage endpoints use a sibling classifier
+
+`_classify_storage_endpoint` reuses the same host, IP and encoded-literal helpers, and differs only in the scheme set it accepts: `bolt`, `bolt+s`, `bolt+ssc`, `neo4j`, `neo4j+s`, `neo4j+ssc`, `http` and `https` (`_vault.py:758-760`, `:774-777`). Userinfo, a missing host and encoded IP literals are refused there too, with storage-flavored messages (`_vault.py:778-793`). `resolve` is opt-in for the same reason.
+
+## The credential namespace allowlist
+
+`api_key_env` names an environment variable. It must match `^OKTO_NEURON_[A-Z0-9_]+$` (`_vault.py:471`, `:681`). Anything else is refused with a message that names the rule and the reason.
+
+The attack this blocks is specific. A config write is a lower-privilege action than reading a server secret, but `api_key_env` turns one into the other: set it to `AWS_SECRET_ACCESS_KEY`, pair that with `allow_remote` and an endpoint you control, and the next call sends that value to you (`_vault.py:465-470`). The pattern restricts the name to Okto Neuron's own namespace, so a config write cannot name an environment variable outside it (`_vault.py:471`).
+
+The same validator guards the embedding block's `api_key_env` (`_vault.py:150-153`) as well as the LLM block's.
+
+Note what is stored and what is not: config holds the variable **name** only. The secret value itself lives in the environment, never in the vault config (`_vault.py:469-470`). See [/config/llm-reference](/config/llm-reference) for where each field lives and [/config/providers-yaml](/config/providers-yaml) for shared provider entries.
+
+## Parameters Okto Neuron owns
+
+`MANAGED_LLM_PARAMETERS` is a frozen set of 31 names (`_vault.py:477-511`) that Okto Neuron refuses to let any parameter map override. There is no user-writable generic `parameters` key in `okto-neuron.yaml`: that surface was removed in decision A, 2026-09-15 (`_vault.py:512-519`, `:926-936`). The resolved parameter map is built only from the typed fields `repeat_penalty`, `reasoning_effort` and `preserve_thinking` (`_vault.py:520`), and the validator still guards that path along with the `/llm/test-completion` probe body (`_vault.py:523`, `:926-936`). The set includes `model`, `messages`, `api_base`, `api_key`, `base_url`, `tools`, `tool_choice`, `functions`, `function_call`, `response_format`, `response_schema`, `response_mime_type`, `stream`, `stream_options`, `timeout`, `drop_params`, `additional_drop_params`, `allowed_openai_params`, `extra_body`, `extra_headers`, `n`, `candidate_count`, `logprobs`, `top_logprobs`, `parallel_tool_calls`, `modalities`, `audio`, `system`, `template`, `include_server_side_tool_invocations` and `web_search_options`. The refusal reads `is managed by Okto Neuron and cannot be overridden` (`_vault.py:531-534`). The stated reason is that these values belong to Okto Neuron's request contract, its connection security, or its response parser (`_vault.py:474-476`). A parameter name also has to be a Python keyword-style identifier (`_vault.py:472`, `:527-530`). The operator-facing escape hatch is `sampling_payload`.
+
+`sampling_payload` is a separate, deliberately unconstrained escape hatch for a self-hosted backend: the backend validates the keys, not Okto Neuron (`_vault.py:544-552`). It reserves a much smaller set, in two groups with different reasons (`_vault.py:571-578`):
+
+- **Connection-owned:** `api_base`, `api_key`, `drop_params`, `messages`, `model`, `timeout`.
+- **Response-shape:** `extra_body`, `n`, `stream`, `tools`. These change the shape of the response Okto Neuron parses. Setting them produces a downstream parse failure rather than a backend error (`_vault.py:561-570`).
+
+Each group raises its own message naming its own category (`_vault.py:580-596`).
+
+## `allow_remote` widens where, never who
+
+`allow_remote` is the vault-level consent flag applied to the resolved `api_base` of the defaults and of every step (`_vault.py:1214`, `:1299-1315`). It is not the only path: a block that resolves through a `provider_ref` is treated as already consenting (`_vault.py:1307`, `:1313`). The embedding block carries its own `allow_remote` and validates its own `api_base` (`_vault.py:138`, `:155-162`).
+
+It does not touch the write path. The LLM and embedding config docstrings state that config writes stay loopback-only regardless of `allow_remote` (`_vault.py:1206-1209`, `:127-129`). That is the documented intent recorded in the config module; the enforcing code lives outside this module. The flag widens where the server may POST, never who may set config. For the server's own listening posture see [/server/remote-access](/server/remote-access), and for the MCP surface see [/mcp/security](/mcp/security).

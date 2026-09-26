@@ -1,0 +1,120 @@
+---
+title: "Change the embedding model"
+description: "Which four fields invalidate your vectors, and what to run afterwards."
+---
+
+Okto Neuron stores one vector per graph node, computed by the embedder named in your vault's `embedding` block. If you change which model produces those vectors, every vector already in the graph came from a different model and will score against your queries incorrectly. This page shows you which fields have that effect, which ones you can change freely, and how to rebuild the vectors afterwards.
+
+<Note>
+Okto Neuron is prerelease software. Treat a change to the embedding block as a change that rewrites your graph. Take your snapshot before you edit `dimension`, not after: once the config and the graph disagree on width, `kg snapshot dump` refuses to run on that vault. See [The procedure](#the-procedure).
+</Note>
+
+## The four fields that invalidate your vectors
+
+Four keys under `embedding` are tracked as `REEMBED_FIELDS`:
+
+- `embedding.provider_ref`
+- `embedding.provider`
+- `embedding.model`
+- `embedding.dimension`
+
+Changing any of them means the stored vectors were produced by something other than what the config now names.
+
+The rest of the block is transport and execution policy. `api_base`, `api_key_env` and `allow_remote` change where the embedder runs, not the vector space, so they are deliberately absent from that list and take effect without a rebuild. `batch_size` and `max_concurrent_batches` are execution policy only and are absent for the same reason.
+
+When you change the block through the HTTP config endpoint, the daemon compares your changed keys against that list and answers with `applied: "reembed"` plus a note that stored embeddings from the old model are incompatible until the vault is re-embedded. The daemon drops its cached embedder on a successful config write, so the new embedder itself is picked up without a restart.
+
+`embedding.allow_remote` gates the `api_base` host check inside this block only. It is a different knob from anything on the serve command line. See [/config/guardrails](/config/guardrails).
+
+## Why `dimension` is special
+
+The width you configure is baked into the graph when it is created and recorded on the graph's schema metadata. Every backend records that width and compares it against your config on open (`store/grafx.py:419-429`, `store/neo4j.py:359-369`, `store/schema.py:313-330`).
+
+If the width recorded on the graph differs from the configured width, Okto Neuron raises `EmbeddingDimMismatch` on open, on ingest and on query. The CLI exits non-zero with the code carried on the error class. The daemon does not exit: it catches the mismatch, refuses to open that vault, and surfaces a warning with the code `embedding_dim_mismatch` whose remedy text tells you to run `okto-neuron kg reembed <vault>`.
+
+<Warning>
+A width change is never applied in place. Until the vectors are rebuilt at the configured width, open, ingest and query all fail on that vault.
+</Warning>
+
+## Config validation will not catch a wrong dimension
+
+Validation only checks that `dimension` is an integer greater than zero. Nothing at config-write time asks the model how wide its vectors actually are, and the four providers behave differently when you get it wrong:
+
+<Tabs>
+<Tab title="stub">
+The deterministic offline embedder produces vectors exactly `dimension` wide. Any value works, because the vectors are generated deterministically rather than by a trained model.
+</Tab>
+<Tab title="fastembed">
+Vectors come from the named FastEmbed model. Every bulk response is validated against `dimension`, and a mismatch raises an embedding provider error naming both widths. Requires the `okto-neuron[embeddings]` extra.
+</Tab>
+<Tab title="sentence-transformers">
+The loaded model's own width wins: `dimension` is only a fallback used when the model does not report one. Your configured value is silently ignored, and the disagreement surfaces later as a stored-width mismatch against the graph. Requires the `okto-neuron[sentence-transformers]` extra.
+</Tab>
+<Tab title="LiteLLM providers">
+Any provider name that is not `stub`, `fastembed` or `sentence-transformers` is routed through LiteLLM against an external endpoint. The configured `dimension` is asserted on every response, so a wrong width fails on the first call. Requires the `okto-neuron[litellm]` extra.
+</Tab>
+</Tabs>
+
+Set `dimension` to the width the model you chose actually emits.
+
+## Naming the model
+
+For the in-process providers, `model` is the model name the library expects. The shipped value is on [/config/vault-yaml](/config/vault-yaml).
+
+For a LiteLLM-routed provider, Okto Neuron builds the request model string itself as `provider/model`. Put only the suffix in `model` and the routing prefix in `provider`, otherwise the prefix is doubled. `provider` is validated against a fixed set of accepted names, and three aliases are folded in: `default` becomes `fastembed`, and both `openai-compat` and `local` become `openai`.
+
+## The procedure
+
+<Note>
+You can also change the block through the daemon's config PATCH endpoint while it is still running. You still have to stop the daemon before the reembed.
+</Note>
+
+<Steps>
+<Step title="Stop the daemon">
+<Warning>
+`okto-neuron stop` stops the application daemon, not one vault. Any other vault served by that daemon goes down with it.
+</Warning>
+
+```bash
+okto-neuron stop
+```
+`kg reembed` takes the rebuild lock for the whole run, so nothing else may hold the vault while it works.
+</Step>
+<Step title="Dump a snapshot while the widths still agree">
+Do this before you touch `dimension`. `kg snapshot dump` compares `okto-neuron.yaml`'s `embedding.dimension` against the graph's stored width and refuses when they differ, so the edit in the next step takes snapshots away from you until the reembed lands (`store/snapshot.py:196-201`, surfaced by the CLI as `error: ...` with exit 1 at `cli/kg.py:3148-3150`). The refusal and the rest of `dump`'s behaviour are on [/reference/cli/kg-snapshot](/reference/cli/kg-snapshot#dump-refusals).
+
+```bash
+okto-neuron kg snapshot dump /path/to/vault ~/backups/vault-snapshot
+okto-neuron kg snapshot verify ~/backups/vault-snapshot
+```
+
+`verify` recomputes every checksum and count in the snapshot, so run it before you trust the copy.
+</Step>
+<Step title="Edit the embedding block">
+Change `embedding` in the vault's `okto-neuron.yaml`. `embedding` is one of the writable config blocks. Field shapes and defaults live on [/config/vault-yaml](/config/vault-yaml).
+
+```yaml
+embedding:
+  provider: fastembed
+  model: BAAI/bge-small-en-v1.5
+  dimension: 384
+```
+
+That block is the shipped configuration, reproduced from [/config/vault-yaml](/config/vault-yaml). If you point `model` at a different model, set `dimension` to the width that model emits.
+</Step>
+<Step title="Rebuild the vectors">
+```bash
+okto-neuron kg reembed /path/to/vault
+```
+This replays the graph's stored text through the newly configured embedder and rebuilds the graph at the configured width. Flags and behaviour are documented on [/reference/cli/kg-lifecycle](/reference/cli/kg-lifecycle).
+</Step>
+<Step title="Start the daemon again">
+Bring `okto-neuron serve` back up and confirm the vault opens without an `embedding_dim_mismatch` warning.
+</Step>
+</Steps>
+
+## Reembed does not re-extract
+
+`kg reembed` is vectors only. It reads the text already stored on the graph and recomputes vectors from it. No language model runs, and nothing is re-read from your markdown, so anything the extraction stage got wrong stays wrong.
+
+If you want the graph rebuilt from the markdown files, that is `kg rebuild`, which re-extracts with a language model instead of replaying stored text. See [/vault/rebuilding](/vault/rebuilding).

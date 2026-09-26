@@ -1,0 +1,162 @@
+---
+title: MCP server overview
+description: Five tools, one bearer token, loopback only. The agent-facing surface of the same daemon.
+---
+
+Okto Neuron exposes an MCP server so a local agent can read from and write to a vault. The server is not a separate process. It runs inside `okto-neuron serve`, alongside the REST surface and the web UI, and it listens on its own port with its own credential. The code uses "REST" as the name of that surface (`src/okto_neuron/server/runtime.py:3`, `:56`); there is no OpenAPI document and no API contract behind the name, and [/reference/http-endpoints](/reference/http-endpoints) lists only the routes the shipped CLI calls.
+
+<Note>
+Okto Neuron is prerelease software (version 0.3.0). The tool set, arguments and return shapes described here are not a stable API contract and can change between releases.
+</Note>
+
+## Where the server runs
+
+`okto-neuron serve` starts one process and creates two asyncio tasks in it: one named `okto-neuron-rest` and one named `okto-neuron-mcp`, each running a uvicorn server (`src/okto_neuron/server/runtime.py:1944-1945`). The command's own help text describes it as "Start the Okto Neuron app server (REST/UI :7777 + FastMCP :8201)" (`src/okto_neuron/cli/__init__.py:2705`).
+
+Because both surfaces live in the same process, they resolve vaults through the same pool. `remember` takes the selected vault runtime's writer lock before it writes (`src/okto_neuron/server/runtime.py:1580`).
+
+See [/server/running](/server/running) for starting, stopping and daemonizing the server.
+
+## Ports
+
+| Surface | Default port | Constant |
+| --- | --- | --- |
+| REST and web UI | 7777 | `DEFAULT_REST_PORT` (`src/okto_neuron/server/runtime.py:56`) |
+| MCP | 8201 | `DEFAULT_MCP_PORT` (`src/okto_neuron/server/runtime.py:57`) |
+
+Both are overridable on `okto-neuron serve` with `--port` and `--mcp-port`; the flags are on [/reference/cli/server-commands](/reference/cli/server-commands).
+
+`okto-neuron dev` declares the same two port defaults ([/contributing/dev-commands](/contributing/dev-commands)). If a `serve` process is already listening on those ports, starting `dev` without changing them puts two servers on the same addresses. Pick different ports for one of them, or stop the other.
+
+## Transport
+
+The MCP app is built by calling FastMCP's `http_app()` on the constructed server (`src/okto_neuron/server/runtime.py:1165-1167`). That is the streamable HTTP transport. Okto Neuron registers no stdio entry point for this server and mounts no SSE endpoint.
+
+The HTTP path comes from FastMCP's own default, `streamable_http_path = "/mcp"` (`fastmcp/settings.py:264`). Okto Neuron does not override it. So the endpoint a client points at has this shape:
+
+```text
+http://127.0.0.1:8201/mcp?vault=<name>
+```
+
+Write the path without a trailing slash. FastMCP registers the endpoint as an exact Starlette route at `streamable_http_path`, which defaults to `/mcp` and which Okto Neuron does not override (`fastmcp/server/http.py:342-347`, `fastmcp/settings.py:264`).
+
+A request to `/mcp/` still reaches the server. The exact route does not match, so Starlette's router strips the trailing slash, finds the route, and answers with a 307 redirect to `/mcp` (`starlette/routing.py:693-707`, `starlette/responses.py:204-213`); the router does this because `redirect_slashes` is on by default (`starlette/routing.py:570`). The redirect keeps the method, the body and the `?vault=` query string.
+
+<Note>
+The redirect only helps a client that follows a 307 and resends the `Authorization` header on the second request. Bearer authentication is applied to every request on this port (`src/okto_neuron/server/runtime.py:1824-1829`), so a client that drops the header when it follows the redirect gets a 401. Configure `/mcp` and the question does not arise.
+</Note>
+
+The `?vault=` query parameter selects which vault the connection works against. The server reads it off the in-flight HTTP request (`src/okto_neuron/server/runtime.py:953`). [/mcp/vault-selection](/mcp/vault-selection) covers how the connection selector, the per-call `vault` argument and the configured fallback interact.
+
+## Installation requirement
+
+The MCP surface needs FastMCP, which ships in the `serve` extra. If it is missing, building the server raises `OptionalDependencyError` with the message "FastMCP is not installed; install okto-neuron[serve] to run `okto-neuron serve`" (`src/okto_neuron/server/runtime.py:1207-1212`).
+
+```bash
+pip install 'okto-neuron[serve]'
+```
+
+## Binding and remote access
+
+The server binds loopback. `DEFAULT_HOST` is `127.0.0.1` and the accepted bind set is `{"127.0.0.1", "localhost", "::1"}` (`src/okto_neuron/server/runtime.py:58-59`).
+
+`okto-neuron serve` refuses to start otherwise. If `--host` is outside that set, or `--allow-remote` is passed, the command prints a refusal and exits with code 2 (`src/okto_neuron/cli/__init__.py:2711-2723`). The message it prints says direct remote serving, including `--allow-remote`, is currently disabled, and tells you to bind to 127.0.0.1 and use an SSH tunnel instead. `okto-neuron dev` applies the same rule and raises a `ClickException` with the same tunnel guidance (`src/okto_neuron/cli/__init__.py:2911-2914`).
+
+<Warning>
+`--allow-remote` does not enable remote access on either command. It exists only to produce a migration message for scripts that still pass it. The only supported way to reach this server from another machine is a tunnel, for example SSH, terminating on the loopback listener.
+</Warning>
+
+## Authentication
+
+The MCP app is wrapped in `AuthTokenMiddleware` before it is served (`src/okto_neuron/server/runtime.py:1824-1829`). REST and the UI are deliberately left credential-free on loopback; MCP alone requires the bearer token.
+
+Every MCP call must present a bearer token. The token file, the 401 shape and rotation are covered in [/mcp/security](/mcp/security), which also goes into the trust model. [/mcp/connect-an-agent](/mcp/connect-an-agent) walks through handing the token to a client.
+
+## The tool surface
+
+Five tools are registered. Writes are gated to loopback callers in the tool body, in addition to the loopback bind (`src/okto_neuron/server/runtime.py:1565-1569`, `:1718`).
+
+| Tool | Kind | Loopback-gated | Registered at |
+| --- | --- | --- | --- |
+| `ask` | read | no | `src/okto_neuron/server/runtime.py:1280` |
+| `explore` | read | no | `src/okto_neuron/server/runtime.py:1465` |
+| `remember` | write | yes | `src/okto_neuron/server/runtime.py:1536` |
+| `list_vaults` | read | no | `src/okto_neuron/server/runtime.py:1633` |
+| `init_vault` | write | yes | `src/okto_neuron/server/runtime.py:1682` |
+
+### ask
+
+Answers a question grounded in the knowledge graph, with citations. It returns `{text, citations, subgraph_evidence_ids, retrieval}` (`src/okto_neuron/server/runtime.py:1312-1318`). Full argument and return reference: [/mcp/tools/ask](/mcp/tools/ask).
+
+### explore
+
+Drills into the graph around a topic, then walks outward by node id. It returns structured graph, so an agent re-queries to widen. Full argument and return reference: [/mcp/tools/explore](/mcp/tools/explore).
+
+### remember
+
+Ingests a source and curates it into the graph. It is a write, serialized by the selected vault runtime's writer lock (`src/okto_neuron/server/runtime.py:1580`). A non-loopback caller is refused with `forbidden: remember is restricted to loopback callers; tunnel (e.g. SSH) to write remotely` (`src/okto_neuron/server/runtime.py:1565-1569`). Full argument and return reference: [/mcp/tools/remember](/mcp/tools/remember).
+
+### list_vaults
+
+Lists the vault names this server can reach. Use it to discover what exists, then pass `vault=<name>` to `ask`, `explore` or `remember`. Full return reference: [/mcp/tools/vaults](/mcp/tools/vaults).
+
+The `list_vaults` docstring points the client at a `.marginalia-vault` file in the project directory (JSON, `{"vault": "<name>"}`). The server deliberately does not read it. [/mcp/connect-an-agent](/mcp/connect-an-agent) covers why and what the client is expected to do.
+
+### init_vault
+
+Creates one application-managed named vault without selecting it. The vault is created under the global vault root at `~/.okto-neuron/vaults/<name>` and adopted into the pool, so a follow-up `?vault=<name>` connection resolves without reopening (`src/okto_neuron/server/runtime.py:1696-1700`). Non-loopback callers are refused with `forbidden: vault creation is restricted to loopback callers` (`src/okto_neuron/server/runtime.py:1718`). Full argument and return reference: [/mcp/tools/vaults](/mcp/tools/vaults).
+
+### What the host sees
+
+Every tool is registered with a bare `@mcp.tool()` and no keyword arguments (`src/okto_neuron/server/runtime.py:1280`, `:1465`, `:1536`, `:1633`, `:1682`). That decides three things about what the model on the other end reads when it picks a tool.
+
+The name is the Python function name, so it is the name in the table above, unprefixed by Okto Neuron. Your client may add its own prefix.
+
+The description is the function's docstring. With no `description=` passed, FastMCP falls back to the parsed function description (`fastmcp/tools/function_tool.py:268-270`), and that comes from the docstring (`fastmcp/tools/function_parsing.py:182`). These docstrings are long and argument-heavy. `ask` opens with "Answer a question grounded in the knowledge graph, with citations." and then explains how to choose `k` and `hops` (`src/okto_neuron/server/runtime.py:1300-1311`); `remember` says on its second line "WRITE op - serialized by the selected vault runtime's writer lock." (`src/okto_neuron/server/runtime.py:1544`). So the model reads the same guidance these pages carry, and editing a docstring changes what it reads.
+
+None of the five docstrings uses an `Args:` section, and FastMCP fills per-parameter descriptions only from such a section (`fastmcp/tools/function_parsing.py:211-221`). Each argument therefore reaches the host with its JSON-schema type and default and no prose of its own. The per-tool reference pages under [/mcp/tools/ask](/mcp/tools/ask), [/mcp/tools/explore](/mcp/tools/explore), [/mcp/tools/remember](/mcp/tools/remember) and [/mcp/tools/vaults](/mcp/tools/vaults) are for you, not for the model.
+
+No annotations are set on any of the five. `annotations` defaults to `None` (`fastmcp/tools/function_tool.py:122`) and is handed to the listed tool unchanged (`fastmcp/tools/base.py:151-154`, `:189-201`), so the host receives no `readOnlyHint`, no `destructiveHint`, no `idempotentHint`, no `openWorldHint` and no display `title`.
+
+<Note>
+The Kind column above is documentation. It is not carried in the protocol. A host that marks read tools differently from write tools, or that asks you to confirm a destructive call, has nothing from this server to key on, and it will treat `remember` and `init_vault` like any other tool. What actually restrains those two at runtime is the loopback gate in the tool body (`src/okto_neuron/server/runtime.py:1565-1569`, `:1718`) and the bearer token on every call, covered in [/mcp/security](/mcp/security).
+</Note>
+
+## Draining and shutdown
+
+`init_vault` checks the server drain state first, before its loopback gate: while the server is shutting down it raises `shutting_down: server is shutting down`, and during vault maintenance `maintenance: vault maintenance is in progress; writes are paused` (`src/okto_neuron/server/runtime.py:1714-1717`).
+
+`remember` checks the selected vault runtime's drain state instead, and only after the loopback gate and vault resolution have passed. It raises the same two messages (`src/okto_neuron/server/runtime.py:1574-1578`).
+
+Reads are not exempt from shutdown. `explore` and `list_vaults` also raise `shutting_down: server is shutting down` (`src/okto_neuron/server/runtime.py:1513-1514`, `:1650-1651`).
+
+## Retired entry points
+
+Two older import paths used to build an independent MCP server. They now fail closed.
+
+`okto_neuron.mcp_server` keeps its imports valid for compatibility, but `build_app()` and `run()` both raise `RuntimeError` (`src/okto_neuron/mcp_server.py:26-27`, `:48-59`). The message is: "the legacy okto_neuron.mcp_server API is retired because it bypassed the production authentication and loopback-only contract; run `okto-neuron serve` after installing okto-neuron[serve]" (`src/okto_neuron/mcp_server.py:19-23`). The module docstring records why: the old flat module built a second, unauthenticated eight-tool server and allowed an arbitrary bind host, bypassing the production five-tool capability-token and loopback-only contract (`src/okto_neuron/mcp_server.py:1-8`).
+
+`okto_neuron.mcp.server` is a thin re-export of those same two functions, so it fails the same way (`src/okto_neuron/mcp/server.py:1-6`).
+
+One function survives without a server: `kg_query_natural(vault, text, k=10)` still serializes query hits directly off a `Vault` (`src/okto_neuron/mcp_server.py:30-43`). It is aliased as `marginalia_kg_query`.
+
+<Warning>
+If you have scripts calling `okto_neuron.mcp_server.run(...)` or `okto_neuron.mcp.server.run(...)`, they will raise at runtime. Point them at `okto-neuron serve` instead.
+</Warning>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Connect an agent" href="/mcp/connect-an-agent">
+    Point a client at the endpoint and hand it the bearer token.
+  </Card>
+  <Card title="Security model" href="/mcp/security">
+    Loopback posture, the capability token, and what the write gates cover.
+  </Card>
+  <Card title="Vault selection" href="/mcp/vault-selection">
+    How `?vault=` and the per-call `vault` argument resolve.
+  </Card>
+  <Card title="ask" href="/mcp/tools/ask">
+    Full argument and return reference for the ask tool.
+  </Card>
+</CardGroup>

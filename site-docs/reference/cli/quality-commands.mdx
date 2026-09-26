@@ -1,0 +1,221 @@
+---
+title: "Quality commands: ledger, churn, acceptance"
+description: "Exhaustive reference for the five okto-neuron quality subcommands, their flags, their JSON output and the files they write."
+---
+
+<Note>
+Okto Neuron is prerelease. Flags, output and exit codes on this page describe the current source and can change.
+</Note>
+
+## Who this page is for
+
+The `quality` group is maintainer tooling. Every subcommand reads JSON evidence files that you supply and writes a JSON report; none of them opens a vault graph, runs a model or repairs anything. The group callback carries a one-line docstring:
+
+```text
+Read-only quality evidence and diagnostics.
+```
+
+That line is accurate about the graph and inaccurate about the filesystem. `quality acceptance-collect` requires `--output`, and all five subcommands accept `--output` and `--force`, so four of them can write a file and one of them always does (`src/okto_neuron/cli/__init__.py:279-280`, `:292-297`, `:491-501`).
+
+Audience is what keeps this group out of the day-to-day surface. Its inputs are ADR 0040 evidence bundles, pinned collections and semantic snapshots, and no user-facing Okto Neuron command emits any of them. If you are looking for the state of your own vault, use [`okto-neuron status`](/reference/cli/client-commands) and [drift detection](/vault/drift) instead.
+
+## Shared output behaviour
+
+All five subcommands hand their report to the same emitter (`src/okto_neuron/cli/__init__.py:537-560`).
+
+Without `--output`, the report is serialized with `json.dumps(value, indent=2, sort_keys=True)` plus a trailing newline and printed to stdout. Sorted keys and fixed indentation make the bytes reproducible for a given input.
+
+With `--output`, the JSON does not reach stdout. The path is expanded and resolved, parent directories are created, the bytes are written to a sibling temporary file named `.<name>.<pid>.tmp` and then moved into place with `os.replace`, and the resolved output path is printed instead of the report. If the output path already exists and you did not pass `--force`, the command fails with:
+
+```text
+output already exists: /abs/path/report.json; pass --force to replace it
+```
+
+<Warning>
+`--force` replaces the existing file. The old contents are not copied anywhere first.
+</Warning>
+
+Every evidence file is loaded through one reader that fails closed on the outer JSON shape (`src/okto_neuron/cli/__init__.py:522-534`). A file that cannot be read, is not UTF-8 or is not valid JSON produces `cannot read quality evidence <path>: <error>`, and a file whose top level is the wrong kind produces `quality evidence <path> must contain a JSON object` or `... a JSON list`.
+
+Exit codes follow the group-wide contract on [exit codes](/reference/cli/exit-codes). The three gate flags described below add one case each: they raise exit 1 on a report that is otherwise emitted normally.
+
+## okto-neuron quality ledger
+
+Measure explicit pre-commit runs from a candidate-ledger snapshot (`src/okto_neuron/cli/__init__.py:283-353`).
+
+```bash
+okto-neuron quality ledger ./my-vault --run-id run-2026-09-01T10-00-00
+```
+
+The positional argument is a vault directory, not a file. The command resolves it, opens the candidate ledger under `<vault>/.marginalia`, and fails with `candidate ledger not found: <path>` when that file is absent. It never opens the graph.
+
+The report is built by `evaluate_ledger_scan`, which pairs the selected-run measurements with a complete-file framing proof: the ledger's SHA-256, its size, its line and record counts, malformed line numbers and ledger versions all travel in `evidence.source_framing` (`src/okto_neuron/semantic_quality.py:771-816`). Selecting runs explicitly is deliberate, because picking the latest run would make a baseline non-reproducible when ingestion resumes or interleaves sources (`src/okto_neuron/semantic_quality.py:262-288`). The report stays non-authoritative for stored graph semantics, and unavailable conclusions are reported as `not_measured` rather than assumed.
+
+### Flags
+
+<ParamField path="VAULT" type="path" required>
+Vault directory. Positional. Must not be a file.
+</ParamField>
+
+<ParamField path="--run-id" type="string" required>
+Candidate-ledger run id to measure. Repeat the flag to select several runs. A blank or whitespace-only value raises `run ids must not be blank`.
+</ParamField>
+
+<ParamField path="--adjudication" type="path" default="null">
+A `semantic_adjudication.v1` JSON object to bind and measure. The file must exist and must contain a JSON object.
+</ParamField>
+
+<ParamField path="--registered-predicates" type="path" default="null">
+A JSON list of predicate labels for the registry-coverage measurement. Every element must be a non-empty string, otherwise the command fails with `registered-predicates must contain only non-empty strings`.
+</ParamField>
+
+<ParamField path="--recall-samples" type="path" default="null">
+A JSON list of `recall_cost.v1` samples to bind and aggregate.
+</ParamField>
+
+<ParamField path="--output" type="path" default="null">
+Write the JSON report to this path instead of stdout.
+</ParamField>
+
+<ParamField path="--force" type="boolean" default="false">
+Replace an existing output file.
+</ParamField>
+
+There is no `--sample-limit` flag here. The underlying evaluator takes one as a Python keyword argument, and the CLI does not expose it.
+
+## okto-neuron quality churn
+
+Compare two semantic snapshots without opening either graph (`src/okto_neuron/cli/__init__.py:362-405`).
+
+```bash
+okto-neuron quality churn before.json after.json --require-stable
+```
+
+Both positional arguments are existing files. Each is loaded as a JSON object and then unwrapped: a document whose `schema_version` is `semantic_snapshot.v1` is used directly, and a report envelope carrying a `semantic_snapshot` object has that member used instead (`src/okto_neuron/cli/__init__.py:564-577`).
+
+The comparison runs over three dimensions, `identities`, `predicates` and `relations`. Snapshot members are salted-by-kind SHA-256 identifiers, so the command detects added and removed members without exposing graph content (`src/okto_neuron/semantic_quality.py:190-215`). The result carries `stable`, `population_stable`, `fingerprints` and a per-dimension `dimensions` map (`src/okto_neuron/semantic_quality.py:255-259`).
+
+### Flags
+
+<ParamField path="BEFORE" type="path" required>
+First snapshot file. Positional. Must exist.
+</ParamField>
+
+<ParamField path="AFTER" type="path" required>
+Second snapshot file. Positional. Must exist.
+</ParamField>
+
+<ParamField path="--sample-limit" type="integer" default="20">
+Maximum number of sampled added or removed members per dimension. Must be zero or greater.
+</ParamField>
+
+<ParamField path="--require-stable" type="boolean" default="false">
+Exit 1 when the comparison reports `stable` as false, meaning at least one identity, predicate or relation member changed. The report is still emitted first.
+</ParamField>
+
+<ParamField path="--output" type="path" default="null">
+Write the JSON report to this path instead of stdout.
+</ParamField>
+
+<ParamField path="--force" type="boolean" default="false">
+Replace an existing output file.
+</ParamField>
+
+## okto-neuron quality acceptance
+
+Evaluate an immutable ADR 0040 multi-corpus evidence bundle (`src/okto_neuron/cli/__init__.py:413-441`).
+
+```bash
+okto-neuron quality acceptance bundle.json --output result.json
+```
+
+The positional argument is an existing file holding a JSON object. The evaluator requires `schema_version` to be exactly `semantic_acceptance_matrix.v1` and the top level to carry exactly the fields `schema_version`, `threshold_policy`, `corpora`, `temporal_correction` and `public_diagnostic`; anything else raises an error that becomes a CLI failure message (`src/okto_neuron/semantic_acceptance.py:480-497`).
+
+The emitted report has `schema_version` `semantic_acceptance_result.v1` and carries `threshold_policy_id`, `gating_status`, `public_diagnostic_status`, `temporal_correction_status`, `acceptance_ready`, `corpora`, `checks`, `diagnostic_checks` and `failed_codes` (`src/okto_neuron/semantic_acceptance.py:571-582`). `acceptance_ready` is true only when no check failed and the public diagnostic is complete.
+
+### Flags
+
+<ParamField path="BUNDLE" type="path" required>
+Bundle file. Positional. Must exist and contain a JSON object.
+</ParamField>
+
+<ParamField path="--require-ready" type="boolean" default="false">
+Exit 1 unless `acceptance_ready` is true. The report is still emitted first.
+</ParamField>
+
+<ParamField path="--output" type="path" default="null">
+Write the JSON report to this path instead of stdout.
+</ParamField>
+
+<ParamField path="--force" type="boolean" default="false">
+Replace an existing output file.
+</ParamField>
+
+## okto-neuron quality acceptance-status
+
+Inspect a pinned ADR 0040 collection without materializing its bundle (`src/okto_neuron/cli/__init__.py:450-482`).
+
+```bash
+okto-neuron quality acceptance-status collection.json
+```
+
+The positional argument is an existing file holding a JSON object. Artifact references inside the collection are resolved relative to the collection file's own parent directory, which the CLI passes as `base_dir`. The inspector validates the same exact top-level field set as the bundle evaluator and requires `schema_version` to be `semantic_acceptance_collection.v1` (`src/okto_neuron/semantic_acceptance.py:117-139`). It opens no graph and calls no model.
+
+The report has `schema_version` `semantic_acceptance_collection_status.v1` and carries `status`, a `counts` map over `ready`, `missing`, `invalid` and `total`, and an `artifacts` list with one row per probed reference. `status` is `ready` only when nothing is missing and nothing is invalid (`src/okto_neuron/semantic_acceptance.py:248-258`).
+
+### Flags
+
+<ParamField path="COLLECTION" type="path" required>
+Collection file. Positional. Must exist and contain a JSON object.
+</ParamField>
+
+<ParamField path="--require-ready" type="boolean" default="false">
+Exit 1 unless `status` is `ready`. The report is still emitted first.
+</ParamField>
+
+<ParamField path="--output" type="path" default="null">
+Write the JSON report to this path instead of stdout.
+</ParamField>
+
+<ParamField path="--force" type="boolean" default="false">
+Replace an existing output file.
+</ParamField>
+
+## okto-neuron quality acceptance-collect
+
+Materialize one immutable acceptance bundle from a complete pinned collection (`src/okto_neuron/cli/__init__.py:490-519`).
+
+```bash
+okto-neuron quality acceptance-collect collection.json --output bundle.json
+```
+
+This is the one subcommand where `--output` is required, so it always writes a file. It takes the same collection file as `acceptance-status` and resolves artifact references against that file's parent directory.
+
+Materialization runs the inspection first and refuses to proceed unless the collection's status is `ready`. On an incomplete collection it fails with `acceptance collection is incomplete: <code>=<status>, ...`, listing at most five failing artifacts and then `and N more` (`src/okto_neuron/semantic_acceptance.py:261-278`). On success the written file is the bundle that `okto-neuron quality acceptance` consumes.
+
+### Flags
+
+<ParamField path="COLLECTION" type="path" required>
+Collection file. Positional. Must exist and contain a JSON object.
+</ParamField>
+
+<ParamField path="--output" type="path" required>
+Path to write the materialized bundle to. Required.
+</ParamField>
+
+<ParamField path="--force" type="boolean" default="false">
+Replace an existing output file.
+</ParamField>
+
+There is no `--require-ready` flag here, because readiness is already a precondition of the command.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="CLI overview" href="/reference/cli/overview">
+    Group options, the environment file, and the full command index.
+  </Card>
+  <Card title="Exit codes" href="/reference/cli/exit-codes">
+    What each exit status means across both console scripts.
+  </Card>
+</CardGroup>

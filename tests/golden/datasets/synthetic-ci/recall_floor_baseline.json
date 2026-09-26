@@ -1,0 +1,889 @@
+{
+  "claim_coverage": {
+    "claim_present": 18,
+    "claim_total": 32,
+    "rate": 0.5625
+  },
+  "daemon": false,
+  "deterministic": true,
+  "extraction_completeness": {
+    "gold_targets_present": 18,
+    "gold_targets_total": 32,
+    "rate": 0.5625
+  },
+  "hard_recall_at_k": {
+    "gold_targets_hit": 15,
+    "gold_targets_total": 32,
+    "rate": 0.4688
+  },
+  "k": 10,
+  "llm": false,
+  "metric_payload_sha256": "c3761cc556735f3179b2f025245d7ff98046e0b314c819b324cfc0ffb434655f",
+  "mrr_at_k": {
+    "answerable_questions": 22,
+    "rate": 0.4348,
+    "reciprocal_rank_sum": 9.566667
+  },
+  "per_question": [
+    {
+      "category": "entity_resolution",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3",
+          "extraction_present": true,
+          "n_claims_on_file": 19,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "01-people.md"
+        }
+      ],
+      "hit_files_topk": [
+        "01-people.md",
+        "00-charter.md",
+        "06-grants.md",
+        "06-grants.md",
+        "00-charter.md",
+        "06-grants.md",
+        "06-grants.md",
+        "08-handover-2023.md",
+        "11-calibration-log.md",
+        "06-grants.md"
+      ],
+      "id": "er_dev_is_devran",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.1,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "entity_resolution",
+      "first_relevant_rank": 2,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "07-assembly-2019.md"
+        },
+        {
+          "example_claim_id": "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3",
+          "extraction_present": true,
+          "n_claims_on_file": 19,
+          "rank": 1,
+          "recall_hit": true,
+          "source_path": "01-people.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "01-people.md",
+        "00-charter.md",
+        "10-membership.md",
+        "00-charter.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "",
+        "",
+        ""
+      ],
+      "id": "er_mari_is_marisol",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.2,
+      "reciprocal_rank": 0.5
+    },
+    {
+      "category": "entity_resolution",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3",
+          "extraction_present": true,
+          "n_claims_on_file": 19,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "01-people.md"
+        },
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "07-assembly-2019.md"
+        }
+      ],
+      "hit_files_topk": [
+        "01-people.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "05-licence.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "01-people.md"
+      ],
+      "id": "er_priya_rao_anand",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.5,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "multi_hop",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "20a98eac48a0f454a34d8a475e40c44b8741cc354d5d85dccbcb5b0d92465ed8",
+          "extraction_present": true,
+          "n_claims_on_file": 8,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "11-calibration-log.md"
+        },
+        {
+          "example_claim_id": "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3",
+          "extraction_present": true,
+          "n_claims_on_file": 19,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "01-people.md"
+        }
+      ],
+      "hit_files_topk": [
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "00-charter.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "",
+        "",
+        ""
+      ],
+      "id": "mh_calibrator_reports_to",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.6,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "multi_hop",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "46defe92231e14868c05df53d23f02719a07821c02b8b86c5ea50164e5d3d698",
+          "extraction_present": true,
+          "n_claims_on_file": 1,
+          "rank": 2,
+          "recall_hit": true,
+          "source_path": "09-storm-report-2023.md"
+        },
+        {
+          "example_claim_id": "012d974f58c7e05cb6668c1d4452be2c59bd0ee1851c5a22cbe26a01e8137c89",
+          "extraction_present": true,
+          "n_claims_on_file": 18,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "06-grants.md"
+        }
+      ],
+      "hit_files_topk": [
+        "06-grants.md",
+        "06-grants.md",
+        "09-storm-report-2023.md",
+        "12-cape-verriden.md",
+        "06-grants.md",
+        "11-calibration-log.md",
+        "06-grants.md",
+        "06-grants.md",
+        "10-membership.md",
+        "00-charter.md"
+      ],
+      "id": "mh_grant_funded_replacement",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.6,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "multi_hop",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "04-data-platform.md"
+        },
+        {
+          "example_claim_id": "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3",
+          "extraction_present": true,
+          "n_claims_on_file": 19,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "01-people.md"
+        }
+      ],
+      "hit_files_topk": [
+        "01-people.md",
+        "00-charter.md",
+        "05-licence.md",
+        "10-membership.md",
+        "00-charter.md",
+        "00-charter.md",
+        "06-grants.md",
+        "01-people.md",
+        "00-charter.md",
+        "08-handover-2023.md"
+      ],
+      "id": "mh_schema_authors_roles",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.2,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "negative_control",
+      "first_relevant_rank": null,
+      "gold_targets": [],
+      "hit_files_topk": [
+        "05-licence.md",
+        "05-licence.md",
+        "05-licence.md",
+        "00-charter.md",
+        "00-charter.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md",
+        "05-licence.md",
+        "05-licence.md"
+      ],
+      "id": "nc_bodl_v3",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": true,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "negative_control",
+      "first_relevant_rank": null,
+      "gold_targets": [],
+      "hit_files_topk": [
+        "10-membership.md",
+        "11-calibration-log.md",
+        "06-grants.md",
+        "12-cape-verriden.md",
+        "00-charter.md",
+        "00-charter.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md"
+      ],
+      "id": "nc_membership_fee",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": true,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "negative_control",
+      "first_relevant_rank": null,
+      "gold_targets": [],
+      "hit_files_topk": [
+        "08-handover-2023.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "11-calibration-log.md",
+        "06-grants.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        ""
+      ],
+      "id": "nc_third_director",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": true,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "point_in_time",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "06c5afa19e5c83e61070af5bfa9866814758f4923a564ffea45c800ebf9d34a2",
+          "extraction_present": true,
+          "n_claims_on_file": 13,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "08-handover-2023.md"
+        }
+      ],
+      "hit_files_topk": [
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "11-calibration-log.md",
+        "06-grants.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "06-grants.md",
+        "01-people.md"
+      ],
+      "id": "pit_active_director_after_handover",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.3,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "point_in_time",
+      "first_relevant_rank": 5,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "02-timeline.md"
+        },
+        {
+          "example_claim_id": "07bedc5eee3d32cb32beedb893046d40d8b524f97578c55d7e037dfb32f884e3",
+          "extraction_present": true,
+          "n_claims_on_file": 19,
+          "rank": 4,
+          "recall_hit": true,
+          "source_path": "01-people.md"
+        }
+      ],
+      "hit_files_topk": [
+        "11-calibration-log.md",
+        "06-grants.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "",
+        "",
+        "",
+        "08-handover-2023.md",
+        ""
+      ],
+      "id": "pit_director_2022",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.1,
+      "reciprocal_rank": 0.2
+    },
+    {
+      "category": "point_in_time",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "13-schema-changelog.md"
+        }
+      ],
+      "hit_files_topk": [
+        "05-licence.md",
+        "00-charter.md",
+        "00-charter.md",
+        "05-licence.md",
+        "10-membership.md",
+        "00-charter.md",
+        "00-charter.md",
+        "00-charter.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md"
+      ],
+      "id": "pit_salinity_unit_v1",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "quantitative",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "03-buoys.md"
+        }
+      ],
+      "hit_files_topk": [
+        "10-membership.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "00-charter.md",
+        "00-charter.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "01-people.md"
+      ],
+      "id": "qt_active_buoys",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "quantitative",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "012d974f58c7e05cb6668c1d4452be2c59bd0ee1851c5a22cbe26a01e8137c89",
+          "extraction_present": true,
+          "n_claims_on_file": 18,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "06-grants.md"
+        }
+      ],
+      "hit_files_topk": [
+        "06-grants.md",
+        "00-charter.md",
+        "11-calibration-log.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md",
+        "12-cape-verriden.md",
+        "06-grants.md",
+        "10-membership.md"
+      ],
+      "id": "qt_largest_grant",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.6,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "quantitative",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "03-buoys.md"
+        }
+      ],
+      "hit_files_topk": [
+        "06-grants.md",
+        "06-grants.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "08-handover-2023.md",
+        "11-calibration-log.md",
+        "08-handover-2023.md",
+        "00-charter.md",
+        "06-grants.md",
+        "00-charter.md"
+      ],
+      "id": "qt_ms7_interval",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "quantitative",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "04-data-platform.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "11-calibration-log.md",
+        "10-membership.md",
+        "08-handover-2023.md",
+        "08-handover-2023.md",
+        "00-charter.md",
+        "06-grants.md",
+        "05-licence.md",
+        "05-licence.md",
+        "08-handover-2023.md"
+      ],
+      "id": "qt_readings_per_day",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "simple_lookup",
+      "first_relevant_rank": 5,
+      "gold_targets": [
+        {
+          "example_claim_id": "064ea047828604ba127dce68a81e0eca75aef52076cf41d8895c1a82836cfe12",
+          "extraction_present": true,
+          "n_claims_on_file": 17,
+          "rank": 4,
+          "recall_hit": true,
+          "source_path": "00-charter.md"
+        }
+      ],
+      "hit_files_topk": [
+        "08-handover-2023.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "01-people.md",
+        "00-charter.md",
+        "08-handover-2023.md",
+        "00-charter.md",
+        "01-people.md",
+        "08-handover-2023.md",
+        "00-charter.md"
+      ],
+      "id": "sl_founding_director",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.3,
+      "reciprocal_rank": 0.2
+    },
+    {
+      "category": "simple_lookup",
+      "first_relevant_rank": 1,
+      "gold_targets": [
+        {
+          "example_claim_id": "064ea047828604ba127dce68a81e0eca75aef52076cf41d8895c1a82836cfe12",
+          "extraction_present": true,
+          "n_claims_on_file": 17,
+          "rank": 0,
+          "recall_hit": true,
+          "source_path": "00-charter.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "11-calibration-log.md",
+        "06-grants.md",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "id": "sl_headquarters",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.1,
+      "reciprocal_rank": 1.0
+    },
+    {
+      "category": "simple_lookup",
+      "first_relevant_rank": 3,
+      "gold_targets": [
+        {
+          "example_claim_id": "115beec3b526062ae5eba7caa434b4d05877fb4376d78f3c9e870124d0640e5e",
+          "extraction_present": true,
+          "n_claims_on_file": 8,
+          "rank": 2,
+          "recall_hit": true,
+          "source_path": "05-licence.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "00-charter.md",
+        "05-licence.md",
+        "10-membership.md",
+        "05-licence.md",
+        "00-charter.md",
+        "05-licence.md",
+        "05-licence.md",
+        "00-charter.md",
+        "06-grants.md"
+      ],
+      "id": "sl_licence_short_code",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.4,
+      "reciprocal_rank": 0.333333
+    },
+    {
+      "category": "supersedence",
+      "first_relevant_rank": 3,
+      "gold_targets": [
+        {
+          "example_claim_id": "115beec3b526062ae5eba7caa434b4d05877fb4376d78f3c9e870124d0640e5e",
+          "extraction_present": true,
+          "n_claims_on_file": 8,
+          "rank": 2,
+          "recall_hit": true,
+          "source_path": "05-licence.md"
+        },
+        {
+          "example_claim_id": "115beec3b526062ae5eba7caa434b4d05877fb4376d78f3c9e870124d0640e5e",
+          "extraction_present": true,
+          "n_claims_on_file": 8,
+          "rank": 2,
+          "recall_hit": true,
+          "source_path": "05-licence.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "00-charter.md",
+        "05-licence.md",
+        "10-membership.md",
+        "05-licence.md",
+        "00-charter.md",
+        "05-licence.md",
+        "05-licence.md",
+        "00-charter.md",
+        "06-grants.md"
+      ],
+      "id": "sup_current_licence_version",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.4,
+      "reciprocal_rank": 0.333333
+    },
+    {
+      "category": "supersedence",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "13-schema-changelog.md"
+        },
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "04-data-platform.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "05-licence.md",
+        "10-membership.md",
+        "00-charter.md",
+        "00-charter.md",
+        "00-charter.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md"
+      ],
+      "id": "sup_current_salinity_unit",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "supersedence",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": "46defe92231e14868c05df53d23f02719a07821c02b8b86c5ea50164e5d3d698",
+          "extraction_present": true,
+          "n_claims_on_file": 1,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "09-storm-report-2023.md"
+        },
+        {
+          "example_claim_id": "46defe92231e14868c05df53d23f02719a07821c02b8b86c5ea50164e5d3d698",
+          "extraction_present": true,
+          "n_claims_on_file": 1,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "09-storm-report-2023.md"
+        }
+      ],
+      "hit_files_topk": [
+        "06-grants.md",
+        "06-grants.md",
+        "11-calibration-log.md",
+        "11-calibration-log.md",
+        "08-handover-2023.md",
+        "11-calibration-log.md",
+        "08-handover-2023.md",
+        "00-charter.md",
+        "06-grants.md",
+        "00-charter.md"
+      ],
+      "id": "sup_ms2_replacement",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "timeline",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "02-timeline.md"
+        }
+      ],
+      "hit_files_topk": [
+        "09-storm-report-2023.md",
+        "00-charter.md",
+        "12-cape-verriden.md",
+        "00-charter.md",
+        "00-charter.md",
+        "12-cape-verriden.md",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "id": "tl_first_buoys_date",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "timeline",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "02-timeline.md"
+        }
+      ],
+      "hit_files_topk": [
+        "05-licence.md",
+        "05-licence.md",
+        "05-licence.md",
+        "00-charter.md",
+        "05-licence.md",
+        "00-charter.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md",
+        "01-people.md"
+      ],
+      "id": "tl_licence_upgrade_date",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    },
+    {
+      "category": "timeline",
+      "first_relevant_rank": null,
+      "gold_targets": [
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "02-timeline.md"
+        },
+        {
+          "example_claim_id": null,
+          "extraction_present": false,
+          "n_claims_on_file": 0,
+          "rank": null,
+          "recall_hit": false,
+          "source_path": "02-timeline.md"
+        }
+      ],
+      "hit_files_topk": [
+        "00-charter.md",
+        "01-people.md",
+        "06-grants.md",
+        "06-grants.md",
+        "06-grants.md",
+        "05-licence.md",
+        "12-cape-verriden.md",
+        "12-cape-verriden.md",
+        "12-cape-verriden.md",
+        "12-cape-verriden.md"
+      ],
+      "id": "tl_order_office_vs_index",
+      "k": 10,
+      "n_hits": 10,
+      "negative_control": false,
+      "precision_at_k": 0.0,
+      "reciprocal_rank": 0.0
+    }
+  ],
+  "precision_at_k": {
+    "answerable_questions": 22,
+    "precision_sum": 4.4,
+    "rate": 0.2
+  },
+  "probe": "direct_library_frozen_vault",
+  "questions": 25
+}

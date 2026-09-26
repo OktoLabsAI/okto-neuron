@@ -1,0 +1,121 @@
+---
+title: "Install from a checkout"
+description: "Set up an editable install for development, and the pin trap to avoid."
+---
+
+<Warning>
+Everything under Contributing is repo-developer tooling. None of it belongs in a
+user workflow. If you just want to run Okto Neuron, follow [/start/install](/start/install)
+instead and leave this page alone.
+</Warning>
+
+You need a working copy of the repository, a Python 3.12 or newer interpreter, and
+`uv` on your PATH. The project declares `requires-python = ">=3.12"`, so an older
+interpreter will not resolve.
+
+## Start with uv sync
+
+The repository is set up as a uv project. `[tool.uv]` sets
+`default-groups = ["serve", "dev"]`, so a plain sync installs the app-server
+dependencies and the test tooling together, matching what the declared
+dependency groups pin.
+
+```bash
+cd /path/to/okto-neuron
+uv sync
+uv run okto-neuron --help
+```
+
+The `serve` group pins `ladybug>=0.18.2,<0.19`, `fastmcp>=3.3,<3.4`,
+`starlette>=0.40,<2`, `uvicorn>=0.30,<1`, `fastembed==0.8.0` and `numpy>=1.26,<3`.
+The `dev` group pins `pytest>=8,<10`, `pytest-asyncio>=0.23,<2`, `ruff>=0.5,<1`,
+`hypothesis>=6,<7`, `psutil>=5.9,<8`, `httpx2>=2,<3` and `stub-backend-pkg==0.0.1`.
+
+That last entry is deliberate and only exists in the uv group, never in the
+published `dev` extra. `[tool.uv.sources]` maps it to the repo-relative path
+`tests/fixtures/stub_backend_pkg`, installed editable, so the registry contract
+tests can prove a third-party graph backend resolves without any in-tree import.
+The comment above the groups explains the split: a path-only requirement would
+fail to resolve for anyone installing `okto-neuron[dev]` from the published wheel.
+
+Once synced, see [/contributing/dev-commands](/contributing/dev-commands) for the
+commands you run against the checkout.
+
+## The install-dev scripts, and why the pins bite
+
+The repository also ships `scripts/install-dev.sh` and `scripts/install-dev.ps1`.
+Both are thin wrappers. They locate the repository root, and if the `PYTHON`
+environment variable is set they exec that interpreter against
+`scripts/install-dev.py`, forwarding every argument. Otherwise the shell wrapper
+tries `python3` then `python`; the PowerShell wrapper tries `py` (invoked with
+`-3`), then `python`, then `python3`. Either one exits 1 with "Python 3 not found
+on PATH." when nothing matches. The `.ps1` file being present does not mean
+Windows is a supported platform.
+
+`scripts/install-dev.py` itself does five things:
+
+<Steps>
+  <Step title="Check for uv">
+    It looks up `uv` with `shutil.which`. If uv is missing it prints
+    `uv not found on PATH. Install uv first: https://docs.astral.sh/uv/` and
+    returns 1.
+  </Step>
+  <Step title="Install the checkout as a uv tool">
+    It builds `uv tool install --editable <repo root>`, appends a `--with` flag
+    for each runtime pin, and adds `--force` unless you passed `--no-force`.
+  </Step>
+  <Step title="Resolve the installed command">
+    It searches PATH for the `okto-neuron` command (on Windows it also tries
+    `marginalia.exe` and `marginalia.cmd`), then falls back to
+    `uv tool dir --bin`. If neither finds it, the script reports that the uv
+    tool bin directory is not on PATH and tells you to run `uv tool update-shell`
+    once, restart your terminal, and rerun the installer.
+  </Step>
+  <Step title="Smoke-test the command">
+    It runs `okto-neuron --help` with output suppressed. A non-zero exit is
+    reported as a failed smoke check and the script stops there.
+  </Step>
+  <Step title="Offer onboarding">
+    In an interactive terminal it asks `Run first-time Okto Neuron onboarding now?
+    [Y/n]` and, unless you answer with an `n`, runs `okto-neuron onboard` with the
+    onboarding options you passed through (`--vault`, `--provider`, `--api-base`,
+    `--api-key-env`, `--model`, and the rest). `--no-onboard` skips it,
+    `--onboard` forces it, and a non-interactive stdin or stdout skips the prompt
+    and prints `Next: okto-neuron onboard`.
+  </Step>
+</Steps>
+
+<Warning>
+The script's pins contradict `pyproject.toml`. Its `RUNTIME_WITH` tuple passes
+`--with ladybug>=0.16,<0.17`, `--with fastmcp>=0.4`, `--with fastembed>=0.4` and
+`--with litellm`. `pyproject.toml` lists `ladybug>=0.18.2,<0.19` as a base
+dependency (`[project].dependencies`), and those two ladybug ranges do not overlap
+at all. The script's `fastmcp>=0.4` and
+`fastembed>=0.4` floors sit far below the `fastmcp>=3.3,<3.4` and
+`fastembed==0.8.0` pins the `serve` extra and group use, so the environment it
+builds does not match what the app server is tested against. Because the two
+ladybug ranges cannot both be satisfied, `uv tool install` fails to resolve and the
+script exits with uv's exit code before it ever reaches the smoke check. Use
+`uv sync` instead.
+</Warning>
+
+## The jsonld extra
+
+`Vault.export` imports `rdflib` before it serializes anything, and raises an
+`ExportError` carrying `rdflib is required for JSON-LD export; install
+okto-neuron[jsonld]` when the import fails. `rdflib>=7,<8` is declared twice, once
+as the `jsonld` optional dependency and once as a PEP-735 `jsonld` dependency
+group, and `jsonld` is not in `default-groups`. So a plain `uv sync` gives you no
+JSON-LD export. Add the group when you need it:
+
+```bash
+uv sync --group jsonld
+```
+
+`rdflib` appears nowhere else in `src/`, so nothing but export changes.
+
+<Note>
+Okto Neuron is version 0.3.0 and classified `Development Status :: 2 - Pre-Alpha`.
+Expect the development setup to move. Rough edges and unverified behaviour are
+tracked in [/help/known-gaps](/help/known-gaps).
+</Note>

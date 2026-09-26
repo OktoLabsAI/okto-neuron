@@ -1,0 +1,97 @@
+---
+title: "Why answers look like a map, not a quote dump"
+description: "How the ask path builds a small typed neighbourhood instead of pasting raw excerpts."
+---
+
+When you ask Okto Neuron a question, there are two ways it can hand context to the model. The default one pastes the raw source blocks behind the top hits. The other one, the subgraph path, builds a small typed neighbourhood around those hits and renders it as a map: named nodes, the arrows between them, and the plain sentences that could not be drawn as an arrow.
+
+This page explains the second shape, because it is the one that surprises people. It is off unless you turn it on, and the last section says why.
+
+## The shape: seeds, bridging Claims, neighbours
+
+Retrieval gives the ask path a list of `(node_id, score)` pairs. Those are the seeds. Every seed is re-fetched from the store so the builder reads the raw node facets rather than a search result object (`src/okto_neuron/subgraph.py:309-330`).
+
+From each seed, Okto Neuron walks exactly two edge types: `rdf:subject` and `rdf:object`. Both hang off a Claim, so the topology is `Claim -[rdf:subject]-> subjectEntity` and `Claim -[rdf:object]-> objectEntity` (`subgraph.py:20-23`). That makes an entity seed the *destination* of its own bridging Claims, so the builder lists edges into the seed and picks up each Claim as the edge source. A Claim seed works the other way round and reaches its two endpoints directly.
+
+The result is an ego-graph: the seeds, the Claims that bridge them, and the 1-hop neighbours on the far side of those Claims. Deeper walks are possible, and each extra level is separately bounded so reach cannot bloom the render (`subgraph.py:424-433`).
+
+A Claim seed does not become a visible row. It is a routing anchor only. Retrieval is unified, so a large share of top-k seeds are Claims, and printing each one as a full node row would bloat an index the token budget never trims (`subgraph.py:354-360`).
+
+<Note>
+Okto Neuron is prerelease. The ask path, its knobs and this rendering are all still moving.
+</Note>
+
+## The degree cap is mandatory, not a tuning nicety
+
+A single popular entity can sit on thousands of Claims. Without a cap, one hub seed drowns the answer. So the cap is applied *during* collection, not afterwards: the bridging Claims for a seed are gathered, gated, ranked and then truncated to the cap before anything else happens (`subgraph.py:221-290`).
+
+The ranking has a job beyond ordering. When your query is a question, Okto Neuron scores each candidate Claim by IDF-weighted coverage of the query terms, computed locally over that seed's own Claim pool. The topic word you asked *about* is common in that pool and gets down-weighted; the rare word that would actually answer you gets up-weighted. Coverage is the primary sort key, ahead of confidence, precisely so the answering Claim survives the cap instead of being out-ranked by a high-confidence but generic sibling (`subgraph.py:193-218`, `:276-290`). For a non-interrogative query every coverage score is zero and the order falls back to confidence.
+
+The edge scan itself is bounded too. The store protocol has no server-side limit, so the scan stops after a bounded multiple of the cap rather than exhausting the seed's true degree (`subgraph.py:66-77`).
+
+The cap and the depth are configured, not hardcoded into your question. See [/config/llm-reference](/config/llm-reference) for the knob names and their default values.
+
+## What gets filtered out, and what merely gets hidden here
+
+One gate decides whether a node may enter the render at all. A node is rejected if it is infra plumbing, if it is marked low-salience, if it has been superseded, or if its quality weight is zero (`subgraph.py:167-172`).
+
+Nothing is deleted. Infra nodes are provenance plumbing that must never appear in a content view but stay first-class in the graph (`src/okto_neuron/_internal/infra.py:1-12`). A superseded Claim is dated rather than removed, and its `supersedes` edge keeps the history walkable (`infra.py:43-50`).
+
+The clearest example is `has_heading`. Ingest stamps those Claims low-salience at mint time, because a document's headings are mostly a table of contents (`src/okto_neuron/ingest/__init__.py:91-100`). The subgraph gate curates them out of the ask view. Lexical and vector recall keep them, on purpose: a document's primary heading is often its actual subject, and that Claim is the byte-anchored provenance target for a topical query (`src/okto_neuron/query.py:586-593`). Genuine section-label noise already scores low enough that plain scoring separates it, so recall does not need the filter.
+
+A relationship row is also dropped whole if either endpoint fails the gates. The renderer resolves both ends against the node index, and a row whose subject or object is missing is skipped (`subgraph.py:471-478`, `:804-807`). A half-drawn arrow is worse than no arrow.
+
+## Deduplication
+
+Every kept assertion is deduped on a triple. For a relationship that is `(subject id, predicate, object id)` (`subgraph.py:486-489`); for a literal-valued Claim it is `(subject id, predicate, literal)` (`subgraph.py:526-529`). Both share one `seen_triples` set, so the same fact asserted in three different files enters the render once.
+
+## The rendered block
+
+The render is pure. It takes the assembled graph and returns text. No store lookup, no config read, no model call (`subgraph.py:759-768`).
+
+It emits up to three sections, in this order and with these exact headers. The rows below show the shape the renderer produces, not a real answer:
+
+```text
+=== NODES ===
+N0 [Person] Alice  (seed block:1a2b3c4d)
+N1 [Company] Acme  (neigh)
+
+=== RELATIONSHIPS ===
+N0 -[founded]-> N1  (claim:9f8e7d6c conf=0.90)
+
+=== CLAIMS (verbalized) ===
+- Acme is headquartered in Lisbon. [4b5c6d7e]
+```
+
+`NODES` is the index and the token budget never trims it; only an explicit `max_nodes` cap can (`subgraph.py:779-780`). Predicates are verbalized by a plain string transform, so `participated_in` renders as `participated in` (`subgraph.py:175-177`). Anchor ids ride every row (shortened for compactness, with the full id still available in citations) so a follow-up fetch does not have to re-parse anything (`subgraph.py:854-856`). When the block runs over its budget, `NODES` is charged first, then relationship rows are kept until the budget runs out, and claim rows get whatever is left, so verbalized-claim rows are the first to be dropped. Within each section the order is coverage, then confidence, then id, the same key that survived the cap (`subgraph.py:797-798`, `:825-842`).
+
+## Why `schema:mentions` is not traversed
+
+There is a third bridge edge in the graph, `Document -[schema:mentions]-> entity`, and the subgraph builder deliberately ignores it. The only walk worth making from an entity would lead back to its source Document, and Document nodes are dropped from the answerable pool anyway. Walking the other direction, from a Document to its other mentions, is exactly the hub bloom the degree cap exists to prevent. The omission is written down as a comment in the module rather than left implied (`subgraph.py:57-63`).
+
+So Okto Neuron never answers you by enumerating what else a document mentions.
+
+## Why this is off by default
+
+Subgraph retrieval is opt-in. `enable_subgraph` ships off ([/config/llm-reference](/config/llm-reference) carries the value), so the default ask path stays on the block-dump behaviour (`src/okto_neuron/companion/__init__.py:1712-1714`), and the effective value is read straight from vault config when a call does not override it (`companion/__init__.py:7725-7728`). The MCP `ask` tool follows the same rule: it does not force the subgraph path, it defers to the vault's configured retrieval mode (`src/okto_neuron/server/runtime.py:1383-1386`).
+
+That is also why a depth setting looks inert. Depth only controls how far the ego-graph walks, and in the default mode no ego-graph is built, so there is nothing for it to expand. Turn subgraph retrieval on in vault config and depth starts mattering (`runtime.py:1386`).
+
+The code gives the reason for the default: the graph is still extraction-thin (`runtime.py:1383-1385`).
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Asking your vault" href="/vault/asking">
+    The everyday path for putting a question to a vault.
+  </Card>
+  <Card title="The ask tool" href="/mcp/tools/ask">
+    Same answer path, driven from Claude Code.
+  </Card>
+  <Card title="The explore tool" href="/mcp/tools/explore">
+    Walking the graph directly instead of asking a question about it.
+  </Card>
+  <Card title="Retrieval configuration" href="/config/llm-reference">
+    Every ask knob, its default and its range.
+  </Card>
+</CardGroup>

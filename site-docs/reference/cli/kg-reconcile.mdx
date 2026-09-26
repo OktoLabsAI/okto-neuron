@@ -1,0 +1,237 @@
+---
+title: kg reconcile reference
+description: propose, apply, review and heal. Signatures, JSON shapes and exactly what each one writes.
+---
+
+<Note>
+Okto Neuron is prerelease (version 0.3.0, "2 - Pre-Alpha"). Command names, output lines and JSON field names on this page can change between releases.
+</Note>
+
+`okto-neuron kg reconcile` consolidates entities that were already committed to the graph and turn out to be the same thing under different titles. The group docstring describes it as retroactive entity reconciliation (v0.0.5, ADR 0008), and it splits into two options.
+
+## The two options
+
+**Option A** is `propose`, `apply` and `review`. It is off-graph and reversible: `apply` and `review confirm` write only side-data under `.marginalia/`, never the graph itself (`src/okto_neuron/cli/__init__.py:705`, `src/okto_neuron/cli/kg.py:2954`). The `ReconcileQueue` dataclass holds no store reference (`src/okto_neuron/reconcile/queue.py:114`).
+
+**Option B** is `heal`. It materializes the confirmed off-graph equivalences into a fresh graph file and atomically swaps that graph onto the live one (`src/okto_neuron/cli/kg.py:3070`, `src/okto_neuron/reconcile/heal.py:44`).
+
+You can run Option A on its own and never run `heal`. The read side folds through the same off-graph map either way (`src/okto_neuron/reconcile/heal.py:1`).
+
+For a worked walkthrough of the ordering, see [Duplicate entities](/vault/duplicate-entities).
+
+<Warning>
+`heal` replaces the live graph file through an atomic swap (`src/okto_neuron/reconcile/heal.py:1`). Everything else in this group leaves the graph untouched.
+</Warning>
+
+## Common arguments
+
+Every command here takes an optional `VAULT` positional, resolved through `resolve_vault_reference` (`src/okto_neuron/cli/kg.py:1853`), with one exception: `review confirm` and `review reject` take `CLUSTER_ID` first and `VAULT` second (`src/okto_neuron/cli/__init__.py:796`, `:807`).
+
+Graph commands load the graph implementation lazily. If Ladybug is not installed, the run fails with "Ladybug storage is not installed; install okto-neuron[ladybug] to run graph commands" (`src/okto_neuron/cli/__init__.py:580-590`).
+
+## kg reconcile propose
+
+```bash
+okto-neuron kg reconcile propose [VAULT] [--type TYPE] [--cluster-judge] [--json]
+```
+
+It makes no graph writes and no reconcile side-data writes (`src/okto_neuron/cli/__init__.py:715`, `src/okto_neuron/cli/kg.py:2890-2896`). Opening the vault is still a normal vault open, so it can scaffold missing vault directories, write a default `okto-neuron.yaml` when none exists, and rebuild the search-index cache under `.marginalia/index/` if that cache lags the graph (`src/okto_neuron/store/vault.py:63-67`, `:99-109`).
+
+It is not free of side effects on your LLM budget, though. It opens the vault, builds an `LLMMergeJudge` from the `llm.judge` configuration block (`src/okto_neuron/cli/kg.py:2853-2882`), generates candidate clusters, and adjudicates each one with that judge (`src/okto_neuron/cli/kg.py:2907-2919`).
+
+<ParamField path="VAULT" type="path" required={false}>
+Vault to scan. Resolved by the shared vault reference resolver when omitted.
+</ParamField>
+
+<ParamField path="--type" type="string" required={false}>
+Scope the scan to one node type. Passed through as `type` (`src/okto_neuron/cli/__init__.py:717`).
+</ParamField>
+
+<ParamField path="--cluster-judge" type="flag" required={false}>
+Use the compare/select prompt, which falls back to pairwise. Passed through as `use_cluster_judge` (`src/okto_neuron/cli/__init__.py:719-724`).
+</ParamField>
+
+<ParamField path="--json" type="flag" required={false}>
+Emit JSON instead of the line format.
+</ParamField>
+
+### Output
+
+Text mode prints one line per cluster (`src/okto_neuron/cli/kg.py:2945-2952`):
+
+```text
+<cluster_id> [<type>] SAME|distinct conf=<0.00> corr=<relational|lexical|both|none> members=<n> lanes=<a,b>
+```
+
+`SAME` appears when the verdict's `same` is true, `distinct` otherwise. `conf` is the confidence formatted to two decimals, `corr` the corroboration tier, one of `relational`, `lexical`, `both` or `none`, `members` the member count, and `lanes` the sorted lane keys joined by commas.
+
+When there are no rows, it prints:
+
+```text
+(no candidate clusters)
+```
+
+JSON mode emits a list, one object per cluster, with these fields (`src/okto_neuron/cli/kg.py:2924-2937`):
+
+<ResponseField name="cluster_id" type="string">Content-derived cluster identifier (`src/okto_neuron/reconcile/candidates.py:268`).</ResponseField>
+<ResponseField name="type" type="string">The cluster's node type.</ResponseField>
+<ResponseField name="member_ids" type="string[]">Node ids in the cluster.</ResponseField>
+<ResponseField name="lanes" type="string[]">Sorted keys of the cluster's lane evidence.</ResponseField>
+<ResponseField name="same" type="boolean">The judge's verdict (`src/okto_neuron/reconcile/propose.py:77`).</ResponseField>
+<ResponseField name="confidence" type="number">Verdict confidence (`src/okto_neuron/reconcile/propose.py:78`).</ResponseField>
+<ResponseField name="canonical_id" type="string">Node id chosen as canonical (`src/okto_neuron/reconcile/propose.py:79`).</ResponseField>
+<ResponseField name="corroboration" type="string">One of `relational`, `lexical`, `both`, `none` (`src/okto_neuron/reconcile/propose.py:81`).</ResponseField>
+<ResponseField name="reason" type="string">Short judge rationale, empty by default (`src/okto_neuron/reconcile/propose.py:82`).</ResponseField>
+
+Lane keys recorded by the candidate lanes are `embedding`, `lexical`, `subset`, `subset_unordered`, `handle` and `nickname` (`src/okto_neuron/reconcile/candidates.py:464`, `:485`, `:494`, `:500`, `:506`, `:522`).
+
+`propose` returns 0 on every path it reaches, including the empty-cluster path and the JSON path (`src/okto_neuron/cli/kg.py:2938`, `:2943`, `:2953`).
+
+## kg reconcile apply
+
+```bash
+okto-neuron kg reconcile apply [VAULT] [--type TYPE] [--cluster-judge] [--json]
+```
+
+Auto-merges the clusters that clear the bar into the off-graph authority index and queues the rest for review (`src/okto_neuron/cli/__init__.py:746`, `src/okto_neuron/cli/kg.py:2954`).
+
+The flags match `propose` exactly: `--type`, `--cluster-judge` and `--json`, wired to the same keyword names (`src/okto_neuron/cli/__init__.py:748-762`).
+
+### What it writes
+
+Two directories under the vault's `.marginalia/` directory, and nothing else (`src/okto_neuron/cli/kg.py:2884-2886`):
+
+- `authority/` for the `AuthorityIndex`, whose index file is `index.json` (`src/okto_neuron/reconcile/authority.py:39-40`).
+- `reconcile/` for the `ReconcileQueue`, whose queue file is `queue.json` (`src/okto_neuron/reconcile/queue.py:24-25`, `:126`).
+
+An authority record is a serialized equivalence class, never a graph node or edge. Its JSON carries `cluster_id`, `canonical_id`, `canonical_name`, `member_ids`, `variants`, `exact_match_pairs`, `verdict`, `confidence` and `provenance` (`src/okto_neuron/reconcile/authority.py:89-100`). The code is explicit that committing the SKOS Authority shape into a populated graph is the ADR-0007 corruption it exists to avoid (`src/okto_neuron/reconcile/authority.py:80-83`).
+
+### Output
+
+Text mode prints one summary line (`src/okto_neuron/cli/kg.py:2996-2999`):
+
+```text
+reconcile apply: <n> auto-merged (off-graph), <n> queued, <n> skipped
+```
+
+JSON mode emits an object with three lists of cluster ids (`src/okto_neuron/cli/kg.py:2983-2993`):
+
+<ResponseField name="auto_merged" type="string[]">Clusters written straight to the authority index (`src/okto_neuron/reconcile/apply.py:44`).</ResponseField>
+<ResponseField name="queued" type="string[]">Clusters parked for review (`src/okto_neuron/reconcile/apply.py:45`).</ResponseField>
+<ResponseField name="skipped" type="string[]">Clusters neither merged nor queued (`src/okto_neuron/reconcile/apply.py:46`).</ResponseField>
+
+A partially-corroborated cluster can split. The auto-merged record covers only the corroborated subset, and because that subset differs from the judged member set it gets its own content-derived cluster id (`src/okto_neuron/reconcile/apply.py:76-81`, `:189-195`). The queued leftovers get a second, separate content-derived id (`src/okto_neuron/reconcile/apply.py:111-118`, `:198-201`). A cluster id you saw in `propose` is therefore not guaranteed to survive `apply` unchanged.
+
+`apply` returns 0 on both the JSON and the text path (`src/okto_neuron/cli/kg.py:2994`, `:3003`).
+
+## kg reconcile review
+
+`review` is a group with explicit `list`, `confirm` and `reject` subcommands. That shape is deliberate: a group-level optional `VAULT` argument would greedily swallow the subcommand name in Click, so each subcommand declares its own positional instead (`src/okto_neuron/cli/__init__.py:777-785`).
+
+### review list
+
+```bash
+okto-neuron kg reconcile review list [VAULT] [--json]
+```
+
+Lists the clusters awaiting confirmation (`src/okto_neuron/cli/__init__.py:787`, `src/okto_neuron/cli/kg.py:3005`).
+
+Text mode prints one line per queued cluster (`src/okto_neuron/cli/kg.py:3040-3044`):
+
+```text
+<cluster_id> [<type>] conf=<0.00> corr=<relational|lexical|both|none> members=<n>
+```
+
+Note the difference from `propose`: there is no `SAME|distinct` token and no `lanes=` field, because everything in the queue already carries a same-verdict.
+
+When the queue is empty:
+
+```text
+(review queue empty)
+```
+
+JSON mode emits a list with five fields per entry (`src/okto_neuron/cli/kg.py:3021-3029`):
+
+<ResponseField name="cluster_id" type="string">The queued cluster's id.</ResponseField>
+<ResponseField name="type" type="string">The cluster's node type.</ResponseField>
+<ResponseField name="confidence" type="number">The parked verdict's confidence.</ResponseField>
+<ResponseField name="corroboration" type="string">The parked verdict's corroboration value.</ResponseField>
+<ResponseField name="member_ids" type="string[]">Node ids in the cluster.</ResponseField>
+
+`review list` returns 0 on both paths (`src/okto_neuron/cli/kg.py:3030`, `:3045`).
+
+### review confirm
+
+```bash
+okto-neuron kg reconcile review confirm CLUSTER_ID [VAULT]
+```
+
+<Warning>
+The argument order is reversed relative to every other command in this group: `CLUSTER_ID` comes first and `VAULT` second (`src/okto_neuron/cli/__init__.py:796-800`). The same reversal applies to `review reject` (`src/okto_neuron/cli/__init__.py:807-811`).
+</Warning>
+
+Confirming appends the cluster's authority record off-graph and removes it from the queue, writing only `index.json` through the authority index and `queue.json` (`src/okto_neuron/reconcile/queue.py:165-176`).
+
+The record's provenance block carries the judge model resolved from the vault's `llm.judge` configuration, alongside the agent (`marginalia-reconcile` by default), the activity `entity-reconciliation`, a UTC `created_at` timestamp, the sorted lane keys, and `source: "review-confirm"` (`src/okto_neuron/reconcile/queue.py:81`, `:100-109`; `src/okto_neuron/cli/kg.py:2870-2871`).
+
+On success it prints and exits 0 (`src/okto_neuron/cli/kg.py:3062-3063`):
+
+```text
+confirmed <cluster_id> → canonical '<name>' (off-graph)
+```
+
+If the id is not in the queue, the queue raises `KeyError`, the command writes to stderr and returns 1 (`src/okto_neuron/cli/kg.py:3055-3058`, `src/okto_neuron/reconcile/queue.py:169-170`):
+
+```text
+no queued cluster '<cluster_id>'
+```
+
+### review reject
+
+```bash
+okto-neuron kg reconcile review reject CLUSTER_ID [VAULT]
+```
+
+Drops the queued cluster (`src/okto_neuron/cli/__init__.py:807`, `src/okto_neuron/cli/kg.py:3067`). The queue's `reject` deletes the entry and re-saves `queue.json` when the id is present (`src/okto_neuron/reconcile/queue.py:177-180`). On success it prints:
+
+```text
+rejected <cluster_id>
+```
+
+Unlike `confirm`, `reject` does not raise on an id it does not hold.
+
+## kg reconcile heal
+
+```bash
+okto-neuron kg reconcile heal [VAULT]
+```
+
+This is Option B. It calls `heal_via_copy`, a deterministic graph-to-fresh-graph copy with no LLM calls, followed by an atomic swap (`src/okto_neuron/cli/kg.py:3070-3080`, `src/okto_neuron/reconcile/heal.py:44`).
+
+The module documents what the copy does: it reads the live graph's nodes and edges, drops variant nodes that merge onto a canonical, remaps edge and claim references through the equivalence map, drops self-loops the collapse creates, deduplicates by content-addressed edge id, builds a fresh graph, and atomic-swaps it onto live (`src/okto_neuron/reconcile/heal.py:1`). The entities are already extracted, so there is nothing left for a judge to decide.
+
+`heal` runs under the same cross-process rebuild lease as other graph swaps. If an Okto Neuron server is running for the vault, the lease raises `VaultLockHeld` naming the owning pid, with the message "cannot reconcile heal while the Okto Neuron server is running for this vault (pid N); stop the server first" (`src/okto_neuron/reconcile/heal.py:51-56`, `src/okto_neuron/store/rebuild_lock.py:79-92`).
+
+On success it prints and returns 0 (`src/okto_neuron/cli/kg.py:3077-3079`):
+
+```text
+reconcile heal: collapsed equivalences into a fresh graph + swap
+```
+
+On any non-zero result it prints nothing and returns the code `heal_via_copy` gave it (`src/okto_neuron/cli/kg.py:3077-3080`).
+
+The heal is documented as re-runnable and idempotent: a second heal on an already-collapsed graph is a verbatim copy. The authority records stay in place as the alias source and still describe the applied merges, and the markdown stays untouched, so a full re-derivation from markdown remains available (`src/okto_neuron/reconcile/heal.py:1`).
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Duplicate entities" href="/vault/duplicate-entities">
+Why look-alike entities appear and how to work through them.
+</Card>
+<Card title="Predicates" href="/reference/predicates">
+Edge predicate vocabulary, including the ones that assert two entities are not the same.
+</Card>
+<Card title="kg command overview" href="/reference/cli/kg-overview">
+The rest of the `kg` group.
+</Card>
+</CardGroup>

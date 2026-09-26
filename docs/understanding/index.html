@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Okto Neuron — Understanding</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#11151f; --panel2:#161b29; --ink:#e6e9f0; --dim:#8b93a7;
+    --line:#222a3d; --accent:#7aa2f7; --green:#9ece6a; --amber:#e0af68; --red:#f7768e;
+    --purple:#bb9af7; --cyan:#7dcfff; --mono:'SFMono-Regular',ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.6;
+    background-image:radial-gradient(900px 600px at 85% -5%,#161d31 0%,transparent 60%),
+                     radial-gradient(800px 700px at -10% 40%,#141a2b 0%,transparent 55%);
+  }
+  code,.mono{font-family:var(--mono)}
+
+  /* sticky nav with tabs */
+  nav{
+    position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:18px;
+    padding:14px 32px;border-bottom:1px solid var(--line);
+    background:rgba(11,14,20,.82);backdrop-filter:blur(10px);
+  }
+  .logo{font-weight:700;font-size:17px}.logo .dot{color:var(--accent)}
+  .sub{color:var(--dim);font-size:12px;font-family:var(--mono)}
+  .tabs{margin-left:auto;display:flex;gap:8px}
+  .tab{
+    cursor:pointer;color:var(--dim);font-size:13.5px;padding:9px 20px;border-radius:999px;
+    border:1px solid var(--line);background:var(--panel);transition:.2s;user-select:none;
+  }
+  .tab:hover{color:var(--ink);border-color:var(--accent)}
+  .tab.active{color:#fff;border-color:var(--accent);background:linear-gradient(180deg,#1b2540,#141a2b);box-shadow:0 0 0 1px var(--accent) inset}
+  .tab .k{font-family:var(--mono);font-size:11px;color:var(--dim);margin-left:7px}
+  .navprog{position:absolute;left:0;bottom:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--purple));width:0}
+
+  .wrap{max-width:1080px;margin:0 auto;padding:0 28px}
+
+  /* tab panels */
+  .panel{display:none}
+  .panel.show{display:block;animation:fade .45s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+  /* hero (per panel) */
+  .hero{padding:74px 0 50px;text-align:center}
+  .hero .emoji{font-size:50px;margin-bottom:12px}
+  .hero h1{font-size:40px;line-height:1.12;font-weight:700;max-width:880px;margin:0 auto 16px}
+  .hero h1 .hl{color:var(--accent)} .hero h1 .hl2{color:var(--purple)} .hero h1 .cy{color:var(--cyan)}
+  .hero p{color:var(--dim);font-size:17px;max-width:730px;margin:0 auto}
+  .hero p b{color:var(--ink)}
+  .badges{margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+  .pill{display:inline-block;padding:4px 12px;border-radius:7px;font-family:var(--mono);font-size:12px;border:1px solid var(--line);background:var(--panel2);color:var(--dim)}
+
+  section{padding:50px 0;border-top:1px solid var(--line)}
+  .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:8px}
+  .sec-kicker{font-family:var(--mono);font-size:12px;letter-spacing:2px;text-transform:uppercase;color:var(--accent)}
+  .sec-kicker.c{color:var(--cyan)}
+  .chapter{font-size:13px;color:var(--dim);font-family:var(--mono)}
+  h2{font-size:29px;font-weight:680;margin-bottom:10px}
+  h2 .hl{color:var(--accent)} h2 .hl2{color:var(--purple)} h2 .rd{color:var(--red)}
+  .sec-lead{color:var(--dim);font-size:16px;max-width:790px;margin-bottom:26px}
+  .sec-lead b{color:var(--ink)}
+
+  .reveal{opacity:0;transform:translateY(22px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.in{opacity:1;transform:none}
+  .reveal.d1{transition-delay:.08s}.reveal.d2{transition-delay:.16s}.reveal.d3{transition-delay:.24s}
+  .reveal.d4{transition-delay:.32s}.reveal.d5{transition-delay:.40s}
+
+  .prims{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+  @media(max-width:880px){.prims{grid-template-columns:repeat(2,1fr)}}
+  .pcard{padding:18px;border-radius:14px;border:1px solid var(--line);background:linear-gradient(180deg,var(--panel2),var(--panel))}
+  .pcard .ic{font-size:24px}.pcard .nm{font-weight:680;margin:9px 0 5px;font-size:15px}
+  .pcard .ds{color:var(--dim);font-size:12.5px;line-height:1.45}
+  .pcard .uri{font-family:var(--mono);font-size:10.5px;color:var(--accent);margin-top:9px;opacity:.85}
+  .support{margin-top:16px;color:var(--dim);font-size:13.5px}.support .pill{color:var(--ink)}
+  .tag{color:var(--amber);font-family:var(--mono);font-size:12.5px}
+
+  .chain{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:6px}
+  .chip{padding:12px 16px;border-radius:12px;border:1px solid var(--line);background:var(--panel2);font-family:var(--mono);font-size:13px}
+  .chip small{display:block;color:var(--dim);font-size:11px;margin-top:3px}
+  .chip b{color:var(--accent)}.chip.b2 b{color:var(--green)}.chip.b3 b{color:var(--purple)}.chip.b4 b{color:var(--amber)}
+  .arrow{color:var(--dim);font-size:20px}
+
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+  @media(max-width:760px){.twocol{grid-template-columns:1fr}}
+  .col{padding:22px;border-radius:14px;border:1px solid var(--line);background:var(--panel2)}
+  .col h3{font-size:15px;margin-bottom:9px;display:flex;align-items:center;gap:8px}
+  .col p{color:var(--dim);font-size:13.5px}.col code{color:var(--cyan);font-size:12.5px}
+  .col.vec{border-color:var(--cyan)} .col.vec h3{color:var(--cyan)}
+  .col.gr{border-color:var(--purple)} .col.gr h3{color:var(--purple)}
+  .col.ok{border-color:var(--green)} .col.ok h3{color:var(--green)}
+  .col.no{border-color:var(--amber)} .col.no h3{color:var(--amber)}
+
+  .flow{display:flex;align-items:stretch;gap:8px;flex-wrap:wrap}
+  .step{flex:1;min-width:140px;padding:16px;border-radius:13px;border:1px solid var(--line);background:var(--panel2)}
+  .step .num{font-family:var(--mono);font-size:12px;color:var(--accent)}
+  .step .t{font-weight:660;font-size:15px;margin:4px 0}.step .s{color:var(--dim);font-size:12px;font-family:var(--mono)}
+  .step.accent{border-color:var(--accent)} .step.purple{border-color:var(--purple)}
+  .step.amber{border-color:var(--amber)} .step.green{border-color:var(--green)}
+  .flowarrow{align-self:center;color:var(--dim);font-size:22px}
+  @media(max-width:760px){.flowarrow{transform:rotate(90deg)}}
+
+  .probes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media(max-width:760px){.probes{grid-template-columns:1fr}}
+  .probe{padding:18px;border-radius:13px;border:1px solid var(--line);background:var(--panel2)}
+  .probe .pi{font-size:22px}.probe .pt{font-weight:660;margin:8px 0 4px;font-family:var(--mono);font-size:14px}
+  .probe .pd{color:var(--dim);font-size:12.5px}.probe.red{border-color:var(--red)}
+
+  .formula{margin-top:18px;padding:16px 20px;border-radius:12px;border:1px dashed var(--line);
+    background:var(--panel);font-family:var(--mono);font-size:13.5px;color:var(--dim);text-align:center}
+  .formula b{color:var(--ink)} .formula .g{color:var(--green)} .formula .r{color:var(--red)} .formula .a{color:var(--amber)}
+
+  .gate{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .gatebox{padding:16px 20px;border-radius:13px;border:1px solid var(--amber);background:var(--panel2);text-align:center;font-family:var(--mono);font-size:13px}
+  .outc{display:flex;flex-direction:column;gap:10px;flex:1;min-width:200px}
+  .outc .o{padding:13px 18px;border-radius:11px;border:1px solid var(--line);background:var(--panel2);font-size:14px}
+  .outc .o.g{border-color:var(--green)} .outc .o.r{border-color:var(--red)}
+  .outc .o .s{color:var(--dim);font-family:var(--mono);font-size:11.5px}
+
+  .stack{display:flex;flex-direction:column;gap:9px}
+  .layer{display:flex;align-items:center;gap:16px;padding:13px 18px;border-radius:11px;border:1px solid var(--line);background:var(--panel2)}
+  .layer .lk{font-family:var(--mono);font-size:11px;color:var(--accent);width:110px;flex-shrink:0;text-transform:uppercase;letter-spacing:1px}
+  .layer .lb{font-size:14px}.layer .lb small{color:var(--dim);font-family:var(--mono);font-size:12px}
+  .layer.root{border-color:var(--green)} .layer.root .lk{color:var(--green)}
+  .layer.loop{border-color:var(--purple)} .layer.loop .lk{color:var(--purple)}
+
+  .callout{margin-top:22px;padding:18px 22px;border-radius:12px;border:1px solid var(--line);
+    border-left:3px solid var(--amber);background:var(--panel);color:var(--dim);font-size:14px}
+  .callout b{color:var(--ink)}
+  .callout.frontier{border-left-color:var(--purple)} .callout.gap{border-left-color:var(--red)}
+
+  footer{padding:46px 0 80px;text-align:center;color:var(--dim);font-size:13px;border-top:1px solid var(--line)}
+  footer .mono{color:var(--accent);margin-top:6px}
+</style>
+</head>
+<body>
+
+<nav>
+  <div>
+    <div class="logo">Okto Neuron<span class="dot">.</span></div>
+    <div class="sub">mental model · verified vs code · 2026-07-28 (full-page audit) · §11/§14 addenda verified 2026-09-07 · §06–§10 write-path claims re-verified 2026-09-18</div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-panel="conceptual">🧠 Conceptual <span class="k">1</span></div>
+    <div class="tab" data-panel="mechanical">🔧 Mechanical <span class="k">2</span></div>
+  </div>
+  <div class="navprog" id="navprog"></div>
+</nav>
+
+<!-- ============ CONCEPTUAL ============ -->
+<div class="panel show" id="conceptual">
+<div class="wrap">
+
+  <div class="hero">
+    <div class="emoji">🧠</div>
+    <h1>What Okto Neuron <span class="hl">is</span> — learning the way you wish you could.</h1>
+    <p>You read a book and forget the sentences but keep the <b>lesson</b> — and you remember <b>which book to return to</b>. Okto Neuron stores the distilled fact <b>and</b> a precise pointer home. Markdown is the truth; the graph is derived and always rebuildable.</p>
+    <div class="badges">
+      <span class="pill">Python library</span><span class="pill">CLI · kg / marginalia</span>
+      <span class="pill">MCP server</span><span class="pill">5 primitives · closed schema</span>
+      <span class="pill">spun out of Pulse's KG</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker">The closed vocabulary</span><span class="chapter">01</span></div>
+    <h2 class="reveal">Everything maps to <span class="hl">5 primitives</span>.</h2>
+    <p class="sec-lead reveal d1">The deliberate bet: a tiny, <b>closed</b> schema. A sixth primitive needs a whole new RFC. Fixed built-in vocabulary profiles organize domain labels and relations, but they do not extend the structural node model at runtime.</p>
+    <div class="prims">
+      <div class="pcard reveal d1"><div class="ic">👤</div><div class="nm">Agent</div><div class="ds">Who acts — person, org, or system.</div><div class="uri">prov:Agent</div></div>
+      <div class="pcard reveal d2"><div class="ic">⚡</div><div class="nm">Activity</div><div class="ds">Something that happened over time.</div><div class="uri">prov:Activity</div></div>
+      <div class="pcard reveal d3"><div class="ic">📄</div><div class="nm">InformationObject</div><div class="ds">A thing that carries meaning.</div><div class="uri">dcmi / bibframe</div></div>
+      <div class="pcard reveal d4"><div class="ic">💡</div><div class="nm">Concept</div><div class="ds">An idea, topic, abstraction.</div><div class="uri">skos:Concept</div></div>
+      <div class="pcard reveal d5"><div class="ic">📍</div><div class="nm">Place</div><div class="ds">A location, physical or logical.</div><div class="uri">prov:Location</div></div>
+    </div>
+    <p class="support reveal d2">Plus 6 support types — <span class="pill">Document</span> <span class="pill">Identifier</span> <span class="pill">Annotation</span> <span class="pill">Claim</span> <span class="pill">Block</span> <span class="pill">Finding</span>. The names aren't invented; they map to <span class="tag">PROV-O · SKOS · Dublin Core · BIBFRAME · CiTO</span>.</p>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker">The atomic unit</span><span class="chapter">02</span></div>
+    <h2 class="reveal">A <span class="hl2">Claim</span> is one sentence of truth — and it never floats free.</h2>
+    <p class="sec-lead reveal d1">The smallest unit isn't a node; it's a <b>Claim</b>: a single subject–predicate–object assertion. A Claim reaches in two directions at once. <b>Down</b> by PROV-O edges to exactly where it came from ("which book to return to" made mechanical), and <b>across</b> to the entities it asserts — so a fact and its referents live in one connected graph, not two disjoint halves.</p>
+    <div class="chain reveal d1">
+      <span class="chip"><b>Claim</b><small>S–P–O assertion</small></span>
+      <span class="arrow">→</span>
+      <span class="chip b2"><b>Block</b><small>path, byte_start, byte_end, hash</small></span>
+      <span class="arrow">→</span>
+      <span class="chip b3"><b>Activity</b><small>the extractor that derived it</small></span>
+      <span class="arrow">→</span>
+      <span class="chip b4"><b>Agent</b><small>who's responsible</small></span>
+    </div>
+    <div class="chain reveal d1">
+      <span class="chip b3"><b>subject</b><small>entity the Claim is about</small></span>
+      <span class="arrow">←</span>
+      <span class="chip"><b>Claim</b><small>rdf:subject always · rdf:object when entity</small></span>
+      <span class="arrow">→</span>
+      <span class="chip b3"><b>object</b><small>entity (literals stay an attribute)</small></span>
+    </div>
+    <div class="callout reveal d2">You can always audit a fact: it carries its byte-range anchor home. <b>Don't bypass Block anchoring</b> — it's load-bearing. And the Claim bridges to its subject/object via canonical <code>rdf:subject</code>/<code>rdf:object</code> edges (the source <b>Document</b> also gets <code>schema:mentions</code> to every entity it names) — so reified facts are navigable, not inert. See <span class="tag">ADR 0005</span>.</div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker">The recent shift</span><span class="chapter">03</span></div>
+    <h2 class="reveal">It stopped being a filing cabinet. It became a <span class="hl">companion that curates</span>.</h2>
+    <p class="sec-lead reveal d1">Hand it a document and it extracts knowledge with an LLM, checks it against what it already knows, surfaces correlations and contradictions, and commits on its own — interrupting you only when genuinely unsure.</p>
+    <div class="twocol">
+      <div class="col vec reveal d1"><h3>🗄️ Before — passive store</h3><p>file → deterministic parse → claims written directly. No judgement, no dedup, no "wait, this contradicts what I knew."</p></div>
+      <div class="col gr reveal d2"><h3>🤖 After — autonomous loop</h3><p>Ports Pulse's proven KG-consolidation shape (<code>propose → resolve → gate → commit</code>) onto the generic 5-primitive spine. A confidence gate keeps it safe; the markdown vault keeps it reversible.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker">Two memories, one relay</span><span class="chapter">04</span></div>
+    <h2 class="reveal">Fuzzy recall to <span class="hl2">land</span>; precise traversal to <span class="hl">expand &amp; prove</span>.</h2>
+    <p class="sec-lead reveal d1">Embeddings and graph aren't rivals — they're a relay, and this is the whole intuition behind the read path.</p>
+    <div class="twocol">
+      <div class="col vec reveal d1"><h3>🌫️ Embeddings</h3><p>Associative, fuzzy. "What feels related to this meaning?" Finds the <b>entry points</b> when you don't know the exact words.</p></div>
+      <div class="col gr reveal d2"><h3>🕸️ Graph</h3><p>Precise, structured, provenanced. "How does X tie to Y, and where's the source?" <b>Expands and grounds</b> once you've landed.</p></div>
+    </div>
+    <div class="callout reveal d2">Vector to find the door, graph to walk the house — the GraphRAG thesis. <span class="tag">The unified "one search" that fuses these shipped (2026-05-29) — see the Mechanical tab.</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker">The honest frontier</span><span class="chapter">05</span></div>
+    <h2 class="reveal">The plumbing works. The <span class="hl">hard bet</span> is precision at firehose scale.</h2>
+    <p class="sec-lead reveal d1">"Every interaction curated and absorbed" is a firehose. It only stays valuable if write-time curation is <b>both mostly-autonomous and high-precision</b> — else the graph rots into noise. The review queue is the safety valve, but you can't review everything.</p>
+    <div class="callout frontier reveal d1">The least-built, most-interesting part: <b>abstraction</b> — forming general <code>Concept</code>s from repeated micro-instances (SKOS broader/narrower). That's "how we actually learn," and it's the real frontier. Not the plumbing — the judgement.</div>
+    <p class="sec-lead reveal d2" style="margin-top:22px">The first answer to "you can't review everything" already shipped: a <b>post-ingest curation layer</b> runs after the write path, reconciling entities that were already committed and sweeping the graph continuously in the background. See the Mechanical tab.</p>
+  </section>
+
+  <footer>
+    <div>Part I of II — switch to <b style="color:var(--cyan)">🔧 Mechanical</b> for how it works.</div>
+    <div class="mono">docs/understanding/index.html</div>
+  </footer>
+</div>
+</div>
+
+<!-- ============ MECHANICAL ============ -->
+<div class="panel" id="mechanical">
+<div class="wrap">
+
+  <div class="hero">
+    <div class="emoji">🔧</div>
+    <h1>How Okto Neuron <span class="cy">works</span> — one call runs the whole write path.</h1>
+    <p>Everything below happens inside a single <code style="color:var(--cyan)">Companion.remember(source)</code> call. Six stages, one staging transaction. Verified against the live code in <code style="color:var(--cyan)">src/okto_neuron/</code>.</p>
+    <div class="badges">
+      <span class="pill">remember()</span><span class="pill">propose → resolve → gate → commit</span>
+      <span class="pill">OpenAI-compatible endpoint · model you configure</span><span class="pill">confidence ≥ 0.75</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">The full pipeline</span><span class="chapter">06</span></div>
+    <h2 class="reveal">Six stages, one transaction.</h2>
+    <p class="sec-lead reveal d1">Extraction <b>never writes directly</b>. It only emits <i>candidates</i> into staging — nothing touches the real graph until the gate says so.</p>
+    <div class="flow">
+      <div class="step accent reveal d1"><div class="num">①</div><div class="t">Intake</div><div class="s">vault.add(source)</div></div>
+      <div class="flowarrow reveal d1">→</div>
+      <div class="step reveal d2"><div class="num">②</div><div class="t">Propose</div><div class="s">extractor.extract()</div></div>
+      <div class="flowarrow reveal d2">→</div>
+      <div class="step purple reveal d3"><div class="num">③</div><div class="t">Stage</div><div class="s">begin() · add_candidate</div></div>
+      <div class="flowarrow reveal d3">→</div>
+      <div class="step reveal d4"><div class="num">④</div><div class="t">Resolve</div><div class="s">resolve(candidate)</div></div>
+      <div class="flowarrow reveal d4">→</div>
+      <div class="step amber reveal d5"><div class="num">⑤</div><div class="t">Gate</div><div class="s">decide() ≥ 0.75?</div></div>
+      <div class="flowarrow reveal d5">→</div>
+      <div class="step green reveal d5"><div class="num">⑥</div><div class="t">Commit / Queue</div><div class="s">session.commit()</div></div>
+    </div>
+    <div class="callout reveal d5"><b>Those six boxes are the conceptual shape; the runtime reports <i>five</i> progress stages.</b> The <code>on_progress</code> callback <code>remember()</code> accepts emits exactly these literals, in order: <code>parsing</code> → <code>extracting</code> → <code>embedding</code> → <code>dedup</code> → <code>committing</code>. Only the first three count a <b>block population</b> (<code>done</code>/<code>total</code> are real block counters). <code>dedup</code> and <code>committing</code> have no block denominator, so they tick an <i>item ordinal with an explicitly undeclared total</i> — the server records a blocks population only for the three block-counting stages, because folding an ordinal of 212 into "of 3 blocks" would both clobber the display and trip the ADR 0039 T9 <code>done ≤ total</code> integrity check. <code>remember()</code> also takes <code>on_event</code> and a cooperative <code>should_cancel</code> predicate.</div>
+    <div class="callout gap reveal d5"><b>Curation, not extraction, is where the wall clock goes — and it is serial by default.</b> One measured live ingest of a 15,882-byte, 3-block Markdown file took <b>1,536 s</b> end to end: 271 s of extraction (18%) against 1,266 s of curation (82%), over 177 completion calls and 438,464 input / 28,495 output tokens, committing 25 candidates and queueing 29. Three blocks, twenty-five minutes — against the default local endpoint (<code>127.0.0.1:8123/v1</code>, qwen3.8-27b on a Mac). The same file and model on a separate LAN inference server took <b>297 s</b> (255 s curation, 163 calls, 407,279 / 26,837 tokens, same <code>units</code> and <code>quality: complete</code>): per-call latency 6.0–9.3 s vs 1.14–2.26 s on an identical payload, so the endpoint alone moves wall clock ~5× while the serial-curation shape stays the same. <code>curation_max_concurrent</code> and <code>curation_batch_size</code> both default to <code>1</code> and <code>curation_call_timeout_s</code> is unbounded (the deliberate ADR 0015 opt-ins) — and raising the first may still do nothing, because <code>curation_effective_max_concurrent</code> clamps it back to 1 unless every curation-step model is listed in <code>llm.parallel_capable_models</code>. A vault can be configured for 4-way fan-out and run strictly sequentially with no error. <span class="tag">measured 2026-09-18, LAN re-run 2026-09-19 · ADR 0015 · ADR 0039</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">① Intake &amp; ② Propose</span><span class="chapter">07</span></div>
+    <h2 class="reveal">Anchored Blocks first — <span class="hl">then</span> the LLM proposes.</h2>
+    <p class="sec-lead reveal d1"><b>Intake</b> runs the deterministic path: markdown → byte-anchored <code>Block</code>s (frontmatter, #tags, [[wikilinks]], headings). <b>Propose</b> hands text to <code>LLMExtractor</code>, which calls the configured LLM provider — a <b>LiteLLM-backed</b> layer that routes any backend, local or hosted, through one <code>complete()</code> interface — and parses tolerant JSON into candidates. Each LLM moment (extraction, the merge-judge, ask) is configured independently; extraction runs with reasoning <i>off</i> by default since it only needs to emit structured JSON, and at temperature <code>0.0</code> (<code>extract/__init__.py</code>) — determinism is the point when the output is structured JSON. There is no baked-in <code>ask</code> temperature: <code>LLMDefaults.temperature</code> is <code>None</code>, so <code>ask</code> sends whatever the vault resolves, and the <code>0.7</code> figure lives only inside the named <code>instruct</code> sampling preset. The curator steps default to <code>0.2</code>; the judge and resolve calls to <code>0.0</code>. The endpoint-specific sampler/template params a self-hosted model needs — including the <code>chat_template_kwargs:&#123;enable_thinking:false&#125;</code> switch — are passed through to any <b>self-hosted</b> endpoint (loopback <i>or</i> private LAN / Tailscale), not just loopback; a known hosted API never receives them. (Gating that passthrough to loopback-only silently dropped thinking-off for a LAN inference server, so it reasoned at length and truncated dense blocks before emitting JSON.)</p>
+    <div class="chain reveal d1">
+      <span class="chip"><b>text</b></span>
+      <span class="arrow">→</span>
+      <span class="chip b3"><b>LLMProvider.complete()</b><small>OpenAI-compatible · base_url switch</small></span>
+      <span class="arrow">→</span>
+      <span class="chip b2"><b>ExtractionResult</b><small>NodeCandidate[] + EdgeCandidate[]</small></span>
+    </div>
+    <div class="callout reveal d2"><b>A vault with no model configured is refused before the first call.</b> <code>LLMDefaults.model</code> is deliberately the <b>empty string</b> — the built-in defaults never claim a model the configured endpoint may not serve — while <code>provider</code> and <code>api_base</code> do have real values. Dialing that combination used to resolve to <code>openai/</code> and kill every block with a per-block <code>provider_unavailable</code> ledger row, blaming a provider that was actually up. <code>remember()</code> now raises <i>before</i> the extractor is built when the vault still resolves to the built-in defaults with an empty model, naming <code>llm.defaults.model</code> and the vault path. A vault that pinned its own provider or <code>api_base</code> is left alone — an empty model there is the operator's explicit choice. <span class="tag">working tree · not yet published</span></div>
+    <div class="callout gap reveal d2">Only the 5 primitives are valid candidate <i>node</i> types — propositional facts ride a separate <code>claims[]</code> channel, so a subjectless <code>Claim</code> node can never be minted. Sensitive content is <span class="tag">pinned local-only — never sent to a hosted provider.</span></div>
+    <div class="callout frontier reveal d3"><b>Extraction is escalate-on-truncation by default (auto mode).</b> A 12k <code>Block</code> can produce more JSON than the response token cap allows; the model stops at <code>finish_reason="length"</code> and the tail facts are silently dropped — measured ~15–20% of dense blocks, exactly the dense surfaces behind the 63% extraction-gap. So <code>extract()</code> now defaults to <code>"auto"</code>: per block, a <code>"stop"</code> finish accepts the baseline single pass as-is (no extra cost); a <code>"length"</code> finish re-runs <i>that block</i> through the enumerate (Mode B) pipeline to recover the lost facts; any other terminal trips an <b>unexpected-finish guard</b> (kept + logged + counted, never silently escalated). A <b>second-order guard</b> logs CRITICAL if the escalation itself still truncates. Byte-anchoring is identical on both paths. <code>"baseline"</code> and <code>"enumerate"</code> stay selectable per-vault. <span class="tag">ADR 0021</span></div>
+    <div class="callout reveal d3"><b>Addendum · 2026-07-07 — extraction recall via multi-sample union (<code>samples=k</code>).</b> A single draw at a non-zero temperature is a lossy sample of what a block asserts; a colder draw drops facts a warmer sibling would have caught. So <code>LLMExtractor</code> now takes an optional <code>samples</code> knob (config <code>llm.extraction.samples</code>, default <b>1</b> = today's single pass, <b>byte-identical</b>): with <code>samples=k</code> it runs <i>k independent draws</i> per block and <b>unions</b> their candidate sets — deduped on node <code>candidate_id</code> and on the claim/edge <code>(type, src, dst|literal)</code> grain — <i>before</i> the companion's normal dedup / curation. The static system prefix is identical across draws, so a prefix-caching provider reuses it; only the sampling variance differs (at temperature 0 the draws coincide and the union is a deliberate no-op). A bounded <b>truncation-retry</b> re-draws exactly once any draw that hit <code>finish_reason="length"</code> with zero parsed candidates, so a runaway draw does not waste tokens on nothing. Model-free tests pin union deduplication, zero-temperature behavior, and the bounded retry contract. <span class="tag">E6 · shipped</span></div>
+    <div class="callout reveal d3"><b>Dense facts also live in prose, not just <code>key=value</code> lines and table cells.</b> The extraction prompt now instructs the model to mint a Claim for a scalar, count, or quantity sitting inside a flowing sentence or a capability bullet (e.g. "searches across 24 providers", "uploaded 2,400 files") — binding the Claim to a subject named only in a nearby heading or earlier sentence rather than dropping the fact. Relational prose ("X becomes a one-way mirror of Y") yields an edge <i>and</i> a Claim. This directly attacks the extraction gap behind a subgraph answer: the answer fact gets minted as a byte-anchored Claim instead of staying buried in raw Block text. Prompt regressions pin both prose-embedded scalar and relational cases.</div>
+    <div class="callout reveal d3"><b>Composite facts bind into one Claim; a Claim's subject is the entity you'd ask about.</b> Two further representation rules. A co-located figure-set — "2,400 files, 80 albums, 0 errors" — mints as <i>one</i> composite Claim (<code>has_measurement</code>, literal capped to noun + qualifiers since the object is hashed into the claim id) instead of being narrated away or atomized into fragments that never reassemble; independent attributes still stay separate (the carve-out). And a fact's Claim <b>subject</b> is bound to the node a reader would <i>name</i> when asking — "AI-generated code", not the sentence's grammatical subject "Verification Gates" — with the original framing preserved as a topology edge. A dense quantity fact also steers to the stable durable entity in scope (ArchiveBox, PhotoShelf, or a person) rather than a document-structure label (a folder, batch, or file name), so the subject is a real entity that commits — and only when no durable entity exists does it keep the structural label. Model-free prompt tests pin composite literals, subject re-pointing, and the independent-attribute carve-out. <span class="tag">closed schema: ADR 0020 predicates only, no new primitive</span></div>
+    <div class="callout reveal d3"><b>The gate promotes a fact's structural anchor instead of dropping the fact.</b> A literal Claim whose subject was queued (not contradicted) and extracted in the current run can promote that subject as a <code>_salience:low</code> anchor, filtered from recall, ask, and subgraph. Promotion is necessary-not-sufficient: the subject commits only if the relation curator accepts its Claim, so it never creates an orphan. ADR 0031 shipped the same guarded promotion for a topology edge with exactly one dead endpoint; both-endpoints-dead edges still dead-letter, and a queued exact-title duplicate stays with the dedup remap path. The sibling retention fix expanded the curator excerpt from 9,000 characters to <code>CURATION_SOURCE_EXCERPT_LIMIT=16000</code>, covering the full extraction window without changing the per-block prefix shape. <span class="tag">ADR 0031 · low-salience is distinct from infrastructure</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">④ Resolve — the "talk-back"</span><span class="chapter">08</span></div>
+    <h2 class="reveal">Two probes ask: <span class="hl2">have I seen this before?</span></h2>
+    <p class="sec-lead reveal d1">For each candidate, <code>resolve()</code> runs two checks against the existing graph and produces a confidence score. This is the "resgate dos nós associados" from your sketch — pulling in the related nodes.</p>
+    <div class="probes">
+      <div class="probe reveal d1"><div class="pi">🔍</div><div class="pt">find_similar</div><div class="pd">Same-type nodes, cosine ≥ 0.82, top-5. Spots near-duplicates.</div></div>
+      <div class="probe red reveal d2"><div class="pi">⚔️</div><div class="pt">find_contradictions</div><div class="pd">Claims with same S·P but a different O. Conflict detection.</div></div>
+    </div>
+    <div class="formula reveal d2">confidence = <b>0.7</b> base &nbsp;·&nbsp; novel <span class="g">+0.2</span> &nbsp;·&nbsp; ambiguous <span class="a">−0.1</span> &nbsp;·&nbsp; contradicted <span class="r">−0.5</span> &nbsp;→ clamped [0, 1]</div>
+    <div class="callout frontier reveal d3"><b>The probes score; a tiered merge decides identity.</b> Before any candidate commits, resolve runs a layered reconcile <i>against the committed store</i>: <b>Tier-0</b> exact <code>reconcile_against_store</code>, <b>Tier-1</b> same-type cosine ≥ 0.82 match, <b>Tier-2</b> an LLM merge-judge (<code>judge_against_store</code>, confidence ≥ 0.8). <b>ADR 0004</b> added a fourth pass — <code>judge_within_batch</code> reconciles candidate-vs-candidate <i>inside one <code>remember()</code> batch</i>, catching namespace twins (a bare <code>alice</code> and a prefixed <code>agent:alice</code> born together) that every store-only tier would miss because both look novel.</div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">⑤ Gate &amp; ⑥ Commit</span><span class="chapter">09</span></div>
+    <h2 class="reveal">One threshold decides: <span class="hl">absorb</span> or <span class="hl2">ask</span>.</h2>
+    <p class="sec-lead reveal d1"><code>consolidate/gate.py</code> applies the rule. At write time the review queue is the only thing that interrupts you — and it persists to disk (<code>review_queue.json</code>), surviving restarts. (The post-ingest layer adds a <i>second</i>, separate review surface — see §12.)</p>
+    <div class="gate">
+      <div class="gatebox reveal d1">confidence ≥ 0.75<br><b>AND</b> no contradiction<br><span style="color:var(--dim)">decide()</span></div>
+      <div class="flowarrow reveal d1">→</div>
+      <div class="outc">
+        <div class="o g reveal d2">✅ auto-commit <span class="s">session.commit() → graph</span></div>
+        <div class="o r reveal d3">🅿️ review queue <span class="s">review_queue.json — commit / discard / merge</span></div>
+      </div>
+    </div>
+    <div class="callout gap reveal d2"><b>Contradiction overrides confidence</b> — even a high score gets parked if it conflicts. Malformed or unresolvable edges go to a <span class="tag">dead-letter queue.</span></div>
+    <div class="callout reveal d3"><b>Addendum · 2026-07-10 — <code>remember()</code> stopped lying about failure.</b> A live-use audit found it could report success while quietly extracting nothing (the "has_heading-only" bug: a configured, reachable-looking LLM whose every call errored, leaving only the structural claim <code>vault.add()</code> mints without any LLM). <code>remember()</code> now resolves to exactly one of three honest outcomes: <b>(a) LLM disabled</b> (<code>llm.enabled=false</code>) — structural-only ingest, <code>RememberResult.llm_disabled=True</code>, never conflated with a failure; <b>(b) total provider failure</b> — every attempted block's extraction call errored, so the ledger run is marked <code>failed</code> and <code>Companion.remember()</code> <b>raises</b> <code>LLMUnavailableError</code> with the real provider error embedded, instead of returning a quiet "done"; <b>(c) partial failure</b> — at least one block succeeded, so it returns normally with the new <code>provider_failures</code> / <code>empty_after_retry_blocks</code> counters populated for caller-side visibility. Batch callers degrade gracefully on the raise: <code>kg rebuild</code> records the file in a <code>failed_files</code> list and keeps going; the folder-watch runner re-queues the file to <code>incoming/</code> for retry instead of routing it to <code>failed/</code>.</div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">Autonomy on top</span><span class="chapter">10</span></div>
+    <h2 class="reveal">The <span class="hl">runner</span> calls remember() while you work.</h2>
+    <p class="sec-lead reveal d1"><code>src/okto_neuron/runner/</code> polls <code>.marginalia/incoming/*.md</code>, calls <code>remember()</code> on each new file, then moves it to <code>processed/</code> or <code>failed/</code> — or, since <span class="tag">2026-07-10</span>, back to <code>incoming/</code> for retry when <code>remember()</code> raises <code>LLMUnavailableError</code> (a genuinely unreachable/misconfigured LLM, not a bad file). Idempotent, oldest-first, poll-based (no fs-watcher dependency). Runs inside <code>okto-neuron serve</code> or standalone as <code>kg watch</code>.</p>
+    <div class="callout reveal d1">This is the "companion working in the background." The confidence gate is what makes leaving it unattended <b>safe</b>.</div>
+    <div class="callout reveal d2"><b>Beyond the inbox — watch any folder (ADR 0025 + 0034).</b> A single global, multi-vault poll loop (<code>server/_folder_watch.py</code>) starts at daemon boot and stat-walks every registered <code>folder_watch.roots</code> directory. Change detection is <b>graph-free</b> — it hashes a file only when <code>(mtime, size)</code> shifts and diffs against a per-vault manifest sidecar, so it never opens a vault handle and scales past the <code>max_open=8</code> pool. A changed file is enqueued only after it stays quiet for <code>quiet_debounce_s</code> (settle-detection) and no more than once per <code>min_interval_s</code>. Every configured vault owns an immutable runtime and drain worker, so its roots continue ingesting even when no browser tab currently selects that vault; work remains serialized only by that vault's writer lock. Maintenance or deletion may surface a <code>paused_reason</code> for that one runtime, and non-text files it skips surface as <code>skipped_non_text</code>. Junk directories are pruned before descent by <code>ignore_dir_globs</code> (default <code>['.*', '__pycache__', 'node_modules']</code>) through one shared <code>_iter_watch_files</code> enumerator used by both the watcher and one-shot folder ingest. <span class="tag">2026-07-02 remediation · ADR 0034 multi-vault completion</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">The second time you ingest a file</span><span class="chapter">11</span></div>
+    <h2 class="reveal">Re-ingest is <span class="hl">incremental</span> — and it reconciles what changed.</h2>
+    <p class="sec-lead reveal d1">The 6-stage pipeline above is the <i>first</i> ingest. Editing a note and re-ingesting no longer re-does the whole file: incremental partitioning is now <b>default ON</b>, driven by a typed <code>IngestConfig</code> (<code>ingest.incremental</code> / <code>ingest.subchunk</code> in <code>okto-neuron.yaml</code>, writable via <code>PATCH /api/v1/config</code>; the <code>OKTO_NEURON_INCREMENTAL_INGEST</code> / <code>OKTO_NEURON_SUBCHUNK_INGEST</code> env vars are two-way overrides — <code>1</code> forces on, <code>0</code> off, unset defers to config; library callers inherit the ON default).</p>
+    <div class="flow">
+      <div class="step accent reveal d1"><div class="num">①</div><div class="t">Block-hash skip</div><div class="s">unchanged block → no LLM</div></div>
+      <div class="flowarrow reveal d1">→</div>
+      <div class="step purple reveal d2"><div class="num">②</div><div class="t">Sub-chunk narrow</div><div class="s">difflib hunks only</div></div>
+      <div class="flowarrow reveal d2">→</div>
+      <div class="step amber reveal d3"><div class="num">③</div><div class="t">Reconcile removals</div><div class="s">supersede · detach · resurrect</div></div>
+    </div>
+    <div class="callout reveal d1"><b>Only the edited bytes hit the LLM.</b> On re-ingest, a Block whose <code>content_hash</code> matches a prior block that already produced claims is <b>skipped</b> (<code>_incremental.plan_extraction</code>); a Block that <i>did</i> change is narrowed by <code>difflib</code> to just its inserted/replaced hunks (<code>subchunk_units_for_block</code>) rather than re-extracting the whole 12k window. <b>Crash-resume</b> is safe: an interrupted run is detected via the durable candidate ledger (<code>ledger.has_open_run</code> → the run re-runs FULL units, bypassing the incremental skip), and <code>close_stale_runs</code> clears dead runs — so incremental partitioning never silently drops an in-flight ingest. <span class="tag">ADR 0023 · ADR 0024</span></div>
+    <div class="callout reveal d1"><b>Addendum · 2026-09-03 — Block ids are vault-relative, and stale deterministic claims are retired on every ingest.</b> A 2026-09-03 deep review found <code>_safe_block_path()</code> hashed only <code>path.name</code> (the bare filename), so two same-basename files in different vault directories whose block bytes hashed identically minted the <i>same</i> Block id — the second file's ingest silently reassigned the first file's stored byte range to its own path. <code>parse_markdown()</code> now takes <code>vault_root</code> and hashes the <b>vault-relative</b> path for both the Block id and <code>Block.path</code> (finding 3.4). The same review reconfirmed the accepted gap ADR 0023 itself documents — "no removal of stale blocks" — for the deterministic <code>has_tag</code>/<code>has_heading</code>/<code>links_to</code> Claims a plain re-ingest used to leave doubled and searchable forever (finding 3.5). <code>ingest/__init__.py</code>'s <code>_retire_stale_deterministic_claims()</code> now runs unconditionally on every <code>ingest_document()</code> call and supersedes (not detaches — a removed tag is now definitively <i>false</i>, unlike an LLM claim whose source line merely went missing) any such Claim absent from the current parse. See ADR 0023's amendment for the LLM-claim contrast. <span class="tag">finding 3.4 · finding 3.5</span></div>
+    <div class="callout frontier reveal d2"><b>The reconcile pass — what an edit does to facts that already exist.</b> Extracted into <code>_reconcile_removals</code> and now run on <b>both</b> the normal commit path <i>and</i> the zero-candidate early return (so a pure deletion — an edit whose remnants extract nothing — finally detaches its facts; that path used to <code>return</code> before reconciling). Three moves: <b>supersede</b> a corrected fact (new object for the same subject·predicate); <b>detach</b> a fact whose source text is gone; <b>resurrect</b> a fact whose text comes back. Detach is <b>sentence-unit and attribution aware</b> — each orphaned Block gets an <code>OrphanDiff</code> line-diffing its stored content against the <i>union</i> of current Blocks, and a claim detaches only when one of its anchored lines actually disappeared, so a fact whose line merely <i>moved</i> to a re-sliced Block survives re-chunking churn. Resurrection strips the <code>_superseded</code>/<code>_detached</code> lifecycle facets when a claim's content returns (a mint-path merge leg plus a deterministic <code>resurrect_reverted_claims</code> sweep — load-bearing because the block-hash skip prevents re-extraction on a pure revert). <span class="tag">ADR 0024 addendum · F6 · F7 · F9</span></div>
+    <div class="callout reveal d3"><b>Corrections are recency-aware, so re-ingesting an old backup can't clobber fresher truth.</b> Every LLM-minted Claim now carries <code>asserted_at</code> — the <i>source file's mtime</i> at ingest (the folder watcher's <code>copy2</code> preserves mtime; fallback is the ingest date). The supersede prefilter drops any existing claim asserted <i>later</i> than the incoming source, corroboration keeps <code>asserted_at = max(old, new)</code>, and the resurrection legs are recency-gated — a restored old backup never resurrects facts that were corrected after it. (Accepted residual: claims minted before this change carry no <code>asserted_at</code>, so the merge judge stays the guard for them.) <span class="tag">ADR 0022 addendum · F8</span></div>
+    <div class="callout reveal d3"><b>Addendum · 2026-07-03 — auto-supersede is bounded to document lineage.</b> The correction prefilter is a cheap subject-token match, so a vault-wide token overlap plus an aggressive judge could let an edit to <i>one</i> document silently supersede a fact sourced only from an <i>unrelated</i> document. <code>supersede_contradicted</code> now auto-applies a judge-confirmed correction only when it stays <b>in-document</b> (the old Claim is anchored on the same <code>source_path</code> being re-ingested) <b>OR</b> the two Claims share a <i>resolved</i> subject id (<code>S_id</code>). A cross-document, token-only match is <b>deferred, never applied</b> — it is returned separately and surfaced through the <code>claims_supersede_deferred</code> ingest telemetry rather than hiding knowledge behind the operator's back. The bound only ever narrows what is auto-applied. <span class="tag">ADR 0022 · Task 5</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">The read path — unified & anchored</span><span class="chapter">12</span></div>
+    <h2 class="reveal">Write path: <span class="hl">done</span>. Read path: <span class="hl">unified & anchored</span>.</h2>
+    <p class="sec-lead reveal d1">This was the honest gap; it shipped 2026-05-29. <code>recall()</code> no longer searches <b>Claim nodes only</b> — one fused retrieval now ranks eligible content nodes together, while filtering infrastructure and excluding raw <code>Block</code> substrate from untyped recall/ask. Blocks remain explicitly queryable and anchor every returned Claim's source span.</p>
+    <div class="twocol">
+      <div class="col ok reveal d1"><h3>✅ Built today</h3><p>Unified retrieval (<code>recall()</code>) across eligible content node types, <code>ask</code> (LLM synthesis over hits), and byte-range provenance grounding on explicitly queried Blocks and LLM-extracted Claims.</p></div>
+      <div class="col ok reveal d2"><h3>✅ Shipped 2026-05-29</h3><p>A unified retrieval (<code>recall()</code>): per-type vector search → 1–2 hop expansion → fuse by <b>RRF</b> (not score-concat) → apply the content gate → return typed, grounded hits. Untyped recall excludes raw Blocks; <code>type=Block</code> remains available for explicit substrate inspection.</p></div>
+    </div>
+    <div class="callout reveal d2"><b>Verified</b> — <code>recall("who is the partner on Okto Neuron?")</code> surfaces <b>Jordan Lee Carter</b> as a byte-anchored Claim; LLM-extracted nodes now carry a real byte-range so <code>ask</code> grounds on source text, not titles.</div>
+    <div class="callout reveal d2"><b>Seed width differs by surface.</b> <code>recall</code> defaults to <code>k=10</code> — an agent can re-query and widen on its own, so the first pass stays tight. <code>ask</code> is one-shot (no agentic re-query), so it seeds wider at <code>k=20</code>. The same asymmetry is now <b>discoverable on every surface</b>: the MCP <code>ask</code> tool defaults to <code>k=20</code> on the validated block path (the earlier MCP default was still <code>k=8</code> and forced the worse subgraph path — both fixed), the MCP <code>explore</code> tool seeds tight at <code>k=12</code>, and a new CLI <code>ask</code> command mirrors the one-shot-wide / agentic-tight split (with the docstrings + <code>query --k</code> help spelling it out). <span class="tag">ADR 0018</span></div>
+    <div class="callout reveal d2"><b>The answer prompt is terse; k=20 is the validated win.</b> <code>ask</code>'s default system prompt (<code>_ASK_SYSTEM</code>) is the terse <code>"You answer grounded in the provided notes. Be concise."</code>. A controlled 5-sample study (15 runs, same daemon, temp 0.7) confirmed the <b>k=8 → k=20 widen is a real win</b>: answer-presence <code>0.635 → 0.720</code>, <b>+0.085</b>, McNemar p=0.0018, bootstrap 95% CI [+0.035, +0.140] (excludes 0), neg-control abstention even improving <code>0.883 → 0.917</code>. An extractive verbatim-extraction prompt was tried but <b>reverted</b> — terse → extractive at k=20 was only +0.019, CI [-0.006, +0.046] (spans 0), McNemar p=0.22, i.e. <i>within the temp-0.7 noise floor</i>; the earlier single-run "0.792" win was cross-daemon noise. <b>≈0.72 is the brute-force block-dump ceiling, not the goal</b>: k=40 overflows the answerer. Single-run answer-presence at temp 0.7 is not a reliable metric — the deterministic floor (recall@k) and this multi-sample study are the trustworthy signals. Overridable per-vault via <code>llm.ask.system_prompt</code>. <span class="tag">ADR 0018</span></div>
+    <div class="callout gap reveal d3"><b>Addendum · 2026-05-29 — graph quality.</b> Two refinements landed on top of the unified read path. <b>Provenance nodes are plumbing, not content:</b> the system and LLM extraction Agent/Activity nodes (and raw <code>Block</code> substrate) are graph machinery, so they are filtered out of recall, ask, and the KG browser — content surfaces now show asserted knowledge, never the apparatus that produced it. <b>Dedup is authority control:</b> two mentions of one entity in a note collapse to a single node before staging (edges remapped to the survivor), the FRBR/LRM "manifestations of one work" reconciliation step. And recall is <b>question-aware</b>: for interrogative queries the Claim that <i>answers</i> the question is ranked above the bare topic entity it is <i>about</i> — the canonical KGQA move of ranking the incident triple, not the focus entity. The grounding is established IR/library science: KGQA triple-ranking, coordination-level matching for coverage, and FRBR/LRM for dedup.</div>
+    <div class="callout frontier reveal d3"><b>Addendum · 2026-06-07 — subgraph-first answer assembly (ADR 0011 · shipped opt-in path).</b> <code>ask</code> gained an optional two-tier graph-RAG path behind <code>llm.ask.enable_subgraph</code>. <b>Tier 1</b> answers from a relevance-capped <i>ego-graph</i> (seed nodes + their bridging claims + N-hop graph neighbours, <code>llm.ask.hops</code>) rendered as a compact typed <code>NODES / RELATIONSHIPS / CLAIMS</code> block (<code>subgraph.py</code>) — median <b>488 tokens vs the block-dump's ~66K</b> (133× smaller) with near-zero hallucination. <b>Tier 2</b> fetches a raw block on demand (path re-validated under the vault root) when Tier 1 is thin or abstains; an abstention floor never fabricates. The dated 120-question baseline put Tier 1 at <b>0.45</b> and Tier 2 at <b>0.61</b>. That result started the measurement program; the coverage gate, bounded source blend, and one-shot bounded escalation later shipped under ADR 0028. The path intentionally remains opt-in. <span class="tag">ADR 0011 · historical baseline, current implementation</span></div>
+    <div class="callout frontier reveal d3"><b>Addendum · 2026-06-21 — graph-native gap diagnosis (ADR 0019 · program closed).</b> The dated audit split the deficit into <b>63% extraction</b>, <b>29% assembly</b>, and 8% wording while showing that simply widening hops did not help. That diagnosis launched the assembly and extraction experiments; it is no longer a proposal or open plan. Ranking, reach, granularity, and seed-quota variants plateaued, ADR 0028 supplied the accepted bounded efficient-hybrid answer path, and ADRs 0030–0031 raised extraction and retention while preserving byte-anchored Claims. <span class="tag">ADR 0019 · superseded by measured resolution</span></div>
+    <div class="callout frontier reveal d3"><b>Addendum · 2026-07-07 — the efficient hybrid: initial block parity at 17.5% of the tokens (ADR 0028 · accepted).</b> The pivotal <b>Tier-2 discovery</b> was that the original subgraph arm's ~69% depended on an abstention fallback reading <b>30–66K tokens unbounded</b>. The accepted path replaced that cliff with the ego-graph render plus an IDF-ranked source excerpt (default 6,000 tokens), and at most one escalation bounded to 2× that budget. No unbounded source read remains in the subgraph path. The initial accepted A/B reached statistical parity at 17.5% of block tokens, and the daemon boot-warms provider dependencies so environment synchronization cannot silently break a running evaluation. <code>llm.ask.enable_subgraph</code> remains <b>default-off by accepted policy</b>, not because its implementation or evaluation is incomplete. <span class="tag">ADR 0028</span></div>
+    <div class="callout ok reveal d3"><b>Addendum · 2026-07-13 — finale closes the graph-native program.</b> Multi-sample union extraction and retention fixes raised strict extraction recall from <b>70.0% to 82.3%</b>. The final paired 142-question run used one pinned semantic judge for both arms and scored subgraph <b>122/142</b> versus block <b>120/142</b> (McNemar <code>p=0.80</code>) while the subgraph path used <b>6.24× fewer context tokens</b>. The opt-in efficient hybrid is therefore a shipped, statistically-parity path; making it the universal default is not an open 0.0.40 release action. <span class="tag">ADRs 0028 · 0030 · 0031 · 0033</span></div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">After the write path — post-ingest curation</span><span class="chapter">13</span></div>
+    <h2 class="reveal">The graph keeps getting <span class="hl2">tidier</span> after the fact — <span class="hl">without rewriting itself</span>.</h2>
+    <p class="sec-lead reveal d1">The write-path gate decides one candidate at a time, in the moment. A separate <b>post-ingest layer</b> works over knowledge that's <i>already committed</i> — catching the duplicates and drift that only become visible once many notes have landed. It runs on the daemon, never on the hot write path. Three distinct mechanisms, deliberately kept apart because the project's edge-id-collision history makes in-place bulk rewrites unsafe.</p>
+    <div class="probes">
+      <div class="probe reveal d1"><div class="pi">🔗</div><div class="pt">reconcile · off-graph</div><div class="pd">Already-committed entities that turn out to be the same thing are merged into an <b>off-graph equivalence class</b> in <code>.marginalia/authority/index.json</code> (<code>skos:exactMatch</code>, not <code>owl:sameAs</code>). The stored graph is <b>never mutated</b> — reads <i>fold</i> the class to its canonical node at query time (<code>query.py · _fold_equivalence</code>). Fully reversible by dropping the entry. <span class="tag">ADR 0008</span></div></div>
+      <div class="probe reveal d2"><div class="pi">♻️</div><div class="pt">heal · the only topology rewrite</div><div class="pd">When the topology genuinely must change, <code>kg rebuild</code> / heal does it the <b>only safe way</b>: copy into a <i>fresh</i> graph (<code>copy_graph_canonicalizing</code>) then atomic-swap. No in-place edge mutation. Bulk in-place migration was retired. <span class="tag">ADR 0007</span></div></div>
+      <div class="probe reveal d3"><div class="pi">⏱️</div><div class="pt">scheduler · propose &amp; detect only</div><div class="pd">A debounced background loop (<code>server/_scheduler.py</code>) sweeps as you ingest: it <b>proposes</b> candidate merges and <b>mints drift Findings</b>. It can never auto-apply a merge — surfacing for review is the whole point. <span class="tag">ADR 0009 P4</span></div></div>
+    </div>
+    <div class="callout frontier reveal d2"><b>A per-vault control plane drives it all.</b> Each immutable vault runtime owns its curation queue, writer lock, and leased Ladybug handle, so blocking work in one vault cannot retarget or freeze another vault. Admin endpoints (<code>/api/v1/reconcile/*</code>, <code>/api/v1/authority/*</code>, <code>/api/v1/curation/*</code>) and an SPA dashboard make each job, the scheduler, and every equivalence class visible and executable; Browse and Graph show a <code>variant_count</code> badge on folded nodes. The reconcile layer carries its <b>own</b> review surface — <code>.marginalia/reconcile/queue.json</code> via <code>kg reconcile review-*</code> — distinct from the write-time review queue.</div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="sec-kicker c">The whole picture</span><span class="chapter">14</span></div>
+    <h2 class="reveal">How it all stacks.</h2>
+    <div class="stack">
+      <div class="layer reveal d1"><span class="lk">Surfaces</span><span class="lb">CLI <small>kg (sync)</small> · MCP <small>FastMCP (async)</small> · HTTP <small>Starlette — detached via fork+<b>exec</b>, never bare double-fork (macOS aborts a fork-without-exec process on its first CoreFoundation/XPC call, e.g. the proxy lookup on an outbound LLM request). The application daemon starts with zero vaults. Browser-tab selection is local and immediate; every scoped request carries its vault selector, and background work stays bound to the immutable runtime where it began. The compatibility fallback switch is CLI/API-only and the SPA never calls it.</small> · Python SDK</span></div>
+      <div class="layer reveal d1"><span class="lk">Contract</span><span class="lb"><small>remember() · recall() · ask() · review_queue() · resolve_review()</small></span></div>
+      <div class="layer loop reveal d2"><span class="lk">Auto loop</span><span class="lb">intake → propose → stage → resolve → gate → commit / queue</span></div>
+      <div class="layer reveal d2"><span class="lk">Brain</span><span class="lb">LiteLLM-backed LLM <small>per-step config · local-first</small></span></div>
+      <div class="layer reveal d3"><span class="lk">Spine</span><span class="lb">5 primitives + 6 support types <small>· packs = fixed selectable vocabularies</small></span></div>
+      <div class="layer reveal d3"><span class="lk">Storage</span><span class="lb">GraphStore protocol → LadybugStore <small>(.lbug)</small> · InMemoryStore <small>(tests)</small> — the vector and BM25 legs read from a separate IndexStore <small>(store/index, a rebuildable cache)</small> while the graph node holds the durable embedding</span></div>
+      <div class="layer root reveal d4"><span class="lk">Trust root</span><span class="lb">markdown vault <small>— graph is always rebuildable from it</small></span></div>
+    </div>
+    <div class="callout reveal d4"><b>Addendum · 2026-09-03 — <code>okto-neuron add</code> is structural-only by design; <code>remember</code> and folder-watch extract.</b> The CLI's <code>okto-neuron add</code> goes through <code>POST /add</code>, which writes a Document + Block directly with <b>no LLM extraction</b> — the deliberate add-vs-remember split (<code>server/_ingest_queue.py</code>'s <code>record_completed</code> docstring). <code>POST /remember</code> (the MCP <code>remember</code> tool's REST twin) and the folder-watch runner both call <code>Companion.remember()</code>, which runs the full six-stage pipeline above. <code>POST /add</code>'s target path is directory-aware (<code>_safe_add_target</code>): a well-formed relative path keeps its full subpath under <code>.marginalia/sources/</code>, so <code>notes/a/README.md</code> and <code>notes/b/README.md</code> land at distinct files instead of collapsing onto one and minting the same document id (finding 3.4-e2e); only an absolute, drive-letter, or <code>..</code>-traversing path falls back to a <code>sources/&lt;sha256(client_path)[:16]&gt;/&lt;name&gt;</code> hashed subdirectory, keyed by the client-posted path string (not file content), so re-adding an edited file at the same path keeps updating the same document. <span class="tag">finding 3.4-e2e</span></div>
+    <div class="callout reveal d4"><b>Addendum · 2026-09-03 — surface-parity security hardening.</b> Three gaps closed between REST and its siblings. <b><code>sensitivity</code> is a strict enum on both surfaces:</b> the MCP <code>remember</code> tool was already <code>Literal["local_only", "default"]</code> (<code>server/runtime.py</code>); REST's <code>POST /remember</code> used to silently coerce any other value — including typos like <code>"local-only"</code> — down to <code>"default"</code>. It now runs the same values through <code>_parse_sensitivity()</code> and returns <code>400</code> on anything else. <b><code>MAX_QUERY_K</code> now caps every k-accepting route:</b> the legacy bare <code>/query</code>, <code>/recall</code>, and <code>/ask</code> routes never checked <code>k</code> against the cap their <code>/api/v1</code> siblings already enforced; all five routes now share one <code>_k_cap_error()</code> helper. <b>Resolve-review routes are loopback-gated:</b> <code>POST /resolve-review(/batch)</code> performed real graph writes without the <code>remote_config_allowed</code> loopback check every other write route enforces; <code>GET /review-queue</code> is gated too, since it hands out the candidate ids the write needs. <span class="tag">finding 3.12 · finding 3.13 · finding 3.21</span></div>
+  </section>
+
+  <footer>
+    <div>Part II of II — built from the design docs + an Explore pass over the live code.</div>
+    <div class="mono">docs/understanding/index.html</div>
+  </footer>
+</div>
+</div>
+
+<script>
+  const io=new IntersectionObserver((entries)=>{
+    entries.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); } });
+  },{threshold:.12,rootMargin:'0px 0px -6% 0px'});
+  function observePanel(p){ p.querySelectorAll('.reveal').forEach(el=>io.observe(el)); }
+  document.querySelectorAll('.panel').forEach(observePanel);
+
+  const tabs=[...document.querySelectorAll('.tab')];
+  const panels={conceptual:document.getElementById('conceptual'),mechanical:document.getElementById('mechanical')};
+  function show(name){
+    Object.entries(panels).forEach(([k,p])=>p.classList.toggle('show',k===name));
+    tabs.forEach(t=>t.classList.toggle('active',t.dataset.panel===name));
+    window.scrollTo({top:0,behavior:'auto'});
+    // re-trigger reveals for whichever are already in view
+    requestAnimationFrame(()=>{
+      panels[name].querySelectorAll('.reveal').forEach(el=>{
+        const r=el.getBoundingClientRect();
+        if(r.top<window.innerHeight*0.95) el.classList.add('in');
+      });
+    });
+  }
+  tabs.forEach(t=>t.onclick=()=>show(t.dataset.panel));
+  document.addEventListener('keydown',e=>{
+    if(e.key==='1') show('conceptual'); else if(e.key==='2') show('mechanical');
+  });
+
+  // scroll progress bar
+  const prog=document.getElementById('navprog');
+  document.addEventListener('scroll',()=>{
+    const h=document.documentElement;
+    prog.style.width=(h.scrollTop/(h.scrollHeight-h.clientHeight)*100)+'%';
+  },{passive:true});
+</script>
+</body>
+</html>

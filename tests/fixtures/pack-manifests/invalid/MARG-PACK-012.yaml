@@ -1,0 +1,3 @@
+id: incompatible-core
+version: "0.1.0"
+compatRange: ">=99.0"

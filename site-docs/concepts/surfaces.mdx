@@ -1,0 +1,92 @@
+---
+title: The four surfaces
+description: How the CLI, the server, the MCP endpoint and the config files relate, and which of them need a daemon running.
+---
+
+Okto Neuron gives you four ways in: a command-line tool, an HTTP server with a bundled web UI, an MCP endpoint, and files on disk. They are not four programs. Three of them are the same running process seen from different angles, and the fourth is the state that process reads.
+
+<Note>
+Okto Neuron is at version 0.3.0 and the packaging metadata classifies it as pre-alpha. Names, routes and file layouts described here can change.
+</Note>
+
+## The map
+
+**The `okto-neuron` CLI.** One executable with two halves. Some subcommands open the vault directly in the Python process you just started. Others send an HTTP request to a running daemon and print what comes back. Nothing in between: there is no auto-spawn, no retry, no fallback to opening the vault when the server is down. If the daemon is not there, a client command prints an unreachable-server message naming the URL and telling you to start `okto-neuron serve`, then exits 2:
+
+```text
+no okto-neuron server reachable at http://127.0.0.1:7777 — start with `okto-neuron serve`
+```
+
+**The server.** `okto-neuron serve` starts one Python process that hosts two listeners. The REST surface defaults to `127.0.0.1:7777` and the FastMCP streamable-HTTP surface defaults to `127.0.0.1:8201`. Both live in that same process, sharing one handle pool. When a built frontend is present, the same Starlette app also serves the bundled web UI.
+
+**The MCP endpoint.** The FastMCP server on port 8201 is what an MCP host connects to. Okto Neuron's supported host is Claude Code. It is not a second daemon you start separately; it comes up and goes down with `serve`.
+
+**The config files.** Global settings live under `~/.okto-neuron`, in `okto-neuron.toml`, next to the default vault root `~/.okto-neuron/vaults`. Each vault carries its own `okto-neuron.yaml` at its root, and a vault is only recognized as a vault if that file is present. Both are plain files you can read.
+
+<Warning>
+Every surface binds to loopback. Nothing here is reachable from another machine, and the server refuses to be talked into it.
+</Warning>
+
+## The question that decides everything
+
+Before running anything, ask: does this command need the daemon?
+
+In-process commands open the vault themselves. `init` and `onboard` create and set up vaults. The `vault` and `kg` groups operate on vault directories and their graphs. `watch` opens the vault with `Vault.open()` and drains the inbox at `.marginalia/incoming`. `pilot` does the same and writes a report file. None of these talk to a server, so they do not need a daemon running. They open the vault directly, which means they take the bootstrap lock themselves while the graph opens (see below).
+
+Client commands do the opposite. `add`, `query`, `ask` and `detect-drift` POST to the server and print the response. `status` issues two GETs and formats the result. `ui` checks the daemon's health and then opens your browser at the endpoint. The `watch-folder` group reads and edits the selected vault's `folder_watch` settings through the running daemon. Each of these fails immediately when no daemon answers.
+
+See [/concepts/thin-client](/concepts/thin-client) for what "thin" buys you and what it costs, and [/server/running](/server/running) for starting and stopping the daemon.
+
+## Why the daemon and the CLI can collide
+
+Opening a vault's graph takes an exclusive file lock. Okto Neuron acquires `.marginalia/.bootstrap.lock` non-blocking and, if that fails with a contention errno, raises `VaultLockHeld` carrying the PID written into the lock file. The store also recognizes the graph engine's own lock messages, such as `database is locked` and `conflicting lock is held`, and classifies them as contention rather than corruption, so a second opener gets an error instead of a destructive recovery pass.
+
+The lock is exclusive and taken non-blocking, so one opener at a time gets through that window. If you need a vault that the daemon is holding, stop the daemon or use the client command that goes through it. Do not delete the lock file.
+
+## One daemon, many vaults
+
+The daemon is application-scoped, not vault-scoped. A single `serve` process can hold several vaults at once, each with its own runtime, queues and writer lock, and `status` reports a vault count and a vault list.
+
+Callers pick a vault per request, and the two surfaces do it differently:
+
+| Surface | How a vault is selected |
+| --- | --- |
+| CLI client commands | `--vault`, sent as the `X-Okto-Neuron-Vault` request header |
+| MCP tools | a `?vault=` query parameter on the request, read from the in-flight HTTP request |
+
+Both are request selectors. Neither changes what the daemon considers its default. Not every command that accepts `--vault` forwards it; the per-command behavior is on [/reference/cli/overview](/reference/cli/overview).
+
+## One app, two blocks of routes
+
+The REST process serves a single Starlette app, and its route list is built in two blocks.
+
+<Steps>
+  <Step title="Versioned routes">
+    The `/api/v1/*` block comes first: 86 route registrations over 76 distinct paths, covering nodes, graph, vaults, config, credentials, providers, ingest, ledger, reconcile, curation and more.
+  </Step>
+  <Step title="Bare routes">
+    Then eleven unversioned routes: `/add`, `/query`, `/detect-drift`, `/remember`, `/recall`, `/ask`, `/review-queue`, `/review-queue/batch`, `/resolve-review`, `/health` and `/version`.
+  </Step>
+  <Step title="The SPA mount, last and conditional">
+    If a built frontend directory exists, a catch-all static mount is appended at `/`. It has to be last, because Starlette matches in order and a catch-all placed earlier would shadow everything above it. With no build present the mount is skipped and the process serves the API only.
+  </Step>
+</Steps>
+
+It is tempting to read this as "versioned is the UI's surface, bare is the CLI's". It is not that clean. The CLI speaks both: `add`, `query` and `detect-drift` post to the bare paths, while `ask` posts to `/api/v1/ask` and `status` reads `/api/v1/status` and `/version`. The bundled UI speaks only the versioned block, which is why several versioned routes exist as aliases of bare ones. The bare routes are kept for the CLI and for backward compatibility.
+
+<Info>
+These are internal HTTP routes, not a published API contract. There is no specification for them, and they carry no compatibility promise at this version.
+</Info>
+
+## Which surface, which docs
+
+| Surface | Where it lives | Docs |
+| --- | --- | --- |
+| `okto-neuron` CLI | your shell | [/reference/cli/overview](/reference/cli/overview) |
+| REST server and bundled UI | `127.0.0.1:7777` | [/server/running](/server/running) |
+| FastMCP endpoint | `127.0.0.1:8201` | [/mcp/overview](/mcp/overview) |
+| Config files | `~/.okto-neuron/okto-neuron.toml`, each vault's `okto-neuron.yaml` | [/config/overview](/config/overview) |
+
+## What to carry away
+
+Start the daemon when you want to add, query, ask, check status or open the UI. Skip it when you are creating a vault or running `kg` work. `watch` also opens the vault directly. The bootstrap lock admits one opener at a time, so do not point a daemon and an in-process command at the same vault.
