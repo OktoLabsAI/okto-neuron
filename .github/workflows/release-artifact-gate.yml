@@ -527,7 +527,7 @@ jobs:
           }
           uv venv $venv --python 3.12
           $python = Join-Path $venv "Scripts\python.exe"
-          $marginalia = Join-Path $venv "Scripts\okto-neuron.exe"
+          $oktoNeuron = Join-Path $venv "Scripts\okto-neuron.exe"
           uv pip install --python $python "$($wheels[0].FullName)[serve]"
 
           $env:HOME = $testHome
@@ -541,17 +541,17 @@ jobs:
           $started = $false
           $stopped = $false
           try {
-            & $okto-neuron serve --daemon --no-open
+            & $oktoNeuron serve --daemon --no-open
             $started = $true
             if ($LASTEXITCODE -ne 0) {
               throw "exact-wheel Windows daemon failed to start"
             }
-            $status = (& $okto-neuron status --json --timeout 30 | Out-String) |
+            $status = (& $oktoNeuron status --json --timeout 30 | Out-String) |
               ConvertFrom-Json
             if ([int]$status.pid -le 0) {
               throw "exact-wheel Windows status returned no live PID"
             }
-            & $okto-neuron stop --timeout 30
+            & $oktoNeuron stop --timeout 30
             if ($LASTEXITCODE -ne 0) {
               throw "exact-wheel Windows daemon failed to stop"
             }
@@ -559,7 +559,7 @@ jobs:
           }
           finally {
             if ($started -and -not $stopped) {
-              try { & $okto-neuron stop --timeout 10 2>$null | Out-Null } catch {}
+              try { & $oktoNeuron stop --timeout 10 2>$null | Out-Null } catch {}
             }
             $global:LASTEXITCODE = 0
           }

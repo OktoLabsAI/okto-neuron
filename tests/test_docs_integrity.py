@@ -907,9 +907,9 @@ def test_windows_artifact_gate_runs_exact_wheel_daemon_lifecycle() -> None:
     assert "Verify exact-wheel Windows daemon lifecycle" in windows_job
     assert "shell: powershell" in windows_job
     assert '"$($wheels[0].FullName)[serve]"' in windows_job
-    assert "& $okto-neuron serve --daemon --no-open" in windows_job
-    assert "& $okto-neuron status --json --timeout 30" in windows_job
-    assert "& $okto-neuron stop --timeout 30" in windows_job
+    assert "& $oktoNeuron serve --daemon --no-open" in windows_job
+    assert "& $oktoNeuron status --json --timeout 30" in windows_job
+    assert "& $oktoNeuron stop --timeout 30" in windows_job
 
 
 def test_source_ci_records_lint_and_workflow_syntax_evidence() -> None:

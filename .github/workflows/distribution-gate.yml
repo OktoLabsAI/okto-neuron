@@ -870,7 +870,7 @@ jobs:
 
           # Forced activation failure: the exact previous tool is restored.
           REAL_UV="$(command -v uv)"
-          # shellcheck disable=SC2329  # exported to the installer's subshell below
+          # shellcheck disable=SC2317,SC2329  # exported to the installer's subshell below
           uv() {
             if [ "${FAIL_UV_TOOL_INSTALL:-}" = 1 ] \
                && [ "${1:-}" = tool ] && [ "${2:-}" = install ]; then
