@@ -1332,10 +1332,26 @@ jobs:
           }
           $addIndex = $source.IndexOf('& claude mcp add --scope $Scope --transport http $CliName')
           $postAddRead = $source.IndexOf('$output = (& claude mcp get $CliName', $addIndex)
-          $postAddVerify = $source.IndexOf('Test-ClaudeMcpRegistrationMatches $output $globalUrl', $postAddRead)
+          $postAddVerify = $source.IndexOf('Test-McpRegistrationVerified $output $Scope', $postAddRead)
           if ($addIndex -lt 0 -or $postAddRead -le $addIndex -or
               $postAddVerify -le $postAddRead) {
             throw "fresh MCP registration must be read back and verified"
+          }
+          # A running daemon must still be Connected; only a daemon this run
+          # intentionally left stopped is verified as written (scope, URL and
+          # this daemon's credential).
+          $verifyFunction = $ast.Find(
+            {
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq "Test-McpRegistrationVerified"
+            },
+            $true
+          )
+          if ($null -eq $verifyFunction -or
+              $verifyFunction.Extent.Text -notmatch '(?s)if \(\$serverStarted\) \{\s*return \(Test-ClaudeMcpRegistrationMatches \$Output \$globalUrl' -or
+              -not $verifyFunction.Extent.Text.Contains('Test-ClaudeMcpRegistrationWritten $Output $globalUrl (Get-ScopeLabel $Scope) $authToken')) {
+            throw "a running daemon's MCP registration must be verified as connected"
           }
 
       - name: Verify fail-closed PID record guard
