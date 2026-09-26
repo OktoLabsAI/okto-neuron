@@ -134,9 +134,12 @@ jobs:
           assert shell_removals == [
               '  if ! claude mcp remove "${LEGACY_CLI}" --scope "${scope}" >/dev/null 2>&1; then'
           ], shell_removals
-          powershell_removals = re.findall(r"(?m)^\s*(?:&\s*)?claude\s+mcp\s+remove\b.*$", powershell)
+          powershell_removals = re.findall(
+              r'(?m)^\s*(?:(?:&\s*)?claude\s+mcp\s+remove\b|Invoke-NativeCommand\s+claude\s+@\("mcp",\s*"remove").*$',
+              powershell,
+          )
           assert powershell_removals == [
-              "    & claude mcp remove $LegacyCliName --scope $Scope 2>$null | Out-Null"
+              '    Invoke-NativeCommand claude @("mcp", "remove", $LegacyCliName, "--scope", $Scope) | Out-Null'
           ], powershell_removals
           assert shell.index("register_mcp() {") < shell.index("remove_legacy_mcp() {")
           assert 'register_mcp local && remove_legacy_mcp local "${LEGACY_MCP_OUTPUT}"' in shell
@@ -175,7 +178,7 @@ jobs:
           # Upgrade path from Marginalia: legacy tool detection, env shim, home migration.
           for needle in ('LEGACY_TOOL_NAME="marginalia"', "import_legacy_env", "migrate-home --json"):
               assert needle in shell, needle
-          for needle in ('$LegacyToolName = "marginalia"', "MARGINALIA_*", "migrate-home --json"):
+          for needle in ('$LegacyToolName = "marginalia"', "MARGINALIA_*", '"migrate-home", "--json"'):
               assert needle in powershell, needle
           assert "Authenticated Okto Neuron UI" not in shell_test
           assert "Authenticated Okto Neuron UI" not in powershell_test
@@ -293,9 +296,9 @@ jobs:
           assert register < shell.index('if output="$(claude mcp get "${CLI}"', register) < shell.index(
               'if claude mcp add --scope "${scope}"', register
           )
-          assert powershell.index("$output = (& claude mcp get $CliName") < powershell.index(
-              "& claude mcp add --scope $Scope"
-          )
+          assert powershell.index(
+              '$output = (Invoke-NativeCommand claude @("mcp", "get", $CliName)'
+          ) < powershell.index('Invoke-NativeCommand claude @("mcp", "add", "--scope", $Scope')
 
           # -- Release pins (only once a release has been baked) ----------------
           manifest_path = Path("release-manifest.json")
@@ -1296,14 +1299,16 @@ jobs:
           $removeCommands = @($ast.FindAll(
             {
               param($node)
-              $node -is [System.Management.Automation.Language.CommandAst] -and
-                $node.GetCommandName() -eq "claude" -and
-                $node.Extent.Text -match '(?i)claude\s+mcp\s+remove\b'
+              $node -is [System.Management.Automation.Language.CommandAst] -and (
+                ($node.GetCommandName() -eq "claude" -and
+                  $node.Extent.Text -match '(?i)claude\s+mcp\s+remove\b') -or
+                ($node.GetCommandName() -eq "Invoke-NativeCommand" -and
+                  $node.Extent.Text -match '(?i)claude\s+@\("mcp",\s*"remove"'))
             },
             $true
           ))
           if ($removeCommands.Count -ne 1 -or
-              $removeCommands[0].Extent.Text -notmatch '^(&\s*)?claude mcp remove \$LegacyCliName --scope \$Scope') {
+              $removeCommands[0].Extent.Text -notmatch '^Invoke-NativeCommand claude @\("mcp", "remove", \$LegacyCliName, "--scope", \$Scope\)') {
             throw "the installer may remove only the legacy MCP entry: $($removeCommands | ForEach-Object { $_.Extent.Text })"
           }
           $removeFunction = $ast.Find(
@@ -1323,15 +1328,15 @@ jobs:
             'if ((Register-Mcp "user") -and $legacyMcpScope -eq "user") { Remove-LegacyMcp "user" $legacyMcpOutput }',
             '$script:LegacyMcpRemovedScope = $Scope',
             'try { Restore-LegacyMcp }',
-            '& claude mcp add --scope $scope --transport http $LegacyCliName $script:GlobalMcpUrl',
+            'Invoke-NativeCommand claude @("mcp", "add", "--scope", $scope, "--transport", "http", $LegacyCliName, $script:GlobalMcpUrl,',
             'Claude MCP registration conflict; resolve the existing entry and re-run this installer'
           )) {
             if (-not $source.Contains($required)) {
               throw "MCP replacement contract is missing: $required"
             }
           }
-          $addIndex = $source.IndexOf('& claude mcp add --scope $Scope --transport http $CliName')
-          $postAddRead = $source.IndexOf('$output = (& claude mcp get $CliName', $addIndex)
+          $addIndex = $source.IndexOf('Invoke-NativeCommand claude @("mcp", "add", "--scope", $Scope, "--transport", "http", $CliName')
+          $postAddRead = $source.IndexOf('$output = (Invoke-NativeCommand claude @("mcp", "get", $CliName)', $addIndex)
           $postAddVerify = $source.IndexOf('Test-McpRegistrationVerified $output $Scope', $postAddRead)
           if ($addIndex -lt 0 -or $postAddRead -le $addIndex -or
               $postAddVerify -le $postAddRead) {
@@ -1353,6 +1358,54 @@ jobs:
               -not $verifyFunction.Extent.Text.Contains('Test-ClaudeMcpRegistrationWritten $Output $globalUrl (Get-ScopeLabel $Scope) $authToken')) {
             throw "a running daemon's MCP registration must be verified as connected"
           }
+
+      - name: Verify native stderr never aborts under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          # Windows PowerShell 5.1 turns a redirected native stderr line into a
+          # terminating NativeCommandError under $ErrorActionPreference = "Stop",
+          # even on exit 0 (a real 0.2.0 install rolled back on `uv tool
+          # update-shell`, 2026-09-26). Prove the bare form still aborts here, and
+          # that both scripts' helpers continue and keep the exit code.
+          $ErrorActionPreference = "Stop"
+          $noisy = 'echo Updated PATH to include executable directory 1>&2 & echo native-out'
+          $bareAborted = $false
+          try { & cmd.exe /c $noisy 2>$null | Out-Null } catch { $bareAborted = $true }
+          if (-not $bareAborted) { throw "control: bare 2>`$null under Stop no longer aborts on this runner" }
+          foreach ($case in @(
+            @{ Path = "install.ps1"; Helper = "Invoke-NativeCommand" },
+            @{ Path = "bin/test-install.ps1"; Helper = "Invoke-TestNative" }
+          )) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD $case.Path), [ref]$null, [ref]$null)
+            $fn = $ast.Find({ param($n)
+              $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $n.Name -eq $case.Helper }, $true)
+            if ($null -eq $fn) { throw "$($case.Helper) is missing from $($case.Path)" }
+            . ([scriptblock]::Create($fn.Extent.Text))
+            $out = @(& $case.Helper cmd.exe @("/c", $noisy))
+            if ($LASTEXITCODE -ne 0 -or ($out -join "|").Trim() -ne "native-out") {
+              throw "$($case.Helper): stderr on exit 0 was not tolerated ($LASTEXITCODE, $($out -join '|'))"
+            }
+            $merged = @(& $case.Helper cmd.exe @("/c", $noisy) -MergeStderr) | ForEach-Object { $_.Trim() }
+            if ($LASTEXITCODE -ne 0 -or
+                @($merged | Where-Object { $_ -is [string] }).Count -ne 2 -or
+                $merged -notcontains "Updated PATH to include executable directory" -or
+                $merged -notcontains "native-out") {
+              throw "$($case.Helper): merged stderr was not plain text ($($merged -join '|'))"
+            }
+            $failed = @(& $case.Helper cmd.exe @("/c", "echo real failure 1>&2 & exit /b 3"))
+            if ($LASTEXITCODE -ne 3) { throw "$($case.Helper): a failing exit code was lost ($LASTEXITCODE)" }
+            if ($ErrorActionPreference -ne "Stop") { throw "$($case.Helper) leaked Continue to its caller" }
+            $missingThrew = $false
+            try { & $case.Helper "okto-neuron-no-such-command" @() | Out-Null } catch { $missingThrew = $true }
+            if (-not $missingThrew) { throw "$($case.Helper): a missing command did not throw" }
+          }
+          $tester = Get-Content -Raw -LiteralPath "bin/test-install.ps1"
+          if ([regex]::Matches($tester, 'function Invoke-TestNative\(').Count -ne 2) {
+            throw "Invoke-TestNative must be defined in both the driver and its child runner"
+          }
+          "WINDOWS_NATIVE_STDERR_OK"
 
       - name: Verify fail-closed PID record guard
         shell: powershell
@@ -1765,6 +1818,7 @@ jobs:
             "Remove-DirectoryTree",
             "Initialize-TestSandbox",
             "Remove-TestSandbox",
+            "Get-PublicPathVariants",
             "Export-PublicEvidence"
           )) {
             $functionAst = $testerAst.Find(
@@ -1810,6 +1864,9 @@ jobs:
             "**********************",
             "TEST_HOME=$privateRoot",
             "CALLER=C:\Users\alice",
+            "WHEEL=file:///C:/Users/alice/AppData/Local/Temp/okto-neuron-install-test-proof/w.whl",
+            "JSON={`"home`": `"C:\\Users\\alice`"}",
+            "ENCODED=C%3A%5CUsers%5Calice",
             "IDENTITY=DOMAIN\alice@TESTHOST",
             "WINDOWS_RELEASE_LIFECYCLE_OK",
             "**********************",
@@ -1823,6 +1880,8 @@ jobs:
             foreach ($required in @(
               "TEST_HOME=<TEST_HOME>",
               "CALLER=<CALLER_HOME>",
+              "WHEEL=file:///<TEST_HOME>/w.whl",
+              "ENCODED=<CALLER_HOME>",
               "IDENTITY=<WINDOWS_USER>@<WINDOWS_MACHINE>",
               "WINDOWS_RELEASE_LIFECYCLE_OK"
             )) {
@@ -1832,8 +1891,7 @@ jobs:
             }
             foreach ($forbidden in @(
               "Windows PowerShell transcript",
-              "C:\Users\alice",
-              "DOMAIN\alice",
+              "alice",
               "TESTHOST"
             )) {
               if ($sanitized.Contains($forbidden)) {

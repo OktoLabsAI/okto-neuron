@@ -27,6 +27,21 @@ function Die([string]$Message) {
     exit 1
 }
 
+# Windows PowerShell 5.1 turns each redirected stderr line of a native command
+# into an ErrorRecord; under $ErrorActionPreference = "Stop" the first one is a
+# terminating NativeCommandError even when the command exits 0. Run native
+# commands with Continue scoped to this function and leave $LASTEXITCODE to the
+# caller. A command that cannot be found still throws.
+function Invoke-TestNative([string]$Command, [object[]]$Arguments = @(), [switch]$MergeStderr) {
+    Get-Command -Name $Command -ErrorAction Stop | Out-Null
+    $ErrorActionPreference = "Continue"
+    if ($MergeStderr) {
+        & $Command @Arguments 2>&1 | ForEach-Object { "$_" }
+    } else {
+        & $Command @Arguments 2>$null
+    }
+}
+
 function Test-PortOpen([int]$Port) {
     $client = [Net.Sockets.TcpClient]::new()
     try {
@@ -115,7 +130,7 @@ function Stop-TestDaemon([string]$HomePath, [string]$VaultName, [string]$ToolBin
     if (-not $sandboxCli) {
         throw "cleanup found a sandbox daemon but no sandbox okto-neuron or marginalia command; retained $HomePath"
     }
-    & $sandboxCli stop --timeout 30 2>$null | Out-Null
+    Invoke-TestNative $sandboxCli @("stop", "--timeout", "30") | Out-Null
 
     for ($i = 0; $i -lt 60; $i++) {
         if ($recordProcessId -le 0) {
@@ -164,6 +179,27 @@ function Remove-TestSandbox([string]$HomePath, [string]$TempRoot) {
     Remove-DirectoryTree $resolvedHome
 }
 
+# Every spelling of a Windows path that tools print: C:\Users\name,
+# C:/Users/name (file:/// URLs, Python), C:\\Users\\name (JSON) and the
+# percent-encoded forms (%3A, %5C, %20). Longest first, so a longer spelling is
+# replaced before a shorter one it contains.
+function Get-PublicPathVariants([string]$Path) {
+    if (-not $Path) { return @() }
+    $back = $Path.Replace('/', '\').TrimEnd('\')
+    if (-not $back) { return @() }
+    $forward = $back.Replace('\', '/')
+    $variants = @(
+        $back,
+        $forward,
+        $back.Replace('\', '\\'),
+        $forward.Replace(' ', '%20'),
+        $forward.Replace(':', '%3A').Replace(' ', '%20'),
+        $back.Replace('\', '%5C').Replace(' ', '%20'),
+        $back.Replace(':', '%3A').Replace('\', '%5C').Replace(' ', '%20')
+    )
+    return @($variants | Select-Object -Unique | Sort-Object -Property { $_.Length } -Descending)
+}
+
 function Export-PublicEvidence(
     [string]$RawPath,
     [string]$PublicPath,
@@ -189,12 +225,17 @@ function Export-PublicEvidence(
         throw "raw Windows transcript contained no evidence body"
     }
     $text = ($lines[$bodyStart..$bodyEnd] -join "`r`n") + "`r`n"
-    foreach ($replacement in @(
-        [pscustomobject]@{ From = $TestRoot; To = "<TEST_HOME>" },
-        [pscustomobject]@{ From = $CallerHome; To = "<CALLER_HOME>" },
-        [pscustomobject]@{ From = $CallerIdentity; To = "<WINDOWS_USER>" },
-        [pscustomobject]@{ From = $MachineIdentity; To = "<WINDOWS_MACHINE>" }
-    )) {
+    # The test root sits under the caller's home, so it is replaced first.
+    $replacements = @()
+    foreach ($variant in (Get-PublicPathVariants $TestRoot)) {
+        $replacements += [pscustomobject]@{ From = $variant; To = "<TEST_HOME>" }
+    }
+    foreach ($variant in (Get-PublicPathVariants $CallerHome)) {
+        $replacements += [pscustomobject]@{ From = $variant; To = "<CALLER_HOME>" }
+    }
+    $replacements += [pscustomobject]@{ From = $CallerIdentity; To = "<WINDOWS_USER>" }
+    $replacements += [pscustomobject]@{ From = $MachineIdentity; To = "<WINDOWS_MACHINE>" }
+    foreach ($replacement in $replacements) {
         if ($replacement.From) {
             $text = [regex]::Replace(
                 $text,
@@ -212,9 +253,17 @@ function Export-PublicEvidence(
             throw "sanitized Windows evidence retained a transcript identity/header field"
         }
     }
-    foreach ($identity in @($TestRoot, $CallerHome, $CallerIdentity, $MachineIdentity)) {
-        if ($identity -and $text.IndexOf($identity, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            throw "sanitized Windows evidence retained private identity data"
+    # Fail closed: no spelling of a private path or identity may survive, not
+    # even one a console wrapped across two lines.
+    $unwrapped = $text -replace "\r?\n", ""
+    $private = @(Get-PublicPathVariants $TestRoot) + @(Get-PublicPathVariants $CallerHome) +
+        @($CallerIdentity, $MachineIdentity)
+    foreach ($identity in $private) {
+        if (-not $identity) { continue }
+        foreach ($candidate in @($text, $unwrapped)) {
+            if ($candidate.IndexOf($identity, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw "sanitized Windows evidence retained private identity data"
+            }
         }
     }
     Set-Content -LiteralPath $PublicPath -Value $text -Encoding UTF8
@@ -325,6 +374,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+# Windows PowerShell 5.1 turns each redirected stderr line of a native command
+# into an ErrorRecord; under $ErrorActionPreference = "Stop" the first one is a
+# terminating NativeCommandError even when the command exits 0. Run native
+# commands with Continue scoped to this function and leave $LASTEXITCODE to the
+# caller. A command that cannot be found still throws.
+function Invoke-TestNative([string]$Command, [object[]]$Arguments = @(), [switch]$MergeStderr) {
+    Get-Command -Name $Command -ErrorAction Stop | Out-Null
+    $ErrorActionPreference = "Continue"
+    if ($MergeStderr) {
+        & $Command @Arguments 2>&1 | ForEach-Object { "$_" }
+    } else {
+        & $Command @Arguments 2>$null
+    }
+}
 
 New-Item -ItemType Directory -Force -Path `
     $TestHome, `
@@ -529,7 +593,7 @@ function Get-TestStatus([string]$Command, [string]$Endpoint = "") {
         } else {
             Remove-Item Env:OKTO_NEURON_ENDPOINT -ErrorAction SilentlyContinue
         }
-        $raw = (& $Command status --json --timeout 5 2>$null | Out-String)
+        $raw = (Invoke-TestNative $Command @("status", "--json", "--timeout", "5") | Out-String)
         if ($LASTEXITCODE -ne 0 -or -not $raw.Trim()) {
             throw "application status failed"
         }
@@ -560,7 +624,7 @@ function Confirm-DefaultDaemon([string]$Command, [string]$Version) {
         throw "plain UI fetch did not return the Okto Neuron HTML application"
     }
 
-    $uiOutput = (& $Command ui --no-open 2>$null | Out-String).Trim()
+    $uiOutput = (Invoke-TestNative $Command @("ui", "--no-open") | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {
         throw "okto-neuron ui --no-open failed"
     }
@@ -615,7 +679,7 @@ function Assert-CanonicalTestPidRecord(
     [int]$ExpectedProcessId
 ) {
     $validationOutput = @(
-        & $Python $HelperPath "validate" $RecordPath ([string]$ExpectedProcessId) 2>&1
+        Invoke-TestNative $Python @($HelperPath, "validate", $RecordPath, [string]$ExpectedProcessId) -MergeStderr
     )
     $validationExitCode = $LASTEXITCODE
     $validationText = (($validationOutput | ForEach-Object { [string]$_ }) -join "`n").Trim()
@@ -658,7 +722,7 @@ function Invoke-StoppedPredecessorUpdate(
         "UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "UV_INSTALL_DIR", "UV_PYTHON_INSTALL_DIR",
         "UV_PYTHON_BIN_DIR", "UV_PYTHON_CACHE_DIR", "UV_CACHE_DIR",
         "MARGINALIA_EXPECTED_VERSION", "MARGINALIA_MANIFEST",
-        "MARGINALIA_DEFAULT_MANIFEST_URL", "MARGINALIA_NO_SERVE",
+        "MARGINALIA_DEFAULT_MANIFEST_URL", "MARGINALIA_NO_SERVE", "MARGINALIA_NO_UPDATE_SHELL",
         "OKTO_NEURON_EXPECTED_VERSION", "OKTO_NEURON_MANIFEST",
         "OKTO_NEURON_DEFAULT_MANIFEST_URL", "OKTO_NEURON_DEFAULT_WHEEL_URL"
     )
@@ -736,11 +800,14 @@ function Invoke-StoppedPredecessorUpdate(
         $env:MARGINALIA_MANIFEST = $predecessorManifestUrl
         $env:MARGINALIA_DEFAULT_MANIFEST_URL = $predecessorManifestUrl
         $env:MARGINALIA_NO_SERVE = "1"
+        # The 0.2.0 installer persists PATH through `uv tool update-shell` into the
+        # real Windows user-PATH registry, which HOME redirection does not isolate.
+        $env:MARGINALIA_NO_UPDATE_SHELL = "1"
         if ((Invoke-RawInstallerProcess $predecessorInstall $predecessorOutput) -ne 0) {
             throw "stopped v0.2.0 predecessor installation failed"
         }
         Remove-Item Env:MARGINALIA_EXPECTED_VERSION, Env:MARGINALIA_MANIFEST, `
-            Env:MARGINALIA_DEFAULT_MANIFEST_URL -ErrorAction SilentlyContinue
+            Env:MARGINALIA_DEFAULT_MANIFEST_URL, Env:MARGINALIA_NO_UPDATE_SHELL -ErrorAction SilentlyContinue
 
         foreach ($name in @("marginalia.exe", "marginalia.cmd", "marginalia")) {
             $candidate = Join-Path $predecessorToolBin $name
@@ -788,7 +855,7 @@ function Invoke-StoppedPredecessorUpdate(
             throw "stopped predecessor update left CLI version '$successorVersion'"
         }
         $aliasVersion = ([string](
-            & $predecessorCli --version 2>$null | Select-Object -First 1
+            Invoke-TestNative $predecessorCli @("--version") | Select-Object -First 1
         )).Trim()
         if ($aliasVersion -ne "okto-neuron $Version") {
             throw "the marginalia alias reports '$aliasVersion' after the update"
@@ -832,7 +899,7 @@ function Invoke-StoppedPredecessorUpdate(
                 if (-not $predecessorCli) {
                     $cleanupFailure = "nested predecessor daemon has no sandbox CLI"
                 } else {
-                    & $predecessorCli stop --timeout 30 2>$null | Out-Null
+                    Invoke-TestNative $predecessorCli @("stop", "--timeout", "30") | Out-Null
                     if ($LASTEXITCODE -ne 0) {
                         $cleanupFailure = "nested predecessor daemon stop failed"
                     }
@@ -1292,7 +1359,7 @@ try {
         Invoke-RestMethod -UseBasicParsing $InstallUrl | Invoke-Expression
     }
 
-    $toolBin = (& uv tool dir --bin 2>$null | Select-Object -First 1)
+    $toolBin = (Invoke-TestNative uv @("tool", "dir", "--bin") | Select-Object -First 1)
     if ($toolBin) {
         $env:Path = "$toolBin;$env:Path"
     }
@@ -1307,7 +1374,7 @@ try {
         throw "CLI version '$($cliVersion.Trim())' does not match $ExpectedVersion"
     }
     if ($Profile -ne "release-lifecycle") {
-        $currentVault = (& $sandboxCli vault current 2>$null | Out-String).Trim()
+        $currentVault = (Invoke-TestNative $sandboxCli @("vault", "current") | Out-String).Trim()
         if ($LASTEXITCODE -ne 0 -or -not $currentVault) {
             throw "okto-neuron vault current failed after fresh installation"
         }

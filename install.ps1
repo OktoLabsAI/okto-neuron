@@ -122,6 +122,25 @@ function Die([string]$Message) {
     exit 1
 }
 
+# Runs a native command with its stderr discarded (or, with -MergeStderr, merged
+# into the output as plain text) and leaves its exit code in $LASTEXITCODE for
+# the caller to check. Windows PowerShell 5.1 wraps every redirected stderr line
+# of a native command in an ErrorRecord, and under this script's
+# $ErrorActionPreference = "Stop" the first such line is a terminating
+# NativeCommandError even when the command exits 0 (uv prints "Updated PATH ..."
+# to stderr on success). Continue is scoped to this function; PowerShell 7
+# never raised here, so its behaviour is unchanged. A command that cannot be
+# found still throws, as before, instead of leaving a stale $LASTEXITCODE.
+function Invoke-NativeCommand([string]$Command, [object[]]$Arguments = @(), [switch]$MergeStderr) {
+    Get-Command -Name $Command -ErrorAction Stop | Out-Null
+    $ErrorActionPreference = "Continue"
+    if ($MergeStderr) {
+        & $Command @Arguments 2>&1 | ForEach-Object { "$_" }
+    } else {
+        & $Command @Arguments 2>$null
+    }
+}
+
 function Open-ApplicationUi([string]$Url) {
     try {
         Start-Process $Url -ErrorAction Stop | Out-Null
@@ -261,7 +280,7 @@ function Get-LegacyVaultPaths {
     $paths = @()
     if ($script:PreviousCommand -and (Test-Path -LiteralPath $script:PreviousCommand)) {
         try {
-            $raw = (& $script:PreviousCommand vault list --json 2>$null | Out-String)
+            $raw = (Invoke-NativeCommand $script:PreviousCommand @("vault", "list", "--json") | Out-String)
             if ($LASTEXITCODE -eq 0 -and $raw) {
                 $payload = ConvertFrom-Json $raw
                 $paths += @($payload.vaults | ForEach-Object { [string]$_.path })
@@ -416,7 +435,7 @@ function Get-DaemonStatus {
     if (-not $command) { $command = Get-CliCommand }
     if ($command) {
         try {
-            $raw = (& $command status --json --timeout 2 2>$null | Out-String)
+            $raw = (Invoke-NativeCommand $command @("status", "--json", "--timeout", "2") | Out-String)
             if ($LASTEXITCODE -eq 0 -and $raw) {
                 $status = ConvertFrom-Json $raw
                 if ($status.pid) { return $status }
@@ -453,7 +472,7 @@ function Find-PreviousTool {
     if (Test-Path -LiteralPath $ownPython) {
         # Joao's 2026-09 Okto Neuron MVP was also a uv tool named okto-neuron
         # (command `neuron`). Never replace or modify it.
-        & $ownPython -c "import okto_neuron._compat" 2>$null | Out-Null
+        Invoke-NativeCommand $ownPython @("-c", "import okto_neuron._compat") | Out-Null
         if ($LASTEXITCODE -ne 0) {
             Die "a different 'okto-neuron' uv tool is installed (the Okto Neuron MVP, command 'neuron'). This installer will not replace it. Keep it by stopping here, or remove it yourself with 'uv tool uninstall okto-neuron' and re-run."
         }
@@ -485,7 +504,7 @@ function Find-PreviousTool {
 function Invoke-AppHomeMigration([string]$Cli) {
     if (-not (Test-Path -LiteralPath $LegacyHomeRoot)) { return }
     $script:MovedToExisted = Test-Path -LiteralPath (Join-Path $LegacyHomeRoot "MOVED_TO")
-    $raw = (& $Cli migrate-home --json 2>$null | Out-String)
+    $raw = (Invoke-NativeCommand $Cli @("migrate-home", "--json") | Out-String)
     if ($LASTEXITCODE -ne 0 -or -not $raw) {
         Die "could not copy app-level files from $LegacyHomeRoot to $HomeRoot"
     }
@@ -517,7 +536,7 @@ function Get-ServerVersion([string]$Command, [string]$VaultPath = "") {
     try {
         $statusArgs = @("status", "--json", "--timeout", "2")
         if ($VaultPath) { $statusArgs += @("--vault", $VaultPath) }
-        $payload = (& $Command @statusArgs 2>$null | Out-String)
+        $payload = (Invoke-NativeCommand $Command $statusArgs | Out-String)
         if ($LASTEXITCODE -eq 0 -and $payload) {
             return (Get-PayloadVersion (ConvertFrom-Json $payload))
         }
@@ -549,7 +568,7 @@ function Stop-CandidateDaemonForRollback {
     }
     $candidate = Join-Path $script:ToolBin "$CliName.exe"
     if (Test-Path -LiteralPath $candidate) {
-        & $candidate stop --timeout 10 2>$null | Out-Null
+        Invoke-NativeCommand $candidate @("stop", "--timeout", "10") | Out-Null
     }
 
     for ($i = 0; $i -lt 15; $i++) {
@@ -609,14 +628,14 @@ function Restore-PreviousDaemonState {
         throw "previous daemon command could not be restored"
     }
     $restartArgs = @("serve", "--daemon")
-    $serveHelp = (& $restored serve --help 2>$null | Out-String)
+    $serveHelp = (Invoke-NativeCommand $restored @("serve", "--help") | Out-String)
     if ($serveHelp -match '(?m)--no-open\b') {
         $restartArgs += "--no-open"
     }
     if ($script:PreviousDaemonVault) {
         $restartArgs += @("--vault", $script:PreviousDaemonVault)
     }
-    & $restored @restartArgs 2>$null | Out-Null
+    Invoke-NativeCommand $restored $restartArgs | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "previous daemon could not be restarted" }
     $runningVersion = ""
     for ($i = 0; $i -lt 30; $i++) {
@@ -704,7 +723,7 @@ function Restore-LegacyMcp {
     if (-not $script:LegacyMcpRemovedScope) { return }
     $scope = $script:LegacyMcpRemovedScope
     $script:LegacyMcpRemovedScope = ""
-    & claude mcp add --scope $scope --transport http $LegacyCliName $script:GlobalMcpUrl --header "Authorization: Bearer $($script:McpAuthToken)" 2>$null | Out-Null
+    Invoke-NativeCommand claude @("mcp", "add", "--scope", $scope, "--transport", "http", $LegacyCliName, $script:GlobalMcpUrl, "--header", "Authorization: Bearer $($script:McpAuthToken)") | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Info "re-added the old '$LegacyCliName' $scope-scope Claude MCP entry"
     } else {
@@ -758,11 +777,11 @@ Info "uv: $((Get-Command uv).Source)"
 
 # A prior uv tool can exist even when this shell has not loaded uv's PATH
 # update yet. Make it reachable before update detection needs to stop it.
-$preinstallToolBin = (& uv tool dir --bin 2>$null | Select-Object -First 1)
+$preinstallToolBin = (Invoke-NativeCommand uv @("tool", "dir", "--bin") | Select-Object -First 1)
 if ($preinstallToolBin) {
     $env:Path = "$preinstallToolBin;$env:Path"
 }
-$script:ToolRoot = (& uv tool dir 2>$null | Select-Object -First 1)
+$script:ToolRoot = (Invoke-NativeCommand uv @("tool", "dir") | Select-Object -First 1)
 $script:ToolBin = if ($preinstallToolBin) { $preinstallToolBin } else { Join-Path $HOME ".local\bin" }
 $script:WorkTmp = Join-Path ([IO.Path]::GetTempPath()) ("okto-neuron-install-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $script:WorkTmp | Out-Null
@@ -889,9 +908,9 @@ if ($ExpectedVersion -and $candidateVersion -ne $ExpectedVersion) {
 }
 $ExpectedVersion = $candidateVersion
 if (-not (Test-Path $stageCli)) { Die "staged wheel did not install the okto-neuron command" }
-& $stageCli --help 2>$null | Out-Null
+Invoke-NativeCommand $stageCli @("--help") | Out-Null
 if ($LASTEXITCODE -ne 0) { Die "staged okto-neuron command failed its help smoke" }
-$stagedCliVersion = [string](& $stageCli --version 2>$null | Select-Object -First 1)
+$stagedCliVersion = [string](Invoke-NativeCommand $stageCli @("--version") | Select-Object -First 1)
 if ($LASTEXITCODE -eq 0 -and $stagedCliVersion.Trim() -ne "okto-neuron $candidateVersion") {
     Die "staged CLI does not match package version $candidateVersion"
 }
@@ -1027,7 +1046,7 @@ $installedVersion = $installedVersion.Trim()
 if ($installedVersion -ne $candidateVersion) {
     Die "installed Okto Neuron $installedVersion, expected staged $candidateVersion"
 }
-$cliVersion = [string](& $cli --version 2>$null | Select-Object -First 1)
+$cliVersion = [string](Invoke-NativeCommand $cli @("--version") | Select-Object -First 1)
 if ($LASTEXITCODE -eq 0 -and $cliVersion.Trim() -ne "okto-neuron $installedVersion") {
     Die "the installed okto-neuron command does not match package version $installedVersion"
 }
@@ -1038,7 +1057,7 @@ Invoke-AppHomeMigration $cli
 # session (next terminal, next re-run) finds okto-neuron without manual setup.
 # Opt out for sandboxed/test runs that must not touch the real user PATH.
 if ($env:OKTO_NEURON_NO_UPDATE_SHELL -ne "1") {
-    & uv tool update-shell 2>$null | Out-Null
+    Invoke-NativeCommand uv @("tool", "update-shell") | Out-Null
     if ($LASTEXITCODE -eq 0) {
         Info "persisted PATH via 'uv tool update-shell'"
     } else {
@@ -1213,7 +1232,7 @@ function Test-McpRegistrationVerified([string]$Output, [string]$Scope) {
 
 function Register-Mcp([string]$Scope) {
     $kind = if ($serverStarted) { "connected" } else { "configured" }
-    $output = (& claude mcp get $CliName 2>&1 | Out-String)
+    $output = (Invoke-NativeCommand claude @("mcp", "get", $CliName) -MergeStderr | Out-String)
     if ($LASTEXITCODE -eq 0) {
         if (Test-McpRegistrationVerified $output $Scope) {
             $script:mcpWired = $true
@@ -1230,9 +1249,9 @@ function Register-Mcp([string]$Scope) {
         }
         Die "Claude MCP registration conflict; resolve the existing entry and re-run this installer"
     }
-    & claude mcp add --scope $Scope --transport http $CliName $globalUrl --header "Authorization: Bearer $authToken" 2>$null | Out-Null
+    Invoke-NativeCommand claude @("mcp", "add", "--scope", $Scope, "--transport", "http", $CliName, $globalUrl, "--header", "Authorization: Bearer $authToken") | Out-Null
     if ($LASTEXITCODE -eq 0) {
-        $output = (& claude mcp get $CliName 2>&1 | Out-String)
+        $output = (Invoke-NativeCommand claude @("mcp", "get", $CliName) -MergeStderr | Out-String)
         if ($LASTEXITCODE -ne 0 -or -not (Test-McpRegistrationVerified $output $Scope)) {
             Die "Claude MCP registration was added but did not verify as a $kind $Scope-scope endpoint"
         }
@@ -1257,13 +1276,13 @@ function Remove-LegacyMcp([string]$Scope, [string]$LegacyOutput) {
         Warn "the old '$LegacyCliName' $Scope-scope entry points somewhere else; it was left unchanged"
         return
     }
-    & claude mcp remove $LegacyCliName --scope $Scope 2>$null | Out-Null
+    Invoke-NativeCommand claude @("mcp", "remove", $LegacyCliName, "--scope", $Scope) | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Warn "could not remove the old '$LegacyCliName' $Scope-scope entry; remove it with: claude mcp remove $LegacyCliName --scope $Scope"
         return
     }
     $script:LegacyMcpRemovedScope = $Scope
-    $after = (& claude mcp get $LegacyCliName 2>&1 | Out-String)
+    $after = (Invoke-NativeCommand claude @("mcp", "get", $LegacyCliName) -MergeStderr | Out-String)
     if ($LASTEXITCODE -eq 0 -and (Get-ClaudeMcpRegistrationScope $after) -eq $Scope) {
         Die "the old '$LegacyCliName' $Scope-scope entry is still registered after removal"
     }
@@ -1276,7 +1295,7 @@ if ($env:OKTO_NEURON_NO_MCP -eq "1") {
     Step "Claude Code wiring deferred"
     Info "start the daemon, then re-run this installer to register its authenticated MCP endpoint"
 } elseif (Get-Command claude -ErrorAction SilentlyContinue) {
-    $legacyMcpOutput = (& claude mcp get $LegacyCliName 2>&1 | Out-String)
+    $legacyMcpOutput = (Invoke-NativeCommand claude @("mcp", "get", $LegacyCliName) -MergeStderr | Out-String)
     $legacyMcpScope = if ($LASTEXITCODE -eq 0) { Get-ClaudeMcpRegistrationScope $legacyMcpOutput } else { "" }
     if ($legacyMcpScope -eq "local") {
         Step "Re-registering the Marginalia MCP entry as '$CliName' (local scope, as before)"
