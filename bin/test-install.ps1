@@ -854,11 +854,18 @@ function Invoke-StoppedPredecessorUpdate(
         if ($successorVersion -ne "okto-neuron $Version") {
             throw "stopped predecessor update left CLI version '$successorVersion'"
         }
+        # The `marginalia` alias now runs Okto Neuron under its old program
+        # name ("marginalia <version>") and warns on stderr, as the Linux
+        # rehearsal and release-artifact-gate check.
         $aliasVersion = ([string](
             Invoke-TestNative $predecessorCli @("--version") | Select-Object -First 1
         )).Trim()
-        if ($aliasVersion -ne "okto-neuron $Version") {
+        if ($aliasVersion -ne "marginalia $Version") {
             throw "the marginalia alias reports '$aliasVersion' after the update"
+        }
+        $aliasOutput = (Invoke-TestNative $predecessorCli @("--version") -MergeStderr | Out-String)
+        if (-not $aliasOutput.Contains("the 'marginalia' command is now 'okto-neuron'")) {
+            throw "the marginalia alias did not warn that the command is now okto-neuron"
         }
         $pidRecords = @()
         foreach ($root in @($pidRoot, $newPidRoot)) {
