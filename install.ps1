@@ -152,8 +152,6 @@ function Assert-ValidPreseedInputs {
     }
 }
 
-Assert-ValidPreseedInputs
-
 function Run-Checked([string]$Command, [string[]]$Arguments) {
     & $Command @Arguments
     if ($LASTEXITCODE -ne 0) {
@@ -702,6 +700,12 @@ trap {
     }
     throw $originalError
 }
+
+# The trap above covers the whole script, including statements that come before
+# it, and every function it reaches must already be defined when it fires. So
+# nothing that can fail runs before this point: the first check comes after the
+# last function the trap needs.
+Assert-ValidPreseedInputs
 
 Write-Host "Okto Neuron installer - local-first knowledge graph for Claude Code"
 

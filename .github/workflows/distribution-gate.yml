@@ -1039,6 +1039,43 @@ jobs:
           }
           if ($failed) { throw "PowerShell syntax validation failed" }
 
+      - name: Verify preseed refusal end to end
+        shell: powershell
+        run: |
+          # Runs the real install.ps1 (both documented shapes) so the refusal is
+          # proven through the script-wide trap, not just the isolated function.
+          # The child writes to stderr; exit codes are checked explicitly.
+          $ErrorActionPreference = "Continue"
+          $install = Join-Path $PWD "install.ps1"
+          $iexRunner = Join-Path $env:RUNNER_TEMP "run-install-iex.ps1"
+          Set-Content -LiteralPath $iexRunner -Value "Get-Content -Raw -LiteralPath '$install' | Invoke-Expression"
+          $env:USERPROFILE = Join-Path $env:RUNNER_TEMP "preseed-home"
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+          $expected = "error: OKTO_NEURON_LLM_PROVIDER requires OKTO_NEURON_VAULT; omit preseed settings and configure vaults in the Web UI, or set OKTO_NEURON_VAULT explicitly"
+          foreach ($case in @(
+            @{ Name = "OKTO_NEURON_LLM_PROVIDER"; Script = $install },
+            @{ Name = "OKTO_NEURON_LLM_PROVIDER"; Script = $iexRunner },
+            @{ Name = "MARGINALIA_LLM_PROVIDER"; Script = $install }
+          )) {
+            Set-Item -Path "Env:$($case.Name)" -Value "skip"
+            $out = Join-Path $env:RUNNER_TEMP "preseed-refusal.out"
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $case.Script *> $out
+            $code = $LASTEXITCODE
+            Remove-Item -Path "Env:$($case.Name)"
+            $text = Get-Content -Raw -LiteralPath $out
+            $text | Out-Host
+            if ($code -eq 0) { throw "$($case.Name) preseed without a vault was accepted ($($case.Script))" }
+            # Compare without line wrapping (and pwsh 7's "|" error gutter).
+            $flat = ($text -replace '\r?\n[ \t]*\|', '') -replace '\s', ''
+            if (-not $flat.Contains(($expected -replace '\s', ''))) {
+              throw "refusal message missing ($($case.Name), $($case.Script))"
+            }
+            foreach ($bad in @("is not recognized", "Remove-InstallerTemps", "Restore-LegacyMcp")) {
+              if ($text.Contains($bad)) { throw "refusal output contains '$bad' ($($case.Name), $($case.Script))" }
+            }
+          }
+          "WINDOWS_PRESEED_REFUSAL_MESSAGE_OK"
+
       - name: Verify Claude MCP registration parsing
         shell: powershell
         run: |
