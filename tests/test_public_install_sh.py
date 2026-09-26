@@ -476,6 +476,40 @@ def test_public_installer_verifies_connected_mcp_get_in_any_locale(
         assert (result.returncode == 0) is should_match, (locale, output, result.stderr)
 
 
+@pytest.mark.parametrize(
+    ("telemetry", "tracking_uri", "extras"),
+    [
+        (None, None, "serve,litellm"),
+        ("1", None, "serve,litellm,telemetry"),
+        (None, "http://mlflow.example:5000", "serve,litellm,telemetry"),
+        ("0", "http://mlflow.example:5000", "serve,litellm"),
+    ],
+)
+def test_public_installer_adds_the_telemetry_extra_when_tracing_is_wanted(
+    tmp_path: Path, telemetry: str | None, tracking_uri: str | None, extras: str
+) -> None:
+    """A tracking URI with no mlflow in the tool traces nothing, silently."""
+    helpers = _script().split("trap installer_exit EXIT", 1)[0]
+    helper_path = tmp_path / "installer-helpers.sh"
+    helper_path.write_text(helpers, encoding="utf-8")
+    env = {
+        k: v for k, v in os.environ.items() if not k.startswith(("OKTO_NEURON_", "MARGINALIA_"))
+    }
+    if telemetry is not None:
+        env["OKTO_NEURON_TELEMETRY"] = telemetry
+    if tracking_uri is not None:
+        env["OKTO_NEURON_MLFLOW_TRACKING_URI"] = tracking_uri
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; printf "%s" "$EXTRAS"', "bash", str(helper_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == extras
+
+
 # -- Marginalia -> Okto Neuron upgrade path (0.3.0) ---------------------------
 
 

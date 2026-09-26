@@ -45,6 +45,12 @@ $DefaultManifestUrl = if ($env:OKTO_NEURON_DEFAULT_MANIFEST_URL) {
 }
 $ExpectedVersion = if ($env:OKTO_NEURON_EXPECTED_VERSION) { $env:OKTO_NEURON_EXPECTED_VERSION } else { "0.3.0" }
 $Extras = "serve,litellm"
+# Trace export needs mlflow in the tool's own environment; a tracking URI with no
+# mlflow traces nothing, so the URI alone is enough to ask for the extra.
+if ($env:OKTO_NEURON_TELEMETRY -eq "1" -or
+    ($env:OKTO_NEURON_TELEMETRY -ne "0" -and $env:OKTO_NEURON_MLFLOW_TRACKING_URI)) {
+    $Extras = "$Extras,telemetry"
+}
 $PyVersion = "3.12"
 $Repo = if ($env:OKTO_NEURON_REPO) { $env:OKTO_NEURON_REPO } else { "https://github.com/OktoLabsAI/okto-neuron.git" }
 $Ref = if ($env:OKTO_NEURON_REF) { $env:OKTO_NEURON_REF } else { "" }

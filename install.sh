@@ -39,6 +39,9 @@
 #   OKTO_NEURON_NO_SERVE=1   install + configure only; don't start the daemon
 #   OKTO_NEURON_NO_OPEN=1    don't open the verified local UI in a browser
 #   OKTO_NEURON_NO_MCP=1     don't run `claude mcp add`
+#   OKTO_NEURON_TELEMETRY=1  also install the 'telemetry' extra (mlflow) for MLflow
+#                            trace export; automatic when OKTO_NEURON_MLFLOW_TRACKING_URI
+#                            is set, OKTO_NEURON_TELEMETRY=0 opts out
 #
 # Flags:
 #   --no-onboard            skip the one-shot greenfield first-run onboarding prompt
@@ -69,6 +72,12 @@ DEFAULT_WHEEL_URL="${OKTO_NEURON_DEFAULT_WHEEL_URL:-https://github.com/OktoLabsA
 DEFAULT_MANIFEST_URL="${OKTO_NEURON_DEFAULT_MANIFEST_URL:-https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/release-manifest.json}"
 EXPECTED_VERSION="${OKTO_NEURON_EXPECTED_VERSION:-0.3.0}"
 EXTRAS="serve,litellm"
+# Trace export needs mlflow in the tool's own environment; a tracking URI with no
+# mlflow traces nothing, so the URI alone is enough to ask for the extra.
+if [ "${OKTO_NEURON_TELEMETRY:-}" = "1" ] \
+   || { [ "${OKTO_NEURON_TELEMETRY:-}" != "0" ] && [ -n "${OKTO_NEURON_MLFLOW_TRACKING_URI:-}" ]; }; then
+  EXTRAS="${EXTRAS},telemetry"
+fi
 PY_VERSION="3.12"
 REPO="${OKTO_NEURON_REPO:-https://github.com/OktoLabsAI/okto-neuron.git}"
 REF="${OKTO_NEURON_REF:-}"

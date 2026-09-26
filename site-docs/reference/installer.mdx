@@ -119,6 +119,10 @@ When set to `1`, adds `--non-interactive` to the onboard call. The script also s
 `1` skips the `claude mcp add` step. This is read once during the install run and affects nothing in a daemon that is already running.
 </ParamField>
 
+<ParamField path="OKTO_NEURON_TELEMETRY" type="string">
+`1` also installs the `telemetry` extra (mlflow), which [MLflow trace export](/config/environment-variables#llm-tracing-mlflow) needs. The installer adds it on its own when `OKTO_NEURON_MLFLOW_TRACKING_URI` is set in its environment; `0` opts out of that. To add it to an existing install, re-run the installer with `OKTO_NEURON_TELEMETRY=1`.
+</ParamField>
+
 <ParamField path="OKTO_NEURON_NO_UPDATE_SHELL" type="string">
 The shell-profile update (`uv tool update-shell`) runs unless this is exactly `1`.
 </ParamField>

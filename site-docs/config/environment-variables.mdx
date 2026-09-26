@@ -121,6 +121,20 @@ search paths, and before the built-in packs
 `OKTO_NEURON_OLLAMA_BACKEND` is stripped and lowercased, and is read before the
 config value in `detect_backend` (`src/okto_neuron/models/runtime.py:59-70`).
 
+### LLM tracing (MLflow)
+
+`OKTO_NEURON_MLFLOW_TRACKING_URI` turns on export of every LLM call to an MLflow
+tracking server as a GenAI trace; unset, nothing is exported and `mlflow` is
+never imported. `OKTO_NEURON_MLFLOW_EXPERIMENT` names the experiment (default
+`okto-neuron`) and `OKTO_NEURON_MLFLOW_TAGS` is a JSON object of extra span tags
+(`src/okto_neuron/llm/_telemetry.py`).
+
+Export needs `mlflow`, which the installer leaves out by default. Install with
+`OKTO_NEURON_TELEMETRY=1` (or with `OKTO_NEURON_MLFLOW_TRACKING_URI` already
+exported, which implies it) to add the `telemetry` extra; for an existing
+install, re-run the installer that way and restart the daemon. The full span
+schema is in `docs/observability.md` in the source repository.
+
 ## The generated env file
 
 Okto Neuron keeps managed provider credentials in a generated file at
@@ -250,7 +264,7 @@ above. These are documented on [/reference/installer](/reference/installer).
 `OKTO_NEURON_LLM_PROVIDER`, `OKTO_NEURON_LLM_API_BASE`, `OKTO_NEURON_LLM_MODEL`,
 `OKTO_NEURON_LLM_API_KEY_ENV`, `OKTO_NEURON_LLM_ALLOW_REMOTE`,
 `OKTO_NEURON_ONBOARD_NONINTERACTIVE`, `OKTO_NEURON_NO_SERVE`,
-`OKTO_NEURON_NO_OPEN`, `OKTO_NEURON_NO_MCP`. The script also reads
+`OKTO_NEURON_NO_OPEN`, `OKTO_NEURON_NO_MCP`, `OKTO_NEURON_TELEMETRY`. The script also reads
 `OKTO_NEURON_DEFAULT_WHEEL_URL` and `OKTO_NEURON_DEFAULT_MANIFEST_URL`, plus `OKTO_NEURON_LLM_SKIP_DISCOVERY` and
 `OKTO_NEURON_ALLOW_REMOTE_LLM` in its preseed validation.
 
