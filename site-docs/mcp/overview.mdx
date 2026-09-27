@@ -6,7 +6,7 @@ description: Five tools, one bearer token, loopback only. The agent-facing surfa
 Okto Neuron exposes an MCP server so a local agent can read from and write to a vault. The server is not a separate process. It runs inside `okto-neuron serve`, alongside the REST surface and the web UI, and it listens on its own port with its own credential. The code uses "REST" as the name of that surface (`src/okto_neuron/server/runtime.py:3`, `:56`); there is no OpenAPI document and no API contract behind the name, and [/reference/http-endpoints](/reference/http-endpoints) lists only the routes the shipped CLI calls.
 
 <Note>
-Okto Neuron is prerelease software (version 0.3.0). The tool set, arguments and return shapes described here are not a stable API contract and can change between releases.
+Okto Neuron is prerelease software (version 0.3.1). The tool set, arguments and return shapes described here are not a stable API contract and can change between releases.
 </Note>
 
 ## Where the server runs

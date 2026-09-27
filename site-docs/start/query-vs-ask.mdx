@@ -26,7 +26,7 @@ okto-neuron ask "what is our retention policy?"
 `query` runs on retrieval alone. The server embeds your text and does a vector search, and no answering model is involved. `ask` cannot work that way, because there is nothing to write the prose. If you skip LLM setup during onboarding, Okto Neuron tells you exactly this: exploring works without an LLM, and you re-run `okto-neuron onboard --reconfigure` to turn on `ask`.
 
 <Note>
-Okto Neuron 0.3.0 is prerelease. Behaviour described here is what the current code does, not a frozen contract.
+Okto Neuron 0.3.1 is prerelease. Behaviour described here is what the current code does, not a frozen contract.
 </Note>
 
 If `ask` prints `(no answer)`, do not read that as "the vault knows nothing". A degraded answer also prints `answer degraded: <status> (<reason>)` to stderr. With `--format json`, the top-level `status` is `degraded` and `retrieval.synthesis_status` says why: `no_llm` means no model is configured, so none was called (set one with `okto-neuron onboard --reconfigure`), `provider_error` means the answering model was unreachable (`retrieval.provider_error` carries the summary, so fix the provider and try again), `empty` means the model replied with nothing, `ok` means synthesis succeeded. See [/config/llm-providers](/config/llm-providers).

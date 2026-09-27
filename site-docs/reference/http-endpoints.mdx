@@ -8,7 +8,7 @@ This is not an API reference. It documents the routes the shipped CLI calls and 
 </Warning>
 
 <Note>
-Okto Neuron is 0.3.0 and prerelease. Route paths, request fields and response fields can change without notice.
+Okto Neuron is 0.3.1 and prerelease. Route paths, request fields and response fields can change without notice.
 </Note>
 
 ## Base URL resolution
@@ -90,7 +90,7 @@ Flag details for each of these commands live in [/reference/cli/client-commands]
 `_routes()` returns 97 `Route()` registrations (`src/okto_neuron/server/http.py:6834-7038`): 86 of them are `/api/v1` registrations over 76 distinct versioned paths, and the remaining 11 are the bare paths. The table above covers the ones a shipped CLI command sends. Most of the rest are called only by the bundled web UI, which resolves every request against one constant, `export const API_BASE = '/api/v1'` (`frontend/src/services/http.ts:6`), and issues them from the modules under `frontend/src/services/`.
 
 <Note>
-This table records which UI service module calls which route. It is not a contract, and it does not describe any screen, button or click path. Request and response shapes for these routes were not surveyed, so they are not given here, with one exception: `POST /api/v1/curation/rollback` was surveyed directly in the server source and its shapes are in [its own section below](#post-apiv1curationrollback). Everything on this page can change without notice while Okto Neuron is prerelease (0.3.0).
+This table records which UI service module calls which route. It is not a contract, and it does not describe any screen, button or click path. Request and response shapes for these routes were not surveyed, so they are not given here, with one exception: `POST /api/v1/curation/rollback` was surveyed directly in the server source and its shapes are in [its own section below](#post-apiv1curationrollback). Everything on this page can change without notice while Okto Neuron is prerelease (0.3.1).
 </Note>
 
 | Route | Method | Caller in the frontend source |
@@ -255,6 +255,6 @@ Three further asymmetries are worth knowing before you read a response:
 
 ## Response bodies
 
-Response fields are documented here only where a CLI `--format json` or `--json` path dumps them, or where the handler's return was read directly. Field sets may change without notice while Okto Neuron is prerelease (0.3.0).
+Response fields are documented here only where a CLI `--format json` or `--json` path dumps them, or where the handler's return was read directly. Field sets may change without notice while Okto Neuron is prerelease (0.3.1).
 
 Response fields for the web-UI routes above were not surveyed and are not documented anywhere on this site, except for `POST /api/v1/curation/rollback` above. Routes called by neither the shipped CLI nor the frontend are tracked in [/help/known-gaps](/help/known-gaps), including the bare `/remember`, `/recall` and `/ask` and the five versioned routes with no caller.
