@@ -1669,6 +1669,42 @@ jobs:
           }
           "WINDOWS_PID_OWNER_LAUNCHER_OK"
 
+      - name: Verify the forced activation failure outranks uv on PATH
+        shell: powershell
+        run: |
+          # The installer prepends `uv tool dir --bin` (which holds the real uv.exe
+          # in the lifecycle sandbox) to PATH, so the driver injects its forced
+          # activation failure as a PowerShell function, which outranks any PATH
+          # entry (a uv.cmd shim on PATH was bypassed on a real run, 2026-09-27).
+          $tester = Get-Content -Raw -LiteralPath "bin/test-install.ps1"
+          $shimMatch = [regex]::Match($tester, "(?m)^\s*\`$failActivationShim = '(?<shim>.*)'\r?$")
+          if (-not $shimMatch.Success) { throw "the forced activation failure shim was not found" }
+          $shim = $shimMatch.Groups["shim"].Value.Replace("''", "'")
+          if (-not $tester.Contains('Invoke-RawInstallerProcess $Url $rollbackOutput $failActivationShim')) {
+            throw "the activation rollback run does not pass the shim to the installer"
+          }
+          $root = Join-Path $env:RUNNER_TEMP "okto-neuron-activation-shim"
+          $bin = Join-Path $root "bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Set-Content -LiteralPath (Join-Path $bin "uv.cmd") -Encoding ASCII -Value @(
+            '@echo off', 'echo real-uv %*', 'exit /b 0')
+          $body = '$ErrorActionPreference = ''Stop''; $env:Path = $env:SHIM_TEST_BIN + '';'' + $env:Path; ' +
+            '& uv tool dir --bin 2>$null | Out-Null; if ($LASTEXITCODE -ne 0) { exit 90 }; ' +
+            '& uv tool install --python 3.12 okto-neuron; exit $LASTEXITCODE'
+          $env:SHIM_TEST_BIN = $bin
+          $env:OKTO_NEURON_REAL_UV = Join-Path $bin "uv.cmd"
+          $env:OKTO_NEURON_TEST_FAIL_ACTIVATION = "1"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ($shim + $body)
+          $failed = $LASTEXITCODE
+          $env:OKTO_NEURON_TEST_FAIL_ACTIVATION = ""
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ($shim + $body)
+          $passed = $LASTEXITCODE
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          if ($failed -ne 77) { throw "forced activation failure was bypassed by uv on PATH (exit $failed)" }
+          if ($passed -ne 0) { throw "shim did not pass uv through when not failing (exit $passed)" }
+          $global:LASTEXITCODE = 0
+          "WINDOWS_ACTIVATION_SHIM_OK"
+
       - name: Verify Windows transaction and sandbox contracts
         shell: powershell
         run: |

@@ -636,9 +636,9 @@ function Confirm-DefaultDaemon([string]$Command, [string]$Version) {
     return $status
 }
 
-function Invoke-RawInstallerProcess([string]$Source, [string]$OutputPath) {
+function Invoke-RawInstallerProcess([string]$Source, [string]$OutputPath, [string]$Prelude = "") {
     $nestedPowerShell = Join-Path $PSHOME "powershell.exe"
-    $installCommand = '$ProgressPreference = ''SilentlyContinue''; $source = $env:OKTO_NEURON_TEST_INSTALL_URL; if (Test-Path -LiteralPath $source) { Get-Content -Raw -LiteralPath $source | Invoke-Expression } else { Invoke-RestMethod -UseBasicParsing $source | Invoke-Expression }'
+    $installCommand = $Prelude + '$ProgressPreference = ''SilentlyContinue''; $source = $env:OKTO_NEURON_TEST_INSTALL_URL; if (Test-Path -LiteralPath $source) { Get-Content -Raw -LiteralPath $source | Invoke-Expression } else { Invoke-RestMethod -UseBasicParsing $source | Invoke-Expression }'
     $oldInstallUrl = $env:OKTO_NEURON_TEST_INSTALL_URL
     $oldErrorActionPreference = $ErrorActionPreference
     try {
@@ -1299,27 +1299,21 @@ if __name__ == "__main__":
     $status = Confirm-DefaultDaemon $Command $Version
     $rollbackBefore = [int]$status.pid
     $rollbackOutput = Join-Path $HomePath "activation-rollback.out"
-    $shimRoot = Join-Path $HomePath "activation-failure-shim"
-    New-Item -ItemType Directory -Force -Path $shimRoot | Out-Null
-    @(
-        '@echo off',
-        'if "%OKTO_NEURON_TEST_FAIL_ACTIVATION%"=="1" if /I "%~1"=="tool" if /I "%~2"=="install" exit /b 77',
-        '"%OKTO_NEURON_REAL_UV%" %*',
-        'exit /b %ERRORLEVEL%'
-    ) | Set-Content -LiteralPath (Join-Path $shimRoot "uv.cmd") -Encoding ASCII
-    $oldPath = $env:Path
+    # The installer prepends `uv tool dir --bin` to PATH before activating, and in
+    # this sandbox that directory holds the real uv.exe, so a uv.cmd earlier on
+    # PATH is bypassed. A PowerShell function outranks every application on any
+    # PATH, like the exported shell function test-install.sh uses, so the forced
+    # failure is injected as a function defined ahead of the installer.
+    $failActivationShim = 'function uv { if ($env:OKTO_NEURON_TEST_FAIL_ACTIVATION -eq ''1'' -and $args.Count -ge 2 -and $args[0] -eq ''tool'' -and $args[1] -eq ''install'') { $global:LASTEXITCODE = 77; return }; $ErrorActionPreference = ''Continue''; & $env:OKTO_NEURON_REAL_UV @args }; '
     $oldFailActivation = $env:OKTO_NEURON_TEST_FAIL_ACTIVATION
     $oldRealUv = $env:OKTO_NEURON_REAL_UV
     try {
         $env:OKTO_NEURON_REAL_UV = $realUv
         $env:OKTO_NEURON_TEST_FAIL_ACTIVATION = "1"
-        $env:Path = "$shimRoot;$oldPath"
-        $rollbackExitCode = Invoke-RawInstallerProcess $Url $rollbackOutput
+        $rollbackExitCode = Invoke-RawInstallerProcess $Url $rollbackOutput $failActivationShim
     } finally {
-        $env:Path = $oldPath
         $env:OKTO_NEURON_TEST_FAIL_ACTIVATION = $oldFailActivation
         $env:OKTO_NEURON_REAL_UV = $oldRealUv
-        Remove-Item -LiteralPath $shimRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     if ($rollbackExitCode -eq 0) {
         throw "forced activation failure unexpectedly succeeded"
