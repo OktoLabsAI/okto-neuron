@@ -1,7 +1,7 @@
 {
-  "version": "0.3.0",
-  "wheel": "okto_neuron-0.3.0-py3-none-any.whl",
-  "wheel_url": "https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.0/okto_neuron-0.3.0-py3-none-any.whl",
-  "sha256": "3a9317b5032d71b56fbd5d2f1097d17dda23f790330db198d69985cbffac0065",
-  "source_commit": "57248397ef3d66642e1b05d00da01e943e289670"
+  "version": "0.3.1",
+  "wheel": "okto_neuron-0.3.1-py3-none-any.whl",
+  "wheel_url": "https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl",
+  "sha256": "01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c",
+  "source_commit": "cf41a14cd345934f039115c53808c037b3e5d778"
 }

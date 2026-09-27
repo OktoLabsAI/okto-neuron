@@ -36,14 +36,14 @@ foreach ($legacyVar in @(Get-ChildItem Env: | Where-Object { $_.Name -like "MARG
 $DefaultWheelUrl = if ($env:OKTO_NEURON_DEFAULT_WHEEL_URL) {
     $env:OKTO_NEURON_DEFAULT_WHEEL_URL
 } else {
-    "https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.0/okto_neuron-0.3.0-py3-none-any.whl"
+    "https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl"
 }
 $DefaultManifestUrl = if ($env:OKTO_NEURON_DEFAULT_MANIFEST_URL) {
     $env:OKTO_NEURON_DEFAULT_MANIFEST_URL
 } else {
     "https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/release-manifest.json"
 }
-$ExpectedVersion = if ($env:OKTO_NEURON_EXPECTED_VERSION) { $env:OKTO_NEURON_EXPECTED_VERSION } else { "0.3.0" }
+$ExpectedVersion = if ($env:OKTO_NEURON_EXPECTED_VERSION) { $env:OKTO_NEURON_EXPECTED_VERSION } else { "0.3.1" }
 $Extras = "serve,litellm"
 # Trace export needs mlflow in the tool's own environment; a tracking URI with no
 # mlflow traces nothing, so the URI alone is enough to ask for the extra.

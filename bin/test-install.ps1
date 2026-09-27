@@ -8,7 +8,7 @@ param(
     [string]$InstallUrl = $(if ($env:OKTO_NEURON_INSTALL_URL) { $env:OKTO_NEURON_INSTALL_URL } else { "https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/install.ps1" }),
     [string]$TestHome = $(if ($env:OKTO_NEURON_TEST_HOME) { $env:OKTO_NEURON_TEST_HOME } else { Join-Path ([IO.Path]::GetTempPath()) ("okto-neuron-install-test-" + [guid]::NewGuid().ToString("N").Substring(0, 12)) }),
     [string]$Vault = $(if ($env:OKTO_NEURON_VAULT) { $env:OKTO_NEURON_VAULT } else { "mynotes" }),
-    [string]$ExpectedVersion = $(if ($env:OKTO_NEURON_EXPECTED_VERSION) { $env:OKTO_NEURON_EXPECTED_VERSION } else { "0.3.0" }),
+    [string]$ExpectedVersion = $(if ($env:OKTO_NEURON_EXPECTED_VERSION) { $env:OKTO_NEURON_EXPECTED_VERSION } else { "0.3.1" }),
     [ValidateSet("interactive", "skip", "custom", "release-lifecycle")]
     [string]$Profile = "interactive",
     [string]$ApiBase = "",

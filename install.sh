@@ -68,9 +68,9 @@ import_legacy_env
 # The release bakes the immutable GitHub Release wheel URL and version here
 # (scripts/release_manifest.py prints the values), so `curl … | bash` needs no env.
 # The wheel is always checked against release-manifest.json's SHA-256.
-DEFAULT_WHEEL_URL="${OKTO_NEURON_DEFAULT_WHEEL_URL:-https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.0/okto_neuron-0.3.0-py3-none-any.whl}"
+DEFAULT_WHEEL_URL="${OKTO_NEURON_DEFAULT_WHEEL_URL:-https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl}"
 DEFAULT_MANIFEST_URL="${OKTO_NEURON_DEFAULT_MANIFEST_URL:-https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/release-manifest.json}"
-EXPECTED_VERSION="${OKTO_NEURON_EXPECTED_VERSION:-0.3.0}"
+EXPECTED_VERSION="${OKTO_NEURON_EXPECTED_VERSION:-0.3.1}"
 EXTRAS="serve,litellm"
 # Trace export needs mlflow in the tool's own environment; a tracking URI with no
 # mlflow traces nothing, so the URI alone is enough to ask for the extra.
