@@ -1586,6 +1586,89 @@ jobs:
             throw "live PID guard is missing custom-port guidance"
           }
 
+      - name: Verify the lifecycle PID owner may run behind a venv launcher
+        shell: powershell
+        run: |
+          # A venv Scripts\python.exe on Windows is a launcher that runs the real
+          # interpreter as its child, so the PID the helper reports is not the
+          # launched PID (a real release-lifecycle run failed on it, 2026-09-27).
+          $tester = Get-Content -Raw -LiteralPath "bin/test-install.ps1"
+          $childMatch = [regex]::Match($tester, '(?s)\$child = @''\r?\n(?<child>.*?)\r?\n''@')
+          if (-not $childMatch.Success) { throw "test-install.ps1 child runner here-string was not found" }
+          $childAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            $childMatch.Groups["child"].Value, [ref]$null, [ref]$null)
+          $fn = $childAst.Find({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $n.Name -eq "Resolve-TestPidOwnerProcessId" }, $true)
+          if ($null -eq $fn) { throw "Resolve-TestPidOwnerProcessId is missing from the child runner" }
+          . ([scriptblock]::Create($fn.Extent.Text))
+          $lifecycle = $childAst.Find({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+              $n.Name -eq "Invoke-ReleaseLifecycle" }, $true).Extent.Text
+          foreach ($required in @(
+            '$guardOwnerProcessId = Resolve-TestPidOwnerProcessId $guardProcess.Id $guardReadyPath',
+            '$guardPython $guardHelperPath $guardRecordPath $guardOwnerProcessId',
+            'live Okto Neuron process (pid $guardOwnerProcessId)',
+            'Test-ChildProcessAlive $guardOwnerProcessId'
+          )) {
+            if (-not $lifecycle.Contains($required)) { throw "lifecycle PID owner contract is missing: $required" }
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP "okto-neuron-pid-owner-launcher"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          & python -m venv (Join-Path $root "venv")
+          if ($LASTEXITCODE -ne 0) { throw "python -m venv failed" }
+          $ready = Join-Path $root "owner.ready"
+          $stop = Join-Path $root "owner.stop"
+          $script = Join-Path $root "owner.py"
+          [IO.File]::WriteAllText($script, @'
+          import os, pathlib, time
+          pathlib.Path(os.environ["OWNER_READY"]).write_text(f"{os.getpid()}\n", encoding="ascii")
+          stop = pathlib.Path(os.environ["OWNER_STOP"])
+          while not stop.exists():
+              time.sleep(0.1)
+          '@, [Text.Encoding]::ASCII)
+          $info = New-Object System.Diagnostics.ProcessStartInfo
+          $info.FileName = Join-Path $root "venv\Scripts\python.exe"
+          $info.WorkingDirectory = $root
+          $info.Arguments = "owner.py"
+          $info.UseShellExecute = $false
+          $info.CreateNoWindow = $true
+          $info.EnvironmentVariables["OWNER_READY"] = $ready
+          $info.EnvironmentVariables["OWNER_STOP"] = $stop
+          $process = [System.Diagnostics.Process]::Start($info)
+          $reported = 0
+          try {
+            for ($i = 0; $i -lt 100 -and -not (Test-Path -LiteralPath $ready); $i++) { Start-Sleep -Milliseconds 100 }
+            if (-not (Test-Path -LiteralPath $ready)) { throw "launcher-backed owner did not become ready" }
+            $reported = [int](Get-Content -Raw -LiteralPath $ready).Trim()
+            if ($reported -eq $process.Id) {
+              throw "control: venv python.exe no longer runs the interpreter as a child on this runner"
+            }
+            $owner = Resolve-TestPidOwnerProcessId $process.Id $ready
+            if ($owner -ne $reported) { throw "launcher child pid $reported was resolved as $owner" }
+
+            [IO.File]::WriteAllText($ready, "$($process.Id)`n", [Text.Encoding]::ASCII)
+            if ((Resolve-TestPidOwnerProcessId $process.Id $ready) -ne $process.Id) {
+              throw "a direct (non-launcher) owner pid was not accepted"
+            }
+            foreach ($bad in @("$PID", "0", "not-a-pid")) {
+              [IO.File]::WriteAllText($ready, "$bad`n", [Text.Encoding]::ASCII)
+              $refused = $false
+              try { Resolve-TestPidOwnerProcessId $process.Id $ready | Out-Null } catch { $refused = $true }
+              if (-not $refused) { throw "unrelated owner pid '$bad' was accepted" }
+            }
+          } finally {
+            [IO.File]::WriteAllText($stop, "stop`n", [Text.Encoding]::ASCII)
+            if (-not $process.WaitForExit(10000)) {
+              if ($reported -gt 0) { Stop-Process -Id $reported -Force -ErrorAction SilentlyContinue }
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "launcher-backed owner did not exit after its stop request"
+            }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          "WINDOWS_PID_OWNER_LAUNCHER_OK"
+
       - name: Verify Windows transaction and sandbox contracts
         shell: powershell
         run: |

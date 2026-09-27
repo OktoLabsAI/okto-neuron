@@ -692,6 +692,27 @@ function Assert-CanonicalTestPidRecord(
     return $validationText
 }
 
+function Resolve-TestPidOwnerProcessId([int]$LaunchedProcessId, [string]$ReadyPath) {
+    # A uv or venv Scripts\python.exe on Windows is a launcher that runs the real
+    # interpreter as its child, so the PID the helper writes (and records in its
+    # PID file) can be the launched process's direct child instead of the process
+    # itself. Accept exactly those two; anything else is not our helper.
+    $readyText = (Get-Content -Raw -LiteralPath $ReadyPath).Trim()
+    $ownerProcessId = 0
+    if (-not ([int]::TryParse($readyText, [ref]$ownerProcessId)) -or $ownerProcessId -le 0) {
+        throw "installed successor PID owner readiness was not a process id: $readyText"
+    }
+    if ($ownerProcessId -eq $LaunchedProcessId) {
+        return $ownerProcessId
+    }
+    $owner = Get-CimInstance -ClassName Win32_Process `
+        -Filter "ProcessId = $ownerProcessId" -ErrorAction SilentlyContinue
+    if ($null -eq $owner -or [int]$owner.ParentProcessId -ne $LaunchedProcessId) {
+        throw "installed successor PID owner readiness pid $ownerProcessId is neither process $LaunchedProcessId nor its direct child"
+    }
+    return $ownerProcessId
+}
+
 function Invoke-StoppedPredecessorUpdate(
     [string]$Url,
     [string]$Version,
@@ -1176,6 +1197,7 @@ if __name__ == "__main__":
     $guardStarted = $false
     $guardCleanupFailure = ""
     $guardForced = $false
+    $guardOwnerProcessId = 0
     try {
         if (-not $guardProcess.Start()) {
             throw "installed successor PID owner process did not start"
@@ -1197,26 +1219,21 @@ if __name__ == "__main__":
         if (-not $guardReady) {
             throw "installed successor PID owner did not become ready"
         }
-        $guardReadyProcessId = 0
-        $guardReadyText = (Get-Content -Raw -LiteralPath $guardReadyPath).Trim()
-        if (-not ([int]::TryParse($guardReadyText, [ref]$guardReadyProcessId)) -or
-            $guardReadyProcessId -ne $guardProcess.Id) {
-            throw "installed successor PID owner readiness did not match process $($guardProcess.Id)"
-        }
+        $guardOwnerProcessId = Resolve-TestPidOwnerProcessId $guardProcess.Id $guardReadyPath
         $guardOwnerId = Assert-CanonicalTestPidRecord `
-            $guardPython $guardHelperPath $guardRecordPath $guardProcess.Id
+            $guardPython $guardHelperPath $guardRecordPath $guardOwnerProcessId
         $guardOutput = Join-Path $HomePath "live-pid-refusal.out"
         $guardExitCode = Invoke-RawInstallerProcess $Url $guardOutput
         if ($guardExitCode -eq 0) {
             throw "installer replaced the tool despite a verified application PID owner"
         }
-        Assert-OutputContains $guardOutput "live Okto Neuron process (pid $($guardProcess.Id))"
+        Assert-OutputContains $guardOutput "live Okto Neuron process (pid $guardOwnerProcessId)"
         Assert-OutputContains $guardOutput "okto-neuron stop"
-        if (-not (Test-ChildProcessAlive $guardProcess.Id)) {
+        if (-not (Test-ChildProcessAlive $guardOwnerProcessId)) {
             throw "live-PID refusal stopped the lifecycle owner process"
         }
         $guardOwnerIdAfter = Assert-CanonicalTestPidRecord `
-            $guardPython $guardHelperPath $guardRecordPath $guardProcess.Id
+            $guardPython $guardHelperPath $guardRecordPath $guardOwnerProcessId
         if ($guardOwnerIdAfter -cne $guardOwnerId) {
             throw "live-PID refusal changed the lifecycle owner identity"
         }
@@ -1238,6 +1255,9 @@ if __name__ == "__main__":
                 }
                 if (-not $guardProcess.WaitForExit(5000)) {
                     $guardForced = $true
+                    if ($guardOwnerProcessId -gt 0 -and $guardOwnerProcessId -ne $guardProcess.Id) {
+                        Stop-Process -Id $guardOwnerProcessId -Force -ErrorAction SilentlyContinue
+                    }
                     Stop-Process -Id $guardProcess.Id -Force -ErrorAction SilentlyContinue
                     if (-not $guardProcess.WaitForExit(5000)) {
                         $guardCleanupFailure = "lifecycle owner remained live after force fallback"
