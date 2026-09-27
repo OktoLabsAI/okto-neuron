@@ -786,6 +786,13 @@ jobs:
           export UV_CACHE_DIR="$RUNNER_TEMP/uv-cache"
           export OKTO_NEURON_WHEEL="$CANDIDATE_WHEEL"
           export OKTO_NEURON_MANIFEST="$CANDIDATE_MANIFEST"
+          # The candidate is the source version, which runs ahead of the release the
+          # installer defaults name until its manifest is baked (parity checks those
+          # defaults against the committed manifest). Overriding the wheel therefore
+          # names its version explicitly, as install.sh documents; the installer still
+          # requires the manifest, the wheel metadata and the installed tool to agree.
+          OKTO_NEURON_EXPECTED_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$CANDIDATE_MANIFEST")"
+          export OKTO_NEURON_EXPECTED_VERSION
           export OKTO_NEURON_NO_SERVE=1
           export OKTO_NEURON_NO_MCP=1
           export OKTO_NEURON_NO_UPDATE_SHELL=1
