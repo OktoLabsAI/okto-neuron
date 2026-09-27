@@ -451,6 +451,14 @@ jobs:
             python -m pytest -q -p no:cacheprovider tests/test_server_api_v1.py `
             -k "credential"
 
+      - name: Run PID-record lifecycle tests on real Windows file sharing
+        # CRT os.open handles block deletes on Windows; before 0.3.1 every clean
+        # stop left server.pid behind because it was unlinked while still open.
+        run: |
+          uv run --frozen --no-default-groups --group dev --group serve `
+            python -m pytest -q -p no:cacheprovider tests/test_server_lifecycle.py `
+            -k "pidfile_writes_and_removes or pidfile_reclaims_stale or send_stop_stale_pidfile_cleans_up or windows_clean_release or windows_release_retries or windows_stop_cleans or windows_start_reclaims or windows_conditional_delete or removal_failure"
+
       - name: Verify exact-wheel DPAPI round-trip in fresh processes
         run: |
           $ErrorActionPreference = "Stop"
@@ -556,6 +564,20 @@ jobs:
               throw "exact-wheel Windows daemon failed to stop"
             }
             $stopped = $true
+            $daemonPid = [int]$status.pid
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Process -Id $daemonPid -ErrorAction SilentlyContinue) -and
+                ((Get-Date) -lt $deadline)) {
+              Start-Sleep -Milliseconds 200
+            }
+            if (Get-Process -Id $daemonPid -ErrorAction SilentlyContinue) {
+              throw "exact-wheel Windows daemon pid $daemonPid still running after stop"
+            }
+            $pidRecord = Join-Path $testHome ".okto-neuron\runtime\.marginalia\server.pid"
+            if (Test-Path -LiteralPath $pidRecord) {
+              throw "clean stop left a PID record: $pidRecord"
+            }
+            Write-Host "WINDOWS_DAEMON_STOP_NO_PID_RECORD_OK"
           }
           finally {
             if ($started -and -not $stopped) {

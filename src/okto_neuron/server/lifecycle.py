@@ -65,6 +65,15 @@ _PID_ACQUIRE_ATTEMPTS = 20
 _PROCESS_START_TOKEN_ATTEMPTS = 3
 _PROCESS_START_TOKEN_RETRY_SECONDS = 0.05
 _SIGNAL_POLL_SECONDS = 0.05
+# Windows refuses to delete or replace a file while any process (including this
+# one) holds an open handle without FILE_SHARE_DELETE, which is how CRT
+# ``os.open`` opens files. Short-lived readers (``okto-neuron stop`` polling the
+# PID record, the stop-request watcher) can therefore make a removal fail with
+# a sharing violation for a few milliseconds; retry briefly before giving up.
+_REMOVE_ATTEMPTS = 20
+_REMOVE_RETRY_SECONDS = 0.05
+
+_LOG = logging.getLogger("okto_neuron.server.lifecycle")
 
 # Default log envelope keys, in canonical order.
 _LOG_KEYS = ("ts", "level", "component", "vault", "request_id", "event", "msg")
@@ -364,6 +373,97 @@ def _read_pid_payload(path: Path) -> tuple[_PidRecord | None, int | None]:
     return _parse_pid_record(raw)
 
 
+def _windows_file_sharing() -> bool:
+    """True where an open handle blocks deleting or replacing the file."""
+    return os.name == "nt"
+
+
+def _remove_attempts() -> int:
+    return _REMOVE_ATTEMPTS if _windows_file_sharing() else 1
+
+
+def _log_remove_failure(path: Path, what: str, exc: BaseException | None) -> None:
+    _LOG.warning(
+        "could not remove %s %s: %s",
+        what,
+        path,
+        exc,
+        extra={"component": "lifecycle", "event": "lifecycle.remove_failed"},
+    )
+
+
+def _remove_path(path: Path, *, what: str) -> bool:
+    """Delete ``path``; retry Windows sharing violations and log a final failure.
+
+    Returns True when the file is gone. A failure is never silent: it is logged
+    so a left-behind lifecycle file can be traced to its cause.
+    """
+    attempts = _remove_attempts()
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return True
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+            break
+        if attempt + 1 < attempts:
+            time.sleep(_REMOVE_RETRY_SECONDS)
+    _log_remove_failure(path, what, last_error)
+    return False
+
+
+def _remove_unlocked_pid_record(path: Path, expected_raw: str) -> bool:
+    """Delete an unowned PID record after the caller closed its own handle.
+
+    Windows only. The caller cannot delete the record while holding it open, and
+    once it closes that handle another daemon may claim the same file. Deleting
+    is therefore conditional: the record must still be unlocked and carry the
+    exact payload the caller validated. Windows sharing rules close the race
+    between that check and the delete: a newcomer keeps its handle open for its
+    whole lifetime, so the delete fails with a sharing violation and the next
+    attempt sees the newcomer's lock and leaves its record alone.
+
+    Returns True when the record is gone, False when it was left in place (a new
+    owner took it over, or the delete kept failing, which is logged).
+    """
+    expected = expected_raw.strip()
+    attempts = _remove_attempts()
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            if not _pid_record_unlocked_and_equal(path, expected):
+                return False
+            path.unlink(missing_ok=True)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            # A sharing violation (a reader has the file open) or a
+            # delete-pending file refusing new opens; both are transient.
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(_REMOVE_RETRY_SECONDS)
+    _log_remove_failure(path, "PID record", last_error)
+    return False
+
+
+def _pid_record_unlocked_and_equal(path: Path, expected: str) -> bool:
+    """True when no process holds ``path``'s lock and it still holds ``expected``."""
+    fd = _open_pid_fd(path, create=False)
+    try:
+        if not _try_lock_pid_fd(fd):
+            return False
+        try:
+            return _read_pid_fd(fd).strip() == expected
+        finally:
+            _unlock_pid_fd(fd)
+    finally:
+        os.close(fd)
+
+
 def read_pid(vault: Path) -> int | None:
     """Read either a versioned or legacy PID file; never implies ownership."""
     record, legacy_pid = _read_pid_payload(pid_file_path(vault))
@@ -429,11 +529,21 @@ class PidFile:
             # A legacy process did not hold an OS lock. Preserve upgrade safety:
             # refuse a still-live legacy PID rather than starting a second daemon,
             # but never use that unverified PID as a signal target.
-            _, legacy_pid = _parse_pid_record(_read_pid_fd(fd))
+            previous, legacy_pid = _parse_pid_record(_read_pid_fd(fd))
             if legacy_pid is not None and legacy_pid != self._pid and _process_alive(legacy_pid):
                 _unlock_pid_fd(fd)
                 os.close(fd)
                 raise StaleLockError(legacy_pid, self.path)
+            stale_pid = previous.pid if previous is not None else legacy_pid
+            if stale_pid is not None:
+                # Nobody holds the lock, so the recorded process is gone (or a
+                # reused PID). Its record is stale; it is overwritten below.
+                _LOG.info(
+                    "reclaiming stale PID record %s (pid=%s)",
+                    self.path,
+                    stale_pid,
+                    extra={"component": "lifecycle", "event": "lifecycle.stale_pid_reclaimed"},
+                )
 
             start_token = _process_start_token(self._pid)
             if start_token is None:
@@ -449,8 +559,7 @@ class PidFile:
                 owner_id=secrets.token_hex(16),
             )
             _write_pid_fd(fd, record)
-            with contextlib.suppress(OSError):
-                signal_file_path(self.vault).unlink(missing_ok=True)
+            _remove_path(signal_file_path(self.vault), what="stop-request file")
             self._fd = fd
             self._record = record
             self._owned = True
@@ -510,18 +619,26 @@ class PidFile:
             return
         fd = self._fd
         record = self._record
+        owned_raw: str | None = None
         try:
             self._watch_stop.set()
             watcher = self._watch_thread
             if watcher is not None and watcher is not threading.current_thread():
                 watcher.join(timeout=0.5)
-            with contextlib.suppress(OSError):
-                signal_file_path(self.vault).unlink(missing_ok=True)
+            _remove_path(signal_file_path(self.vault), what="stop-request file")
             if fd is not None and record is not None and _fd_matches_path(fd, self.path):
-                current, _ = _parse_pid_record(_read_pid_fd(fd))
+                raw = _read_pid_fd(fd)
+                current, _ = _parse_pid_record(raw)
                 if current is not None and current.owner_id == record.owner_id:
-                    with contextlib.suppress(OSError):
-                        self.path.unlink(missing_ok=True)
+                    if _windows_file_sharing():
+                        # Windows refuses to delete a file this process still
+                        # holds open, so the delete waits until the handle is
+                        # closed below (see _remove_unlocked_pid_record).
+                        owned_raw = raw
+                    else:
+                        # POSIX: unlink while the lock is still held, so a
+                        # newcomer can never claim the path in between.
+                        _remove_path(self.path, what="PID record")
         finally:
             if fd is not None:
                 _unlock_pid_fd(fd)
@@ -530,6 +647,8 @@ class PidFile:
             self._record = None
             self._watch_thread = None
             self._owned = False
+        if owned_raw is not None:
+            _remove_unlocked_pid_record(self.path, owned_raw)
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +942,8 @@ def _active_pid_record(
         except FileNotFoundError as exc:
             raise _OwnerGone(f"no Okto Neuron server PID file at {path}") from exc
         acquired = False
+        # Windows: raw payload of a stale record to delete once ``fd`` is closed.
+        stale_raw: str | None = None
         try:
             if not _fd_matches_path(fd, path):
                 continue
@@ -831,14 +952,13 @@ def _active_pid_record(
                 # No process owns the new lifecycle lock. A live legacy number
                 # is handed to the bounded migration proof below; it is never
                 # signalled merely because the numeric PID is alive.
-                record, legacy_pid = _parse_pid_record(_read_pid_fd(fd))
+                raw = _read_pid_fd(fd)
+                record, legacy_pid = _parse_pid_record(raw)
                 if legacy_pid is not None and _process_alive(legacy_pid):
                     raise _LegacyOwner(legacy_pid)
                 if _fd_matches_path(fd, path):
-                    with contextlib.suppress(OSError):
-                        path.unlink(missing_ok=True)
-                    with contextlib.suppress(OSError):
-                        signal_file_path(vault).unlink(missing_ok=True)
+                    stale_raw = _remove_stale_record_locked(path, raw)
+                    _remove_path(signal_file_path(vault), what="stop-request file")
                 stale_pid = record.pid if record is not None else legacy_pid
                 raise _OwnerGone(f"stale PID file (pid={stale_pid or 'unknown'}); removed")
 
@@ -866,10 +986,8 @@ def _active_pid_record(
                     acquired = _try_lock_pid_fd(fd)
                     if acquired:
                         if _fd_matches_path(fd, path):
-                            with contextlib.suppress(OSError):
-                                path.unlink(missing_ok=True)
-                            with contextlib.suppress(OSError):
-                                signal_file_path(vault).unlink(missing_ok=True)
+                            stale_raw = _remove_stale_record_locked(path, _read_pid_fd(fd))
+                            _remove_path(signal_file_path(vault), what="stop-request file")
                         raise _OwnerGone(f"daemon owner {record.pid} released its lifecycle lock")
                     # Lock is still held by the recorded owner (it has not
                     # exited) but the process-birth read itself was
@@ -921,7 +1039,22 @@ def _active_pid_record(
             if acquired:
                 _unlock_pid_fd(fd)
             os.close(fd)
+            if stale_raw is not None:
+                _remove_unlocked_pid_record(path, stale_raw)
     raise LifecycleError(f"daemon PID file changed repeatedly while inspecting {path}")
+
+
+def _remove_stale_record_locked(path: Path, raw: str) -> str | None:
+    """Remove a stale PID record while its lock is held by the caller.
+
+    POSIX deletes immediately (the held lock keeps newcomers out). Windows
+    cannot delete a file the caller holds open, so it returns ``raw`` for
+    :func:`_remove_unlocked_pid_record` to delete after the handle is closed.
+    """
+    if _windows_file_sharing():
+        return raw
+    _remove_path(path, what="stale PID record")
+    return None
 
 
 def _process_command(pid: int) -> list[str] | None:
@@ -1136,7 +1269,17 @@ def _write_signal_request(vault: Path, record: _PidRecord, sig: int) -> None:
     finally:
         os.close(fd)
     try:
-        os.replace(tmp, path)
+        attempts = _remove_attempts()
+        for attempt in range(attempts):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows: the owner's watcher may be reading the previous
+                # request at this instant (sharing violation). Retry briefly.
+                if attempt + 1 == attempts:
+                    raise
+                time.sleep(_REMOVE_RETRY_SECONDS)
     finally:
         tmp.unlink(missing_ok=True)
 

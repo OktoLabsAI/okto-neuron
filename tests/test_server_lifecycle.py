@@ -1795,3 +1795,181 @@ def test_wait_for_server_health_accepts_expected_daemon_without_browser_auth(
         expected_pid=5151,
         vault_path=tmp_path,
     )
+
+
+# ---------------------------------------------------------------------------
+# Windows file-sharing semantics (0.3.1 stale-PID fix)
+#
+# CRT ``os.open`` on Windows opens files without FILE_SHARE_DELETE, so deleting
+# a file while any handle to it is open fails with a sharing violation
+# (PermissionError, WinError 32). Before 0.3.1, ``PidFile.release`` unlinked
+# ``server.pid`` while still holding it open and swallowed that error, so every
+# clean stop on Windows left a stale PID record behind. The fixture below gives
+# POSIX the Windows rule for the lifecycle module: ``Path.unlink`` refuses a file
+# that any PID-record handle still has open, and the module takes its Windows
+# (close, then conditionally delete) path. Locking stays the native ``flock``,
+# which has the same exclusive, per-handle semantics as ``msvcrt.locking``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def windows_sharing(monkeypatch: pytest.MonkeyPatch) -> list[logging.LogRecord]:
+    tracked: set[int] = set()
+    real_open_pid_fd = lifecycle_module._open_pid_fd
+    real_unlink = Path.unlink
+
+    def tracking_open_pid_fd(path: Path, *, create: bool) -> int:
+        fd = real_open_pid_fd(path, create=create)
+        tracked.add(fd)
+        return fd
+
+    def sharing_unlink(self: Path, missing_ok: bool = False) -> None:
+        try:
+            target = os.stat(self)
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        for fd in list(tracked):
+            try:
+                opened = os.fstat(fd)
+            except OSError:
+                tracked.discard(fd)
+                continue
+            if (opened.st_dev, opened.st_ino) == (target.st_dev, target.st_ino):
+                raise PermissionError(
+                    13,
+                    "The process cannot access the file because it is being used "
+                    "by another process",
+                    str(self),
+                )
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(lifecycle_module, "_windows_file_sharing", lambda: True)
+    monkeypatch.setattr(lifecycle_module, "_open_pid_fd", tracking_open_pid_fd)
+    monkeypatch.setattr(Path, "unlink", sharing_unlink)
+    monkeypatch.setattr(lifecycle_module, "_REMOVE_RETRY_SECONDS", 0.0)
+
+    records: list[logging.LogRecord] = []
+
+    class ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = ListHandler(level=logging.DEBUG)
+    lifecycle_module._LOG.addHandler(handler)
+    previous_level = lifecycle_module._LOG.level
+    lifecycle_module._LOG.setLevel(logging.DEBUG)
+    yield records
+    lifecycle_module._LOG.removeHandler(handler)
+    lifecycle_module._LOG.setLevel(previous_level)
+
+
+def _write_dead_owner_record(root: Path) -> Path:
+    target = pid_file_path(root)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        lifecycle_module._PidRecord(
+            pid=99999999,
+            start_token="posix:dead",
+            owner_id="d" * 32,
+        ).to_json(),
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_windows_clean_release_removes_pid_record(
+    tmp_path: Path, windows_sharing: list[logging.LogRecord]
+) -> None:
+    with PidFile(tmp_path) as owner:
+        assert read_pid(tmp_path) == owner.pid
+    assert not pid_file_path(tmp_path).exists()
+    assert not [r for r in windows_sharing if r.levelno >= logging.WARNING]
+
+
+def test_windows_release_retries_while_a_reader_holds_the_record(
+    tmp_path: Path,
+    windows_sharing: list[logging.LogRecord],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``okto-neuron stop`` polls the record while the daemon shuts down; a poll
+    # that has the file open at the instant of the delete must not leave it.
+    owner = PidFile(tmp_path)
+    owner.acquire()
+    reader = lifecycle_module._open_pid_fd(pid_file_path(tmp_path), create=False)
+    real_sleep = time.sleep
+    closed: list[bool] = []
+
+    def close_reader_on_first_retry(seconds: float) -> None:
+        if not closed:
+            os.close(reader)
+            closed.append(True)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(lifecycle_module.time, "sleep", close_reader_on_first_retry)
+    owner.release()
+    assert closed == [True]
+    assert not pid_file_path(tmp_path).exists()
+
+
+def test_windows_stop_cleans_stale_record_of_dead_owner(
+    tmp_path: Path, windows_sharing: list[logging.LogRecord]
+) -> None:
+    target = _write_dead_owner_record(tmp_path)
+    with pytest.raises(LifecycleError, match="stale PID file"):
+        send_stop(tmp_path)
+    assert not target.exists()
+
+
+def test_windows_start_reclaims_stale_record_and_stop_leaves_none(
+    tmp_path: Path, windows_sharing: list[logging.LogRecord]
+) -> None:
+    target = _write_dead_owner_record(tmp_path)
+    with PidFile(tmp_path) as owner:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert payload["pid"] == owner.pid
+        assert payload["owner_id"] != "d" * 32
+    assert not target.exists()
+    reclaimed = [
+        r for r in windows_sharing if getattr(r, "event", None) == "lifecycle.stale_pid_reclaimed"
+    ]
+    assert len(reclaimed) == 1
+    assert "99999999" in reclaimed[0].getMessage()
+
+
+def test_windows_conditional_delete_never_removes_a_new_owner_record(
+    tmp_path: Path, windows_sharing: list[logging.LogRecord]
+) -> None:
+    old = PidFile(tmp_path)
+    old.acquire()
+    old_raw = pid_file_path(tmp_path).read_text(encoding="utf-8")
+    old.release()
+    assert not pid_file_path(tmp_path).exists()
+
+    with PidFile(tmp_path) as newcomer:
+        # A late cleanup for the previous owner (the daemon or a stop poller)
+        # must leave the live newcomer's record in place.
+        assert lifecycle_module._remove_unlocked_pid_record(pid_file_path(tmp_path), old_raw) is False
+        assert read_pid(tmp_path) == newcomer.pid
+    assert not pid_file_path(tmp_path).exists()
+
+
+def test_pid_record_removal_failure_is_logged_not_swallowed(
+    tmp_path: Path,
+    windows_sharing: list[logging.LogRecord],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def always_shared(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "sharing violation", str(self))
+
+    owner = PidFile(tmp_path)
+    owner.acquire()
+    monkeypatch.setattr(Path, "unlink", always_shared)
+    owner.release()
+    failures = [
+        r for r in windows_sharing if getattr(r, "event", None) == "lifecycle.remove_failed"
+    ]
+    assert failures
+    assert any("PID record" in r.getMessage() for r in failures)
+    assert all(r.levelno == logging.WARNING for r in failures)

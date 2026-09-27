@@ -959,6 +959,15 @@ the app.
   Okto Neuron `serve` command identity, matching health PID, exact vault identity
   (or the canonical global runtime root), and a valid version response. Every escalation rechecks
   the captured birth identity; any missing or contradictory evidence refuses the legacy signal.
+- **PID record removal on a clean stop.** On POSIX the daemon unlinks `server.pid` while it still
+  holds the lock, so no newcomer can claim the path in between. Windows refuses to delete a file
+  that any handle (including the daemon's own) still has open, so there the daemon closes the record
+  first and then deletes it only if it is still unlocked and byte-identical to the record it owned; a
+  newcomer keeps its handle open, so its record is never removed. Short sharing violations from
+  readers such as the `stop` poller are retried. A removal that still fails is logged as
+  `lifecycle.remove_failed` rather than swallowed, `stop` removes a dead owner's record the same
+  way, and a start that finds one logs `lifecycle.stale_pid_reclaimed` and takes it over. Before
+  0.3.1 every clean stop on Windows left the record behind.
 
 ## Addendum · 2026-09-14 — distinct Document titles, and an `empty` outcome that isn't an error
 

@@ -4,7 +4,7 @@ description: "Start, stop, inspect and open the daemon: flags, defaults, output 
 ---
 
 <Note>
-Okto Neuron is prerelease software. Flags, output lines and defaults on this page describe version 0.3.0 and can change.
+Okto Neuron is prerelease software. Flags, output lines and defaults on this page describe version 0.3.1 and can change.
 </Note>
 
 These four commands own the local server process. `serve` starts it, `stop` ends it, `status` reports on it, and `ui` opens its web interface in your browser. For the task-shaped walkthroughs, see [/server/running](/server/running) and [/server/status-and-logs](/server/status-and-logs).
@@ -179,6 +179,8 @@ The final line prints the PID that `stop_server` returned.
 
 New-format daemons are never signalled by raw PID: `send_stop` validates the random owner identity and the process-birth fingerprint, and the daemon signals itself.
 
+A clean stop removes the PID record. On Windows the daemon closes the record before deleting it, because Windows refuses to delete a file that is still open, and it deletes the record only if it is still unlocked and unchanged. A removal that keeps failing is logged as `lifecycle.remove_failed`. Before 0.3.1 every clean stop on Windows left `server.pid` behind.
+
 If the deadline passes, `stop_server` raises `LifecycleError`, which `stop` prints to stderr before exiting 1:
 
 ```text
@@ -222,7 +224,7 @@ The assembled payload, which is exactly what `--json` prints, carries: `status`,
 ### Text output
 
 ```text
-Okto Neuron 0.3.0 — ok
+Okto Neuron 0.3.1 — ok
   Endpoint: http://127.0.0.1:7777
   PID:      41234
   Scope:    application
