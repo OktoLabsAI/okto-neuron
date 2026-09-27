@@ -1,0 +1,1720 @@
+﻿Transcript started, output file is <TEST_HOME>\evidence-20260927-042023.private.raw.log
+TEST_HOME=<TEST_HOME>
+VAULT=mynotes
+PROFILE=release-lifecycle
+DRIVER_COMMIT=877b63f4807b6cf0f4c684335d039015ccc9657c
+DRIVER_URL=https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/877b63f4807b6cf0f4c684335d039015ccc9657c/bin/test-install.ps1
+DRIVER_SHA256=bd55358d707af9dae71aeac3f2cba444fd3f648ed0cb15203e6e1c05c3bf2ce8
+INSTALL_SHA256=05362b2cdd27145dc859305a0f54ed6eca19cc44c753429a9761e59d5c4dc0f6
+MANIFEST_URL=https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/877b63f4807b6cf0f4c684335d039015ccc9657c/release-manifest.json
+MANIFEST_SHA256=0deabc8c23594d5e18511b06a5d407b6759ff081efc4a37b7f575cc87476e556
+ENTRYPOINT_URL=https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/877b63f4807b6cf0f4c684335d039015ccc9657c/install.ps1
+INPUT_REDIRECTED=False
+PREDECESSOR_DIST_COMMIT=29683d2156840eadaff43efd6133750cd7f24465
+PREDECESSOR_MANIFEST_URL=https://raw.githubusercontent.com/OktoLabsAI/marginalia-dist/29683d2156840eadaff43efd6133750cd7f24465/release-manifest.json
+PREDECESSOR_MANIFEST_SHA256=22eb2f07ee453a708052469d71382a2dc47b0491ff8534d7899325f3bea8068f
+PREDECESSOR_WHEEL_SHA256=59adee4483d8f85525e30a5e6271e6328238ac275d4b3fe05e29325d2ed29520
+PREDECESSOR_INSTALL_URL=https://raw.githubusercontent.com/OktoLabsAI/marginalia-dist/29683d2156840eadaff43efd6133750cd7f24465/install.ps1
+PREDECESSOR_INSTALL_SHA256=3207bcbee4b738491afd617bcb10e0fa583a6e6af41df51cfd999459f23e7327
+PREDECESSOR_BOOTSTRAP_MODE=pinned-marginalia-dist-v0.2.0-installer-stopped
+Marginalia installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Marginalia runs through)
+    uv not found - installing from astral.sh ...
+downloading uv 0.12.19 (aarch64-pc-windows-msvc)
+installing to <TEST_HOME>\stopped-predecessor\.uv\bin
+  uv.exe
+  uvx.exe
+  uvw.exe
+everything's installed!
+    uv: <TEST_HOME>\stopped-predecessor\.uv\bin\uv.exe
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Downloading cpython-3.12.14-windows-x86_64-none (download) (21.0MiB)
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Downloading cpy...load) (21.0MiB):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+ Downloaded cpython-3.12.14-windows-x86_64-none (download)
+Extracting cpython-3.12.14-windows-x86_64-none (extract) (21.0MiB)
+ Extracted cpython-3.12.14-windows-x86_64-none (extract)
+note: uv selected a Python distribution with an emulated architecture (x86_64) for your platform because support for
+the native architecture (aarch64) is not yet mature; to override this behaviour, request the native architecture
+explicitly with: cpython-3.12-windows-aarch64-none
+Installed Python 3.12.14 in 2.03s
+ + cpython-3.12.14-windows-x86_64-none (python3.12.exe)
+warning:
+`<TEST_HOME>\stopped-predecessor\.uv\python-bin` is not
+on your PATH. To use installed Python executables, run `$env:PATH = "<CALLER_HOME>\AppData\Local\Temp\okto-neuron-i
+nstall-test-042083d38988\stopped-predecessor\.uv\python-bin;$env:PATH"` or `uv python update-shell`.
+
+==> Resolving and staging the Marginalia candidate
+    using release wheel: https://github.com/OktoLabsAI/marginalia-dist/releases/download/v0.2.0/marginalia-0.2.0-py3-none-any.whl
+    verified wheel SHA-256: 59adee4483d8f85525e30a5e6271e6328238ac275d4b3fe05e29325d2ed29520
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\stopped-predecessor\tmp\margi
+nalia-install-e665d1ef-65af-4ab0-9be7-c8306074f078\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\stopped-predecessor\tmp\marginalia-install-e665
+d1ef-65af-4ab0-9be7-c8306074f078\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\stopped-predecessor\tmp\m
+arginalia-install-e665d1ef-65af-4ab0-9be7-c8306074f078\stage
+Resolved 111 packages in 735ms
+Downloading onnxruntime (13.6MiB)
+Downloading numpy (12.0MiB)
+Downloading tokenizers (2.7MiB)
+Downloading ladybug (8.0MiB)
+Downloading beartype (1.3MiB)
+Downloading litellm (14.8MiB)
+Downloading cryptography (3.7MiB)
+Downloading pygments (1.2MiB)
+Downloading openai (1.6MiB)
+Downloading pydantic-core (1.9MiB)
+Downloading pywin32 (6.6MiB)
+Downloading pillow (6.9MiB)
+Downloading okto-grafx (1.7MiB)
+ Downloaded beartype
+ Downloaded pygments
+ Downloaded pydantic-core
+ Downloaded okto-grafx
+ Downloaded tokenizers
+ Downloaded cryptography
+ Downloaded openai
+ Downloaded pillow
+ Downloaded ladybug
+ Downloaded numpy
+ Downloaded pywin32
+ Downloaded onnxruntime
+ Downloaded litellm
+Prepared 111 packages in 6.69s
+Installed 111 packages in 5.23s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + marginalia==0.2.0 (from file:///<TEST_HOME>/stopped-p
+redecessor/tmp/marginalia-install-e665d1ef-65af-4ab0-9be7-c8306074f078/marginalia-0.2.0-py3-none-any.whl)
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Marginalia 0.2.0; active installation is still untouched
+
+==> Activating staged Marginalia 0.2.0
+Resolved 111 packages in 312ms
+Installed 111 packages in 5.36s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + marginalia==0.2.0 (from file:///<TEST_HOME>/stopped-p
+redecessor/tmp/marginalia-install-e665d1ef-65af-4ab0-9be7-c8306074f078/marginalia-0.2.0-py3-none-any.whl)
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+Installed 2 executables: kg, marginalia
+    marginalia: <TEST_HOME>\stopped-predecessor\.uv\bin\marginalia.exe
+    version: 0.2.0
+
+==> Application-first setup
+    no startup vault was requested; create, select, and configure vaults in the web UI
+
+==> Skipping daemon start (MARGINALIA_NO_SERVE=1)
+
+==> Claude Code wiring deferred
+    start the daemon, then re-run this installer to register its authenticated MCP endpoint
+
+Marginalia 0.2.0 installed; daemon was not started.
+    vaults   : managed independently in the application
+    graph backend: chosen at vault creation, Okto Grafx by default (Ladybug or Neo4j selectable)
+    start    : marginalia serve --daemon
+    update   : re-run this installer
+ !! MARGINALIA_NO_SERVE is deprecated; using it as OKTO_NEURON_NO_SERVE
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv: <TEST_HOME>\stopped-predecessor\.uv\bin\uv.exe
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Python 3.12 is already installed
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python 3.12 is already installed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\stopped-predecessor\tmp\okto-
+neuron-install-fae37af6-830f-4ddf-b34c-e993ffb35322\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\stopped-predecessor\tmp\okto-neuron-install-fae
+37af6-830f-4ddf-b34c-e993ffb35322\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\stopped-predecessor\tmp\o
+kto-neuron-install-fae37af6-830f-4ddf-b34c-e993ffb35322\stage
+Resolved 111 packages in 41ms
+Prepared 1 package in 59ms
+Installed 111 packages in 5.74s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/stopped-
+predecessor/tmp/okto-neuron-install-fae37af6-830f-4ddf-b34c-e993ffb35322/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Okto Neuron 0.3.1; active installation is still untouched
+    found Marginalia 0.2.0 (the pre-0.3.0 name of Okto Neuron); it will be replaced
+
+==> Existing Okto Neuron install detected (daemon not running) - updating in place
+
+==> Activating staged Okto Neuron 0.3.1
+Resolved 111 packages in 39ms
+Installed 111 packages in 5.33s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/stopped-
+predecessor/tmp/okto-neuron-install-fae37af6-830f-4ddf-b34c-e993ffb35322/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+Installed 3 executables: kg, marginalia, okto-neuron
+    okto-neuron: <TEST_HOME>\stopped-predecessor\.uv\bin\okto-neuron.exe
+    version: 0.3.1
+
+==> Update mode - leaving your vaults, default, and LLM config untouched
+
+==> Skipping daemon start (OKTO_NEURON_NO_SERVE=1)
+
+==> Skipping Claude Code wiring (OKTO_NEURON_NO_MCP=1)
+
+Okto Neuron 0.3.1 updated; daemon remains stopped.
+    vaults   : managed independently in the application
+    graph backend: chosen at vault creation, Okto Grafx by default (Ladybug or Neo4j selectable)
+    start    : okto-neuron serve --daemon
+    update   : re-run this installer
+marginalia.exe : warning: the 'marginalia' command is now 'okto-neuron'. The old name keeps working until 0.5.
+At <TEST_HOME>\windows-runner.ps1:34 char:9
++         & $Command @Arguments 2>$null
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: the 'm...king until 0.5.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+>> TerminatingError(): "The pipeline has been stopped."
+WINDOWS_RELEASE_LIFECYCLE_PREDECESSOR_STOPPED_UPDATE_OK
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv not found - installing from astral.sh ...
+    uv: <TEST_HOME>\.uv\bin\uv.exe
+PS>TerminatingError(): "The pipeline has been stopped."
+PS>TerminatingError(): "The pipeline has been stopped."
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+
+
+PS>TerminatingError(): "The pipeline has been stopped."
+    staged Okto Neuron 0.3.1; active installation is still untouched
+PS>TerminatingError(Invoke-RestMethod): "The operation has timed out."
+>> TerminatingError(Invoke-RestMethod): "The operation has timed out."
+
+==> Activating staged Okto Neuron 0.3.1
+
+    okto-neuron: <TEST_HOME>\.uv\bin\okto-neuron.exe
+PS>TerminatingError(): "The pipeline has been stopped."
+    version: 0.3.1
+
+==> Application-first setup
+    no startup vault was requested; create, select, and configure vaults in the web UI
+
+==> Starting the Okto Neuron daemon (UI/REST :7777 + MCP :8201)
+
+    waiting for server version 0.3.1 ...
+    server: ready (http://127.0.0.1:7777, version 0.3.1)
+
+==> Skipping Claude Code wiring (OKTO_NEURON_NO_MCP=1)
+
+Okto Neuron 0.3.1 is ready.
+    vaults   : managed independently in the application
+    graph backend: chosen at vault creation, Okto Grafx by default (Ladybug or Neo4j selectable)
+    web UI   : http://127.0.0.1:7777/
+    stop     : okto-neuron stop
+    update   : re-run this installer
+PS>TerminatingError(): "The pipeline has been stopped."
+Usage: okto-neuron [OPTIONS] COMMAND [ARGS]...
+
+  Okto Neuron by Okto Labs - local-first knowledge graph memory for agents.
+
+Options:
+  --version   Show the version and exit.
+  --debug     Print chained tracebacks.
+  -h, --help  Show this message and exit.
+
+Commands:
+  add           Ingest one markdown file via the running server.
+  ask           Ask a question and get a grounded, citation-bearing answer.
+TEST_HEALTH_OK=ok
+TEST_VERSION_OK=0.3.1
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+WINDOWS_RELEASE_LIFECYCLE_APP_FIRST_OK
+
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+RELEASE_LIFECYCLE_FRESH_INSTALL_OK
+RELEASE_LIFECYCLE_STATUS_UI_OK
+
+PS>TerminatingError(Get-Process): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Cannot find a process with the process identifier 3504."
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv: <TEST_HOME>\.uv\bin\uv.exe
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Python 3.12 is already installed
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python 3.12 is already installed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-25341
+30f-fa41-4cba-a85a-acbae9e7b5b1\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-2534130f-fa41-4cba-a85a
+-acbae9e7b5b1\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-2
+534130f-fa41-4cba-a85a-acbae9e7b5b1\stage
+Resolved 111 packages in 35ms
+Prepared 1 package in 45ms
+Installed 111 packages in 4.95s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-2534130f-fa41-4cba-a85a-acbae9e7b5b1/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Okto Neuron 0.3.1; active installation is still untouched
+
+==> Existing Okto Neuron install detected (daemon not running) - updating in place
+
+==> Activating staged Okto Neuron 0.3.1
+Resolved 111 packages in 38ms
+Installed 111 packages in 4.75s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-2534130f-fa41-4cba-a85a-acbae9e7b5b1/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+Installed 3 executables: kg, marginalia, okto-neuron
+    okto-neuron: <TEST_HOME>\.uv\bin\okto-neuron.exe
+    version: 0.3.1
+
+==> Update mode - leaving your vaults, default, and LLM config untouched
+
+==> Preserving stopped daemon state
+    the daemon was stopped before this update, so it remains stopped
+
+==> Skipping Claude Code wiring (OKTO_NEURON_NO_MCP=1)
+
+Okto Neuron 0.3.1 updated; daemon remains stopped.
+    vaults   : managed independently in the application
+    graph backend: chosen at vault creation, Okto Grafx by default (Ladybug or Neo4j selectable)
+    start    : okto-neuron serve --daemon
+    update   : re-run this installer
+RELEASE_LIFECYCLE_STOPPED_UPDATE_OK
+
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv: <TEST_HOME>\.uv\bin\uv.exe
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Python 3.12 is already installed
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python 3.12 is already installed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-f2016
+759-d02f-49e0-9fa7-18397c0d4c42\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-f2016759-d02f-49e0-9fa7
+-18397c0d4c42\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-f
+2016759-d02f-49e0-9fa7-18397c0d4c42\stage
+Resolved 111 packages in 40ms
+Prepared 1 package in 46ms
+Installed 111 packages in 4.98s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-f2016759-d02f-49e0-9fa7-18397c0d4c42/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Okto Neuron 0.3.1; active installation is still untouched
+
+==> Existing Okto Neuron daemon detected - updating in place
+stopping okto-neuron server (pid=11952); waiting up to 30.0s for drain, then escalating automatically
+stopped okto-neuron server (pid=11952)
+    stopped the running daemon - it will restart on the new version below
+
+==> Activating staged Okto Neuron 0.3.1
+Resolved 111 packages in 36ms
+Installed 111 packages in 4.70s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-f2016759-d02f-49e0-9fa7-18397c0d4c42/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+Installed 3 executables: kg, marginalia, okto-neuron
+    okto-neuron: <TEST_HOME>\.uv\bin\okto-neuron.exe
+    version: 0.3.1
+
+==> Update mode - leaving your vaults, default, and LLM config untouched
+
+==> Restarting the application daemon on the new version
+Okto Neuron is running in the background (pid=11072)
+  UI: http://127.0.0.1:7777/
+  Status: okto-neuron status --endpoint http://127.0.0.1:7777
+  Stop: okto-neuron stop
+  Logs: <TEST_HOME>\.okto-neuron\logs\okto-neuron-serve.log
+    waiting for server version 0.3.1 ...
+    server: ready (http://127.0.0.1:7777, version 0.3.1)
+
+==> Skipping Claude Code wiring (OKTO_NEURON_NO_MCP=1)
+
+Okto Neuron 0.3.1 updated and restarted.
+    vaults   : managed independently in the application
+    graph backend: chosen at vault creation, Okto Grafx by default (Ladybug or Neo4j selectable)
+    web UI   : http://127.0.0.1:7777/
+    stop     : okto-neuron stop
+    update   : re-run this installer
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+RELEASE_LIFECYCLE_RUNNING_UPDATE_OK
+
+PS>TerminatingError(Get-Process): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Cannot find a process with the process identifier 11072."
+
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv: <TEST_HOME>\.uv\bin\uv.exe
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Python 3.12 is already installed
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python 3.12 is already installed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-7a17d
+e3a-4472-475a-8689-57a4887a29e8\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-7a17de3a-4472-475a-8689
+-57a4887a29e8\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-7
+a17de3a-4472-475a-8689-57a4887a29e8\stage
+Resolved 111 packages in 33ms
+Prepared 1 package in 38ms
+Installed 111 packages in 4.68s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-7a17de3a-4472-475a-8689-57a4887a29e8/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Okto Neuron 0.3.1; active installation is still untouched
+Die : error: live Okto Neuron daemon uses custom endpoint http://127.0.0.1:7788; update aborted before shutdown
+because the installer cannot preserve custom ports automatically. Stop it first: okto-neuron stop
+At line:960 char:13
++             Die "live Okto Neuron daemon uses custom endpoint $status ...
++             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
+    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Die
+
+
+PS>TerminatingError(Get-Process): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Cannot find a process with the process identifier 9364."
+RELEASE_LIFECYCLE_CUSTOM_PORT_REFUSAL_OK
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv: <TEST_HOME>\.uv\bin\uv.exe
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Python 3.12 is already installed
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python 3.12 is already installed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-3b5d1
+feb-772d-4f1c-b099-e2b4be43a3d6\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-3b5d1feb-772d-4f1c-b099
+-e2b4be43a3d6\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-3
+b5d1feb-772d-4f1c-b099-e2b4be43a3d6\stage
+Resolved 111 packages in 34ms
+Prepared 1 package in 39ms
+Installed 111 packages in 4.70s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-3b5d1feb-772d-4f1c-b099-e2b4be43a3d6/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Okto Neuron 0.3.1; active installation is still untouched
+Die : error: a live Okto Neuron process (pid 3168) was found at
+'<TEST_HOME>\.okto-neuron\runtime', but status at
+http://127.0.0.1:7777 was unavailable. Run: okto-neuron stop. Custom endpoint/ports may require manual stop. Update
+aborted before activation.
+At line:396 char:13
++             Die "a live Okto Neuron process (pid $recordProcessId) wa ...
++             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
+    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Die
+
+RELEASE_LIFECYCLE_LIVE_PID_REFUSAL_OK
+
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+Okto Neuron installer - local-first knowledge graph for Claude Code
+
+==> Checking uv (the package manager Okto Neuron runs through)
+    uv:
+
+==> Ensuring Python 3.12 (uv-managed; no system Python touched)
+powershell.exe : Python 3.12 is already installed
+At <TEST_HOME>\windows-runner.ps1:292 char:21
++ ... $output = @(& $nestedPowerShell -NoProfile -ExecutionPolicy Bypass -C ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python 3.12 is already installed:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Resolving and staging the Okto Neuron candidate
+    using release wheel: https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.1/okto_neuron-0.3.1-py3-none-any.whl
+    verified wheel SHA-256: 01cddb85d33d4ee7b13eda4842d48d319b35c4cdd2709bf44033dada7f8e6d8c
+Using CPython 3.12.14
+Creating virtual environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-b8914
+661-ad6c-45bf-ab45-d992df1065a1\stage
+Activate with: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-b8914661-ad6c-45bf-ab45
+-d992df1065a1\stage\Scripts\activate
+Using Python 3.12.14 environment at: AppData\Local\Temp\okto-neuron-install-test-042083d38988\tmp\okto-neuron-install-b
+8914661-ad6c-45bf-ab45-d992df1065a1\stage
+Resolved 111 packages in 36ms
+Prepared 1 package in 48ms
+Installed 111 packages in 4.74s
+ + aiofile==3.12.3
+ + aiohappyeyeballs==2.7.1
+ + aiohttp==3.14.3
+ + aiosignal==1.4.0
+ + annotated-types==0.8.0
+ + anyio==4.15.1
+ + attrs==26.1.0
+ + authlib==1.8.0
+ + beartype==0.22.9
+ + cachetools==7.2.0
+ + caio==0.12.9
+ + certifi==2026.7.22
+ + cffi==2.1.1
+ + charset-normalizer==3.5.1
+ + click==8.5.0
+ + colorama==0.4.6
+ + cryptography==50.0.1
+ + cyclopts==5.0.0
+ + distro==1.9.0
+ + dnspython==2.8.0
+ + docstring-parser==0.18.0
+ + email-validator==2.3.0
+ + exceptiongroup==1.3.1
+ + fastembed==0.8.0
+ + fastmcp==3.3.1
+ + fastmcp-slim==3.3.1
+ + fastuuid==0.14.0
+ + filelock==4.0.4
+ + flatbuffers==25.12.19
+ + frozenlist==1.8.0
+ + fsspec==2026.9.0
+ + google-crc32c==1.9.0
+ + griffelib==2.3.0
+ + h11==0.16.0
+ + httpcore==1.0.9
+ + httpx==0.28.1
+ + httpx-sse==0.4.3
+ + huggingface-hub==1.33.0
+ + idna==3.20
+ + importlib-metadata==8.9.0
+ + jaraco-classes==3.4.0
+ + jaraco-context==6.1.2
+ + jaraco-functools==4.6.0
+ + jinja2==3.1.6
+ + jiter==0.17.0
+ + joserfc==1.7.5
+ + jsonref==1.1.0
+ + jsonschema==4.26.0
+ + jsonschema-path==0.5.0
+ + jsonschema-specifications==2025.9.1
+ + keyring==25.7.0
+ + ladybug==0.18.3
+ + litellm==1.89.7
+ + loguru==0.7.3
+ + markdown-it-py==4.2.0
+ + markupsafe==3.0.3
+ + mcp==1.30.0
+ + mdurl==0.1.2
+ + mmh3==5.3.0
+ + more-itertools==11.1.0
+ + multidict==6.9.1
+ + numpy==2.5.3
+ + okto-grafx==0.0.7
+ + okto-neuron==0.3.1 (from file:///<TEST_HOME>/tmp/okto
+-neuron-install-b8914661-ad6c-45bf-ab45-d992df1065a1/okto_neuron-0.3.1-py3-none-any.whl)
+ + onnxruntime==1.30.0
+ + openai==2.54.0
+ + openapi-pydantic==0.5.1
+ + opentelemetry-api==1.45.0
+ + packaging==26.3
+ + pathable==0.6.0
+ + pillow==12.3.0
+ + platformdirs==4.12.0
+ + propcache==0.5.4
+ + protobuf==7.36.2
+ + py-key-value-aio==0.4.6
+ + py-rust-stemmers==0.1.8
+ + pycparser==3.0
+ + pydantic==2.13.5
+ + pydantic-core==2.46.5
+ + pydantic-settings==2.15.0
+ + pygments==2.21.0
+ + pyjwt==2.15.0
+ + pyperclip==1.11.0
+ + python-dotenv==1.2.3
+ + python-multipart==0.0.32
+ + pywin32==312
+ + pywin32-ctypes==0.2.3
+ + pyyaml==6.0.3
+ + referencing==0.37.0
+ + regex==2026.9.10
+ + requests==2.34.2
+ + rich==15.0.0
+ + rich-rst==2.1.0
+ + rpds-py==2026.6.3
+ + sniffio==1.3.1
+ + sse-starlette==3.4.11
+ + starlette==1.7.0
+ + tiktoken==0.14.0
+ + tokenizers==0.23.2
+ + tqdm==4.70.1
+ + typing-extensions==4.16.0
+ + typing-inspection==0.4.4
+ + tzdata==2026.4
+ + uncalled-for==0.4.0
+ + urllib3==2.8.0
+ + uvicorn==0.54.0
+ + watchfiles==1.3.0
+ + websockets==17.1
+ + win32-setctime==1.2.0
+ + yarl==1.25.1
+ + zipp==4.1.0
+    staged Okto Neuron 0.3.1; active installation is still untouched
+
+==> Existing Okto Neuron daemon detected - updating in place
+stopping okto-neuron server (pid=2192); waiting up to 30.0s for drain, then escalating automatically
+stopped okto-neuron server (pid=2192)
+    stopped the running daemon - it will restart on the new version below
+
+==> Activating staged Okto Neuron 0.3.1
+ !! installation failed; restoring the previous installation
+    restored and restarted Okto Neuron 0.3.1
+Die : error: candidate activation failed
+At line:1029 char:28
++ if ($LASTEXITCODE -ne 0) { Die "candidate activation failed" }
++                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException
+    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException,Die
+
+Okto Neuron UI is ready at http://127.0.0.1:7777/; browser launch skipped
+RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_SHA256=6e9f9a7da72afe357c8fe198e817e3bc151fed682916f896d69eace8cdc60e92
+RELEASE_LIFECYCLE_PREVIOUS_TOOL_SENTINEL_OK
+RELEASE_LIFECYCLE_ACTIVATION_ROLLBACK_OK
+
+PS>TerminatingError(Get-Process): "The running command stopped because the preference variable "ErrorActionPreference" or common parameter is set to Stop: Cannot find a process with the process identifier 11592."
+RELEASE_LIFECYCLE_FINAL_STOP_OK
+WINDOWS_RELEASE_LIFECYCLE_OK
+
