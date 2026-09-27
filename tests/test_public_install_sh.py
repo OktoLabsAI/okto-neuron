@@ -9,6 +9,7 @@ raw-URL Docker+tmux install test (bin/test-install.sh), which is a surfaced manu
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -515,13 +516,16 @@ def test_public_installer_adds_the_telemetry_extra_when_tracing_is_wanted(
 
 def test_public_installer_bakes_the_okto_neuron_release_manifest() -> None:
     text = _script()
+    # The installer names the release baked in release-manifest.json (both move
+    # together in the manifest-bake commit that follows a release).
+    version = json.loads((REPO_ROOT / "release-manifest.json").read_text(encoding="utf-8"))["version"]
 
     assert (
-        "https://github.com/OktoLabsAI/okto-neuron/releases/download/v0.3.0/"
-        "okto_neuron-0.3.0-py3-none-any.whl"
+        f"https://github.com/OktoLabsAI/okto-neuron/releases/download/v{version}/"
+        f"okto_neuron-{version}-py3-none-any.whl"
     ) in text
     assert "https://raw.githubusercontent.com/OktoLabsAI/okto-neuron/main/release-manifest.json" in text
-    assert 'EXPECTED_VERSION="${OKTO_NEURON_EXPECTED_VERSION:-0.3.0}"' in text
+    assert f'EXPECTED_VERSION="${{OKTO_NEURON_EXPECTED_VERSION:-{version}}}"' in text
     assert "verified wheel SHA-256" in text
     assert "marginalia-dist" not in text
 

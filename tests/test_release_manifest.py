@@ -13,6 +13,14 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+# The installers bake the *published* release: they move to a new version in the
+# same commit that bakes its release-manifest.json, after the tagged source commit
+# (which already carries the new pyproject version) has been built and released.
+# Until that bake, raw `main` installers must keep naming the manifest's version.
+_MANIFEST = ROOT / "release-manifest.json"
+INSTALLER_VERSION = (
+    json.loads(_MANIFEST.read_text(encoding="utf-8"))["version"] if _MANIFEST.exists() else VERSION
+)
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 
@@ -52,12 +60,23 @@ def test_write_produces_the_five_key_immutable_release_manifest(tmp_path: Path) 
 
 def test_installers_bake_the_manifest_defaults_for_this_version(tmp_path: Path) -> None:
     rm = _module()
-    manifest = rm.build_manifest(_wheel(tmp_path), COMMIT)
+    manifest = {
+        "version": INSTALLER_VERSION,
+        "wheel": rm.wheel_filename(INSTALLER_VERSION),
+        "wheel_url": rm.wheel_url(INSTALLER_VERSION),
+        "sha256": "0" * 64,
+        "source_commit": COMMIT,
+    }
     assert rm.installer_default_errors(manifest) == []
-    # check() ties manifest, wheel and installer defaults together.
+    # check() ties the manifest and the installer defaults together.
     path = tmp_path / "release-manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
-    rm.check(path, _wheel(tmp_path))
+    rm.check(path, None)
+
+
+def test_installers_never_name_a_version_ahead_of_the_source() -> None:
+    parse = lambda value: tuple(int(part) for part in value.split("."))  # noqa: E731
+    assert parse(INSTALLER_VERSION) <= parse(VERSION)
 
 
 @pytest.mark.parametrize(
