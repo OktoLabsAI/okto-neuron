@@ -28,7 +28,6 @@ from okto_neuron.store.ladybug import VaultConnection
 from okto_neuron.store.writer_lease import release_all
 from tests.perf._synthetic_vault import build_synthetic_vault, scaled
 
-_REPO = Path(__file__).resolve().parents[2]
 
 _HOLDER = textwrap.dedent(
     """
@@ -237,7 +236,7 @@ def _cli(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if k not in drop}
     env["HOME"] = str(home)
     return subprocess.run(
-        [str(_REPO / ".venv" / "bin" / "okto-neuron"), "kg", "review-queue", "migrate", *args],
+        [sys.executable, "-m", "okto_neuron.cli", "kg", "review-queue", "migrate", *args],
         env=env,
         capture_output=True,
         text=True,

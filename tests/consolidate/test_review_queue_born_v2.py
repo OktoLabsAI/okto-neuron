@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -108,7 +109,7 @@ def _cli(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     }
     env["HOME"] = str(home)
     result = subprocess.run(
-        [str(_REPO / ".venv" / "bin" / "okto-neuron"), *args],
+        [sys.executable, "-m", "okto_neuron.cli", *args],
         env=env,
         capture_output=True,
         text=True,
