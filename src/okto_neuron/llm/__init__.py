@@ -40,7 +40,11 @@ from urllib.parse import urlparse
 
 from okto_neuron._compat import getenv as _compat_getenv
 from okto_neuron._compat import secret_env as _secret_env
-from okto_neuron.config._vault import MANAGED_LLM_PARAMETERS, classify_api_base
+from okto_neuron.config._vault import (
+    DEFAULT_LLM_REQUEST_TIMEOUT_S,
+    MANAGED_LLM_PARAMETERS,
+    classify_api_base,
+)
 from okto_neuron._internal.completion_guard import assert_completion_allowed
 from okto_neuron.errors import OktoNeuronError
 from okto_neuron.providers import LOCAL_EXTENDED_DRIVERS, litellm_proxy_models
@@ -431,6 +435,11 @@ def last_call_stats() -> dict[str, object] | None:
 # own call span.
 PROVIDER_MAX_ATTEMPTS = 2
 PROVIDER_MAX_RETRY_DELAY_SECONDS = 60.0
+# A timeout or dropped connection names no Retry-After, so the retry would
+# otherwise fire instantly into the same dead endpoint. Back off exponentially
+# (2 s, then 4 s ... capped) for those categories only (issue #24).
+PROVIDER_RETRY_BACKOFF_BASE_SECONDS = 2.0
+_BACKOFF_CATEGORIES = frozenset({"timeout", "connection"})
 PROVIDER_ERROR_SUMMARY_MAX = 300
 _RETRY_CANCEL_POLL_SECONDS = 0.25
 
@@ -443,10 +452,10 @@ def provider_retry_delay(exc: BaseException, attempt: int) -> float | None:
     """
     if attempt >= PROVIDER_MAX_ATTEMPTS or not bool(getattr(exc, "retryable", False)):
         return None
-    return min(
-        PROVIDER_MAX_RETRY_DELAY_SECONDS,
-        max(0.0, float(getattr(exc, "retry_after_s", 0.0) or 0.0)),
-    )
+    delay = max(0.0, float(getattr(exc, "retry_after_s", 0.0) or 0.0))
+    if delay == 0.0 and getattr(exc, "category", None) in _BACKOFF_CATEGORIES:
+        delay = PROVIDER_RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+    return min(PROVIDER_MAX_RETRY_DELAY_SECONDS, delay)
 
 
 def provider_error_summary(exc: BaseException) -> str:
@@ -862,7 +871,7 @@ _OPENAI_STANDARD_PARAMS = frozenset(
 )
 _LITELLM_CAPABILITY_ONLY_PARAMS = frozenset({"reasoning_effort", "thinking"})
 _LITELLM_CONTROL_PARAMS = frozenset(
-    {"api_base", "api_key", "drop_params", "messages", "model", "timeout"}
+    {"api_base", "api_key", "drop_params", "max_retries", "messages", "model", "timeout"}
 )
 # Request keys that must never reach a request observer (see
 # ``_notify_request_observer``). ``_LITELLM_CONTROL_PARAMS`` is the same set
@@ -1621,9 +1630,9 @@ class LiteLLMProvider:
             )
 
         # A named provider connection owns its request policy. An explicit
-        # positive deadline is forwarded through LiteLLM; ``None`` means
-        # Okto Neuron adds no deadline and relies on LiteLLM/provider transport
-        # policy plus the owned-process Stop/shutdown cancellation boundary.
+        # positive deadline is forwarded through LiteLLM; ``None`` falls back to
+        # ``DEFAULT_LLM_REQUEST_TIMEOUT_S`` (300 s) so no call can wait forever
+        # on an endpoint that accepts the connection and never answers.
         # The env var remains only as a compatibility override for legacy
         # inline connections that do not reference a named provider.
         request_timeout = self._resolved.request_timeout_s
@@ -1645,11 +1654,11 @@ class LiteLLMProvider:
                             "ignoring non-positive OKTO_NEURON_LLM_REQUEST_TIMEOUT=%r",
                             timeout_env,
                         )
+        if request_timeout is None:
+            request_timeout = DEFAULT_LLM_REQUEST_TIMEOUT_S
         task_timeout = _current_call_timeout_s()
         if task_timeout is not None:
-            request_timeout = (
-                min(request_timeout, task_timeout) if request_timeout is not None else task_timeout
-            )
+            request_timeout = min(request_timeout, task_timeout)
 
         # Frozen raw sampling-payload override for this resolved role (see
         # StepLLM/LLMDefaults.sampling_payload). Empty == feature untouched.
@@ -1669,11 +1678,13 @@ class LiteLLMProvider:
             # hand-written curl request would fail loud.
             "drop_params": not raw_payload,
         }
-        if request_timeout is not None:
-            # LiteLLM natively owns provider-specific timeout adaptation. A
-            # numeric value becomes its completion HTTP timeout; the same value
-            # also bounds Okto Neuron's cancellable helper process below.
-            kwargs["timeout"] = request_timeout
+        # LiteLLM natively owns provider-specific timeout adaptation. The value
+        # becomes its completion HTTP timeout; the same value also bounds Okto
+        # Neuron's cancellable helper process. ``max_retries=0`` stops the SDK
+        # from silently multiplying that deadline: retry policy is ours
+        # (``complete_with_retry``), bounded and visible.
+        kwargs["timeout"] = request_timeout
+        kwargs["max_retries"] = 0
 
         extra_body: dict = {}
 

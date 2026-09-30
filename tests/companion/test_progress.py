@@ -935,7 +935,7 @@ def test_tracing_provider_translates_cli_cancel_and_restores_thread_local() -> N
 # made a live run unverifiable.
 
 _TRACE_CONTROL_KEYS = frozenset(
-    {"api_base", "api_key", "drop_params", "extra_body", "messages", "model", "timeout"}
+    {"api_base", "api_key", "drop_params", "extra_body", "max_retries", "messages", "model", "timeout"}
 )
 
 

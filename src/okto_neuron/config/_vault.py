@@ -119,6 +119,14 @@ def _check_embedding_provider(value: str | None) -> str | None:
     return value
 
 
+DEFAULT_LLM_REQUEST_TIMEOUT_S = 300.0
+"""Wall/read deadline for one LiteLLM completion when neither the provider
+connection nor ``OKTO_NEURON_LLM_REQUEST_TIMEOUT`` sets one (issue #24)."""
+DEFAULT_CURATION_CALL_TIMEOUT_S = 600.0
+"""Wall-clock deadline for one curation/judge call, enclosing its one retry."""
+DEFAULT_JOB_STALL_TIMEOUT_S = 900.0
+"""No-progress watchdog for a running curation job."""
+
 class EmbeddingConfig(BaseModel):
     """Embedding provider settings for a vault.
 
@@ -991,8 +999,7 @@ class ResolvedLLM(BaseModel):
     model: str
     api_key_env: str | None
     # Transport policy inherited from a named provider connection. ``None``
-    # means Okto Neuron adds no completion deadline and leaves the adapter/
-    # provider policy intact.
+    # means the bounded default ``DEFAULT_LLM_REQUEST_TIMEOUT_S`` applies.
     request_timeout_s: float | None = Field(default=None, gt=0.0)
     # Deprecated typed fields stay at this boundary so existing YAML and call
     # sites remain readable.
@@ -1452,10 +1459,11 @@ class ConsolidationConfig(BaseModel):
     # sequential behavior (default). Raising it only pays when the LLM endpoint
     # accepts concurrent requests (llama.cpp needs --parallel N > 1).
     curation_max_concurrent: int = Field(default=1, ge=1, le=32)
-    # Optional scheduler wait deadline. ``None`` is intentionally unbounded:
-    # provider request policy belongs to the provider connection, while Stop /
-    # shutdown use the explicit cancellable-call boundary.
-    curation_call_timeout_s: float | None = Field(default=None, gt=0.0)
+    # Wall-clock deadline for one curation/judge call (issue #24). Any finite
+    # value routes the call through the killable helper process, so a server that
+    # accepts the connection and never answers cannot hold a writer lock forever.
+    # ``None`` opts out (unbounded), which is only safe for a trusted local model.
+    curation_call_timeout_s: float | None = Field(default=DEFAULT_CURATION_CALL_TIMEOUT_S, gt=0.0)
     # ADR 0015 D4 — block-keyed batched curation. 1 = off (today's per-candidate
     # calls, default). >1 evaluates up to K same-block candidates per LLM call
     # with schema-constrained output and per-candidate single-call fallback.
@@ -1491,6 +1499,12 @@ class CurationSchedulerConfig(BaseModel):
     enabled: bool = True
     quiet_debounce_s: int = Field(default=60, ge=0)
     min_interval_s: int = Field(default=3600, gt=0)
+    # Watchdog (issue #24): a running curation job that reports no progress for
+    # this many seconds is failed (read-only jobs) and surfaced as
+    # ``curation_job_stalled`` on /api/v1/status. ``None`` disables it. Keep it
+    # above ``consolidation.curation_call_timeout_s`` so the call deadline fires
+    # first and the watchdog is only the backstop.
+    job_stall_timeout_s: float | None = Field(default=DEFAULT_JOB_STALL_TIMEOUT_S, gt=0.0)
 
 
 class UpkeepConfig(BaseModel):

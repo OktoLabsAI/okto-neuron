@@ -137,6 +137,27 @@ class CurationJob:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    # Watchdog state (issue #24). ``last_progress_at`` is stamped at start and on
+    # every ``progress()`` call; ``stall_after_s`` is the no-progress limit in
+    # force when the job started (``None`` = watchdog off).
+    last_progress_at: float | None = None
+    stall_after_s: float | None = None
+
+    @property
+    def elapsed_s(self) -> float | None:
+        if self.started_at is None:
+            return None
+        return round((self.finished_at or time.time()) - self.started_at, 1)
+
+    def stalled_for_s(self, now: float | None = None) -> float | None:
+        """Seconds without progress for a running job past its limit, else ``None``."""
+        if self.status != "running" or self.stall_after_s is None:
+            return None
+        reference = self.last_progress_at or self.started_at
+        if reference is None:
+            return None
+        idle = (now if now is not None else time.time()) - reference
+        return idle if idle > self.stall_after_s else None
 
     def to_public(self) -> dict:
         """The poll shape the UI sees."""
@@ -152,6 +173,8 @@ class CurationJob:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "elapsed_s": self.elapsed_s,
+            "last_progress_at": self.last_progress_at,
         }
 
 
@@ -356,7 +379,71 @@ def _set_progress(state: "ServerState", job: CurationJob, stage: str) -> None:
     it immediately) and persists. Runs in the to_thread worker; persist only
     writes a file, so it is safe there."""
     job.progress = stage
+    job.last_progress_at = time.time()
     persist(state)
+
+
+class JobStalledError(RuntimeError):
+    """A read-only job reported no progress for longer than its watchdog limit."""
+
+
+def _job_stall_timeout(state: "ServerState") -> float | None:
+    from okto_neuron.server._scheduler import _load_scheduler_config
+
+    return _load_scheduler_config(state).job_stall_timeout_s
+
+
+def stalled_jobs(state: "ServerState", now: float | None = None) -> list[CurationJob]:
+    """Running jobs past their no-progress limit (for the status payload)."""
+    return [job for job in state.curation_jobs if job.stalled_for_s(now) is not None]
+
+
+async def _run_watched(
+    job: CurationJob,
+    run: Callable[[], dict],
+    *,
+    abandon_ok: bool,
+    orphans: list["asyncio.Future[dict]"],
+) -> dict:
+    """Run a job's runner on the job pool under the no-progress watchdog.
+
+    A runner that goes ``job.stall_after_s`` seconds without calling
+    ``progress()`` is presumed stuck (a model server that accepted the
+    connection and never answered). A read-only job is then failed and
+    *abandoned*: its worker thread cannot be interrupted, so it is handed to
+    ``orphans`` and the caller releases the writer lock. A job that writes is
+    never abandoned (a thread still writing while another writer starts would
+    corrupt state); it is left running and stays visible as
+    ``curation_job_stalled`` until its own deadlines end it.
+    """
+    task = asyncio.ensure_future(job_io(run))
+    stall_s = job.stall_after_s
+    if stall_s is None:
+        return await task
+    poll = min(5.0, max(0.02, stall_s / 4))
+    warned = False
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=poll)
+        if done:
+            return task.result()
+        idle = job.stalled_for_s()
+        if idle is None:
+            continue
+        if abandon_ok:
+            orphans.append(task)
+            task.add_done_callback(lambda fut: fut.cancelled() or fut.exception())
+            raise JobStalledError(
+                f"job made no progress for {idle:.0f}s (limit {stall_s:.0f}s) and was abandoned"
+            )
+        if not warned:
+            warned = True
+            _LOG.error(
+                "curation job %s (%s) has made no progress for %.0fs; it writes, so it is "
+                "not abandoned",
+                job.id,
+                job.kind,
+                idle,
+            )
 
 
 def _waits_for_ingest_quiet(state: "ServerState", job: CurationJob) -> bool:
@@ -443,7 +530,12 @@ async def _drain(state: "ServerState") -> None:
             verified_snapshot = job.kind in _VERIFIED_SNAPSHOT_KINDS
             job.status = "running"
             job.started_at = time.time()
+            job.last_progress_at = job.started_at
             job.progress = "starting"
+            try:
+                job.stall_after_s = await store_io(_job_stall_timeout, state)
+            except Exception:  # noqa: BLE001 - a config read must not fail the job
+                job.stall_after_s = None
             await store_io(persist, state)
 
             try:
@@ -464,7 +556,10 @@ async def _drain(state: "ServerState") -> None:
 
                 # The job's immutable VaultRuntime owns both its sidecar and its
                 # graph lease. Selection changes in a browser cannot retarget it.
-                with lease_context as leased_vault:
+                orphans: list[asyncio.Future[dict]] = []
+                stack = contextlib.ExitStack()
+                leased_vault = stack.enter_context(lease_context)
+                try:
                     if writes or verified_snapshot:
                         async with state.writer_lock:
                             vault = leased_vault or getattr(state, "vault", None)
@@ -474,9 +569,20 @@ async def _drain(state: "ServerState") -> None:
                                     state,
                                     vault,
                                 )
-                            result = await job_io(_run)
+                            result = await _run_watched(
+                                job, _run, abandon_ok=not writes, orphans=orphans
+                            )
                     else:
-                        result = await job_io(_run)
+                        result = await _run_watched(
+                            job, _run, abandon_ok=not writes, orphans=orphans
+                        )
+                finally:
+                    if orphans:
+                        # The abandoned worker thread may still be reading the
+                        # graph: keep its lease until it actually returns.
+                        orphans[0].add_done_callback(lambda _fut: stack.close())
+                    else:
+                        stack.close()
                 job.result = result if isinstance(result, dict) else {"result": result}
                 job.status = "done"
                 job.progress = "done"
@@ -555,6 +661,8 @@ __all__ = [
     "CurationJob",
     "InterruptedJobRecovery",
     "JobRunner",
+    "JobStalledError",
+    "stalled_jobs",
     "JOBS_FILENAME",
     "JOBS_VERSION",
     "RETENTION_CAP",

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from okto_neuron.config._capacity import curation_effective_max_concurrent
+from okto_neuron.llm import _scoped_call_timeout
 from okto_neuron.errors import RebuildAuditFailed, VaultCorrupted
 
 if TYPE_CHECKING:
@@ -1131,16 +1132,23 @@ def run_propose(state: "ServerState", job: Any) -> dict:
     job.progress("clustering")
     clusters = generate_candidate_clusters(store, embedder=embedder, type=type_filter)
     rows: list[dict] = []
+    call_timeout_s = _load_config(state, vault_path=vault_path).consolidation.curation_call_timeout_s
     for i, cluster in enumerate(clusters):
         job.progress(f"adjudicating {i + 1}/{len(clusters)}")
-        verdict = adjudicate_cluster(
-            cluster,
-            store,
-            judge=judge,
-            embedder=embedder,
-            use_cluster_judge=use_cluster_judge,
-            merge_blocked=decisions.is_distinct,
-        )
+        # A wall-clock deadline per cluster (issue #24): with one in force, every
+        # judge call runs in the killable helper process instead of an
+        # unstoppable in-process request, so a model server that accepts the
+        # connection and never answers fails this cluster's verdict in bounded
+        # time instead of holding the writer lock forever.
+        with _scoped_call_timeout(call_timeout_s):
+            verdict = adjudicate_cluster(
+                cluster,
+                store,
+                judge=judge,
+                embedder=embedder,
+                use_cluster_judge=use_cluster_judge,
+                merge_blocked=decisions.is_distinct,
+            )
         rows.append(cluster_verdict_row(cluster, verdict))
 
     outcome = {
@@ -1272,12 +1280,14 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
 
     judge = _build_predicate_judge(state, vault_path=vault_path)
     outcomes: list[dict] = []
+    call_timeout_s = _load_config(state, vault_path=vault_path).consolidation.curation_call_timeout_s
     for i, candidate in enumerate(candidates):
         job.progress(f"judging predicate pair {i + 1}/{len(candidates)}")
-        result = judge.judge(
-            candidate,
-            auto_fold_threshold=cfg.upkeep.auto_fold_threshold,
-        )
+        with _scoped_call_timeout(call_timeout_s):
+            result = judge.judge(
+                candidate,
+                auto_fold_threshold=cfg.upkeep.auto_fold_threshold,
+            )
         outcomes.append(predicate_outcome_row(result))
 
     auto_eligible = sum(1 for row in outcomes if row["status"] == "auto")

@@ -1111,6 +1111,21 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
     )
     if queue_error_count > 0:
         reasons.append(f"queue_errors: {queue_error_count} ingest item(s) failed or degraded")
+
+    # 5. Curation job watchdog (issue #24): a running job with no progress past its
+    #    limit holds the vault's writer lock (snapshot jobs) and is otherwise
+    #    invisible: the vault just looks busy forever.
+    stalled = [
+        (runtime, job) for runtime in runtimes for job in _jobs.stalled_jobs(runtime, now)
+    ]
+    if stalled:
+        worst = max(job.stalled_for_s(now) or 0.0 for _runtime, job in stalled)
+        kinds = ", ".join(sorted({job.kind for _runtime, job in stalled}))
+        reasons.append(
+            f"curation_job_stalled: {len(stalled)} running curation job(s) ({kinds}) made no "
+            f"progress for up to {worst:.0f}s; a stuck model call may be holding the vault's "
+            "writer lock"
+        )
     ingest_summary = (
         _aggregate_ingest_summaries(runtimes)
         if application_scope

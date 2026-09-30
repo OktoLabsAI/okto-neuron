@@ -53,6 +53,7 @@ _LITELLM_CONTROL_PARAMS = {
     "api_base",
     "api_key",
     "drop_params",
+    "max_retries",
     "messages",
     "model",
     "timeout",
@@ -624,10 +625,13 @@ def test_litellm_provider_forwards_response_format(monkeypatch: pytest.MonkeyPat
     assert calls[0]["response_format"] == response_format
 
 
-def test_litellm_provider_adds_no_default_request_timeout(
+def test_litellm_provider_defaults_to_a_bounded_request_timeout_without_sdk_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Long provider calls are not killed by a hidden Okto Neuron deadline."""
+    """No call may wait forever (issue #24): a 300 s default deadline, and the SDK
+    must not retry silently (``max_retries=0``) and multiply that deadline."""
+    from okto_neuron.config._vault import DEFAULT_LLM_REQUEST_TIMEOUT_S
+
     calls: list[dict] = []
 
     def completion(**kwargs):
@@ -639,7 +643,9 @@ def test_litellm_provider_adds_no_default_request_timeout(
     provider = LiteLLMProvider(_compat_resolved())
 
     assert provider.complete([Message("user", "hello")]) == "ok"
-    assert "timeout" not in calls[0]
+    assert DEFAULT_LLM_REQUEST_TIMEOUT_S == 300.0
+    assert calls[0]["timeout"] == 300.0
+    assert calls[0]["max_retries"] == 0
 
 
 def test_litellm_provider_request_timeout_env_override(
@@ -671,9 +677,11 @@ def test_named_provider_request_timeout_is_authoritative(
     monkeypatch.setenv("OKTO_NEURON_LLM_REQUEST_TIMEOUT", "45")
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
 
+    # A named connection with no explicit deadline gets the bounded default (issue
+    # #24), not "forever"; the legacy env override does not apply to it.
     no_deadline = LiteLLMProvider(_compat_resolved(provider_ref="managed", request_timeout_s=None))
     assert no_deadline.complete([Message("user", "hello")]) == "ok"
-    assert "timeout" not in calls[-1]
+    assert calls[-1]["timeout"] == 300.0
 
     bounded = LiteLLMProvider(_compat_resolved(provider_ref="managed", request_timeout_s=900))
     assert bounded.complete([Message("user", "hello")]) == "ok"
