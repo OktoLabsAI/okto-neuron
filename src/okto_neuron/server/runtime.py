@@ -715,6 +715,14 @@ def _open_startup_vault(
     if vault_path is None:
         return None, None, None
     resolved = Path(vault_path).expanduser().resolve(strict=False)
+    from okto_neuron.consolidate.review_queue import layout_refusal, log_layout_refusal_once
+
+    # BEFORE the writer lease and the graph open (#14): a v1 vault is refused
+    # untouched; the daemon starts without it, status shows the same refusal.
+    refusal = layout_refusal(resolved)
+    if refusal is not None:
+        log_layout_refusal_once(resolved, refusal)
+        return None, None, dict(refusal)
     try:
         acquire_daemon_writer_lease(resolved)
     except VaultPoolError as exc:
