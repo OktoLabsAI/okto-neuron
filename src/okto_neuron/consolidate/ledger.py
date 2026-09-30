@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AnyStr, Iterable, Iterator, Literal
 
 try:  # POSIX
     import fcntl
@@ -76,6 +76,52 @@ _LEDGER_INDEXES_GUARD = threading.Lock()
 _LEDGER_INDEX_CACHE_SIZE = 8
 _LEDGER_INDEXES: OrderedDict[str, "_LedgerOffsetIndex"] = OrderedDict()
 _LEDGER_INDEX_BUILD_LOCKS: dict[str, threading.Lock] = {}
+
+
+_STREAM_CHUNK_BYTES = 1 << 20
+
+
+def _stream_lines(chunks: Iterable[AnyStr]) -> Iterator[AnyStr]:
+    """Yield the lines of a chunked ``bytes`` or ``str`` stream without holding it.
+
+    The result equals ``"".join(chunks).splitlines()`` for any chunking (``bytes``
+    break on ``\\n``/``\\r``/``\\r\\n`` only; ``str`` on the wider set). A terminator
+    that could still be extended by the next chunk (a trailing ``\\r`` that may pair
+    with a leading ``\\n``) and an unterminated tail are held back, so peak memory
+    is one chunk plus the longest line.
+    """
+
+    pending: list[AnyStr] = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+        cr: AnyStr = b"\r" if isinstance(chunk, bytes) else "\r"  # type: ignore[assignment]
+        pieces = chunk.splitlines(keepends=True)
+        if pending:
+            if pending[-1].endswith(cr):
+                pieces = (chunk[:0].join(pending) + chunk).splitlines(keepends=True)
+                pending = []
+            elif len(pieces) == 1 and pieces[0].splitlines()[0] == pieces[0]:
+                pending.append(chunk)  # still inside one long line; do not re-join
+                continue
+            else:
+                pieces[0] = chunk[:0].join(pending) + pieces[0]
+                pending = []
+        last = pieces[-1]
+        if last.splitlines()[0] == last or last.endswith(cr):
+            pending.append(pieces.pop())
+        for piece in pieces:
+            yield piece.splitlines()[0]
+    if pending:
+        yield from pending[0][:0].join(pending).splitlines()
+
+
+def _read_chunks(handle: Any, size: int) -> Iterator[Any]:
+    while True:
+        chunk = handle.read(size)
+        if not chunk:
+            return
+        yield chunk
 
 
 def _now() -> str:
@@ -1641,6 +1687,7 @@ class CandidateLedger:
         self,
         *,
         max_malformed_samples: int = _MALFORMED_SAMPLE_LIMIT,
+        kinds: frozenset[str] | None = None,
     ) -> LedgerScanResult:
         """Read all ledger bytes and report any evidence that could not be parsed.
 
@@ -1649,6 +1696,14 @@ class CandidateLedger:
         can still fail on invalid UTF-8. Semantic audits use this method so such
         rows and interrupted final appends cannot disappear without an explicit
         incomplete result.
+
+        The file is streamed one chunk at a time under the ledger lock, so the
+        view stays immutable while memory is bounded by one chunk, one row and
+        the retained ``parsed_records``. Every line is still parsed and counted
+        (completeness, hash, sizes are always whole-file); ``kinds`` only limits
+        which parsed rows are *retained* in ``parsed_records`` for callers that
+        read one record kind from a large ledger. With ``kinds`` set,
+        ``parsed_record_count`` counts the retained rows.
         """
         if max_malformed_samples < 0:
             raise ValueError("max_malformed_samples must be >= 0")
@@ -1672,10 +1727,18 @@ class CandidateLedger:
                 completeness_reason="ledger_file_absent",
             )
 
-        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
-            data = self.path.read_bytes()
-        raw_lines = data.splitlines()
-        unterminated_final_line = bool(data) and not data.endswith((b"\n", b"\r"))
+        digest = hashlib.sha256()
+        file_size = 0
+        last_byte = b""
+
+        def hashed_chunks(handle: Any) -> Iterator[bytes]:
+            nonlocal file_size, last_byte
+            for chunk in _read_chunks(handle, _STREAM_CHUNK_BYTES):
+                digest.update(chunk)
+                file_size += len(chunk)
+                last_byte = chunk[-1:]
+                yield chunk
+
         parsed_records: list[dict[str, Any]] = []
         malformed: list[MalformedLedgerLine] = []
         malformed_line_count = 0
@@ -1685,59 +1748,67 @@ class CandidateLedger:
         unrecognized_version_record_count = 0
         final_nonempty_line_number: int | None = None
 
-        for line_number, raw_line in enumerate(raw_lines, start=1):
-            if not raw_line.strip():
-                continue
-            nonempty_lines += 1
-            final_nonempty_line_number = line_number
-            reason: str | None = None
-            try:
-                line = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                line = raw_line.decode("utf-8", errors="replace")
-                reason = "invalid_utf8"
+        line_number = 0
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            with self.path.open("rb") as handle:
+                for line_number, raw_line in enumerate(
+                    _stream_lines(hashed_chunks(handle)), start=1
+                ):
+                    if not raw_line.strip():
+                        continue
+                    nonempty_lines += 1
+                    final_nonempty_line_number = line_number
+                    reason: str | None = None
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError:
+                        line = raw_line.decode("utf-8", errors="replace")
+                        reason = "invalid_utf8"
 
-            record: Any = None
-            if reason is None:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    reason = "invalid_json"
-                else:
-                    if not isinstance(record, dict):
-                        reason = "record_not_object"
+                    record: Any = None
+                    if reason is None:
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            reason = "invalid_json"
+                        else:
+                            if not isinstance(record, dict):
+                                reason = "record_not_object"
 
-            if reason is not None:
-                malformed_line_count += 1
-                malformed_line_numbers.add(line_number)
-                if len(malformed) < max_malformed_samples:
-                    sample = json.dumps(line.strip(), ensure_ascii=True)[1:-1]
-                    sample_truncated = len(sample) > _MALFORMED_SAMPLE_CHARS
-                    if sample_truncated:
-                        sample = sample[: _MALFORMED_SAMPLE_CHARS - 3] + "..."
-                    malformed.append(
-                        MalformedLedgerLine(
-                            line_number=line_number,
-                            reason=reason,
-                            sample=sample,
-                            sample_truncated=sample_truncated,
-                        )
-                    )
-                continue
+                    if reason is not None:
+                        malformed_line_count += 1
+                        malformed_line_numbers.add(line_number)
+                        if len(malformed) < max_malformed_samples:
+                            sample = json.dumps(line.strip(), ensure_ascii=True)[1:-1]
+                            sample_truncated = len(sample) > _MALFORMED_SAMPLE_CHARS
+                            if sample_truncated:
+                                sample = sample[: _MALFORMED_SAMPLE_CHARS - 3] + "..."
+                            malformed.append(
+                                MalformedLedgerLine(
+                                    line_number=line_number,
+                                    reason=reason,
+                                    sample=sample,
+                                    sample_truncated=sample_truncated,
+                                )
+                            )
+                        continue
 
-            parsed_records.append(record)
-            version = record.get("ledger_version")
-            if isinstance(version, int) and not isinstance(version, bool):
-                ledger_versions.add(version)
-                if version not in _ACCEPTED_LEDGER_VERSIONS:
-                    unrecognized_version_record_count += 1
-            else:
-                unrecognized_version_record_count += 1
+                    if kinds is None or record.get("kind") in kinds:
+                        parsed_records.append(record)
+                    version = record.get("ledger_version")
+                    if isinstance(version, int) and not isinstance(version, bool):
+                        ledger_versions.add(version)
+                        if version not in _ACCEPTED_LEDGER_VERSIONS:
+                            unrecognized_version_record_count += 1
+                    else:
+                        unrecognized_version_record_count += 1
+
+        unterminated_final_line = bool(file_size) and last_byte not in (b"\n", b"\r")
 
         trailing_partial = bool(
             unterminated_final_line
             and final_nonempty_line_number is not None
-            and final_nonempty_line_number == len(raw_lines)
+            and final_nonempty_line_number == line_number
             and final_nonempty_line_number in malformed_line_numbers
         )
         incomplete_reasons: list[str] = []
@@ -1760,7 +1831,7 @@ class CandidateLedger:
         return LedgerScanResult(
             path=self.path,
             parsed_records=tuple(parsed_records),
-            total_lines=len(raw_lines),
+            total_lines=line_number,
             nonempty_lines=nonempty_lines,
             malformed_line_count=malformed_line_count,
             malformed_lines=tuple(malformed),
@@ -1770,26 +1841,39 @@ class CandidateLedger:
             trailing_partial=trailing_partial,
             trailing_partial_line_number=(final_nonempty_line_number if trailing_partial else None),
             ledger_versions=tuple(sorted(ledger_versions)),
-            file_size_bytes=len(data),
-            file_sha256=hashlib.sha256(data).hexdigest(),
+            file_size_bytes=file_size,
+            file_sha256=digest.hexdigest(),
             completeness_status=completeness_status,
             completeness_reason=completeness_reason,
         )
 
-    def records(self) -> list[dict[str, Any]]:
+    def iter_records(self) -> Iterator[dict[str, Any]]:
+        """Stream every parseable record in file order, one row in memory at a time.
+
+        Same filtering and errors as :meth:`records`: blank, non-JSON and
+        non-object rows are skipped, invalid UTF-8 raises ``UnicodeDecodeError``
+        (here when the reader reaches it, not before the first row). Prefer this
+        over :meth:`records` for any consumer that does not need the whole ledger
+        at once; the ledger can be far larger than memory.
+        """
         if not self.path.exists():
-            return []
-        records: list[dict[str, Any]] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
-        return records
+            return
+        # ``read_text().splitlines()`` semantics (universal newlines, then the
+        # ``str`` line boundaries), streamed instead of slurped.
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in _stream_lines(_read_chunks(handle, _STREAM_CHUNK_BYTES)):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+
+    def records(self) -> list[dict[str, Any]]:
+        """Every parseable record as a list (the whole ledger: prefer :meth:`iter_records`)."""
+        return list(self.iter_records())
 
     def _open_runs(self) -> dict[str, dict[str, Any]]:
         """All runs whose LAST ``ingest_run`` record is state ``started``
