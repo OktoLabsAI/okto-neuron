@@ -447,6 +447,12 @@ class ServerState:
     shutdown: "GracefulShutdown | None" = field(default=None, repr=False)
     """Cross-transport request/deadline coordinator installed by runtime."""
     _vault_runtimes: dict[Path, VaultRuntime] = field(default_factory=dict, init=False, repr=False)
+    _runtimes_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
+    """Guards ``_vault_runtimes``. Runtime resolution runs on store-executor
+    threads (issue #13), so two requests for a new path must still agree on ONE
+    runtime (and therefore one writer lock)."""
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -533,26 +539,27 @@ class ServerState:
         to the pool without a compatibility pin.
         """
         key = Path(vault_path).expanduser().resolve(strict=False)
-        runtime = self._vault_runtimes.get(key)
-        if runtime is None and self.vault_pool.is_fenced(key):
-            raise VaultPoolError(
-                "vault_fenced",
-                f"vault runtime is unavailable after deletion or maintenance: {key}",
-            )
-        if vault is not None:
-            self.vault_pool.adopt(vault, key, pin=False)
-        if runtime is None:
-            runtime = VaultRuntime(vault_path=key, server=self)
-            self._vault_runtimes[key] = runtime
-        if rehydrate and not runtime._rehydrated:
-            from okto_neuron.server import _ingest_queue, _jobs
+        with self._runtimes_lock:
+            runtime = self._vault_runtimes.get(key)
+            if runtime is None and self.vault_pool.is_fenced(key):
+                raise VaultPoolError(
+                    "vault_fenced",
+                    f"vault runtime is unavailable after deletion or maintenance: {key}",
+                )
+            if vault is not None:
+                self.vault_pool.adopt(vault, key, pin=False)
+            if runtime is None:
+                runtime = VaultRuntime(vault_path=key, server=self)
+                self._vault_runtimes[key] = runtime
+            if rehydrate and not runtime._rehydrated:
+                from okto_neuron.server import _ingest_queue, _jobs
 
-            # Mark first so a malformed/best-effort sidecar cannot cause every
-            # status poll to repeat disk work forever.
-            runtime._rehydrated = True
-            _ingest_queue.rehydrate_queue(runtime)
-            _jobs.rehydrate_jobs(runtime)
-        return runtime
+                # Mark first so a malformed/best-effort sidecar cannot cause every
+                # status poll to repeat disk work forever.
+                runtime._rehydrated = True
+                _ingest_queue.rehydrate_queue(runtime)
+                _jobs.rehydrate_jobs(runtime)
+            return runtime
 
     @property
     def active_runtime(self) -> VaultRuntime | None:
@@ -570,15 +577,21 @@ class ServerState:
         if discover:
             from okto_neuron.vault_registry import list_vaults
 
-            for entry in list_vaults(
+            entries = list_vaults(
                 current=self.vault_path if self.vault_path is not None else None
-            ):
-                key = entry.path.resolve(strict=False)
-                if key not in self._vault_runtimes and self.vault_pool.is_fenced(key):
-                    continue
-                self.runtime_for(entry.path)
-            self._migrate_legacy_targeted_jobs()
-        return tuple(self._vault_runtimes[path] for path in sorted(self._vault_runtimes))
+            )
+            with self._runtimes_lock:
+                for entry in entries:
+                    key = entry.path.resolve(strict=False)
+                    if key not in self._vault_runtimes and self.vault_pool.is_fenced(key):
+                        continue
+                    self.runtime_for(entry.path)
+                self._migrate_legacy_targeted_jobs()
+        # No lock for the snapshot itself: copying the dict is atomic under the
+        # GIL, and the event loop must never wait behind a thread that holds the
+        # lock while it rehydrates sidecars from disk.
+        snapshot = dict(self._vault_runtimes)
+        return tuple(snapshot[path] for path in sorted(snapshot))
 
     def _migrate_legacy_targeted_jobs(self) -> None:
         """Move live pre-ADR-0034 targeted jobs to their owning runtime.
@@ -618,20 +631,23 @@ class ServerState:
         The deletion coordinator must fence and release the pool path first.
         """
         key = Path(vault_path).expanduser().resolve(strict=False)
-        runtime = self._vault_runtimes.get(key)
-        if runtime is None:
-            return False
-        if not runtime.idle:
-            raise RuntimeError(f"vault runtime still has active work: {key}")
-        if self.vault_pool.peek(key) is not None:
-            raise RuntimeError(f"vault handle must be released before dropping runtime: {key}")
-        self._vault_runtimes.pop(key, None)
-        return True
+        with self._runtimes_lock:
+            runtime = self._vault_runtimes.get(key)
+            if runtime is None:
+                return False
+            if not runtime.idle:
+                raise RuntimeError(f"vault runtime still has active work: {key}")
+            if self.vault_pool.peek(key) is not None:
+                raise RuntimeError(
+                    f"vault handle must be released before dropping runtime: {key}"
+                )
+            self._vault_runtimes.pop(key, None)
+            return True
 
     def runtime_tasks(self) -> set[asyncio.Task]:
         """Every background task owned by all vault contexts."""
         tasks: set[asyncio.Task] = set()
-        for runtime in self._vault_runtimes.values():
+        for runtime in tuple(self._vault_runtimes.values()):
             for task in (runtime.ingest_worker_task, runtime.curation_worker_task):
                 if task is not None:
                     tasks.add(task)
@@ -843,6 +859,12 @@ def reset_state_for_tests() -> None:
     """Drop the module singleton; close any underlying vault. Test-only."""
     global _STATE
     if _STATE is not None:
+        # A store-executor call abandoned by a cancelled request (or a worker
+        # task torn down with its test loop) may still be inside the graph;
+        # never close a vault underneath it.
+        from okto_neuron.server._store_io import wait_store_idle
+
+        wait_store_idle(timeout=30.0)
         try:
             _STATE.close()
         except Exception:  # noqa: BLE001

@@ -34,6 +34,14 @@ from okto_neuron.llm._cli_provider import kill_active_cli_processes
 from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._store_io import (
+    DEFAULT_STORE_WORKERS,
+    acquire_off_loop,
+    configure_store_executor,
+    shutdown_store_executor,
+    store_io,
+    wait_store_idle,
+)
 from okto_neuron.server._vault_pool import VaultLease, VaultPoolError
 from okto_neuron.server.http import build_rest_app
 from okto_neuron.server.lifecycle import GracefulShutdown
@@ -58,6 +66,26 @@ DEFAULT_REST_PORT = 7777
 DEFAULT_MCP_PORT = 8201
 DEFAULT_HOST = "127.0.0.1"
 _LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _configured_store_workers() -> int:
+    """``[server] store_workers`` from ``okto-neuron.toml`` (default 4).
+
+    A broken or unreadable app config never stops ``serve``; it falls back to the
+    default and says so, because the same file is re-read (and reported) by the
+    commands that actually depend on it.
+    """
+    from okto_neuron.config import OktoNeuronConfig
+
+    try:
+        return int(OktoNeuronConfig.load().server.store_workers)
+    except Exception as exc:  # noqa: BLE001 - startup must not die on this knob
+        _LOG.warning(
+            "could not read [server] store_workers (%s); using %d",
+            exc,
+            DEFAULT_STORE_WORKERS,
+        )
+        return DEFAULT_STORE_WORKERS
 
 
 class _ShutdownSignalHandler:
@@ -323,7 +351,11 @@ async def _graceful_shutdown(
                 tasks=owned_tasks,
                 force_process_exit=force_process_exit,
             )
-        await asyncio.wait_for(asyncio.to_thread(state.close), timeout=remaining)
+        # A store call whose request was cancelled keeps running on its worker;
+        # let it finish (bounded by the deadline) before any handle closes.
+        await asyncio.to_thread(wait_store_idle, remaining)
+        remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
+        await asyncio.wait_for(asyncio.to_thread(state.close), timeout=max(remaining, 0.001))
     except asyncio.TimeoutError:
         _force_shutdown(
             reason="writer lock or vault close",
@@ -1290,6 +1322,9 @@ def _build_mcp_server(state: ServerState):
             # RuntimeError style so existing MCP clients keep parsing the message).
             raise RuntimeError(f"{exc.code}: {exc}") from exc
 
+    def _release_pair(pair: tuple[VaultRuntime, VaultLease[Vault]]) -> None:
+        pair[1].release()
+
     def _lease(
         vault_override: str | None = None,
         override_ignored: list[str] | None = None,
@@ -1509,7 +1544,7 @@ def _build_mcp_server(state: ServerState):
         }
 
     @mcp.tool()
-    def explore(
+    async def explore(
         topic: str = "",
         node_id: str | None = None,
         hops: int = 1,
@@ -1556,6 +1591,29 @@ def _build_mcp_server(state: ServerState):
         Before choosing, check the project directory for a ``.okto-neuron-vault``
         file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
         """
+        # Pure graph read (no LLM): the whole call is one store op (issue #13).
+        return await store_io(
+            _explore_impl,
+            topic,
+            node_id,
+            hops,
+            k,
+            vault,
+            relationship_types,
+            min_claim_confidence,
+            max_degree_per_seed,
+        )
+
+    def _explore_impl(
+        topic: str,
+        node_id: str | None,
+        hops: int,
+        k: int,
+        vault: str | None,
+        relationship_types: list[str] | None,
+        min_claim_confidence: float | None,
+        max_degree_per_seed: int | None,
+    ) -> dict[str, object]:
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
         _ignored: list[str] = []
@@ -1615,8 +1673,9 @@ def _build_mcp_server(state: ServerState):
             )
         sens = sensitivity
         # Resolution happens here, AFTER the loopback write gate above, so an
-        # unknown vault name fails loudly before anything is written.
-        runtime, lease = _lease(vault)
+        # unknown vault name fails loudly before anything is written. Resolving
+        # reads the registry and leasing may open the vault: off-loop.
+        runtime, lease = await acquire_off_loop(_lease, vault, release=_release_pair)
         if runtime.draining:
             lease.release()
             if runtime.shutting_down:
@@ -1625,10 +1684,10 @@ def _build_mcp_server(state: ServerState):
         with lease as selected_vault:
             async with runtime.writer_lock:
                 try:
-                    await asyncio.to_thread(
-                        graph_integrity.require_write_allowed, runtime, selected_vault
+                    await store_io(graph_integrity.require_write_allowed, runtime, selected_vault)
+                    ingest_source = await store_io(
+                        _materialize_raw_text_source, selected_vault, source
                     )
-                    ingest_source = _materialize_raw_text_source(selected_vault, source)
                     # Off-load the blocking extraction so the event loop stays
                     # responsive while this vault's lock serializes writes.
                     result = await asyncio.to_thread(
@@ -1667,7 +1726,8 @@ def _build_mcp_server(state: ServerState):
                     raise
         from okto_neuron.server import _curation
 
-        remember_outcome = _curation.attach_verified_reconciliation_outcome(
+        remember_outcome = await store_io(
+            _curation.attach_verified_reconciliation_outcome,
             runtime,
             dict(getattr(result, "outcome", {}) or {}),
             trigger="verified_file_commit",
@@ -1689,7 +1749,7 @@ def _build_mcp_server(state: ServerState):
         }
 
     @mcp.tool()
-    def list_vaults() -> dict[str, object]:
+    async def list_vaults() -> dict[str, object]:
         """List the vault NAMES this server can reach, so you can pick one.
 
         Use this to discover what exists, then pass ``vault=<name>`` to
@@ -1708,6 +1768,10 @@ def _build_mcp_server(state: ServerState):
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
+        # Registry scan + selector resolution read YAML: one store op (issue #13).
+        return await store_io(_list_vaults_impl)
+
+    def _list_vaults_impl() -> dict[str, object]:
         # DELIBERATE NON-DISCLOSURE: this surface returns NAMES ONLY. No ``path``,
         # and no ``id`` either (the id is derived from the vault path). Do not
         # "fix" this by re-adding them or by switching to VaultEntry.to_json() /
@@ -1786,9 +1850,16 @@ def _build_mcp_server(state: ServerState):
             vault_path_for_name,
         )
 
+        def _init_target(vault_name: str) -> tuple[Path, bool]:
+            """Store op: ensure the app layout, map the name, probe the path."""
+            ensure_global_layout()
+            resolved = vault_path_for_name(vault_name).resolve(strict=False)
+            return resolved, is_vault(resolved)
+
         resolved_backend = (backend or "").strip() or DEFAULT_NEW_VAULT_BACKEND
         try:
-            resolve_graph_backend(resolved_backend)
+            # Entry-point discovery reads installed package metadata: off-loop.
+            await store_io(resolve_graph_backend, resolved_backend)
         except NoSuchBackendError as exc:
             raise RuntimeError(f"bad_request: {exc}") from exc
 
@@ -1805,11 +1876,10 @@ def _build_mcp_server(state: ServerState):
 
         try:
             pack_list = _parse_packs(packs)
-            ensure_global_layout()
-            target = vault_path_for_name(name.strip()).resolve(strict=False)
+            target, exists = await store_io(_init_target, name.strip())
         except ValueError as exc:
             raise RuntimeError(f"bad_vault_name: {exc}") from exc
-        if is_vault(target):
+        if exists:
             raise RuntimeError(f"vault_exists: vault already exists at {target}")
 
         # REST and MCP creation mutate the same registry/ownership boundary. The
@@ -1817,7 +1887,7 @@ def _build_mcp_server(state: ServerState):
         # cancelled tool task cannot release serialization while init continues.
         async with state.config_lock:
             try:
-                await asyncio.to_thread(
+                await store_io(
                     _initialize_managed_vault,
                     state,
                     target,
@@ -1834,9 +1904,9 @@ def _build_mcp_server(state: ServerState):
                 )
             except FileExistsError:
                 raise RuntimeError(f"vault_exists: vault already exists at {target}")
-            state.runtime_for(target, rehydrate=True)
+            await store_io(state.runtime_for, target, rehydrate=True)
         created: dict[str, object] = {"name": name.strip(), "path": str(target)}
-        hint = _vault_llm_model_hint(target)
+        hint = await store_io(_vault_llm_model_hint, target)
         if hint:
             created["hint"] = hint
         return created
@@ -1869,6 +1939,11 @@ async def _run_async(
     state.vault_open_error = vault_warning
     # ``init_state`` already adopted the startup fallback vault into the pool (the
     # pool owns ALL handles, so shutdown closes it once via ``pool.close_all()``).
+
+    # Issue #13: one bounded executor owns every store/vault-file/config read a
+    # handler needs, so no request ever blocks the loop that serves /health,
+    # REST and MCP. Shut down in the ``finally`` below after the vaults close.
+    configure_store_executor(_configured_store_workers())
 
     # Pin the configured LLM providers' lazy imports (litellm, boto3) into this
     # process NOW, while the launch-time environment is intact — see the helper's
@@ -2039,6 +2114,7 @@ async def _run_async(
                         loop.remove_signal_handler(sig)
             uvicorn_error_logger.removeFilter(mcp_lifecycle_filter)
             reset_state_for_tests()
+            shutdown_store_executor()
 
     if cancellation is not None:  # pragma: no cover - defensive
         raise cancellation

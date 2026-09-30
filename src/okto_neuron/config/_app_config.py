@@ -60,6 +60,17 @@ def _warn_missing_version_once(path: Path) -> None:
     )
 
 
+class ServerSettings(BaseModel):
+    """``[server]`` table: settings read once when ``okto-neuron serve`` starts."""
+
+    model_config = ConfigDict(extra="allow")
+
+    store_workers: int = Field(default=4, ge=1, le=64)
+    """Threads in the daemon's bounded store executor. Every graph read, vault
+    sidecar/JSON read and YAML load a request handler needs runs there instead
+    of on the event loop that also serves ``/health``, REST and MCP."""
+
+
 class OktoNeuronConfig(BaseModel):
     """Typed global configuration loaded from okto-neuron.toml (or a pre-0.3.0 marginalia.toml)."""
 
@@ -70,6 +81,7 @@ class OktoNeuronConfig(BaseModel):
     default_vault: Path | None = None
     strict_acl: bool = False
     default_directory_mode: int = 0o755
+    server: ServerSettings = Field(default_factory=ServerSettings)
 
     @field_validator("vault_roots", mode="after")
     @classmethod
@@ -145,4 +157,4 @@ def _select_config_path(path: Path | str | None) -> Path | None:
     return None
 
 
-__all__ = ["OktoNeuronConfig", "default_app_home"]
+__all__ = ["OktoNeuronConfig", "ServerSettings", "default_app_home"]

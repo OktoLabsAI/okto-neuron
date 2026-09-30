@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -231,19 +232,21 @@ def _publish_linked_reconcile_outcome(
     outcome: dict[str, object],
     *,
     expected_job_id: str | None = None,
-) -> None:
+    persist_now: bool = True,
+) -> bool:
     """Project one propose job's state onto the ingest items that requested it.
 
     The graph commit and the semantic follow-up have deliberately separate
     outcomes.  Reconciliation may fail after a technically verified commit; in
     that case the ingest item stays ``done`` and only this additive semantic
-    outcome becomes ``failed``.
+    outcome becomes ``failed``. Returns whether any item changed;
+    ``persist_now=False`` leaves the sidecar write to an off-loop caller.
     """
     if not isinstance(ingest_item_ids, list):
-        return
+        return False
     item_ids = {str(value) for value in ingest_item_ids if str(value)}
     if not item_ids:
-        return
+        return False
     changed = False
     for item in getattr(state, "ingest_queue", ()):
         if str(getattr(item, "id", "")) not in item_ids:
@@ -259,13 +262,38 @@ def _publish_linked_reconcile_outcome(
         current["cross_document_reconciliation"] = dict(outcome)
         item.outcome = current
         changed = True
-    if changed:
+    if changed and persist_now:
         from okto_neuron.server import _ingest_queue
 
         _ingest_queue.persist(state)
+    return changed
+
+
+# Find-or-submit below must stay atomic: callers now run it on store-executor
+# threads (issue #13), where two verified commits could otherwise both miss the
+# queued pass and submit two proposals instead of coalescing into one.
+_SCHEDULE_LOCK = threading.RLock()
 
 
 def schedule_cross_document_reconciliation(
+    state: "ServerState",
+    *,
+    trigger: str,
+    ingest_item_id: str | None = None,
+    graph_generation: str | None = None,
+) -> dict[str, object]:
+    """Schedule one propose-only reconciliation pass (see
+    :func:`_schedule_cross_document_reconciliation`), atomically."""
+    with _SCHEDULE_LOCK:
+        return _schedule_cross_document_reconciliation(
+            state,
+            trigger=trigger,
+            ingest_item_id=ingest_item_id,
+            graph_generation=graph_generation,
+        )
+
+
+def _schedule_cross_document_reconciliation(
     state: "ServerState",
     *,
     trigger: str,

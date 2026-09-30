@@ -96,6 +96,12 @@ class VaultPool:
         self._fenced: set[Path] = set()
         self._clock = 0
         self._lock = threading.Lock()
+        # Lease-count increments/decrements only. Releasing a borrow must never
+        # wait behind ``_lock``, which is held across a (possibly slow) open of an
+        # unrelated vault; the event loop releases request leases (issue #13).
+        # Every other ``_leases`` mutation happens under ``_lock`` while that
+        # path's count is zero, so it cannot race a release.
+        self._count_lock = threading.Lock()
         self._paths_snapshot: tuple[Path, ...] = ()
 
     @staticmethod
@@ -214,13 +220,14 @@ class VaultPool:
                     "vault_fenced", f"vault is fenced for deletion or release: {key}"
                 )
             vault = self._get_or_open_locked(key, evict_idle=True)
-            self._leases[key] = self._leases.get(key, 0) + 1
+            with self._count_lock:
+                self._leases[key] = self._leases.get(key, 0) + 1
             self._touch_locked(key)
             return VaultLease(self, key, vault)
 
     def _release_lease(self, path: Path) -> None:
         key = self._key(path)
-        with self._lock:
+        with self._count_lock:
             count = self._leases.get(key, 0)
             if count <= 0:
                 return
@@ -331,12 +338,18 @@ class VaultPool:
             self._refresh_snapshot_locked()
             return vault
 
+    # ``peek``, ``is_fenced`` and ``lease_count`` are point-in-time reads that
+    # deliberately skip ``_lock`` (issue #13). The lock is held across
+    # ``Vault.open``/eviction close, which can take seconds; the event loop calls
+    # these on every request (``VaultRuntime.vault`` peeks), and a single dict/set
+    # lookup is atomic under the GIL. The answer can be stale the instant it is
+    # returned either way, so the lock never made it stronger for the caller.
+
     def peek(self, path: Path) -> Vault | None:
         """Return the currently owned live handle without opening or leasing it."""
         key = self._key(path)
-        with self._lock:
-            vault = self._vaults.get(key)
-            return vault if vault is not None and _is_live(vault) else None
+        vault = self._vaults.get(key)
+        return vault if vault is not None and _is_live(vault) else None
 
     def fence(self, path: Path) -> int:
         """Reject future leases for ``path`` and return its current lease count."""
@@ -353,13 +366,11 @@ class VaultPool:
 
     def is_fenced(self, path: Path) -> bool:
         key = self._key(path)
-        with self._lock:
-            return key in self._fenced
+        return key in self._fenced
 
     def lease_count(self, path: Path) -> int:
         key = self._key(path)
-        with self._lock:
-            return self._leases.get(key, 0)
+        return self._leases.get(key, 0)
 
     def release_path(
         self,

@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
@@ -46,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, store_io
 
 if TYPE_CHECKING:
     from okto_neuron.server.state import ServerState
@@ -176,12 +178,22 @@ def _persist_payload(jobs: list[CurationJob]) -> dict:
     return {"version": JOBS_VERSION, "jobs": [asdict(j) for j in kept]}
 
 
+_PERSIST_LOCK = threading.Lock()
+
+
 def persist(state: "ServerState") -> None:
     """Atomically write the job list to the sidecar (temp + os.replace).
 
     Best-effort: a persistence failure never aborts an in-flight job (the queue
     stays correct in memory). Snapshots the list first because the worker runs in
-    a thread and may mutate concurrently."""
+    a thread and may mutate concurrently. Writers are serialized and each one
+    snapshots INSIDE the lock, so the last write to land always carries the
+    newest queue even when store-executor threads persist concurrently."""
+    with _PERSIST_LOCK:
+        _persist_locked(state)
+
+
+def _persist_locked(state: "ServerState") -> None:
     path = jobs_path(state)
     payload = _persist_payload(list(state.curation_jobs))
     try:
@@ -324,7 +336,12 @@ def snapshot(state: "ServerState", *, kind: str | None = None) -> dict:
 
 # ── worker ─────────────────────────────────────────────────────────────────────
 def ensure_worker(state: "ServerState") -> None:
-    """Start and retain the drain worker if one is not already running."""
+    """Start and retain the drain worker if one is not already running.
+
+    Safe to call from a store-executor thread: the start is handed back to the
+    event loop that dispatched that work."""
+    if call_soon_on_loop(ensure_worker, state):
+        return
     existing = getattr(state, "curation_worker_task", None)
     if state.curation_worker_active or (existing is not None and not existing.done()):
         return
@@ -362,21 +379,27 @@ def _reconcile_failure_outcome(job: CurationJob, exc: Exception) -> dict[str, ob
     }
 
 
-def _publish_linked_terminal_outcome(state: "ServerState", job: CurationJob) -> None:
-    """Publish after ``to_thread`` returns, while queue ownership is on-loop."""
+async def _publish_linked_terminal_outcome(state: "ServerState", job: CurationJob) -> None:
+    """Publish after ``to_thread`` returns, while queue ownership is on-loop.
+
+    The ingest items are updated here on the loop; only the sidecar write goes
+    to the store executor."""
     if job.kind != "reconcile-propose" or not isinstance(job.result, dict):
         return
     outcome = job.result.get("outcome")
     if not isinstance(outcome, dict):
         return
+    from okto_neuron.server import _ingest_queue
     from okto_neuron.server._curation import _publish_linked_reconcile_outcome
 
-    _publish_linked_reconcile_outcome(
+    if _publish_linked_reconcile_outcome(
         state,
         job.params.get("ingest_item_ids"),
         outcome,
         expected_job_id=job.id,
-    )
+        persist_now=False,
+    ):
+        await store_io(_ingest_queue.persist, state)
 
 
 async def _drain(state: "ServerState") -> None:
@@ -402,7 +425,7 @@ async def _drain(state: "ServerState") -> None:
                 job = candidate
                 break
             if parked_changed:
-                persist(state)
+                await store_io(persist, state)
             if job is None:
                 break
             entry = _REGISTRY.get(job.kind)
@@ -413,20 +436,23 @@ async def _drain(state: "ServerState") -> None:
                 if job.kind == "reconcile-propose":
                     job.result = {"outcome": _reconcile_failure_outcome(job, exc)}
                 job.finished_at = time.time()
-                _publish_linked_terminal_outcome(state, job)
-                persist(state)
+                await _publish_linked_terminal_outcome(state, job)
+                await store_io(persist, state)
                 continue
             runner, writes = entry
             verified_snapshot = job.kind in _VERIFIED_SNAPSHOT_KINDS
             job.status = "running"
             job.started_at = time.time()
             job.progress = "starting"
-            persist(state)
+            await store_io(persist, state)
 
             try:
                 lease_factory = getattr(state, "lease_vault", None)
+                # Leasing may open the vault under the pool lock; never on the loop.
                 lease_context = (
-                    lease_factory() if callable(lease_factory) else contextlib.nullcontext()
+                    await acquire_off_loop(lease_factory)
+                    if callable(lease_factory)
+                    else contextlib.nullcontext()
                 )
 
                 def _run() -> dict:
@@ -443,7 +469,7 @@ async def _drain(state: "ServerState") -> None:
                         async with state.writer_lock:
                             vault = leased_vault or getattr(state, "vault", None)
                             if vault is not None and job.kind not in _INTEGRITY_RECOVERY_KINDS:
-                                await asyncio.to_thread(
+                                await store_io(
                                     graph_integrity.require_write_allowed,
                                     state,
                                     vault,
@@ -472,8 +498,8 @@ async def _drain(state: "ServerState") -> None:
                 if job.kind == "reconcile-propose":
                     job.result = {"outcome": _reconcile_failure_outcome(job, exc)}
             job.finished_at = time.time()
-            _publish_linked_terminal_outcome(state, job)
-            persist(state)
+            await _publish_linked_terminal_outcome(state, job)
+            await store_io(persist, state)
             await asyncio.sleep(0)  # yield so polls stay responsive
     finally:
         state.curation_worker_active = False

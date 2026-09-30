@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from okto_neuron.server._store_io import store_io
+
 if TYPE_CHECKING:
     from okto_neuron.config import FolderWatchConfig
     from okto_neuron.server.state import ServerState
@@ -629,11 +631,15 @@ async def _tick_root(
     r_str = str(root)
     file_table = vs.get_root(r_str)
     mf_path = _manifest_path(vault_path, root)
-    manifest = _load_manifest(mf_path)
+    # Every filesystem touch below (manifest read, stat-walk + hashing, the
+    # is_file probes, manifest save) runs on the store executor (issue #13);
+    # only the in-memory debounce table is updated on the event loop.
+    manifest = await store_io(_load_manifest, mf_path)
 
     # Stat-walk and compute diff.
     try:
-        diff, new_manifest = compute_manifest_diff(
+        diff, new_manifest = await store_io(
+            compute_manifest_diff,
             root,
             manifest,
             recursive=cfg.recursive,
@@ -712,18 +718,15 @@ async def _tick_root(
     # belt-and-braces guard in run_folder_watch) the GLOBAL watch loop task
     # forever. Treat an unreadable-parent error the same as "still present":
     # keep the entry so it retries once access is restored.
-    for relpath in [r for r in file_table if r not in new_manifest]:
-        try:
-            still_present = (root / relpath).is_file()
-        except OSError:
-            still_present = True
-        if not still_present:
+    missing = [r for r in file_table if r not in new_manifest]
+    if missing:
+        for relpath in await store_io(_vanished_relpaths, root, missing):
             file_table.pop(relpath, None)
 
     # Fire settled files. State flips AFTER the enqueue reports acceptance —
     # a file whose durable copy failed (unreadable source, full disk) stays
     # pending, keeps its old manifest entry, and is retried next tick.
-    to_ingest: list[tuple[str, Path]] = []
+    settled: list[tuple[str, str]] = []
     for relpath, fs in file_table.items():
         reason = _should_ingest_changes(
             now,
@@ -732,16 +735,25 @@ async def _tick_root(
             fs.pending,
             cfg,
         )
-        if reason is None:
+        if reason is not None:
+            settled.append((relpath, reason))
+    present = (
+        await store_io(_present_relpaths, root, [relpath for relpath, _ in settled])
+        if settled
+        else set()
+    )
+    to_ingest: list[tuple[str, Path]] = []
+    for relpath, reason in settled:
+        if relpath not in present:
             continue
         abs_path = root / relpath
-        if not abs_path.is_file():
-            continue
         _LOG.info("folder-watch: queuing %s (%s)", abs_path.name, reason)
         to_ingest.append((relpath, abs_path))
 
     if not to_ingest:
-        _save_manifest(mf_path, _manifest_for_persist(manifest, new_manifest, file_table))
+        await store_io(
+            _save_manifest, mf_path, _manifest_for_persist(manifest, new_manifest, file_table)
+        )
         return
 
     # Enqueue via the ingest queue for this vault; per-path acceptance drives
@@ -755,10 +767,11 @@ async def _tick_root(
         _LOG.exception("folder-watch: enqueue failed for %s; will retry", root)
         accepted = set()
 
+    resolved = await store_io(_resolved_paths, [abs_path for _, abs_path in to_ingest])
     fired_names: list[str] = []
-    for relpath, abs_path in to_ingest:
+    for (relpath, abs_path), resolved_path in zip(to_ingest, resolved, strict=True):
         fs = file_table[relpath]
-        if str(abs_path.resolve()) in accepted:
+        if resolved_path in accepted:
             fs.last_enqueue_at = now
             fs.pending = False
             fired_names.append(abs_path.name)
@@ -781,7 +794,32 @@ async def _tick_root(
 
     # Persist post-enqueue: fired files carry their new sha; anything still
     # pending keeps the pre-edit entry so a restart re-detects it.
-    _save_manifest(mf_path, _manifest_for_persist(manifest, new_manifest, file_table))
+    await store_io(
+        _save_manifest, mf_path, _manifest_for_persist(manifest, new_manifest, file_table)
+    )
+
+
+def _vanished_relpaths(root: Path, relpaths: list[str]) -> list[str]:
+    """Relpaths that are really gone. ``is_file()`` raises (not just returns
+    False) when a PARENT directory loses search permission; that counts as
+    "still present" so the entry retries once access is restored."""
+    gone: list[str] = []
+    for relpath in relpaths:
+        try:
+            still_present = (root / relpath).is_file()
+        except OSError:
+            still_present = True
+        if not still_present:
+            gone.append(relpath)
+    return gone
+
+
+def _present_relpaths(root: Path, relpaths: list[str]) -> set[str]:
+    return {relpath for relpath in relpaths if (root / relpath).is_file()}
+
+
+def _resolved_paths(paths: list[Path]) -> list[str]:
+    return [str(path.resolve()) for path in paths]
 
 
 async def run_folder_watch(state: "ServerState") -> None:
@@ -842,9 +880,12 @@ async def _poll_tick(
 
     now = time.time()
 
-    # Enumerate all known vaults.
+    # Enumerate all known vaults. Registry scan, config reads, runtime
+    # resolution and root probes run on the store executor (issue #13).
     try:
-        entries = list_vaults(current=state.vault_path if state.vault_path else None)
+        entries = await store_io(
+            list_vaults, current=state.vault_path if state.vault_path else None
+        )
     except Exception:  # noqa: BLE001
         return
 
@@ -853,7 +894,7 @@ async def _poll_tick(
         vp_str = str(vault_path)
 
         try:
-            cfg = _load_folder_watch_config(vault_path)
+            cfg = await store_io(_load_folder_watch_config, vault_path)
         except Exception:  # noqa: BLE001
             continue
 
@@ -878,7 +919,9 @@ async def _poll_tick(
             continue
 
         multi_runtime = bool(getattr(state, "multi_vault_runtime_enabled", False))
-        target_state = state.runtime_for(vault_path) if multi_runtime else state
+        target_state = (
+            await store_io(state.runtime_for, vault_path) if multi_runtime else state
+        )
         if multi_runtime and target_state.draining:
             _write_status(
                 vp_str,
@@ -894,9 +937,8 @@ async def _poll_tick(
         # Preserve the old single-fallback behavior only for direct ServerState
         # test fixtures and compatibility callers. Production resolves an
         # immutable target above, so every registered watch continues.
-        is_active = (
-            state.vault_path is not None
-            and vault_path.resolve() == Path(state.vault_path).resolve()
+        is_active = state.vault_path is not None and await store_io(
+            _same_resolved_path, vault_path, Path(state.vault_path)
         )
         if not multi_runtime and not is_active:
             if vp_str not in inactive_warned:
@@ -941,9 +983,7 @@ async def _poll_tick(
         # Collapse nested/duplicate roots so a subtree is descended once
         # (the "tracking/tracking" double-descent) — the per-root debounce
         # keep-set and the tick loop both work off the deduped list.
-        resolved_roots = _dedupe_roots(
-            [Path(root_str).expanduser().resolve() for root_str in cfg.roots]
-        )
+        resolved_roots = await store_io(_resolved_roots, list(cfg.roots))
         current_roots = {str(root) for root in resolved_roots}
         for stale in [r for r in vs.file_states if r not in current_roots]:
             vs.file_states.pop(stale, None)
@@ -958,7 +998,7 @@ async def _poll_tick(
                 continue
             lp[r_str] = now
 
-            if not root.is_dir():
+            if not await store_io(root.is_dir):
                 _LOG.debug("folder-watch: root not found, skipping: %s", root)
                 continue
 
@@ -974,6 +1014,14 @@ async def _poll_tick(
                 _LOG.exception("folder-watch: unhandled error ticking root %s; will retry", root)
 
         _write_status(vp_str, enabled=cfg.enabled, roots=list(cfg.roots), now=now, vs=vs, cfg=cfg)
+
+
+def _same_resolved_path(left: Path, right: Path) -> bool:
+    return left.resolve() == right.resolve()
+
+
+def _resolved_roots(roots: list[str]) -> list[Path]:
+    return _dedupe_roots([Path(root_str).expanduser().resolve() for root_str in roots])
 
 
 async def _enqueue_for_vault(
@@ -1005,7 +1053,7 @@ async def _enqueue_for_vault(
         )
     sources = target_path / ".marginalia" / "sources"
     accepted: set[str] = set()
-    queued = _ingest_queue.enqueue_paths(
+    queued = await _ingest_queue.enqueue_paths_async(
         state, paths, sources, rel_root=rel_root, accepted_srcs=accepted
     )
     # Wake the worker whenever ANYTHING is queued — not only when this enqueue

@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from okto_neuron.companion import LLMUnavailableError, RememberCancelled
 from okto_neuron.server._integrity import IntegrityFenceError, require_write_allowed
+from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, store_io
 
 if TYPE_CHECKING:
     from okto_neuron.server.state import ServerState
@@ -180,9 +182,13 @@ def _next_id(state: "ServerState", path: str) -> str:
     id then collides with a still-present item (the live-run audit observed the
     same id on distinct items). ``rehydrate_queue`` seeds the counter past every
     persisted id."""
-    seq = int(getattr(state, "ingest_seq", 0) or 0)
-    state.ingest_seq = seq + 1
+    with _ID_LOCK:
+        seq = int(getattr(state, "ingest_seq", 0) or 0)
+        state.ingest_seq = seq + 1
     return f"{seq}-{hashlib.sha1(path.encode('utf-8')).hexdigest()[:8]}"
+
+
+_ID_LOCK = threading.Lock()
 
 
 # ── restart-durable persistence (Feature 1) ───────────────────────────────────
@@ -293,7 +299,18 @@ def persist(state: "ServerState") -> None:
     Local-only queue history: records status/progress plus bounded inspector
     events. Those events may include chunk text and LLM request/response bodies.
     Best-effort — a persistence failure must never abort an in-flight ingest, so
-    OS errors are swallowed (the queue stays correct in memory)."""
+    OS errors are swallowed (the queue stays correct in memory). Writers are
+    serialized and snapshot INSIDE the lock, so whichever write lands last
+    carries the newest queue even when store-executor threads persist
+    concurrently (issue #13)."""
+    with _PERSIST_LOCK:
+        _persist_locked(state)
+
+
+_PERSIST_LOCK = threading.Lock()
+
+
+def _persist_locked(state: "ServerState") -> None:
     path = history_path(state)
     # Snapshot the list first: the drain worker runs ``remember`` off the event
     # loop and may append/mutate concurrently, so iterate a stable copy.
@@ -551,13 +568,53 @@ def enqueue_paths(
     of dedup refreshes — so callers can tell "everything was already queued"
     apart from "nothing enqueued".
     """
-    import shutil
-
     if getattr(state, "draining", False):
         raise RuntimeError("vault runtime is draining; cannot enqueue ingest work")
+    copied = _copy_sources(paths, sources_dir, rel_root)
+    stats = stats if stats is not None else {}
+    items = _register_copied(state, copied, accepted_srcs=accepted_srcs, stats=stats)
+    if items or stats.get("refreshed"):
+        persist(state)
+    return items
+
+
+async def enqueue_paths_async(
+    state: "ServerState",
+    paths: list[Path],
+    sources_dir: Path,
+    *,
+    rel_root: Path | None = None,
+    accepted_srcs: set[str] | None = None,
+    stats: dict | None = None,
+) -> list[IngestItem]:
+    """:func:`enqueue_paths` for event-loop callers (issue #13).
+
+    The durable copies and the sidecar write run on the store executor; the
+    dedup check and the append stay on the loop, where the drain worker flips
+    statuses, so the queued-check still cannot race the worker.
+    """
+    if getattr(state, "draining", False):
+        raise RuntimeError("vault runtime is draining; cannot enqueue ingest work")
+    copied = await store_io(_copy_sources, paths, sources_dir, rel_root)
+    stats = stats if stats is not None else {}
+    items = _register_copied(state, copied, accepted_srcs=accepted_srcs, stats=stats)
+    if items or stats.get("refreshed"):
+        await store_io(persist, state)
+    return items
+
+
+def _copy_sources(
+    paths: list[Path], sources_dir: Path, rel_root: Path | None
+) -> list[tuple[Path, str, str]]:
+    """Copy each readable source into the durable sources dir.
+
+    Returns ``(source, resolved source path, resolved durable copy path)`` for
+    every file copied; an unreadable file is skipped rather than aborting the
+    whole batch."""
+    import shutil
+
     sources_dir.mkdir(parents=True, exist_ok=True)
-    items: list[IngestItem] = []
-    refreshed = 0
+    copied: list[tuple[Path, str, str]] = []
     for p in paths:
         src_abs = str(p.resolve())
         target = durable_copy_path(sources_dir, p, rel_root)
@@ -566,7 +623,21 @@ def enqueue_paths(
             shutil.copy2(p, target)
         except OSError:
             continue  # unreadable file — skip rather than abort the whole batch
-        abs = str(target.resolve())
+        copied.append((p, src_abs, str(target.resolve())))
+    return copied
+
+
+def _register_copied(
+    state: "ServerState",
+    copied: list[tuple[Path, str, str]],
+    *,
+    accepted_srcs: set[str] | None,
+    stats: dict,
+) -> list[IngestItem]:
+    """Dedup-or-append already-copied sources; no I/O."""
+    items: list[IngestItem] = []
+    refreshed = 0
+    for p, src_abs, abs in copied:
         existing = next(
             (i for i in state.ingest_queue if i.path == abs and i.status == "queued"),
             None,
@@ -589,10 +660,7 @@ def enqueue_paths(
         items.append(item)
         if accepted_srcs is not None:
             accepted_srcs.add(src_abs)
-    if stats is not None:
-        stats["refreshed"] = refreshed
-    if items or refreshed:
-        persist(state)
+    stats["refreshed"] = refreshed
     return items
 
 
@@ -603,18 +671,44 @@ def enqueue_uploads(
     dir (trust root), then queue them."""
     if getattr(state, "draining", False):
         raise RuntimeError("vault runtime is draining; cannot enqueue ingest work")
+    items = _register_uploads(state, _write_uploads(files, sources_dir))
+    if items:
+        persist(state)
+    return items
+
+
+async def enqueue_uploads_async(
+    state: "ServerState", files: list[tuple[str, str]], sources_dir: Path
+) -> list[IngestItem]:
+    """:func:`enqueue_uploads` for event-loop callers: file writes and the
+    sidecar write run on the store executor, the append stays on the loop."""
+    if getattr(state, "draining", False):
+        raise RuntimeError("vault runtime is draining; cannot enqueue ingest work")
+    written = await store_io(_write_uploads, files, sources_dir)
+    items = _register_uploads(state, written)
+    if items:
+        await store_io(persist, state)
+    return items
+
+
+def _write_uploads(files: list[tuple[str, str]], sources_dir: Path) -> list[tuple[str, str]]:
+    """Materialize uploads; returns ``(display name, resolved path)`` per file."""
     sources_dir.mkdir(parents=True, exist_ok=True)
-    items: list[IngestItem] = []
+    written: list[tuple[str, str]] = []
     for raw_name, content in files:
         target = upload_target_path(sources_dir, raw_name, content)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        abs = str(target.resolve())
-        item = IngestItem(id=_next_id(state, abs), name=target.name, path=abs)
+        written.append((target.name, str(target.resolve())))
+    return written
+
+
+def _register_uploads(state: "ServerState", written: list[tuple[str, str]]) -> list[IngestItem]:
+    items: list[IngestItem] = []
+    for name, abs in written:
+        item = IngestItem(id=_next_id(state, abs), name=name, path=abs)
         state.ingest_queue.append(item)
         items.append(item)
-    if items:
-        persist(state)
     return items
 
 
@@ -625,6 +719,7 @@ def record_completed(
     path: str,
     committed: int = 1,
     stage: str = "stored",
+    persist_now: bool = True,
 ) -> IngestItem:
     """Record an already-completed deterministic store in the durable queue.
 
@@ -653,7 +748,8 @@ def record_completed(
     # ADR 0009 P4: a deterministic REST /add store is in-process ingest activity
     # too; signal the continuous curation scheduler.
     _note_ingest(state)
-    persist(state)
+    if persist_now:
+        persist(state)
     return item
 
 
@@ -757,17 +853,46 @@ def verify_receipt(state: "ServerState", item: IngestItem) -> dict:
     mirrors ``_item_retryable``'s own "no quality means legacy/unclassified"
     treatment of an empty outcome.
     """
+    if not _receipt_check_needed(item):
+        return {}
+    verification = _graph_receipt_state(_receipt_store(state), item.path)
+    return _apply_receipt(state, item, verification, persist_now=True)
+
+
+async def verify_receipt_async(state: "ServerState", item: IngestItem) -> dict:
+    """:func:`verify_receipt` for event-loop callers (issue #13): the graph
+    lookups and the sidecar write run on the store executor; the item itself is
+    only updated on the loop, where the drain worker also updates items."""
+    if not _receipt_check_needed(item):
+        return {}
+    verification = await store_io(_graph_receipt_state, _receipt_store(state), item.path)
+    before = item.outcome.get("graph_verification") if isinstance(item.outcome, dict) else None
+    outcome = _apply_receipt(state, item, verification, persist_now=False)
+    if outcome and outcome.get("graph_verification") != before:
+        await store_io(persist, state)
+    return outcome
+
+
+def _receipt_check_needed(item: IngestItem) -> bool:
     if item.status != "done":
-        return {}
+        return False
     outcome_in = item.outcome if isinstance(item.outcome, dict) else {}
-    if not str(outcome_in.get("quality") or "").strip():
-        return {}
+    return bool(str(outcome_in.get("quality") or "").strip())
+
+
+def _receipt_store(state: "ServerState") -> object:
     vault = getattr(state, "vault", None)
-    store = getattr(vault, "store", None)
-    verification = _graph_receipt_state(store, item.path)
+    return getattr(vault, "store", None)
+
+
+def _apply_receipt(
+    state: "ServerState", item: IngestItem, verification: dict, *, persist_now: bool
+) -> dict:
     if not verification.get("checked"):
         return {}
-    outcome = outcome_in
+    if not _receipt_check_needed(item):
+        return {}
+    outcome = item.outcome
     previous = outcome.get("graph_verification")
     changed = previous != verification
     outcome["graph_verification"] = verification
@@ -789,7 +914,8 @@ def verify_receipt(state: "ServerState", item: IngestItem) -> dict:
                 verification,
                 persist_now=False,
             )
-        persist(state)
+        if persist_now:
+            persist(state)
     return outcome
 
 
@@ -798,6 +924,19 @@ def item_detail(state: "ServerState", item_id: str) -> dict | None:
     if item is None:
         return None
     verify_receipt(state, item)
+    return _item_detail_payload(state, item)
+
+
+async def item_detail_async(state: "ServerState", item_id: str) -> dict | None:
+    """:func:`item_detail` with the receipt check off the event loop."""
+    item = next((i for i in state.ingest_queue if i.id == item_id), None)
+    if item is None:
+        return None
+    await verify_receipt_async(state, item)
+    return _item_detail_payload(state, item)
+
+
+def _item_detail_payload(state: "ServerState", item: IngestItem) -> dict:
     return {
         "status": "ok",
         "vault": _vault_payload(state),
@@ -824,7 +963,7 @@ def _cancel_queued_items(state: "ServerState") -> int:
     return cancelled
 
 
-def cancel(state: "ServerState") -> dict:
+def cancel(state: "ServerState", *, persist_now: bool = True) -> dict:
     """Request a cooperative bulk-ingest stop.
 
     Queued files become terminal immediately. The processing file stops at the
@@ -855,7 +994,8 @@ def cancel(state: "ServerState") -> dict:
             )
     if not state.ingest_worker_active:
         state.ingest_cancel_requested = False
-    persist(state)
+    if persist_now:
+        persist(state)
     snap = snapshot(state)
     snap["cancelled"] = cancelled
     return snap
@@ -898,7 +1038,13 @@ def _item_retryable(item: IngestItem) -> bool:
     return quality == "partial" and bool(item.provider_error)
 
 
-def retry_item(state: "ServerState", item_id: str) -> tuple[IngestItem | None, str | None]:
+def retry_item(
+    state: "ServerState",
+    item_id: str,
+    *,
+    verify: bool = True,
+    persist_now: bool = True,
+) -> tuple[IngestItem | None, str | None]:
     """Re-enqueue a failed or provider-degraded item for the drain worker.
 
     New outcomes are retryable only when at least one failed unit says so;
@@ -914,8 +1060,10 @@ def retry_item(state: "ServerState", item_id: str) -> tuple[IngestItem | None, s
         return None, "not_found"
     # Task #13: a sidecar-only "done" can be stale (graph content lost to an
     # unclean shutdown before the next checkpoint) — re-check the live graph
-    # before trusting the sidecar's retryability verdict.
-    verify_receipt(state, item)
+    # before trusting the sidecar's retryability verdict. ``verify=False`` means
+    # the caller already ran :func:`verify_receipt_async` off the event loop.
+    if verify:
+        verify_receipt(state, item)
     if not _item_retryable(item):
         return item, "conflict"
     # Same-path dedup (mirrors enqueue_paths): if this durable path already has
@@ -950,11 +1098,14 @@ def retry_item(state: "ServerState", item_id: str) -> tuple[IngestItem | None, s
     item.stage_progress_done = 0
     item.stage_progress_total = 0
     record_event(state, item, "retried", "Re-queued after error", persist_now=False)
-    persist(state)
+    if persist_now:
+        persist(state)
     return item, None
 
 
-def delete_item(state: "ServerState", item_id: str) -> tuple[IngestItem | None, str | None]:
+def delete_item(
+    state: "ServerState", item_id: str, *, persist_now: bool = True
+) -> tuple[IngestItem | None, str | None]:
     """Remove a terminal (done/error/cancelled) item from the queue history.
 
     Returns ``(item, error_code)`` with the same shape as :func:`retry_item`;
@@ -966,14 +1117,20 @@ def delete_item(state: "ServerState", item_id: str) -> tuple[IngestItem | None, 
     if item.status not in _TERMINAL:
         return item, "conflict"
     state.ingest_queue.remove(item)
-    persist(state)
+    if persist_now:
+        persist(state)
     return item, None
 
 
 def ensure_worker(
     state: "ServerState", companion_factory: Callable[[object], SupportsRemember]
 ) -> None:
-    """Start the drain worker if one isn't already running."""
+    """Start the drain worker if one isn't already running.
+
+    Safe to call from a store-executor thread: the start is handed back to the
+    event loop that dispatched that work."""
+    if call_soon_on_loop(ensure_worker, state, companion_factory):
+        return
     if getattr(state, "draining", False) or state.ingest_worker_active:
         return
     state.ingest_cancel_requested = False
@@ -1202,7 +1359,7 @@ async def _checkpoint_after_drain(state: "ServerState", vault: object) -> None:
     if not callable(checkpoint):
         return
     try:
-        await asyncio.to_thread(checkpoint)
+        await store_io(checkpoint)
     except Exception:
         _LOG.warning(
             "post-drain checkpoint failed for vault %s; the graph stays "
@@ -1229,7 +1386,7 @@ async def _drain(
             if getattr(state, "ingest_cancel_requested", False):
                 # Catch files enqueued while the active item was winding down.
                 if _cancel_queued_items(state):
-                    persist(state)
+                    await store_io(persist, state)
                 break
             item = next((i for i in state.ingest_queue if i.status == "queued"), None)
             if item is None:
@@ -1245,7 +1402,8 @@ async def _drain(
                 {"path": item.path},
                 persist_now=False,
             )
-            persist(state)  # transition is now durable before the slow LLM call
+            # transition is now durable before the slow LLM call
+            await store_io(persist, state)
             on_progress = _make_on_progress(state, item)
             on_event = _make_on_event(state, item)
             try:
@@ -1259,7 +1417,8 @@ async def _drain(
                 # Prove it produced a context manager before entering it.
                 lease_context: contextlib.AbstractContextManager[Any] = contextlib.nullcontext()
                 if callable(lease_factory):
-                    leased = lease_factory()
+                    # Leasing may open the vault under the pool lock: off-loop.
+                    leased = await acquire_off_loop(lease_factory)
                     if not isinstance(leased, contextlib.AbstractContextManager):
                         raise TypeError("lease_vault() must return a context manager")
                     lease_context = leased
@@ -1270,7 +1429,7 @@ async def _drain(
                     async with state.writer_lock:
                         vault = leased_vault or getattr(state, "vault", None)
                         if vault is not None:
-                            await asyncio.to_thread(require_write_allowed, state, vault)
+                            await store_io(require_write_allowed, state, vault)
                         companion = companion_factory(state)
                         # remember() is synchronous and blocks on the LLM HTTP call;
                         # run it off the event loop so /ingest-queue polls and reads
@@ -1365,7 +1524,9 @@ async def _drain(
                     from okto_neuron.server import _curation
 
                     previous_outcome = item.outcome
-                    item.outcome = _curation.attach_verified_reconciliation_outcome(
+                    # Reads the vault config and persists job/queue sidecars.
+                    item.outcome = await store_io(
+                        _curation.attach_verified_reconciliation_outcome,
                         state,
                         item.outcome,
                         trigger="verified_file_commit",
@@ -1469,7 +1630,7 @@ async def _drain(
                     {"error": item.error},
                     persist_now=False,
                 )
-            persist(state)  # always persist the terminal status
+            await store_io(persist, state)  # always persist the terminal status
             await asyncio.sleep(0)  # yield so /ingest-queue polls stay responsive
     finally:
         state.ingest_worker_active = False

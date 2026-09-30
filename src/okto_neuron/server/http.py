@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import inspect
 import ipaddress
@@ -21,6 +22,7 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 import uuid
 from collections import Counter
@@ -70,6 +72,7 @@ from okto_neuron.server import _curation, _jobs, _scheduler
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
+from okto_neuron.server._store_io import acquire_off_loop, single_flight, store_io
 from okto_neuron.server._vault_pool import VaultPoolError
 from okto_neuron.server.lifecycle import request_id as bind_request_id
 from okto_neuron.server.state import (
@@ -311,6 +314,21 @@ async def _read_json(request: Request) -> dict[str, Any]:
     return payload
 
 
+class _ApiError(Exception):
+    """A named store operation's client-facing failure, raised off the event loop
+    and turned into the same structured JSON error body by its handler."""
+
+    def __init__(self, status: int, code: str, detail: str, **extra: Any) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.code = code
+        self.detail = detail
+        self.extra = extra
+
+    def response(self) -> JSONResponse:
+        return _err(self.status, self.code, self.detail, **self.extra)
+
+
 class _BadRequest(Exception):
     """Internal sentinel for 400 responses raised inside handlers."""
 
@@ -436,7 +454,7 @@ async def _writer_lock_fast(
         raise _LockBusy from None
     try:
         if verify_write_allowed:
-            await asyncio.to_thread(graph_integrity.require_write_allowed, state, state.vault)
+            await store_io(graph_integrity.require_write_allowed, state, state.vault)
         yield
     finally:
         if acquired:
@@ -859,7 +877,8 @@ class ActiveVaultMiddleware:
             return
         try:
             state = get_server_state()
-            runtime = _resolve_rest_runtime(state, selector)
+            # Registry scan + runtime rehydrate read YAML/sidecars: off-loop.
+            runtime = await store_io(_resolve_rest_runtime, state, selector)
         except AmbiguousVaultNameError as exc:
             response = _err(409, "ambiguous_vault", str(exc))
             await response(scope, receive, send)
@@ -907,7 +926,9 @@ class ActiveVaultMiddleware:
             return
 
         try:
-            lease = runtime.lease_vault()
+            # A lease may open the vault under the pool lock (seconds for a cold
+            # or large graph): never on the loop that also serves /health.
+            lease = await acquire_off_loop(runtime.lease_vault)
         except VaultPoolError as exc:
             status = 503 if exc.code == "pool_full" else 409
             response = _err(status, exc.code, str(exc))
@@ -981,7 +1002,12 @@ async def api_status(request: Request) -> JSONResponse:
     state = get_state()
     if state.shutting_down:
         return _draining_response()
+    payload = await store_io(_status_payload, state)
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
+
+def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
+    """Store op: discover runtimes, read integrity verdicts and backend pins."""
     now = time.time()
     reasons: list[str] = []
     application_scope = isinstance(state, ServerState)
@@ -1159,7 +1185,7 @@ async def api_status(request: Request) -> JSONResponse:
             extra={"event": "health_recovered"},
         )
     state.last_degraded_reasons = current_reason_keys
-    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+    return payload
 
 
 async def version(request: Request) -> JSONResponse:
@@ -1209,7 +1235,7 @@ def _vaults_payload(state: ServerState) -> dict[str, object]:
 
 
 async def api_vaults(request: Request) -> JSONResponse:
-    return JSONResponse(_vaults_payload(get_state()))
+    return JSONResponse(await store_io(_vaults_payload, get_state()))
 
 
 async def api_backends(request: Request) -> JSONResponse:
@@ -1223,7 +1249,12 @@ async def api_backends(request: Request) -> JSONResponse:
     registered a capabilities entry (a valid, if unusual, state — see
     ``capabilities_for``'s own docstring).
     """
-    backends = [
+    # Entry-point discovery reads installed package metadata from disk.
+    return JSONResponse(await store_io(_backends_payload))
+
+
+def _backends_payload() -> list[dict[str, Any]]:
+    return [
         {
             "name": name,
             "capabilities": (
@@ -1232,7 +1263,6 @@ async def api_backends(request: Request) -> JSONResponse:
         }
         for name in list_graph_backends()
     ]
-    return JSONResponse(backends)
 
 
 def _parse_packs(raw: Any) -> list[str]:
@@ -1439,15 +1469,14 @@ async def api_vault_create(request: Request) -> JSONResponse:
         return _err(400, "bad_request", exc.detail)
 
     try:
-        ensure_global_layout()
-        target_path = vault_path_for_name(name.strip())
+        target_path, exists = await store_io(_vault_create_target, name.strip())
     except ValueError as exc:
         return _err(400, "bad_request", str(exc))
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("vault layout initialization failed")
         return _err(500, "vault_create_failed", f"vault layout initialization failed: {exc}")
 
-    if is_vault(target_path):
+    if exists:
         return _err(409, "vault_exists", f"vault already exists: {target_path}")
 
     # Creation is application-level and touches a brand-new path. Serialize only
@@ -1456,7 +1485,7 @@ async def api_vault_create(request: Request) -> JSONResponse:
     # rewrites the process fallback or waits for another vault's workers.
     async with state.config_lock:
         try:
-            await asyncio.to_thread(
+            await store_io(
                 _initialize_managed_vault,
                 state,
                 target_path,
@@ -1471,10 +1500,10 @@ async def api_vault_create(request: Request) -> JSONResponse:
                 storage_database=storage_database.strip() if storage_database else None,
                 allow_remote_db=allow_remote_db,
             )
-            # Runtime state stays on the event-loop side. Its graph handle opens
-            # lazily on the first scoped request rather than retaining the init
-            # handle from a worker whose caller may have been cancelled.
-            state.runtime_for(target_path, rehydrate=True)
+            # Its graph handle opens lazily on the first scoped request rather
+            # than retaining the init handle from a worker whose caller may have
+            # been cancelled. Registration rehydrates sidecars, so it is a store op.
+            await store_io(state.runtime_for, target_path, rehydrate=True)
         except FileExistsError:
             return _err(409, "vault_exists", f"vault already exists: {target_path}")
         except VaultPoolError as exc:
@@ -1485,8 +1514,19 @@ async def api_vault_create(request: Request) -> JSONResponse:
             _LOG.exception("vault create failed")
             return _err(500, "vault_create_failed", f"vault create failed: {exc}")
 
+    return JSONResponse(await store_io(_vault_created_payload, state, target_path))
+
+
+def _vault_create_target(name: str) -> tuple[Path, bool]:
+    """Store op: ensure the app layout, map ``name`` to its path, probe it."""
+    ensure_global_layout()
+    target_path = vault_path_for_name(name)
+    return target_path, is_vault(target_path)
+
+
+def _vault_created_payload(state: ServerState, target_path: Path) -> dict[str, object]:
     payload = _vaults_payload(state)
-    created = next(
+    payload["created"] = next(
         (
             entry.to_json()
             for entry in _vault_entries(state)
@@ -1494,8 +1534,7 @@ async def api_vault_create(request: Request) -> JSONResponse:
         ),
         None,
     )
-    payload["created"] = created
-    return JSONResponse(payload)
+    return payload
 
 
 def _runtime_delete_busy(runtime: VaultRuntime) -> dict[str, int | bool]:
@@ -1524,13 +1563,13 @@ async def _run_blocking_to_completion(
 ) -> tuple[Any | None, Exception | None, asyncio.CancelledError | None]:
     """Wait for one worker operation even if its request task is cancelled.
 
-    ``asyncio.to_thread`` cannot stop its worker when the awaiting task is
+    A store-executor worker cannot be stopped when the awaiting task is
     cancelled. Shield the worker and remember cancellation instead, so callers
     can finish state cleanup that depends on the worker's actual outcome before
     propagating cancellation. Repeated cancellation is handled by the same loop.
     """
 
-    worker = asyncio.create_task(asyncio.to_thread(operation))
+    worker = asyncio.ensure_future(store_io(operation))
     while True:
         try:
             return await asyncio.shield(worker), None, deferred_cancellation
@@ -1564,7 +1603,9 @@ async def api_vault_delete(request: Request) -> JSONResponse:
         return _err(400, "bad_request", "missing or invalid field: confirm_name")
 
     vault_id = request.path_params.get("vault_id")
-    entry = next((item for item in _vault_entries(state) if item.id == vault_id), None)
+    entry = next(
+        (item for item in await store_io(_vault_entries, state) if item.id == vault_id), None
+    )
     if entry is None:
         return _err(404, "vault_not_found", "vault is not registered")
     if confirm_name != entry.name:
@@ -1576,7 +1617,7 @@ async def api_vault_delete(request: Request) -> JSONResponse:
             entry.delete_reason or "this vault cannot be deleted by Okto Neuron",
         )
 
-    identity, guard_error = managed_vault_delete_guard(entry.path)
+    identity, guard_error = await store_io(managed_vault_delete_guard, entry.path)
     if identity is None or identity.id != entry.id:
         return _err(
             409,
@@ -1584,16 +1625,17 @@ async def api_vault_delete(request: Request) -> JSONResponse:
             guard_error or "vault identity does not match the registry entry",
         )
 
-    runtime = state.runtime_for(entry.path, rehydrate=True)
+    runtime = await store_io(state.runtime_for, entry.path, rehydrate=True)
     busy = _runtime_delete_busy(runtime)
     if any(bool(value) for value in busy.values()):
         return _err(409, "vault_busy", "vault has queued or running work", busy=busy)
 
     pool = state.vault_pool
-    pool.fence(entry.path)
-    # No await separates the fence from the runtime drain: requests are rejected
-    # by the former and supervisors/workers observe the latter.
+    # Workers observe the drain immediately (no await since the busy check);
+    # the pool fence, which takes the pool lock, then rejects new requests.
+    # Anything that leased in between is covered by the lease wait below.
     runtime.mark_draining()
+    await store_io(pool.fence, entry.path)
     active_fallback = state.vault_path == entry.path
     released = False
     default_cleared = False
@@ -1632,10 +1674,10 @@ async def api_vault_delete(request: Request) -> JSONResponse:
             # Configuration is the only reversible state outside the vault
             # directory. Clear it before the filesystem commit point; the
             # ``finally`` block restores it if release/guard/rmtree fails.
-            default_cleared = clear_default_vault(entry.path)
-            pool.release_path(entry.path, require_fenced=True)
+            default_cleared = await store_io(clear_default_vault, entry.path)
+            await store_io(pool.release_path, entry.path, require_fenced=True)
             released = True
-            identity_now, guard_error = managed_vault_delete_guard(entry.path)
+            identity_now, guard_error = await store_io(managed_vault_delete_guard, entry.path)
             if identity_now is None or identity_now.id != entry.id:
                 raise RuntimeError(
                     guard_error or "vault identity changed immediately before deletion"
@@ -1654,7 +1696,7 @@ async def api_vault_delete(request: Request) -> JSONResponse:
             state.vault_open_error = None
         runtime.draining = False
         try:
-            state.drop_runtime(entry.path)
+            await store_io(state.drop_runtime, entry.path)
         except Exception:  # noqa: BLE001 - deletion already committed
             # Do not report an ambiguous failure after the irreversible rmtree.
             # The fenced handle is gone; a stale in-memory runtime can only be
@@ -1670,7 +1712,9 @@ async def api_vault_delete(request: Request) -> JSONResponse:
         reopened = None
         if not filesystem_deleted:
             try:
-                identity_after, rollback_error = managed_vault_delete_guard(entry.path)
+                identity_after, rollback_error = await store_io(
+                    managed_vault_delete_guard, entry.path
+                )
             except Exception as exc:  # noqa: BLE001 - failed validation must quarantine
                 identity_after = None
                 rollback_error = f"rollback validation failed: {exc}"
@@ -1699,7 +1743,7 @@ async def api_vault_delete(request: Request) -> JSONResponse:
 
             if rollback_usable and default_cleared:
                 try:
-                    set_default_vault(entry.path)
+                    await store_io(set_default_vault, entry.path)
                 except Exception:  # noqa: BLE001
                     rollback_usable = False
                     _LOG.exception("could not restore default after failed vault deletion")
@@ -1714,7 +1758,7 @@ async def api_vault_delete(request: Request) -> JSONResponse:
                 # fail closed for the rest of this process.
                 if pool.peek(entry.path) is not None:
                     try:
-                        pool.release_path(entry.path, require_fenced=True)
+                        await store_io(pool.release_path, entry.path, require_fenced=True)
                     except Exception:  # noqa: BLE001
                         _LOG.exception("could not release unusable vault handle for %s", entry.path)
                 if active_fallback:
@@ -1723,21 +1767,21 @@ async def api_vault_delete(request: Request) -> JSONResponse:
                     state.vault_open_error = None
                 runtime.draining = False
                 try:
-                    state.drop_runtime(entry.path)
+                    await store_io(state.drop_runtime, entry.path)
                 except Exception:  # noqa: BLE001
                     _LOG.exception("could not drop unusable vault runtime for %s", entry.path)
                 finally:
                     runtime.mark_draining()
 
         if (filesystem_deleted or rollback_usable) and pool.is_fenced(entry.path):
-            pool.unfence(entry.path)
+            await store_io(pool.unfence, entry.path)
 
     if deferred_cancellation is not None:
         raise deferred_cancellation
     if failure_response is not None:
         return failure_response
 
-    response = _vaults_payload(state)
+    response = await store_io(_vaults_payload, state)
     response["deleted"] = {
         "id": entry.id,
         "name": entry.name,
@@ -1748,8 +1792,12 @@ async def api_vault_delete(request: Request) -> JSONResponse:
 
 async def api_vault_current(request: Request) -> JSONResponse:
     state = get_state()
+    return JSONResponse(await store_io(_vault_current_payload, state))
+
+
+def _vault_current_payload(state: ServerState) -> dict[str, object]:
     current = next((entry for entry in _vault_entries(state) if entry.current), None)
-    return JSONResponse({"status": "ok", "current": current.to_json() if current else None})
+    return {"status": "ok", "current": current.to_json() if current else None}
 
 
 def _reembed_status_payload(
@@ -1843,7 +1891,7 @@ def _open_and_install_fenced_sync(runtime: VaultRuntime) -> Vault:
 
 async def _open_and_install_fenced(runtime: VaultRuntime) -> Vault:
     """Async wrapper whose worker owns the full claim/open/install transaction."""
-    return await asyncio.to_thread(_open_and_install_fenced_sync, runtime)
+    return await store_io(_open_and_install_fenced_sync, runtime)
 
 
 def _set_runtime_open_warning(runtime: VaultRuntime, warning: dict[str, object] | None) -> None:
@@ -1860,6 +1908,13 @@ def _set_runtime_open_warning(runtime: VaultRuntime, warning: dict[str, object] 
         server.vault_open_error = warning
 
 
+def _kg_reembed(vault_path: Path) -> None:
+    # Imported here, on the worker: the CLI module is heavy to import on the loop.
+    from okto_neuron.cli.kg import kg_reembed
+
+    kg_reembed(vault_path)
+
+
 async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
     """Reembed exactly one fenced runtime, replacing its pooled handle safely."""
     pool = runtime.vault_pool
@@ -1874,12 +1929,12 @@ async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
                     "vault_in_use",
                     f"vault became leased during maintenance: {runtime.vault_path}",
                 )
-            pool.release_path(runtime.vault_path, require_fenced=True)
+            await store_io(pool.release_path, runtime.vault_path, require_fenced=True)
             released = True
 
-            from okto_neuron.cli.kg import kg_reembed
-
-            await asyncio.to_thread(kg_reembed, runtime.vault_path)
+            # Embedding-bound (minutes): stays on the default executor so it
+            # never occupies a store worker for the whole re-embed.
+            await asyncio.to_thread(_kg_reembed, runtime.vault_path)
             await _open_and_install_fenced(runtime)
             released = False
         _set_runtime_open_warning(runtime, None)
@@ -1894,7 +1949,11 @@ async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
         # original graph available. Restore a pool owner before lifting the
         # fence. If open itself fails, the next request receives a clean open
         # error instead of borrowing a known-closed handle.
-        if released and runtime.vault_path.exists() and pool.peek(runtime.vault_path) is None:
+        if (
+            released
+            and await store_io(runtime.vault_path.exists)
+            and pool.peek(runtime.vault_path) is None
+        ):
             try:
                 async with runtime.writer_lock, runtime.config_lock:
                     await _open_and_install_fenced(runtime)
@@ -1905,7 +1964,7 @@ async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
                 )
         runtime.vault_reembed_active = False
         runtime.draining = False
-        pool.unfence(runtime.vault_path)
+        await store_io(pool.unfence, runtime.vault_path)
 
 
 async def api_vault_reembed(request: Request) -> JSONResponse:
@@ -1921,7 +1980,7 @@ async def api_vault_reembed(request: Request) -> JSONResponse:
     try:
         payload = await _read_json(request)
         raw = _require(payload, "vault", str)
-        target_path = _resolve_repair_vault(raw)
+        target_path = await store_io(_resolve_repair_vault, raw)
     except _BadRequest as exc:
         return _err(400, "bad_request", exc.detail)
     except FileNotFoundError as exc:
@@ -1931,7 +1990,7 @@ async def api_vault_reembed(request: Request) -> JSONResponse:
     except ValueError as exc:
         return _err(400, "bad_request", str(exc))
 
-    runtime = state.runtime_for(target_path, rehydrate=True)
+    runtime = await store_io(state.runtime_for, target_path, rehydrate=True)
     if runtime.draining or runtime.vault_reembed_active:
         return _err(409, "busy", "this vault already has maintenance in progress")
     busy = _runtime_delete_busy(runtime)
@@ -1940,12 +1999,13 @@ async def api_vault_reembed(request: Request) -> JSONResponse:
     if state.vault_pool.is_fenced(target_path):
         return _err(409, "vault_fenced", "this vault is already fenced for maintenance")
 
-    # Fence and drain synchronously before returning 202, so a second request or
-    # background worker cannot enter the target during task scheduling.
-    state.vault_pool.fence(target_path)
+    # Claim and drain with no await since the checks above, so a second request
+    # or background worker cannot enter the target; the pool fence (which takes
+    # the pool lock) follows off-loop before 202 is returned.
     runtime.mark_draining()
     runtime.vault_reembed_active = True
     runtime.vault_reembed_path = str(target_path)
+    await store_io(state.vault_pool.fence, target_path)
     try:
         _start_owned_maintenance(
             runtime,
@@ -1955,13 +2015,13 @@ async def api_vault_reembed(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001
         runtime.vault_reembed_active = False
         runtime.draining = False
-        state.vault_pool.unfence(target_path)
+        await store_io(state.vault_pool.unfence, target_path)
         raise
     return JSONResponse(
         {
             "status": "started",
             "vault": str(target_path),
-            "reembed": _reembed_status_payload(runtime, target_path),
+            "reembed": await store_io(_reembed_status_payload, runtime, target_path),
         },
         status_code=202,
     )
@@ -1973,15 +2033,19 @@ async def api_vault_reembed_status(request: Request) -> JSONResponse:
     if not raw:
         return _err(400, "bad_request", "missing vault")
     try:
-        target_path = _resolve_repair_vault(raw)
+        return JSONResponse(await store_io(_vault_reembed_status_op, state, raw))
     except FileNotFoundError as exc:
         return _err(404, "vault_not_found", f"vault not found: {exc}")
     except AmbiguousVaultNameError as exc:
         return _err(409, "ambiguous_vault", str(exc))
     except ValueError as exc:
         return _err(400, "bad_request", str(exc))
+
+
+def _vault_reembed_status_op(state: ServerState, raw: str) -> dict[str, object]:
+    target_path = _resolve_repair_vault(raw)
     runtime = state.runtime_for(target_path, rehydrate=True)
-    return JSONResponse(_reembed_status_payload(runtime, target_path))
+    return _reembed_status_payload(runtime, target_path)
 
 
 def _maintenance_blocker(state: ServerState) -> dict[str, object] | None:
@@ -2065,13 +2129,13 @@ async def api_vault_switch(request: Request) -> JSONResponse:
         return _err(400, "bad_request", exc.detail)
 
     try:
-        target_path = resolve_vault_reference(raw)
+        target_path, target_is_vault = await store_io(_resolve_switch_target, raw)
     except AmbiguousVaultNameError as exc:
         return _err(409, "ambiguous_vault", str(exc))
     except ValueError as exc:
         return _err(400, "bad_request", str(exc))
 
-    if not is_vault(target_path):
+    if not target_is_vault:
         return _err(
             404,
             "vault_not_found",
@@ -2084,7 +2148,7 @@ async def api_vault_switch(request: Request) -> JSONResponse:
     async with state.config_lock:
         if state.vault_path is not None and target_path == state.vault_path:
             try:
-                set_default_vault(target_path)
+                await store_io(set_default_vault, target_path)
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("vault default update failed")
                 return _err(
@@ -2092,19 +2156,19 @@ async def api_vault_switch(request: Request) -> JSONResponse:
                     "vault_switch_failed",
                     f"vault default update failed: {exc}",
                 )
-            return JSONResponse(_vaults_payload(state))
+            return JSONResponse(await store_io(_vaults_payload, state))
 
         lease = None
         try:
-            runtime = state.runtime_for(target_path, rehydrate=True)
-            lease = await asyncio.to_thread(runtime.lease_vault)
+            runtime = await store_io(state.runtime_for, target_path, rehydrate=True)
+            lease = await acquire_off_loop(runtime.lease_vault)
             new_vault = lease.vault
-            set_default_vault(target_path)
-            state.switch_vault(new_vault, target_path)
+            await store_io(set_default_vault, target_path)
+            await store_io(state.switch_vault, new_vault, target_path)
             state.vault_open_error = None
         except EmbeddingDimMismatch as exc:
             state.vault_open_error = _vault_open_warning(target_path, exc)
-            return JSONResponse(_vaults_payload(state))
+            return JSONResponse(await store_io(_vaults_payload, state))
         except OktoNeuronError as exc:
             return _err(500, "vault_switch_failed", str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -2119,7 +2183,12 @@ async def api_vault_switch(request: Request) -> JSONResponse:
         if any(job.status == "queued" for job in runtime.curation_jobs):
             _jobs.ensure_worker(runtime)
 
-    return JSONResponse(_vaults_payload(state))
+    return JSONResponse(await store_io(_vaults_payload, state))
+
+
+def _resolve_switch_target(raw: str) -> tuple[Path, bool]:
+    target_path = resolve_vault_reference(raw)
+    return target_path, is_vault(target_path)
 
 
 def _safe_add_target(sources: Path, client_path: str) -> Path:
@@ -2192,38 +2261,7 @@ async def add(request: Request) -> JSONResponse:
         if state.draining:
             return _draining_response()
         try:
-            await asyncio.to_thread(graph_integrity.require_write_allowed, state, state.vault)
-            # Vault.add takes a path; materialize the posted content to a DURABLE
-            # location under the vault and ingest from there. The bytes MUST
-            # persist: a Block's provenance stores this path as source_path, and
-            # byte-range provenance is re-derived by re-reading + re-hashing the
-            # source on disk ("markdown/vault is canonical"). Unlinking it would
-            # leave that source_path dangling. We use .marginalia/sources/ — a
-            # dedicated durable dir, distinct from the runner's .marginalia/
-            # incoming inbox (which the runner drains and MOVES out), so an /add
-            # source is never re-ingested or relocated out from under its prov.
-            # The target is directory-aware (``_safe_add_target``): two posted
-            # paths sharing a basename in different directories (e.g.
-            # ``notes/a/README.md`` vs ``notes/b/README.md``) land at distinct
-            # files instead of collapsing onto one, which used to silently
-            # overwrite the first file's bytes and mint identical document ids
-            # for genuinely different documents.
-            sources = state.vault_path / ".marginalia" / "sources"
-            target = _safe_add_target(sources, path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            doc = state.vault.add(target)
-            # Record the deterministic store in the durable ingest queue so
-            # server-initiated /add is visible in /api/v1/ingest-queue and the UI.
-            # Same semantics (no LLM); stage="stored" distinguishes it from a full
-            # remember() extraction.
-            iq.record_completed(
-                state,
-                name=Path(path).name,
-                path=str(target),
-                committed=1,
-                stage="stored",
-            )
+            doc = await store_io(_add_materialized, state, path, content)
         except IntegrityFenceError as exc:
             return _integrity_fenced_response(exc)
         except IngestError as exc:
@@ -2244,6 +2282,43 @@ async def add(request: Request) -> JSONResponse:
             "embedding_model": EMBEDDING_MODEL,
         }
     )
+
+
+def _add_materialized(state: ServerState | VaultRuntime, path: str, content: str) -> Any:
+    """Store op for ``POST /add``; the caller holds the vault's writer lock."""
+    graph_integrity.require_write_allowed(state, state.vault)
+    # Vault.add takes a path; materialize the posted content to a DURABLE
+    # location under the vault and ingest from there. The bytes MUST
+    # persist: a Block's provenance stores this path as source_path, and
+    # byte-range provenance is re-derived by re-reading + re-hashing the
+    # source on disk ("markdown/vault is canonical"). Unlinking it would
+    # leave that source_path dangling. We use .marginalia/sources/ — a
+    # dedicated durable dir, distinct from the runner's .marginalia/
+    # incoming inbox (which the runner drains and MOVES out), so an /add
+    # source is never re-ingested or relocated out from under its prov.
+    # The target is directory-aware (``_safe_add_target``): two posted
+    # paths sharing a basename in different directories (e.g.
+    # ``notes/a/README.md`` vs ``notes/b/README.md``) land at distinct
+    # files instead of collapsing onto one, which used to silently
+    # overwrite the first file's bytes and mint identical document ids
+    # for genuinely different documents.
+    sources = state.vault_path / ".marginalia" / "sources"
+    target = _safe_add_target(sources, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    doc = state.vault.add(target)
+    # Record the deterministic store in the durable ingest queue so
+    # server-initiated /add is visible in /api/v1/ingest-queue and the UI.
+    # Same semantics (no LLM); stage="stored" distinguishes it from a full
+    # remember() extraction.
+    iq.record_completed(
+        state,
+        name=Path(path).name,
+        path=str(target),
+        committed=1,
+        stage="stored",
+    )
+    return doc
 
 
 def _query_with_recall_cost(vault: Any, text: str, *, k: int) -> tuple[list[Any], dict[str, Any]]:
@@ -2288,7 +2363,9 @@ async def query(request: Request) -> JSONResponse:
 
     try:
         # Off-load the blocking query (embedding + vector search) so the event
-        # loop stays responsive during a slow retrieval.
+        # loop stays responsive during a slow retrieval. Deliberately NOT a store
+        # op: the query embedding (and a cold model load) must not occupy one of
+        # the few store workers that serve graph reads.
         hits, metrics = await asyncio.to_thread(_query_with_recall_cost, state.vault, text, k=k)
     except QueryError as exc:
         return _err(500, "query_failed", str(exc))
@@ -2346,8 +2423,6 @@ async def detect_drift(request: Request) -> JSONResponse:
     root = Path(corpus_root)
     if not root.is_absolute():
         return _err(400, "bad_request", "corpus_root missing or not absolute")
-    if not root.exists():
-        return _err(404, "not_found", "corpus_root does not exist")
 
     # No writer_lock: every registered detector (see detectors.py) only reads
     # ``vault.store`` and returns Finding values — ``dry_run`` is echoed back but
@@ -2357,12 +2432,26 @@ async def detect_drift(request: Request) -> JSONResponse:
     # ingest/rebuild/heal/reembed for no reason (the module docstring in
     # state.py is explicit: "Read handlers MUST NOT acquire it").
     try:
-        by_detector = {name: run_detector(name, state.vault) for name in DETECTOR_NAMES}
+        body = await store_io(
+            _detect_drift_payload, state, root, dry_run, payload.get("mode", "on-query")
+        )
+    except _ApiError as exc:
+        return exc.response()
     except OktoNeuronError as exc:
         return _err(500, "drift_failed", str(exc))
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("unexpected drift failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
+    return JSONResponse(body)
+
+
+def _detect_drift_payload(
+    state: ServerState | VaultRuntime, root: Path, dry_run: bool, mode: Any
+) -> dict[str, Any]:
+    """Store op: run every drift detector and resolve each finding's subject."""
+    if not root.exists():
+        raise _ApiError(404, "not_found", "corpus_root does not exist")
+    by_detector = {name: run_detector(name, state.vault) for name in DETECTOR_NAMES}
 
     findings_json: list[dict[str, Any]] = []
     actions: list[dict[str, str]] = []
@@ -2373,25 +2462,23 @@ async def detect_drift(request: Request) -> JSONResponse:
     counts = {name: len(findings) for name, findings in by_detector.items()}
     total = len(findings_json)
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "schema_version": "drift.v1",
-            "vault_name": state.vault.root.name,
-            "vault_root": str(state.vault.root.resolve()),
-            "ran_at": datetime.now(timezone.utc).isoformat(),
-            "mode": payload.get("mode", "on-query"),
-            "findings": findings_json,
-            "counts": counts,
-            "total": total,
-            # back-compat keys (pre-drift.v1 clients):
-            "added": 0,
-            "removed": 0,
-            "changed": total,
-            "actions": actions,
-            "dry_run": dry_run,
-        }
-    )
+    return {
+        "status": "ok",
+        "schema_version": "drift.v1",
+        "vault_name": state.vault.root.name,
+        "vault_root": str(state.vault.root.resolve()),
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "findings": findings_json,
+        "counts": counts,
+        "total": total,
+        # back-compat keys (pre-drift.v1 clients):
+        "added": 0,
+        "removed": 0,
+        "changed": total,
+        "actions": actions,
+        "dry_run": dry_run,
+    }
 
 
 def _finding_payload(state: ServerState, finding: Any) -> dict[str, Any]:
@@ -2470,7 +2557,7 @@ async def remember(request: Request) -> JSONResponse:
         if state.draining:
             return _draining_response()
         try:
-            await asyncio.to_thread(graph_integrity.require_write_allowed, state, state.vault)
+            await store_io(graph_integrity.require_write_allowed, state, state.vault)
             # Off-load the blocking LLM extraction so the event loop stays
             # responsive; writer_lock still serializes the write.
             result = await asyncio.to_thread(
@@ -2505,7 +2592,9 @@ async def remember(request: Request) -> JSONResponse:
             log_remember_failure(exc, source)
             return _err(500, "internal", f"unexpected server error: {exc}")
 
-    remember_outcome = _curation.attach_verified_reconciliation_outcome(
+    # Reads the vault config and persists the job sidecar: store op.
+    remember_outcome = await store_io(
+        _curation.attach_verified_reconciliation_outcome,
         state,
         dict(getattr(result, "outcome", {}) or {}),
         trigger="verified_file_commit",
@@ -2548,7 +2637,9 @@ async def recall(request: Request) -> JSONResponse:
 
     try:
         # Off-load the blocking query (embedding + vector search) so the event
-        # loop stays responsive during a slow retrieval.
+        # loop stays responsive during a slow retrieval. Deliberately NOT a store
+        # op: the query embedding (and a cold model load) must not occupy one of
+        # the few store workers that serve graph reads.
         hits, metrics = await asyncio.to_thread(_query_with_recall_cost, state.vault, text, k=k)
     except QueryError as exc:
         return _err(500, "query_failed", str(exc))
@@ -2633,7 +2724,7 @@ async def review_queue(request: Request) -> JSONResponse:
     if state.shutting_down:
         return _draining_response()
     try:
-        items = _companion(state).review_queue_all()
+        items = await store_io(_review_queue_payload, state)
     except VaultClosedError as exc:
         return _err(503, "vault_closed", str(exc))
     except OktoNeuronError as exc:
@@ -2642,9 +2733,30 @@ async def review_queue(request: Request) -> JSONResponse:
         _LOG.exception("unexpected review_queue failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
 
-    return JSONResponse(
-        {"status": "ok", "items": [_review_item_payload(state, item) for item in items]}
+    return JSONResponse({"status": "ok", "items": items})
+
+
+def _review_queue_payload(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
+    """Store op: parse the review queue and attach source evidence.
+
+    Every evidence Block is fetched with ONE ``get_nodes`` batch per request
+    instead of one ``get_node`` round trip per item (thousands on a large queue).
+    """
+    items = _companion(state).review_queue_all()
+    payloads = [_review_item_payload(state, item) for item in items]
+    block_ids = [
+        str(payload["source_evidence"]["block_id"])
+        for payload in payloads
+        if payload["source_evidence"]["block_id"]
+    ]
+    blocks = (
+        {str(node.id): node for node in state.vault.store.get_nodes(block_ids)}
+        if block_ids
+        else {}
     )
+    for payload in payloads:
+        _attach_block_excerpt(payload["source_evidence"], blocks)
+    return payloads
 
 
 def _review_item_payload(state: ServerState, item: Any) -> dict[str, Any]:
@@ -2682,25 +2794,38 @@ def _review_item_payload(state: ServerState, item: Any) -> dict[str, Any]:
     else:
         raise ValueError(f"unknown review item kind: {kind!r}")
 
-    excerpt = None
-    excerpt_truncated = False
-    if block_id:
-        block = state.vault.store.get_node(str(block_id))
-        if block is not None and block.type == "Block":
-            text = str(block.content or "").strip()
-            excerpt = text[:500] if text else None
-            excerpt_truncated = len(text) > 500
-            source_path = source_path or str((block.facets or {}).get("source_path") or "")
+    # The evidence excerpt is attached by ``_attach_block_excerpt`` from one
+    # batched Block read for the whole queue.
     payload["source_evidence"] = {
         "source_path": source_path or None,
         "block_id": block_id,
         "byte_start": byte_start,
         "byte_end": byte_end,
         "content_hash": content_hash,
-        "excerpt": excerpt,
-        "excerpt_truncated": excerpt_truncated,
+        "excerpt": None,
+        "excerpt_truncated": False,
     }
     return payload
+
+
+def _attach_block_excerpt(evidence: dict[str, Any], blocks: dict[str, Any]) -> None:
+    block_id = evidence["block_id"]
+    if not block_id:
+        return
+    block = blocks.get(str(block_id))
+    if block is None or block.type != "Block":
+        return
+    text = str(block.content or "").strip()
+    evidence["excerpt"] = text[:500] if text else None
+    evidence["excerpt_truncated"] = len(text) > 500
+    evidence["source_path"] = evidence["source_path"] or (
+        str((block.facets or {}).get("source_path") or "") or None
+    )
+
+
+def _resolve_review_op(state: ServerState | VaultRuntime, candidate_id: str, action: str) -> Any:
+    """Store op: apply one review decision (graph write under the writer lock)."""
+    return _companion(state).resolve_review(candidate_id, action)  # type: ignore[arg-type]
 
 
 _REVIEW_ACTIONS = {"commit", "discard", "merge"}
@@ -2726,11 +2851,7 @@ async def resolve_review(request: Request) -> JSONResponse:
 
     try:
         async with _writer_lock_fast(state):
-            outcome = await asyncio.to_thread(
-                _companion(state).resolve_review,
-                candidate_id,
-                action,  # type: ignore[arg-type]
-            )
+            outcome = await store_io(_resolve_review_op, state, candidate_id, action)
     except IntegrityFenceError as exc:
         return _integrity_fenced_response(exc)
     except _LockBusy:
@@ -2803,8 +2924,8 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
 
     try:
         async with state.writer_lock:
-            await asyncio.to_thread(graph_integrity.require_write_allowed, state, state.vault)
-            result = await asyncio.to_thread(_run_batch)
+            await store_io(graph_integrity.require_write_allowed, state, state.vault)
+            result = await store_io(_run_batch)
     except IntegrityFenceError as exc:
         return _integrity_fenced_response(exc)
     except VaultClosedError as exc:
@@ -2824,6 +2945,41 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
 def _store(state: ServerState) -> Any:
     """Return the vault's GraphStore (typed loosely as ``object`` on Vault)."""
     return state.vault.store
+
+
+async def _graph_read(what: str, op: Callable[..., Any], *args: Any) -> Any:
+    """Run one KG-browser store op off the loop; map its failures to a response.
+
+    Returns the op's payload, or a ``JSONResponse`` for a failure. A typed
+    store/backend failure (e.g. GraphBackendError from a driver limit) carries
+    a real cause; it is reported instead of the bare catch-all's "internal
+    server error", which hid Grafx's 1024-element query cap.
+    """
+    try:
+        return await store_io(op, *args)
+    except _ApiError as exc:
+        return exc.response()
+    except VaultClosedError as exc:
+        return _err(503, "vault_closed", str(exc))
+    except OktoNeuronError as exc:
+        return _err(500, "graph_read_failed", str(exc))
+    except Exception:  # noqa: BLE001
+        _LOG.exception("unexpected %s failure", what)
+        return _internal_error()
+
+
+async def _graph_read_shared(what: str, key: Any, op: Callable[..., Any], *args: Any) -> Any:
+    """:func:`_graph_read` for an expensive full scan: concurrent identical
+    requests share ONE execution (single-flight) and its result or failure."""
+    try:
+        return await single_flight(key, op, *args)
+    except VaultClosedError as exc:
+        return _err(503, "vault_closed", str(exc))
+    except OktoNeuronError as exc:
+        return _err(500, "graph_read_failed", str(exc))
+    except Exception:  # noqa: BLE001
+        _LOG.exception("unexpected %s failure", what)
+        return _internal_error()
 
 
 def _node_summary(node: Any) -> dict[str, Any]:
@@ -2899,24 +3055,35 @@ async def api_nodes_list(request: Request) -> JSONResponse:
         return _err(400, "bad_request", "offset must be >= 0")
     include_structural = _include_structural(request)
 
-    try:
-        all_nodes = [
-            n
-            for n in _store(state).list_nodes(type=type_filter)
-            if str(getattr(n, "type", "")) in CLOSED_NODE_TYPES
-            and not is_infra(n)
-            and (include_structural or not _is_structural_claim(n))
-        ]
-    except VaultClosedError as exc:
-        return _err(503, "vault_closed", str(exc))
-    except OktoNeuronError as exc:
-        # A typed store/backend failure (e.g. GraphBackendError from a driver
-        # limit) carries a real cause; report it instead of the bare catch-all's
-        # "internal server error", which hid Grafx's 1024-element query cap.
-        return _err(500, "graph_read_failed", str(exc))
-    except Exception:  # noqa: BLE001
-        _LOG.exception("unexpected node-list failure")
-        return _internal_error()
+    body = await _graph_read(
+        "node-list",
+        _nodes_list_payload,
+        state,
+        type_filter,
+        q,
+        limit,
+        offset,
+        include_structural,
+    )
+    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+
+
+def _nodes_list_payload(
+    state: ServerState | VaultRuntime,
+    type_filter: str | None,
+    q: str,
+    limit: int,
+    offset: int,
+    include_structural: bool,
+) -> dict[str, Any]:
+    """Store op: filtered, equivalence-folded, paged node list."""
+    all_nodes = [
+        n
+        for n in _store(state).list_nodes(type=type_filter)
+        if str(getattr(n, "type", "")) in CLOSED_NODE_TYPES
+        and not is_infra(n)
+        and (include_structural or not _is_structural_claim(n))
+    ]
 
     if q:
         all_nodes = [n for n in all_nodes if _matches_query(n, q)]
@@ -2938,15 +3105,13 @@ async def api_nodes_list(request: Request) -> JSONResponse:
             row["variant_count"] = vc
         return row
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "nodes": [_summary_with_badge(n) for n in page],
-        }
-    )
+    return {
+        "status": "ok",
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "nodes": [_summary_with_badge(n) for n in page],
+    }
 
 
 def _provenance_payload(state: ServerState, node: Any) -> dict[str, Any] | None:
@@ -2965,40 +3130,30 @@ async def api_node_detail(request: Request) -> JSONResponse:
     if state.shutting_down:
         return _draining_response()
     node_id = request.path_params["id"]
+    body = await _graph_read("node-detail", _node_detail_payload, state, node_id)
+    return body if isinstance(body, JSONResponse) else JSONResponse(body)
 
-    try:
-        node = _store(state).get_node(node_id)
-        if (
-            node is None
-            or str(getattr(node, "type", "")) not in CLOSED_NODE_TYPES
-            or is_infra(node)
-        ):
-            return _err(404, "not_found", f"node not found: {node_id}")
-        out_edges = [
-            {"type": str(e.type), "dst": str(e.dst)} for e in _store(state).list_edges(src=node_id)
-        ]
-        in_edges = [
-            {"type": str(e.type), "src": str(e.src)} for e in _store(state).list_edges(dst=node_id)
-        ]
-        provenance = _provenance_payload(state, node)
-        block = None
-        if provenance and provenance.get("block_id"):
-            block_node = _store(state).get_node(provenance["block_id"])
-            if block_node is not None:
-                block = {
-                    "id": str(block_node.id),
-                    "facets": dict(getattr(block_node, "facets", {}) or {}),
-                }
-    except VaultClosedError as exc:
-        return _err(503, "vault_closed", str(exc))
-    except OktoNeuronError as exc:
-        # A typed store/backend failure (e.g. GraphBackendError from a driver
-        # limit) carries a real cause; report it instead of the bare catch-all's
-        # "internal server error", which hid Grafx's 1024-element query cap.
-        return _err(500, "graph_read_failed", str(exc))
-    except Exception:  # noqa: BLE001
-        _LOG.exception("unexpected node-detail failure")
-        return _internal_error()
+
+def _node_detail_payload(state: ServerState | VaultRuntime, node_id: str) -> dict[str, Any]:
+    """Store op: one node, its edges, provenance, and equivalence canonical."""
+    node = _store(state).get_node(node_id)
+    if node is None or str(getattr(node, "type", "")) not in CLOSED_NODE_TYPES or is_infra(node):
+        raise _ApiError(404, "not_found", f"node not found: {node_id}")
+    out_edges = [
+        {"type": str(e.type), "dst": str(e.dst)} for e in _store(state).list_edges(src=node_id)
+    ]
+    in_edges = [
+        {"type": str(e.type), "src": str(e.src)} for e in _store(state).list_edges(dst=node_id)
+    ]
+    provenance = _provenance_payload(state, node)
+    block = None
+    if provenance and provenance.get("block_id"):
+        block_node = _store(state).get_node(provenance["block_id"])
+        if block_node is not None:
+            block = {
+                "id": str(block_node.id),
+                "facets": dict(getattr(block_node, "facets", {}) or {}),
+            }
 
     node_payload = _node_summary(node)
     node_payload["facets"] = dict(getattr(node, "facets", {}) or {})
@@ -3007,42 +3162,36 @@ async def api_node_detail(request: Request) -> JSONResponse:
     # only surface the equivalence. The canonical's own detail is unaffected.
     equivalence = _curation.equivalence_map(state)
     canonical_id = _curation.canonical_for(node_id, equivalence)
-    return JSONResponse(
-        {
-            "status": "ok",
-            "node": node_payload,
-            "edges": {"out": out_edges, "in": in_edges},
-            "provenance": provenance,
-            "block": block,
-            "canonical_id": canonical_id,
-        }
-    )
+    return {
+        "status": "ok",
+        "node": node_payload,
+        "edges": {"out": out_edges, "in": in_edges},
+        "provenance": provenance,
+        "block": block,
+        "canonical_id": canonical_id,
+    }
 
 
 async def api_node_types(request: Request) -> JSONResponse:
     state = get_state()
     if state.shutting_down:
         return _draining_response()
-    counts: dict[str, int] = {t: 0 for t in CLOSED_NODE_TYPES}
     include_structural = _include_structural(request)
-    try:
-        for node in _store(state).list_nodes():
-            if is_infra(node) or (not include_structural and _is_structural_claim(node)):
-                continue
-            t = str(getattr(node, "type", ""))
-            if t in counts:
-                counts[t] += 1
-    except VaultClosedError as exc:
-        return _err(503, "vault_closed", str(exc))
-    except OktoNeuronError as exc:
-        # A typed store/backend failure (e.g. GraphBackendError from a driver
-        # limit) carries a real cause; report it instead of the bare catch-all's
-        # "internal server error", which hid Grafx's 1024-element query cap.
-        return _err(500, "graph_read_failed", str(exc))
-    except Exception:  # noqa: BLE001
-        _LOG.exception("unexpected node-types failure")
-        return _internal_error()
+    body = await _graph_read("node-types", _node_types_payload, state, include_structural)
+    return body if isinstance(body, JSONResponse) else JSONResponse(body)
 
+
+def _node_types_payload(
+    state: ServerState | VaultRuntime, include_structural: bool
+) -> dict[str, Any]:
+    """Store op: per-type node census over the closed schema."""
+    counts: dict[str, int] = {t: 0 for t in CLOSED_NODE_TYPES}
+    for node in _store(state).list_nodes():
+        if is_infra(node) or (not include_structural and _is_structural_claim(node)):
+            continue
+        t = str(getattr(node, "type", ""))
+        if t in counts:
+            counts[t] += 1
     types = [
         {
             "name": t,
@@ -3052,7 +3201,7 @@ async def api_node_types(request: Request) -> JSONResponse:
         }
         for t in (*_PRIMITIVE_TYPES, *_SUPPORT_TYPES)
     ]
-    return JSONResponse({"status": "ok", "types": types})
+    return {"status": "ok", "types": types}
 
 
 # --------------------------- /api/v1 — graph visualization (read-only) ---------------------------
@@ -3147,39 +3296,49 @@ async def api_graph(request: Request) -> JSONResponse:
     limit = min(limit, GRAPH_MAX_LIMIT)  # clamp, never 400 on oversize
 
     include_structural = _include_structural(request)
+    body = await _graph_read(
+        "graph-overview",
+        _graph_payload,
+        state,
+        types,
+        relations,
+        limit,
+        min_degree,
+        include_structural,
+    )
+    return body if isinstance(body, JSONResponse) else JSONResponse(body)
 
-    try:
-        store = _store(state)
-        # 1. Visible nodes (optionally restricted to requested types).
-        node_by_id: dict[str, Any] = {}
-        if types is None:
-            for n in store.list_nodes():
+
+def _graph_payload(
+    state: ServerState | VaultRuntime,
+    types: set[str] | None,
+    relations: set[str] | None,
+    limit: int,
+    min_degree: int,
+    include_structural: bool,
+) -> dict[str, Any]:
+    """Store op: the capped overview subgraph (see :func:`api_graph`)."""
+    store = _store(state)
+    # 1. Visible nodes (optionally restricted to requested types).
+    node_by_id: dict[str, Any] = {}
+    if types is None:
+        for n in store.list_nodes():
+            if _visible_node(n, include_structural=include_structural):
+                node_by_id[str(n.id)] = n
+    else:
+        for t in types:
+            for n in store.list_nodes(type=t):
                 if _visible_node(n, include_structural=include_structural):
                     node_by_id[str(n.id)] = n
-        else:
-            for t in types:
-                for n in store.list_nodes(type=t):
-                    if _visible_node(n, include_structural=include_structural):
-                        node_by_id[str(n.id)] = n
 
-        # 2. Edge universe: relation-filtered edges whose BOTH endpoints are
-        #    visible nodes in the filtered set.
-        universe: list[Any] = []
-        for e in store.list_edges():
-            if relations is not None and str(e.type) not in relations:
-                continue
-            if str(e.src) in node_by_id and str(e.dst) in node_by_id:
-                universe.append(e)
-    except VaultClosedError as exc:
-        return _err(503, "vault_closed", str(exc))
-    except OktoNeuronError as exc:
-        # A typed store/backend failure (e.g. GraphBackendError from a driver
-        # limit) carries a real cause; report it instead of the bare catch-all's
-        # "internal server error", which hid Grafx's 1024-element query cap.
-        return _err(500, "graph_read_failed", str(exc))
-    except Exception:  # noqa: BLE001
-        _LOG.exception("unexpected graph-overview failure")
-        return _internal_error()
+    # 2. Edge universe: relation-filtered edges whose BOTH endpoints are
+    #    visible nodes in the filtered set.
+    universe: list[Any] = []
+    for e in store.list_edges():
+        if relations is not None and str(e.type) not in relations:
+            continue
+        if str(e.src) in node_by_id and str(e.dst) in node_by_id:
+            universe.append(e)
 
     # 3. Degree over the full filtered subgraph (BEFORE the cap — ranking needs it).
     degree: dict[str, int] = dict.fromkeys(node_by_id, 0)
@@ -3210,18 +3369,16 @@ async def api_graph(request: Request) -> JSONResponse:
     equivalence = _curation.equivalence_map(state)
     nodes_out, edges_out = _curation.fold_graph(nodes_out, edges_out, equivalence)
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "truncated": len(kept_ids) < total_nodes,
-            "total_nodes": total_nodes,
-            "total_edges": total_edges,
-            "returned_nodes": len(nodes_out),
-            "returned_edges": len(edges_out),
-            "nodes": nodes_out,
-            "edges": edges_out,
-        }
-    )
+    return {
+        "status": "ok",
+        "truncated": len(kept_ids) < total_nodes,
+        "total_nodes": total_nodes,
+        "total_edges": total_edges,
+        "returned_nodes": len(nodes_out),
+        "returned_edges": len(edges_out),
+        "nodes": nodes_out,
+        "edges": edges_out,
+    }
 
 
 async def api_node_neighbors(request: Request) -> JSONResponse:
@@ -3255,77 +3412,89 @@ async def api_node_neighbors(request: Request) -> JSONResponse:
     limit = min(limit, NEIGHBORS_MAX_LIMIT)
 
     include_structural = _include_structural(request)
+    body = await _graph_read(
+        "node-neighbors",
+        _neighbors_payload,
+        state,
+        seed,
+        types,
+        relations,
+        hops,
+        limit,
+        include_structural,
+    )
+    return body if isinstance(body, JSONResponse) else JSONResponse(body)
 
-    try:
-        store = _store(state)
-        seed_node = store.get_node(seed)
-        # 404 mirrors api_node_detail: missing OR hidden (not closed / infra).
-        # The seed is exempt from the structural filter for the same reason
-        # api_node_detail is — the caller navigated to this id on purpose, so a
-        # direct link to a structural anchor must still resolve. The filter only
-        # governs what the expansion admits around it.
-        if seed_node is None or not _visible_node(seed_node, include_structural=True):
-            return _err(404, "not_found", f"node not found: {seed}")
 
-        def _admit(node: Any) -> bool:
-            if node is None or not _visible_node(node, include_structural=include_structural):
-                return False
-            if types is not None and str(node.type) not in types:
-                return False
-            return True
+def _neighbors_payload(
+    state: ServerState | VaultRuntime,
+    seed: str,
+    types: set[str] | None,
+    relations: set[str] | None,
+    hops: int,
+    limit: int,
+    include_structural: bool,
+) -> dict[str, Any]:
+    """Store op: capped BFS neighbourhood (see :func:`api_node_neighbors`)."""
+    store = _store(state)
+    seed_node = store.get_node(seed)
+    # 404 mirrors api_node_detail: missing OR hidden (not closed / infra).
+    # The seed is exempt from the structural filter for the same reason
+    # api_node_detail is — the caller navigated to this id on purpose, so a
+    # direct link to a structural anchor must still resolve. The filter only
+    # governs what the expansion admits around it.
+    if seed_node is None or not _visible_node(seed_node, include_structural=True):
+        raise _ApiError(404, "not_found", f"node not found: {seed}")
 
-        kept: dict[str, Any] = {seed: seed_node}
-        kept_edges: dict[str, Any] = {}
-        frontier = {seed}
-        for _hop in range(hops):
-            if not frontier or len(kept) >= limit:
-                break
-            next_frontier: set[str] = set()
-            incident: list[Any] = []
-            for nid in frontier:
-                incident.extend(store.list_edges(src=nid))
-                incident.extend(store.list_edges(dst=nid))
-            for e in incident:
-                if relations is not None and str(e.type) not in relations:
-                    continue
-                src, dst = str(e.src), str(e.dst)
-                other = dst if src in frontier else src
-                if other not in kept:
-                    if len(kept) >= limit:
-                        continue  # node cap hit — skip new nodes (keep edges among kept)
-                    other_node = store.get_node(other)
-                    if not _admit(other_node):
-                        continue
-                    kept[other] = other_node
-                    next_frontier.add(other)
-                # Record the edge only when BOTH endpoints are kept.
-                if src in kept and dst in kept:
-                    kept_edges[str(e.id)] = e
-            frontier = next_frontier
+    def _admit(node: Any) -> bool:
+        if node is None or not _visible_node(node, include_structural=include_structural):
+            return False
+        if types is not None and str(node.type) not in types:
+            return False
+        return True
 
-        # Closing pass: BFS records an edge only while processing the frontier
-        # that DISCOVERS the far endpoint, so same-ring edges in the OUTERMOST
-        # ring (added at the final hop, never processed) are otherwise missed —
-        # most visible at the default hops=1, where neighbors-of-the-seed edges
-        # would all drop. Sweep the final frontier; both endpoints are already in
-        # ``kept`` so this adds no nodes and the cap is unaffected. Still fully
-        # targeted (src=/dst= per node), never a full edge scan.
+    kept: dict[str, Any] = {seed: seed_node}
+    kept_edges: dict[str, Any] = {}
+    frontier = {seed}
+    for _hop in range(hops):
+        if not frontier or len(kept) >= limit:
+            break
+        next_frontier: set[str] = set()
+        incident: list[Any] = []
         for nid in frontier:
-            for e in (*store.list_edges(src=nid), *store.list_edges(dst=nid)):
-                if relations is not None and str(e.type) not in relations:
+            incident.extend(store.list_edges(src=nid))
+            incident.extend(store.list_edges(dst=nid))
+        for e in incident:
+            if relations is not None and str(e.type) not in relations:
+                continue
+            src, dst = str(e.src), str(e.dst)
+            other = dst if src in frontier else src
+            if other not in kept:
+                if len(kept) >= limit:
+                    continue  # node cap hit — skip new nodes (keep edges among kept)
+                other_node = store.get_node(other)
+                if not _admit(other_node):
                     continue
-                if str(e.src) in kept and str(e.dst) in kept:
-                    kept_edges[str(e.id)] = e
-    except VaultClosedError as exc:
-        return _err(503, "vault_closed", str(exc))
-    except OktoNeuronError as exc:
-        # A typed store/backend failure (e.g. GraphBackendError from a driver
-        # limit) carries a real cause; report it instead of the bare catch-all's
-        # "internal server error", which hid Grafx's 1024-element query cap.
-        return _err(500, "graph_read_failed", str(exc))
-    except Exception:  # noqa: BLE001
-        _LOG.exception("unexpected node-neighbors failure")
-        return _internal_error()
+                kept[other] = other_node
+                next_frontier.add(other)
+            # Record the edge only when BOTH endpoints are kept.
+            if src in kept and dst in kept:
+                kept_edges[str(e.id)] = e
+        frontier = next_frontier
+
+    # Closing pass: BFS records an edge only while processing the frontier
+    # that DISCOVERS the far endpoint, so same-ring edges in the OUTERMOST
+    # ring (added at the final hop, never processed) are otherwise missed —
+    # most visible at the default hops=1, where neighbors-of-the-seed edges
+    # would all drop. Sweep the final frontier; both endpoints are already in
+    # ``kept`` so this adds no nodes and the cap is unaffected. Still fully
+    # targeted (src=/dst= per node), never a full edge scan.
+    for nid in frontier:
+        for e in (*store.list_edges(src=nid), *store.list_edges(dst=nid)):
+            if relations is not None and str(e.type) not in relations:
+                continue
+            if str(e.src) in kept and str(e.dst) in kept:
+                kept_edges[str(e.id)] = e
 
     # Degree WITHIN the returned set (per the neighbors contract).
     degree: dict[str, int] = dict.fromkeys(kept, 0)
@@ -3335,54 +3504,57 @@ async def api_node_neighbors(request: Request) -> JSONResponse:
 
     nodes_out = [_graph_node_payload(kept[nid], degree[nid]) for nid in kept]
     edges_out = [_graph_edge_payload(e) for e in kept_edges.values()]
-    return JSONResponse(
-        {
-            "status": "ok",
-            "seed": seed,
-            "total_nodes": len(nodes_out),
-            "total_edges": len(edges_out),
-            "returned_nodes": len(nodes_out),
-            "returned_edges": len(edges_out),
-            "nodes": nodes_out,
-            "edges": edges_out,
-        }
-    )
+    return {
+        "status": "ok",
+        "seed": seed,
+        "total_nodes": len(nodes_out),
+        "total_edges": len(edges_out),
+        "returned_nodes": len(nodes_out),
+        "returned_edges": len(edges_out),
+        "nodes": nodes_out,
+        "edges": edges_out,
+    }
 
 
 async def api_graph_stats(request: Request) -> JSONResponse:
     """Counts for the filter controls: node-type counts (closed schema) + the
-    open-vocabulary edge-type counts, plus totals."""
+    open-vocabulary edge-type counts, plus totals.
+
+    A full node+edge scan: concurrent polls of the same vault share one scan."""
     state = get_state()
     if state.shutting_down:
         return _draining_response()
+    include_structural = _include_structural(request)
+    body = await _graph_read_shared(
+        "graph-stats",
+        ("graph_stats", str(state.vault_path), include_structural),
+        _graph_stats_payload,
+        state,
+        include_structural,
+    )
+    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+
+
+def _graph_stats_payload(
+    state: ServerState | VaultRuntime, include_structural: bool
+) -> dict[str, Any]:
+    """Store op: node-type and edge-type census over the whole graph."""
     node_counts: dict[str, int] = {t: 0 for t in CLOSED_NODE_TYPES}
     edge_counts: dict[str, int] = {}
     total_nodes = 0
     total_edges = 0
-    include_structural = _include_structural(request)
-    try:
-        store = _store(state)
-        for node in store.list_nodes():
-            if is_infra(node) or (not include_structural and _is_structural_claim(node)):
-                continue
-            t = str(getattr(node, "type", ""))
-            if t in node_counts:
-                node_counts[t] += 1
-                total_nodes += 1
-        for edge in store.list_edges():
-            et = str(getattr(edge, "type", ""))
-            edge_counts[et] = edge_counts.get(et, 0) + 1
-            total_edges += 1
-    except VaultClosedError as exc:
-        return _err(503, "vault_closed", str(exc))
-    except OktoNeuronError as exc:
-        # A typed store/backend failure (e.g. GraphBackendError from a driver
-        # limit) carries a real cause; report it instead of the bare catch-all's
-        # "internal server error", which hid Grafx's 1024-element query cap.
-        return _err(500, "graph_read_failed", str(exc))
-    except Exception:  # noqa: BLE001
-        _LOG.exception("unexpected graph-stats failure")
-        return _internal_error()
+    store = _store(state)
+    for node in store.list_nodes():
+        if is_infra(node) or (not include_structural and _is_structural_claim(node)):
+            continue
+        t = str(getattr(node, "type", ""))
+        if t in node_counts:
+            node_counts[t] += 1
+            total_nodes += 1
+    for edge in store.list_edges():
+        et = str(getattr(edge, "type", ""))
+        edge_counts[et] = edge_counts.get(et, 0) + 1
+        total_edges += 1
 
     node_types = [
         {"type": t, "count": node_counts[t]}
@@ -3390,15 +3562,13 @@ async def api_graph_stats(request: Request) -> JSONResponse:
         if node_counts[t] > 0
     ]
     edge_types = [{"type": t, "count": edge_counts[t]} for t in sorted(edge_counts)]
-    return JSONResponse(
-        {
-            "status": "ok",
-            "node_types": node_types,
-            "edge_types": edge_types,
-            "total_nodes": total_nodes,
-            "total_edges": total_edges,
-        }
-    )
+    return {
+        "status": "ok",
+        "node_types": node_types,
+        "edge_types": edge_types,
+        "total_nodes": total_nodes,
+        "total_edges": total_edges,
+    }
 
 
 async def api_graph_integrity(request: Request) -> JSONResponse:
@@ -3406,13 +3576,23 @@ async def api_graph_integrity(request: Request) -> JSONResponse:
     state = get_state()
     if not isinstance(state, VaultRuntime):
         return _err(409, "no_active_vault", "select a vault to inspect graph integrity")
+    # Reads the durable verdict sidecar; concurrent polls share one read.
+    integrity = await single_flight(
+        ("graph_integrity_summary", str(state.vault_path)),
+        _integrity_summary,
+        state,
+    )
     return JSONResponse(
         {
             "status": "ok",
-            "integrity": graph_integrity.summary(state, state.vault),
+            "integrity": integrity,
         },
         headers={"Cache-Control": "no-store"},
     )
+
+
+def _integrity_summary(state: VaultRuntime) -> dict[str, object]:
+    return graph_integrity.summary(state, state.vault)
 
 
 async def api_graph_integrity_run(request: Request) -> JSONResponse:
@@ -3713,7 +3893,7 @@ async def api_semantic_governance(request: Request) -> JSONResponse:
         )
     try:
         async with state.config_lock:
-            payload = await asyncio.to_thread(_semantic_governance_payload, state)
+            payload = await store_io(_semantic_governance_payload, state)
     except (PredicateRegistryError, ValueError):
         _LOG.exception("semantic governance side-store validation failed")
         return _internal_error()
@@ -3817,7 +3997,7 @@ async def api_semantic_quality(request: Request) -> JSONResponse:
             if state.draining:
                 return _draining_response()
             if variant == "candidate_ledger":
-                report = await asyncio.to_thread(
+                report = await store_io(
                     _fresh_candidate_ledger_quality_report,
                     state,
                     run_ids=run_ids,
@@ -3826,7 +4006,7 @@ async def api_semantic_quality(request: Request) -> JSONResponse:
                     adjudication=adjudication,
                 )
             else:
-                report = await asyncio.to_thread(
+                report = await store_io(
                     _fresh_semantic_quality_report,
                     state,
                     recall_samples=recall_samples,
@@ -3984,13 +4164,19 @@ async def api_config_get(request: Request) -> JSONResponse:
     if state.shutting_down:
         return _draining_response()
     try:
-        cfg = _load_vault_config(state)
+        payload = await store_io(_vault_config_payload, state)
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected config-read failure")
         return _internal_error()
-    payload = _config_payload(cfg, scope="vault")
-    payload["status"] = "ok"
     return JSONResponse(payload)
+
+
+def _vault_config_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
+    """Store op: load this vault's YAML and render the config view (pack
+    prompts are read from disk)."""
+    payload = _config_payload(_load_vault_config(state), scope="vault")
+    payload["status"] = "ok"
+    return payload
 
 
 async def api_application_config_get(request: Request) -> JSONResponse:
@@ -3998,15 +4184,19 @@ async def api_application_config_get(request: Request) -> JSONResponse:
     if state.shutting_down:
         return _draining_response()
     try:
-        from okto_neuron.config import VaultConfig
-
-        cfg = VaultConfig.load_application_defaults()
+        payload = await store_io(_application_config_payload)
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected application-config read failure")
         return _internal_error()
-    payload = _config_payload(cfg, scope="application")
-    payload["status"] = "ok"
     return JSONResponse(payload)
+
+
+def _application_config_payload() -> dict[str, Any]:
+    from okto_neuron.config import VaultConfig
+
+    payload = _config_payload(VaultConfig.load_application_defaults(), scope="application")
+    payload["status"] = "ok"
+    return payload
 
 
 def _prepare_config_patch(patch: dict[str, Any]) -> str | None:
@@ -4055,22 +4245,12 @@ async def api_config_patch(request: Request) -> JSONResponse:
         if state.draining:
             return _draining_response()
         try:
-            cfg, changed = VaultConfig.apply_patch(state.vault_path, patch)
+            cfg, changed = await store_io(_apply_vault_config_patch, state, patch)
         except ValueError as exc:
             return _err(400, "bad_request", str(exc))
         except Exception:  # noqa: BLE001
             _LOG.exception("unexpected config-write failure")
             return _internal_error()
-        if changed and state.vault is not None:
-            # The vault caches its resolved embedder for process life; without
-            # this, a PATCHed embedding model only takes effect after a daemon
-            # restart (stale-embedder bug). LLM providers are rebuilt from
-            # config per call, so the embedder is the only runtime cache to
-            # drop. In-flight work keeps its old instance; the next use
-            # constructs fresh. The dimension-mismatch guard is untouched —
-            # the reembed note below and the ``embedding_dim_mismatch`` vault
-            # warning still apply to stored vectors.
-            state.vault.invalidate_runtime_caches()
 
     reembed = any(c in VaultConfig.REEMBED_FIELDS for c in changed)
     semantic_rebuild = any(c in VaultConfig.SEMANTIC_REBUILD_FIELDS for c in changed)
@@ -4128,7 +4308,7 @@ async def api_config_patch(request: Request) -> JSONResponse:
         applied = "live"
         notes.append("no fields changed")
 
-    payload = _config_payload(cfg, scope="vault")
+    payload = await store_io(_config_payload, cfg, scope="vault")
     payload["status"] = "ok"
     return JSONResponse(
         {
@@ -4141,6 +4321,42 @@ async def api_config_patch(request: Request) -> JSONResponse:
             "rebuild_required_vaults": ([str(state.vault_path)] if semantic_rebuild else []),
         }
     )
+
+
+def _apply_vault_config_patch(
+    state: ServerState | VaultRuntime, patch: dict[str, Any]
+) -> tuple[Any, list[str]]:
+    """Store op: write the vault YAML patch and drop stale runtime caches."""
+    from okto_neuron.config import VaultConfig
+
+    cfg, changed = VaultConfig.apply_patch(state.vault_path, patch)
+    if changed and state.vault is not None:
+        # The vault caches its resolved embedder for process life; without
+        # this, a PATCHed embedding model only takes effect after a daemon
+        # restart (stale-embedder bug). LLM providers are rebuilt from
+        # config per call, so the embedder is the only runtime cache to
+        # drop. In-flight work keeps its old instance; the next use
+        # constructs fresh. The dimension-mismatch guard is untouched —
+        # the reembed note below and the ``embedding_dim_mismatch`` vault
+        # warning still apply to stored vectors.
+        state.vault.invalidate_runtime_caches()
+    return cfg, changed
+
+
+def _apply_application_config_patch(
+    state: ServerState, patch: dict[str, Any]
+) -> tuple[Any, list[str], list[str], list[str], list[str]]:
+    """Store op: write the app defaults and walk every inheriting vault's YAML."""
+    from okto_neuron.config import VaultConfig
+
+    before = VaultConfig.load_application_defaults()
+    cfg, changed = VaultConfig.apply_application_defaults_patch(patch)
+    embedding_changed, reembed_vaults, rebuild_vaults = _application_config_effects(before, cfg)
+    for path in embedding_changed:
+        cached = state.vault_pool.peek(Path(path))
+        if cached is not None:
+            cached.invalidate_runtime_caches()
+    return cfg, changed, embedding_changed, reembed_vaults, rebuild_vaults
 
 
 def _application_config_effects(
@@ -4195,28 +4411,23 @@ async def api_application_config_patch(request: Request) -> JSONResponse:
     if patch_error:
         return _err(400, "bad_request", patch_error)
 
-    from okto_neuron.config import VaultConfig
 
     async with state.config_lock:
         if state.draining:
             return _draining_response()
         try:
-            before = VaultConfig.load_application_defaults()
-            cfg, changed = VaultConfig.apply_application_defaults_patch(patch)
             (
-                embedding_changed,
+                cfg,
+                changed,
+                _embedding_changed,
                 reembed_vaults,
                 rebuild_vaults,
-            ) = _application_config_effects(before, cfg)
+            ) = await store_io(_apply_application_config_patch, state, patch)
         except ValueError as exc:
             return _err(400, "bad_request", str(exc))
         except Exception:  # noqa: BLE001
             _LOG.exception("unexpected application-config write failure")
             return _internal_error()
-        for path in embedding_changed:
-            cached = state.vault_pool.peek(Path(path))
-            if cached is not None:
-                cached.invalidate_runtime_caches()
 
     notes: list[str] = []
     if rebuild_vaults:
@@ -4271,7 +4482,7 @@ async def api_application_config_patch(request: Request) -> JSONResponse:
         applied = "live"
         notes.append("no fields changed")
 
-    payload = _config_payload(cfg, scope="application")
+    payload = await store_io(_config_payload, cfg, scope="application")
     payload["status"] = "ok"
     return JSONResponse(
         {
@@ -4364,9 +4575,9 @@ async def _api_provider_credential_put(
         # while filesystem/DPAPI work is still running off-loop.
         state = get_server_state()
         async with state.config_lock:
-            await asyncio.to_thread(
+            await store_io(
                 state.run_application_mutation,
-                lambda: write_user_env_secret(env_name, api_key),
+                functools.partial(write_user_env_secret, env_name, api_key),
             )
     except ValueError as exc:
         return _err(400, "bad_request", str(exc))
@@ -4394,6 +4605,15 @@ async def api_llm_credential_put(request: Request) -> JSONResponse:
     """Compatibility alias for clients released before the generic route."""
 
     return await _api_provider_credential_put(request, default_kind="llm")
+
+
+def _provider_ref_profile(provider_ref: str) -> tuple[Any, str | None, Any]:
+    """Store op: resolve a saved provider connection and the uses its driver
+    supports (both read the provider registry YAML)."""
+    from okto_neuron.providers import ProviderRegistry, resolve_provider
+
+    profile, api_key_env = resolve_provider(provider_ref)
+    return profile, api_key_env, ProviderRegistry.load().provider_uses(profile.driver)
 
 
 def _credential_payload(record: Any) -> dict[str, Any]:
@@ -4433,25 +4653,25 @@ def _provider_payload(registry: Any, profile: Any) -> dict[str, Any]:
 async def _run_provider_registry_mutation(operation: Any) -> Any:
     state = get_server_state()
     async with state.config_lock:
-        return await asyncio.to_thread(state.run_application_mutation, operation)
+        return await store_io(state.run_application_mutation, operation)
 
 
 async def api_credentials_list(request: Request) -> JSONResponse:
-    from okto_neuron.providers import ProviderRegistry
-
     try:
-        registry = ProviderRegistry.load()
+        credentials = await store_io(_credentials_payload)
     except ValueError as exc:
         return _err(500, "provider_registry_invalid", str(exc))
     return JSONResponse(
-        {
-            "status": "ok",
-            "credentials": [
-                _credential_payload(record) for record in registry.document.credentials
-            ],
-        },
+        {"status": "ok", "credentials": credentials},
         headers={"Cache-Control": "no-store"},
     )
+
+
+def _credentials_payload() -> list[dict[str, Any]]:
+    from okto_neuron.providers import ProviderRegistry
+
+    registry = ProviderRegistry.load()
+    return [_credential_payload(record) for record in registry.document.credentials]
 
 
 async def api_credentials_create(request: Request) -> JSONResponse:
@@ -4603,24 +4823,29 @@ def _provider_reference_locations(provider_id: str, *, embedding_only: bool = Fa
 
 
 async def api_providers_list(request: Request) -> JSONResponse:
-    from okto_neuron.providers import ProviderRegistry
-
     try:
-        registry = ProviderRegistry.load()
+        providers = await store_io(_providers_payload)
     except ValueError as exc:
         return _err(500, "provider_registry_invalid", str(exc))
     return JSONResponse(
-        {
-            "status": "ok",
-            "providers": [
-                _provider_payload(registry, profile) for profile in registry.document.providers
-            ],
-        },
+        {"status": "ok", "providers": providers},
         headers={"Cache-Control": "no-store"},
     )
 
 
+def _providers_payload() -> list[dict[str, Any]]:
+    from okto_neuron.providers import ProviderRegistry
+
+    registry = ProviderRegistry.load()
+    return [_provider_payload(registry, profile) for profile in registry.document.providers]
+
+
 async def api_provider_types(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "provider_types": await store_io(_provider_types)})
+
+
+def _provider_types() -> list[dict[str, Any]]:
+    """Registry read (YAML) + driver catalog for the provider editor."""
     from okto_neuron.config._vault import _EMBEDDING_PROVIDERS, _LLM_PROVIDERS
     from okto_neuron.onboarding import (
         MANAGED_API_KEY_PROVIDERS,
@@ -4652,7 +4877,7 @@ async def api_provider_types(request: Request) -> JSONResponse:
                 "local_extended_allowed": driver in LOCAL_EXTENDED_DRIVERS,
             }
         )
-    return JSONResponse({"status": "ok", "provider_types": types})
+    return types
 
 
 async def api_providers_create(request: Request) -> JSONResponse:
@@ -4791,7 +5016,7 @@ async def api_provider_delete(request: Request) -> JSONResponse:
     if not remote_config_allowed(request):
         return _err(403, "forbidden", "provider writes are restricted to loopback callers")
     provider_id = request.path_params["provider_id"]
-    references = _provider_reference_locations(provider_id)
+    references = await store_io(_provider_reference_locations, provider_id)
     if references:
         return _err(
             409,
@@ -4843,8 +5068,10 @@ async def api_reset(request: Request) -> JSONResponse:
         return _err(409, "vault_fenced", "this vault is already fenced for maintenance")
 
     pool = state.vault_pool
-    pool.fence(state.vault_path)
+    # Drain first (no await since the checks above); the fence takes the pool
+    # lock, so it runs off-loop. Leases taken in between are waited out below.
     state.mark_draining()
+    await store_io(pool.fence, state.vault_path)
     released = False
     safe_to_unfence = True
     ownership = None
@@ -4855,18 +5082,18 @@ async def api_reset(request: Request) -> JSONResponse:
             if any(bool(value) for value in busy.values()):
                 state.draining = False
                 return _err(409, "busy", "reset is blocked by active work", busy=busy)
-            pool.release_path(state.vault_path, require_fenced=True)
+            await store_io(pool.release_path, state.vault_path, require_fenced=True)
             released = True
             safe_to_unfence = False
-            ownership = pool.claim_fenced_ownership(state.vault_path)
-            await asyncio.to_thread(wipe_vault, state.vault_path, keep_config=True)
+            ownership = await store_io(pool.claim_fenced_ownership, state.vault_path)
+            await store_io(wipe_vault, state.vault_path, keep_config=True)
             ownership.require_held()
-            reopened = await asyncio.to_thread(Vault.open, state.vault_path)
+            reopened = await store_io(Vault.open, state.vault_path)
             try:
-                state.install_fenced_vault(reopened, ownership=ownership)
+                await store_io(state.install_fenced_vault, reopened, ownership=ownership)
                 ownership = None
             except Exception:
-                reopened.close()
+                await store_io(reopened.close)
                 raise
             released = False
             safe_to_unfence = True
@@ -4878,22 +5105,27 @@ async def api_reset(request: Request) -> JSONResponse:
         return _err(409, exc.code, str(exc))
     except Exception:  # noqa: BLE001
         _LOG.exception("vault reset failed mid-wipe")
-        if released and state.vault_path.exists() and pool.peek(state.vault_path) is None:
+        if (
+            released
+            and await store_io(state.vault_path.exists)
+            and pool.peek(state.vault_path) is None
+        ):
             try:
                 async with state.writer_lock, state.config_lock:
                     if ownership is None:
                         await _open_and_install_fenced(state)
                     else:
                         ownership.require_held()
-                        reopened = await asyncio.to_thread(Vault.open, state.vault_path)
+                        reopened = await store_io(Vault.open, state.vault_path)
                         try:
-                            state.install_fenced_vault(
+                            await store_io(
+                                state.install_fenced_vault,
                                 reopened,
                                 ownership=ownership,
                             )
                             ownership = None
                         except Exception:
-                            reopened.close()
+                            await store_io(reopened.close)
                             raise
                 safe_to_unfence = True
                 state.draining = False
@@ -4907,9 +5139,9 @@ async def api_reset(request: Request) -> JSONResponse:
         return _err(500, "reset_failed", detail)
     finally:
         if ownership is not None:
-            ownership.release()
+            await store_io(ownership.release)
         if safe_to_unfence:
-            pool.unfence(state.vault_path)
+            await store_io(pool.unfence, state.vault_path)
 
 
 # --------------------------- /api/v1 — query (rich provenance) ---------------------------
@@ -4984,15 +5216,7 @@ async def api_ingest(request: Request) -> JSONResponse:
         if state.draining:
             return _draining_response()
         try:
-            await asyncio.to_thread(graph_integrity.require_write_allowed, state, state.vault)
-            sources = state.vault_path / ".marginalia" / "sources"
-            sources.mkdir(parents=True, exist_ok=True)
-            # Mirrors any directory prefix in the posted name and never
-            # clobbers a different document's bytes (a Block anchors to this
-            # path); a flat basename here used to overwrite silently.
-            target = iq.upload_target_path(sources, raw_name, content)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            target = await store_io(_write_ingest_source, state, raw_name, content)
             filename = target.name
             # Off-load the blocking LLM extraction so the event loop stays
             # responsive; writer_lock still serializes the write.
@@ -5027,6 +5251,20 @@ async def api_ingest(request: Request) -> JSONResponse:
             "outcome": dict(getattr(result, "outcome", {}) or {}),
         }
     )
+
+
+def _write_ingest_source(state: ServerState | VaultRuntime, raw_name: str, content: str) -> Path:
+    """Store op for ``POST /api/v1/ingest``: integrity gate + durable source copy."""
+    graph_integrity.require_write_allowed(state, state.vault)
+    sources = state.vault_path / ".marginalia" / "sources"
+    sources.mkdir(parents=True, exist_ok=True)
+    # Mirrors any directory prefix in the posted name and never
+    # clobbers a different document's bytes (a Block anchors to this
+    # path); a flat basename here used to overwrite silently.
+    target = iq.upload_target_path(sources, raw_name, content)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return target
 
 
 # --------------------------- /api/v1 — bulk ingest (folder + upload queue) ---------------------------
@@ -5070,22 +5308,11 @@ async def api_ingest_folder(request: Request) -> JSONResponse:
     root = Path(raw_path).expanduser()
     if not root.is_absolute():
         return _err(400, "bad_request", "path must be absolute")
-    if not root.exists() or not root.is_dir():
-        return _err(404, "not_found", f"folder not found: {root}")
-
-    # Enumerate with the vault's own folder_watch exclusion policy so a
-    # customized ignore_globs/ignore_dir_globs keeps one-shot ingest and the
-    # continuous watcher identical (falls back to packaged defaults).
-    fw_ignore_globs, fw_ignore_dir_globs = _folder_watch_globs(state)
     walk_stats: dict = {}
     try:
-        found = iq.discover_folder(
-            root,
-            recursive=recursive,
-            ignore_globs=fw_ignore_globs,
-            ignore_dir_globs=fw_ignore_dir_globs,
-            stats=walk_stats,
-        )
+        found = await store_io(_discover_ingest_folder, state, root, recursive, walk_stats)
+    except _ApiError as exc:
+        return exc.response()
     except OSError as exc:
         return _err(400, "bad_request", f"could not read folder: {exc}")
     if not found:
@@ -5095,7 +5322,9 @@ async def api_ingest_folder(request: Request) -> JSONResponse:
 
     sources = state.vault_path / ".marginalia" / "sources"
     enqueue_stats: dict = {}
-    queued_items = iq.enqueue_paths(state, found, sources, rel_root=root, stats=enqueue_stats)
+    queued_items = await iq.enqueue_paths_async(
+        state, found, sources, rel_root=root, stats=enqueue_stats
+    )
     iq.ensure_worker(state, _companion)
     snap = iq.snapshot(state)
     snap["enqueued"] = len(queued_items)
@@ -5103,6 +5332,25 @@ async def api_ingest_folder(request: Request) -> JSONResponse:
     snap["truncated"] = truncated
     snap["skipped_non_text"] = int(walk_stats.get("skipped_non_text", 0))
     return JSONResponse(snap)
+
+
+def _discover_ingest_folder(
+    state: ServerState | VaultRuntime, root: Path, recursive: bool, walk_stats: dict
+) -> list[Path]:
+    """Store op: probe the folder, read the vault's exclusion policy, walk it."""
+    if not root.exists() or not root.is_dir():
+        raise _ApiError(404, "not_found", f"folder not found: {root}")
+    # Enumerate with the vault's own folder_watch exclusion policy so a
+    # customized ignore_globs/ignore_dir_globs keeps one-shot ingest and the
+    # continuous watcher identical (falls back to packaged defaults).
+    fw_ignore_globs, fw_ignore_dir_globs = _folder_watch_globs(state)
+    return iq.discover_folder(
+        root,
+        recursive=recursive,
+        ignore_globs=fw_ignore_globs,
+        ignore_dir_globs=fw_ignore_dir_globs,
+        stats=walk_stats,
+    )
 
 
 # --------------------------- /api/v1 — folder-watch (ADR 0025) ---------------------------
@@ -5146,11 +5394,9 @@ async def api_folder_watch_roots_add(request: Request) -> JSONResponse:
     except _BadRequest as exc:
         return _err(400, "bad_request", exc.detail)
 
-    root = Path(raw_path).expanduser().resolve()
-    if not root.is_dir():
+    root, root_is_dir = await store_io(_resolve_watch_root, raw_path)
+    if not root_is_dir:
         return _err(404, "not_found", f"folder not found: {root}")
-
-    from okto_neuron.config import VaultConfig
 
     # config_lock, NOT writer_lock: this only PATCHes okto-neuron.yaml
     # (folder_watch.roots), same underlying write as api_config_patch — an
@@ -5159,16 +5405,8 @@ async def api_folder_watch_roots_add(request: Request) -> JSONResponse:
     async with state.config_lock:
         if state.draining:
             return _draining_response()
-        cfg = _load_vault_config(state)
-        roots = list(cfg.folder_watch.roots)
-        root_str = str(root)
-        if root_str not in roots:
-            roots.append(root_str)
         try:
-            updated, _changed = VaultConfig.apply_patch(
-                state.vault_path,
-                {"folder_watch": {"roots": roots, "enabled": True}},
-            )
+            updated = await store_io(_patch_watch_roots, state, str(root), True)
         except ValueError as exc:
             return _err(400, "bad_request", str(exc))
         except Exception:  # noqa: BLE001
@@ -5193,20 +5431,14 @@ async def api_folder_watch_roots_remove(request: Request) -> JSONResponse:
     except _BadRequest as exc:
         return _err(400, "bad_request", exc.detail)
 
-    root_str = str(Path(raw_path).expanduser().resolve())
-
-    from okto_neuron.config import VaultConfig
+    root, _root_is_dir = await store_io(_resolve_watch_root, raw_path)
 
     # config_lock, NOT writer_lock — see api_folder_watch_roots_add.
     async with state.config_lock:
         if state.draining:
             return _draining_response()
-        cfg = _load_vault_config(state)
-        roots = [r for r in cfg.folder_watch.roots if r != root_str]
         try:
-            updated, _changed = VaultConfig.apply_patch(
-                state.vault_path, {"folder_watch": {"roots": roots}}
-            )
+            updated = await store_io(_patch_watch_roots, state, str(root), False)
         except ValueError as exc:
             return _err(400, "bad_request", str(exc))
         except Exception:  # noqa: BLE001
@@ -5216,6 +5448,28 @@ async def api_folder_watch_roots_remove(request: Request) -> JSONResponse:
     return JSONResponse(
         {"status": "ok", "folder_watch": updated.folder_watch.model_dump(mode="json")}
     )
+
+
+def _resolve_watch_root(raw_path: str) -> tuple[Path, bool]:
+    root = Path(raw_path).expanduser().resolve()
+    return root, root.is_dir()
+
+
+def _patch_watch_roots(state: ServerState | VaultRuntime, root_str: str, add: bool) -> Any:
+    """Store op: add (and enable) or remove one ``folder_watch.roots`` entry."""
+    from okto_neuron.config import VaultConfig
+
+    cfg = _load_vault_config(state)
+    if add:
+        roots = list(cfg.folder_watch.roots)
+        if root_str not in roots:
+            roots.append(root_str)
+        patch: dict[str, Any] = {"folder_watch": {"roots": roots, "enabled": True}}
+    else:
+        roots = [r for r in cfg.folder_watch.roots if r != root_str]
+        patch = {"folder_watch": {"roots": roots}}
+    updated, _changed = VaultConfig.apply_patch(state.vault_path, patch)
+    return updated
 
 
 # Per-file upload size cap (chars) — a backstop so a single huge paste/upload
@@ -5266,7 +5520,7 @@ async def api_ingest_batch(request: Request) -> JSONResponse:
     if len(raw_files) > iq.MAX_ENQUEUE:
         return _err(400, "bad_request", f"too many files (max {iq.MAX_ENQUEUE})")
 
-    fw_ignore_globs, fw_ignore_dir_globs = _folder_watch_globs(state)
+    fw_ignore_globs, fw_ignore_dir_globs = await store_io(_folder_watch_globs, state)
     files: list[tuple[str, str]] = []
     skipped: list[dict[str, str]] = []
     skip_counts: Counter[str] = Counter()
@@ -5327,7 +5581,7 @@ async def api_ingest_batch(request: Request) -> JSONResponse:
     # Materializing source files to disk is not a vault write — don't hold the
     # writer lock (that would stall enqueue behind the worker's current file).
     sources = state.vault_path / ".marginalia" / "sources"
-    queued_items = iq.enqueue_uploads(state, files, sources)
+    queued_items = await iq.enqueue_uploads_async(state, files, sources)
     iq.ensure_worker(state, _companion)
     snap = iq.snapshot(state)
     snap["enqueued"] = len(queued_items)
@@ -5357,7 +5611,7 @@ async def api_ingest_queue_item(request: Request) -> JSONResponse:
     item_id = request.path_params.get("item_id")
     if not isinstance(item_id, str) or not item_id:
         return _err(400, "bad_request", "missing item id")
-    detail = iq.item_detail(state, item_id)
+    detail = await iq.item_detail_async(state, item_id)
     if detail is None:
         return _err(404, "not_found", f"ingest queue item not found: {item_id}")
     return JSONResponse(detail)
@@ -5378,7 +5632,14 @@ async def api_ingest_queue_retry(request: Request) -> JSONResponse:
     item_id = request.path_params.get("item_id")
     if not isinstance(item_id, str) or not item_id:
         return _err(400, "bad_request", "missing item id")
-    item, error = iq.retry_item(state, item_id)
+    candidate = iq._find_item(state, item_id)
+    if candidate is not None:
+        # The live-graph receipt check reads the store: off-loop first, then the
+        # re-queue itself stays on the loop with the drain worker's flips.
+        await iq.verify_receipt_async(state, candidate)
+    item, error = iq.retry_item(state, item_id, verify=False, persist_now=False)
+    if error is None:
+        await store_io(iq.persist, state)
     if error == "not_found":
         return _err(404, "not_found", f"ingest queue item not found: {item_id}")
     if error == "conflict":
@@ -5407,7 +5668,9 @@ async def api_ingest_queue_delete(request: Request) -> JSONResponse:
     item_id = request.path_params.get("item_id")
     if not isinstance(item_id, str) or not item_id:
         return _err(400, "bad_request", "missing item id")
-    item, error = iq.delete_item(state, item_id)
+    item, error = iq.delete_item(state, item_id, persist_now=False)
+    if error is None:
+        await store_io(iq.persist, state)
     if error == "not_found":
         return _err(404, "not_found", f"ingest queue item not found: {item_id}")
     if error == "conflict":
@@ -5421,19 +5684,26 @@ async def api_ingest_queue_delete(request: Request) -> JSONResponse:
 
 
 async def api_ledger_runs(request: Request) -> JSONResponse:
-    """Durable ADR 0013 candidate-ledger run list."""
+    """Durable ADR 0013 candidate-ledger run list (a whole-ledger read: concurrent
+    polls of the same vault and limit share one scan)."""
     state = get_state()
     if state.shutting_down:
         return _draining_response()
-    from okto_neuron.consolidate.ledger import CandidateLedger
-
     raw_limit = request.query_params.get("limit", "50")
     try:
         limit = max(1, min(int(raw_limit), 500))
     except ValueError:
         return _err(400, "bad_request", "limit must be an integer")
-    ledger = CandidateLedger(Path(state.vault_path) / ".marginalia")
-    return JSONResponse({"status": "ok", "runs": ledger.run_summaries(limit=limit)})
+    runs = await single_flight(
+        ("ledger_runs", str(state.vault_path), limit), _ledger_runs, state.vault_path, limit
+    )
+    return JSONResponse({"status": "ok", "runs": runs})
+
+
+def _ledger_runs(vault_path: Path, limit: int) -> list[dict[str, Any]]:
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    return CandidateLedger(Path(vault_path) / ".marginalia").run_summaries(limit=limit)
 
 
 async def api_ledger_run_detail(request: Request) -> JSONResponse:
@@ -5441,25 +5711,27 @@ async def api_ledger_run_detail(request: Request) -> JSONResponse:
     state = get_state()
     if state.shutting_down:
         return _draining_response()
-    from okto_neuron.consolidate.ledger import CandidateLedger
-
     run_id = request.path_params.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         return _err(400, "bad_request", "missing run id")
-    ledger = CandidateLedger(Path(state.vault_path) / ".marginalia")
-    detail = ledger.run_detail(run_id)
+    detail = await store_io(_ledger_run_detail, state.vault_path, run_id)
     if detail is None:
         return _err(404, "not_found", f"ledger run not found: {run_id}")
     return JSONResponse({"status": "ok", **detail})
 
 
+def _ledger_run_detail(vault_path: Path, run_id: str) -> dict[str, Any] | None:
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    return CandidateLedger(Path(vault_path) / ".marginalia").run_detail(run_id)
+
+
 async def api_ledger_summary(request: Request) -> JSONResponse:
-    """Compact ADR 0013 ledger progress for committed-vs-pending UI surfaces."""
+    """Compact ADR 0013 ledger progress for committed-vs-pending UI surfaces (a
+    whole-ledger read: concurrent identical polls share one scan)."""
     state = get_state()
     if state.shutting_down:
         return _draining_response()
-    from okto_neuron.consolidate.ledger import CandidateLedger
-
     raw_limit = request.query_params.get("limit", "12")
     try:
         limit = max(1, min(int(raw_limit), 50))
@@ -5467,11 +5739,24 @@ async def api_ledger_summary(request: Request) -> JSONResponse:
         return _err(400, "bad_request", "limit must be an integer")
     raw_run_id = request.query_params.get("run_id")
     run_id = str(raw_run_id) if raw_run_id else None
-    ledger = CandidateLedger(Path(state.vault_path) / ".marginalia")
-    summary = ledger.run_progress_summary(run_id, limit=limit)
+    summary = await single_flight(
+        ("ledger_summary", str(state.vault_path), run_id, limit),
+        _ledger_summary,
+        state.vault_path,
+        run_id,
+        limit,
+    )
     if summary is None:
         return JSONResponse({"status": "ok", "run": None})
     return JSONResponse({"status": "ok", **summary})
+
+
+def _ledger_summary(vault_path: Path, run_id: str | None, limit: int) -> dict[str, Any] | None:
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    return CandidateLedger(Path(vault_path) / ".marginalia").run_progress_summary(
+        run_id, limit=limit
+    )
 
 
 async def api_ingest_cancel(request: Request) -> JSONResponse:
@@ -5481,7 +5766,9 @@ async def api_ingest_cancel(request: Request) -> JSONResponse:
         return _draining_response()
     if not remote_config_allowed(request):
         return _err(403, "forbidden", "ingest cancellation is restricted to loopback callers")
-    return JSONResponse(iq.cancel(state))
+    snap = iq.cancel(state, persist_now=False)
+    await store_io(iq.persist, state)
+    return JSONResponse(snap)
 
 
 async def api_recall(request: Request) -> JSONResponse:
@@ -5502,7 +5789,9 @@ async def api_recall(request: Request) -> JSONResponse:
 
     try:
         # Off-load the blocking query (embedding + vector search) so the event
-        # loop stays responsive during a slow retrieval.
+        # loop stays responsive during a slow retrieval. Deliberately NOT a store
+        # op: the query embedding (and a cold model load) must not occupy one of
+        # the few store workers that serve graph reads.
         hits, metrics = await asyncio.to_thread(_query_with_recall_cost, state.vault, text, k=k)
     except QueryError as exc:
         return _err(500, "query_failed", str(exc))
@@ -5613,11 +5902,10 @@ async def api_llm_test(request: Request) -> JSONResponse:
     provider_allow_remote: bool | None = None
     if provider_ref is not None:
         try:
-            from okto_neuron.providers import ProviderRegistry, resolve_provider
-
-            profile, managed_api_key_env = resolve_provider(provider_ref)
-            registry = ProviderRegistry.load()
-            if "llm" not in registry.provider_uses(profile.driver):
+            profile, managed_api_key_env, uses = await store_io(
+                _provider_ref_profile, provider_ref
+            )
+            if "llm" not in uses:
                 raise ValueError(f"provider {provider_ref!r} does not support LLM calls")
             provider = profile.driver
             provider_allow_remote = profile.allow_remote
@@ -5701,7 +5989,7 @@ async def api_llm_test(request: Request) -> JSONResponse:
     # Determine effective api_base (body overrides vault config default).
     state = get_state()
     try:
-        cfg = _load_vault_config(state)
+        cfg = await store_io(_load_vault_config, state)
         cfg_allow_remote: bool = (
             provider_allow_remote if provider_allow_remote is not None else cfg.llm.allow_remote
         )
@@ -5878,11 +6166,10 @@ async def api_llm_test_completion(request: Request) -> JSONResponse:
     provider_request_timeout_s: float | None = None
     if provider_ref is not None:
         try:
-            from okto_neuron.providers import ProviderRegistry, resolve_provider
-
-            profile, managed_api_key_env = resolve_provider(provider_ref)
-            registry = ProviderRegistry.load()
-            if "llm" not in registry.provider_uses(profile.driver):
+            profile, managed_api_key_env, uses = await store_io(
+                _provider_ref_profile, provider_ref
+            )
+            if "llm" not in uses:
                 raise ValueError(f"provider {provider_ref!r} does not support LLM calls")
             provider = profile.driver
             provider_allow_remote = profile.allow_remote
@@ -5914,7 +6201,7 @@ async def api_llm_test_completion(request: Request) -> JSONResponse:
     # but ResolvedLLM requires the field, so a harmless default is used for them.
     state = get_state()
     try:
-        cfg = _load_vault_config(state)
+        cfg = await store_io(_load_vault_config, state)
         cfg_allow_remote: bool = (
             provider_allow_remote if provider_allow_remote is not None else cfg.llm.allow_remote
         )
@@ -6090,10 +6377,12 @@ async def api_embedding_reembed(request: Request) -> JSONResponse:
     if state.vault_pool.is_fenced(state.vault_path):
         return _err(409, "vault_fenced", "this vault is already fenced for maintenance")
 
-    state.vault_pool.fence(state.vault_path)
+    # Claim + drain with no await since the checks; the fence takes the pool
+    # lock, so it runs off-loop before 202 is returned.
     state.mark_draining()
     state.vault_reembed_active = True
     state.vault_reembed_path = str(state.vault_path)
+    await store_io(state.vault_pool.fence, state.vault_path)
     try:
         _start_owned_maintenance(
             state,
@@ -6103,7 +6392,7 @@ async def api_embedding_reembed(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001
         state.vault_reembed_active = False
         state.draining = False
-        state.vault_pool.unfence(state.vault_path)
+        await store_io(state.vault_pool.unfence, state.vault_path)
         raise
     return JSONResponse({"status": "started", "vault": str(state.vault_path)}, status_code=202)
 
@@ -6116,7 +6405,7 @@ async def api_embedding_reembed_status(request: Request) -> JSONResponse:
     state = get_state()
     if not isinstance(state, VaultRuntime):
         return _err(409, "no_active_vault", "select a vault to inspect reembed status")
-    return JSONResponse(_reembed_status_payload(state, state.vault_path))
+    return JSONResponse(await store_io(_reembed_status_payload, state, state.vault_path))
 
 
 async def api_embedding_models(request: Request) -> JSONResponse:
@@ -6157,11 +6446,8 @@ async def api_embedding_models(request: Request) -> JSONResponse:
 
     if provider_ref is not None:
         try:
-            from okto_neuron.providers import ProviderRegistry, resolve_provider
-
-            profile, api_key_env = resolve_provider(provider_ref)
-            registry = ProviderRegistry.load()
-            if "embedding" not in registry.provider_uses(profile.driver):
+            profile, api_key_env, uses = await store_io(_provider_ref_profile, provider_ref)
+            if "embedding" not in uses:
                 raise ValueError(f"provider {provider_ref!r} does not support embeddings")
             provider = profile.driver
             api_base = profile.api_base or ""
@@ -6352,7 +6638,7 @@ async def api_reconcile_propose(request: Request) -> JSONResponse:
         "type": payload.get("type"),
         "use_cluster_judge": bool(payload.get("use_cluster_judge", False)),
     }
-    job = _jobs.submit(get_state(), "reconcile-propose", label="reconcile propose", params=params)
+    job = await store_io(_jobs.submit, get_state(), "reconcile-propose", label="reconcile propose", params=params)
     return JSONResponse({"status": "ok", "job": job.to_public()})
 
 
@@ -6370,7 +6656,7 @@ async def api_reconcile_apply(request: Request) -> JSONResponse:
         "type": payload.get("type"),
         "use_cluster_judge": bool(payload.get("use_cluster_judge", False)),
     }
-    job = _jobs.submit(get_state(), "reconcile-apply", label="reconcile apply", params=params)
+    job = await store_io(_jobs.submit, get_state(), "reconcile-apply", label="reconcile apply", params=params)
     return JSONResponse({"status": "ok", "job": job.to_public()})
 
 
@@ -6390,12 +6676,7 @@ async def api_reconcile_status(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "job": job.to_public()})
     last_propose = _jobs.latest_of_kind(state, "reconcile-propose")
     last_apply = _jobs.latest_of_kind(state, "reconcile-apply")
-    try:
-        queue_len = len(_curation.reconcile_queue(state))
-        authority_len = len(_curation.authority_index(state).records())
-    except Exception:  # noqa: BLE001
-        queue_len = 0
-        authority_len = 0
+    queue_len, authority_len = await store_io(_reconcile_counts, state)
     return JSONResponse(
         {
             "status": "ok",
@@ -6408,6 +6689,17 @@ async def api_reconcile_status(request: Request) -> JSONResponse:
     )
 
 
+def _reconcile_counts(state: ServerState | VaultRuntime) -> tuple[int, int]:
+    """Store op: reconcile-queue and authority-index sizes (JSON side-files)."""
+    try:
+        return (
+            len(_curation.reconcile_queue(state)),
+            len(_curation.authority_index(state).records()),
+        )
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
 async def api_reconcile_queue(request: Request) -> JSONResponse:
     """List the reconcile review queue (parked clusters awaiting confirmation).
     SEPARATE from the companion review queue (/review-queue) by design."""
@@ -6416,13 +6708,15 @@ async def api_reconcile_queue(request: Request) -> JSONResponse:
         return gate
     state = get_state()
     try:
-        entries = _curation.reconcile_queue(state).list()
+        rows = await store_io(_reconcile_queue_rows, state)
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected reconcile-queue failure")
         return _internal_error()
-    return JSONResponse(
-        {"status": "ok", "entries": [_curation.queued_cluster_row(qc) for qc in entries]}
-    )
+    return JSONResponse({"status": "ok", "entries": rows})
+
+
+def _reconcile_queue_rows(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
+    return [_curation.queued_cluster_row(qc) for qc in _curation.reconcile_queue(state).list()]
 
 
 async def api_reconcile_review_confirm(request: Request) -> JSONResponse:
@@ -6442,9 +6736,7 @@ async def api_reconcile_review_confirm(request: Request) -> JSONResponse:
     try:
         async with _writer_lock_fast(state):
             try:
-                rec = _curation.reconcile_queue(state).confirm(
-                    cluster_id, judge_model=_curation._judge_model(state)
-                )
+                rec = await store_io(_reconcile_confirm, state, cluster_id)
             except KeyError:
                 return _err(404, "not_found", f"queued cluster not found: {cluster_id}")
             except Exception as exc:  # noqa: BLE001
@@ -6473,7 +6765,7 @@ async def api_reconcile_review_reject(request: Request) -> JSONResponse:
     try:
         async with _writer_lock_fast(state):
             try:
-                _curation.reconcile_queue(state).reject(cluster_id)
+                await store_io(_reconcile_reject, state, cluster_id)
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected reconcile reject failure")
                 return _err(500, "reconcile_reject_failed", str(exc))
@@ -6484,6 +6776,18 @@ async def api_reconcile_review_reject(request: Request) -> JSONResponse:
             "vault is busy ingesting/curating — retry when the current item finishes",
         )
     return JSONResponse({"status": "ok", "cluster_id": cluster_id})
+
+
+def _reconcile_confirm(state: ServerState | VaultRuntime, cluster_id: str) -> Any:
+    """Store op (caller holds writer_lock): queued cluster -> AuthorityIndex."""
+    return _curation.reconcile_queue(state).confirm(
+        cluster_id, judge_model=_curation._judge_model(state)
+    )
+
+
+def _reconcile_reject(state: ServerState | VaultRuntime, cluster_id: str) -> None:
+    """Store op (caller holds writer_lock): drop one parked cluster."""
+    _curation.reconcile_queue(state).reject(cluster_id)
 
 
 # --------------------------- predicate upkeep (ADR 0017 workstream B) ---------------------------
@@ -6509,7 +6813,7 @@ async def api_predicate_upkeep_propose(request: Request) -> JSONResponse:
     params = {
         "judged_pairs": payload.get("judged_pairs"),
     }
-    job = _jobs.submit(get_state(), "predicate-propose", label="predicate propose", params=params)
+    job = await store_io(_jobs.submit, get_state(), "predicate-propose", label="predicate propose", params=params)
     return JSONResponse({"status": "ok", "job": job.to_public()})
 
 
@@ -6527,7 +6831,7 @@ async def api_predicate_upkeep_apply(request: Request) -> JSONResponse:
         "proposals": payload.get("proposals"),
         "outcomes": payload.get("outcomes"),
     }
-    job = _jobs.submit(get_state(), "predicate-apply", label="predicate apply", params=params)
+    job = await store_io(_jobs.submit, get_state(), "predicate-apply", label="predicate apply", params=params)
     return JSONResponse({"status": "ok", "job": job.to_public()})
 
 
@@ -6542,7 +6846,8 @@ async def api_companion_triage(request: Request) -> JSONResponse:
     state = get_state()
     if state.draining:
         return _draining_response()
-    job = _jobs.submit(
+    job = await store_io(
+        _jobs.submit,
         state,
         "companion-triage",
         label="companion triage",
@@ -6570,25 +6875,26 @@ def _predicate_vocabulary_size(state: "ServerState") -> int:
 
 
 async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
-    """Predicate alias index snapshot grouped by status."""
+    """Predicate alias index snapshot grouped by status.
+
+    The UI polls this every few seconds from several panels. The alias-index
+    read and the vocabulary scan run as ONE single-flight store op per vault,
+    so concurrent polls share a single execution instead of piling up scans."""
     gate = _upkeep_gate(request)
     if gate is not None:
         return gate
 
     state = get_state()
     try:
-        index = _curation.predicate_alias_index(state)
-        records = index.records()
-        # The vocabulary scan must never run on the event loop (the UI polls
-        # this endpoint); off-load it and serve from a short-lived cache.
-        vocabulary_size = await asyncio.to_thread(_predicate_vocabulary_size, state)
+        grouped, vocabulary_size = await single_flight(
+            ("predicate_snapshot", str(state.vault_path)),
+            _predicate_snapshot,
+            state,
+        )
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected predicate upkeep snapshot failure")
         return _internal_error()
 
-    grouped = {"auto": [], "confirmed": [], "queued": [], "rejected": []}
-    for record in records:
-        grouped.setdefault(record.status, []).append(_curation.predicate_record_row(record))
     last_propose = _jobs.latest_of_kind(state, "predicate-propose")
     last_apply = _jobs.latest_of_kind(state, "predicate-apply")
     return JSONResponse(
@@ -6604,6 +6910,45 @@ async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
     )
 
 
+def _predicate_snapshot(
+    state: ServerState | VaultRuntime,
+) -> tuple[dict[str, list[dict[str, Any]]], int]:
+    """Store op: alias records grouped by status + vocabulary size (60 s cache)."""
+    records = _curation.predicate_alias_index(state).records()
+    vocabulary_size = _predicate_vocabulary_size(state)
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "auto": [],
+        "confirmed": [],
+        "queued": [],
+        "rejected": [],
+    }
+    for record in records:
+        grouped.setdefault(record.status, []).append(_curation.predicate_record_row(record))
+    return grouped, vocabulary_size
+
+
+def _set_predicate_record_status(
+    state: ServerState | VaultRuntime,
+    record_id: str,
+    status: str,
+    required_status: str | None,
+) -> Any:
+    """Store op (caller holds writer_lock): move one alias record to ``status``."""
+    index = _curation.predicate_alias_index(state)
+    record = next((rec for rec in index.records() if rec.id == record_id), None)
+    if record is None:
+        raise _ApiError(404, "not_found", f"predicate record not found: {record_id}")
+    if required_status is not None and record.status != required_status:
+        raise _ApiError(
+            409,
+            "conflict",
+            f"predicate record {record_id} is {record.status}, not {required_status}",
+        )
+    updated = replace(record, status=status)
+    index.upsert(updated)
+    return updated
+
+
 async def api_predicate_upkeep_confirm(request: Request) -> JSONResponse:
     """Confirm a queued predicate mapping record."""
     gate = _upkeep_gate(request)
@@ -6614,18 +6959,11 @@ async def api_predicate_upkeep_confirm(request: Request) -> JSONResponse:
     try:
         async with _writer_lock_fast(state):
             try:
-                index = _curation.predicate_alias_index(state)
-                record = next((rec for rec in index.records() if rec.id == record_id), None)
-                if record is None:
-                    return _err(404, "not_found", f"predicate record not found: {record_id}")
-                if record.status != "queued":
-                    return _err(
-                        409,
-                        "conflict",
-                        f"predicate record {record_id} is {record.status}, not queued",
-                    )
-                updated = replace(record, status="confirmed")
-                index.upsert(updated)
+                updated = await store_io(
+                    _set_predicate_record_status, state, record_id, "confirmed", "queued"
+                )
+            except _ApiError as exc:
+                return exc.response()
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected predicate confirm failure")
                 return _err(500, "predicate_confirm_failed", str(exc))
@@ -6648,12 +6986,11 @@ async def api_predicate_upkeep_reject(request: Request) -> JSONResponse:
     try:
         async with _writer_lock_fast(state):
             try:
-                index = _curation.predicate_alias_index(state)
-                record = next((rec for rec in index.records() if rec.id == record_id), None)
-                if record is None:
-                    return _err(404, "not_found", f"predicate record not found: {record_id}")
-                updated = replace(record, status="rejected")
-                index.upsert(updated)
+                updated = await store_io(
+                    _set_predicate_record_status, state, record_id, "rejected", None
+                )
+            except _ApiError as exc:
+                return exc.response()
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected predicate reject failure")
                 return _err(500, "predicate_reject_failed", str(exc))
@@ -6674,13 +7011,24 @@ async def api_authority_list(request: Request) -> JSONResponse:
         return gate
     state = get_state()
     try:
-        records = _curation.authority_index(state).records()
+        rows = await store_io(_authority_rows, state)
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected authority-list failure")
         return _internal_error()
-    return JSONResponse(
-        {"status": "ok", "records": [_curation.authority_record_row(r) for r in records]}
-    )
+    return JSONResponse({"status": "ok", "records": rows})
+
+
+def _authority_rows(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
+    return [_curation.authority_record_row(r) for r in _curation.authority_index(state).records()]
+
+
+def _authority_unmerge(state: ServerState | VaultRuntime, cluster_id: str) -> bool:
+    """Store op (caller holds writer_lock): drop one AuthorityRecord; returns
+    whether it existed."""
+    index = _curation.authority_index(state)
+    existed = any(r.cluster_id == cluster_id for r in index.records())
+    index.remove(cluster_id)
+    return existed
 
 
 async def api_authority_unmerge(request: Request) -> JSONResponse:
@@ -6699,9 +7047,7 @@ async def api_authority_unmerge(request: Request) -> JSONResponse:
     try:
         async with _writer_lock_fast(state):
             try:
-                index = _curation.authority_index(state)
-                existed = any(r.cluster_id == cluster_id for r in index.records())
-                index.remove(cluster_id)
+                existed = await store_io(_authority_unmerge, state, cluster_id)
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected authority unmerge failure")
                 return _err(500, "authority_unmerge_failed", str(exc))
@@ -6736,7 +7082,7 @@ async def api_curation_scheduler(request: Request) -> JSONResponse:
     if not remote_config_allowed(request):
         return _err(403, "forbidden", "curation scheduler is restricted to loopback callers")
     state = get_state()
-    cfg = _scheduler._load_scheduler_config(state)
+    cfg = await store_io(_scheduler._load_scheduler_config, state)
     now = time.time()
     # Recent history = the loop's OWN auto sweeps: sweep-kind jobs tagged
     # trigger=scheduler. Most-recent first, capped for the panel.
@@ -6762,54 +7108,63 @@ async def api_curation_scheduler(request: Request) -> JSONResponse:
         }
     )
 
-
-# ── ADR 0009 P3: in-process rebuild / heal / reembed ────────────────────────────
-# Submit a fresh-graph rebuild/heal/reembed to the curation job queue. The job runs
-# through the selected runtime and its leased pool handle (no second Vault — the
-# ADR-0007 corruption path): it builds a fresh graph at a tmp path while the daemon
-# keeps serving from the live handle, then close→os.replace→reopen swaps only at the
-# end (that runtime is unavailable for the swap instant). Loopback-gated like the
-# other vault-wide admin ops.
-
 _REBUILD_KINDS = frozenset({"rebuild", "rollback", "heal", "reembed"})
 
 
-def _curation_vaultwide_gate(request: Request) -> JSONResponse | None:
-    """Loopback gate + 409 if a vault-wide op (any rebuild-family job, or a reembed
-    that set ``draining``) is already running. Mirrors the reconcile gate but also
-    rejects when ``draining`` is set, since a rebuild/heal/reembed holds it."""
-    if not remote_config_allowed(request):
-        return _err(403, "forbidden", "this operation is restricted to loopback callers")
-    state = get_state()
-    if state.draining:
-        return _err(409, "busy", "a vault-wide operation is already in progress")
-    # A queued/running rebuild-family job also blocks (it will set draining once it
-    # starts; reject early so two never queue back-to-back unexpectedly).
-    for job in state.curation_jobs:
-        if job.kind in _REBUILD_KINDS and job.status in ("queued", "running"):
-            return _err(409, "busy", f"a {job.kind} job is already {job.status}")
-    return None
+_VAULTWIDE_SUBMIT_LOCK = threading.Lock()
 
 
-def _submit_rebuild_family(
+async def _submit_rebuild_family(
     request: Request,
     kind: str,
     label: str,
     *,
     params: dict | None = None,
 ) -> JSONResponse:
-    gate = _curation_vaultwide_gate(request)
-    if gate is not None:
-        return gate
-    job = _jobs.submit(get_state(), kind, label=label, params=params)
+    if not remote_config_allowed(request):
+        return _err(403, "forbidden", "this operation is restricted to loopback callers")
+    try:
+        job = await store_io(_gated_rebuild_submit, get_state(), kind, label, params)
+    except _ApiError as exc:
+        return exc.response()
     return JSONResponse({"status": "ok", "job": job.to_public()}, status_code=202)
+
+
+def _vaultwide_busy(state: ServerState | VaultRuntime) -> _ApiError | None:
+    if state.draining:
+        return _ApiError(409, "busy", "a vault-wide operation is already in progress")
+    # A queued/running rebuild-family job also blocks (it will set draining once it
+    # starts; reject early so two never queue back-to-back unexpectedly).
+    for job in state.curation_jobs:
+        if job.kind in _REBUILD_KINDS and job.status in ("queued", "running"):
+            return _ApiError(409, "busy", f"a {job.kind} job is already {job.status}")
+    return None
+
+
+def _gated_rebuild_submit(
+    state: ServerState | VaultRuntime,
+    kind: str,
+    label: str,
+    params: dict | None,
+    *,
+    prepare: Callable[[], dict | None] | None = None,
+) -> Any:
+    """Store op: the vault-wide busy gate and the job submit (sidecar write) as
+    one atomic step, so two concurrent requests can never both pass the gate."""
+    with _VAULTWIDE_SUBMIT_LOCK:
+        busy = _vaultwide_busy(state)
+        if busy is not None:
+            raise busy
+        if prepare is not None:
+            params = prepare()
+        return _jobs.submit(state, kind, label=label, params=params)
 
 
 async def api_curation_rebuild(request: Request) -> JSONResponse:
     """Submit a fresh-graph rebuild from the markdown trust root. Re-extracts every
     source file into a brand-new graph and atomic-swaps it onto LIVE. Returns 202 +
     the job; poll GET /api/v1/curation/rebuild/status for per-file progress."""
-    return _submit_rebuild_family(request, "rebuild", "rebuild")
+    return await _submit_rebuild_family(request, "rebuild", "rebuild")
 
 
 async def api_curation_rollback(request: Request) -> JSONResponse:
@@ -6819,32 +7174,42 @@ async def api_curation_rollback(request: Request) -> JSONResponse:
     filesystem path. The runner requires the effective semantic configuration to
     match that checkpoint and restores its saved decision files with the graph.
     """
-    gate = _curation_vaultwide_gate(request)
-    if gate is not None:
-        return gate
+    if not remote_config_allowed(request):
+        return _err(403, "forbidden", "this operation is restricted to loopback callers")
     state = get_state()
-    generation = state.vault.store.generation()
+    try:
+        job = await store_io(
+            _gated_rebuild_submit,
+            state,
+            "rollback",
+            "rollback",
+            None,
+            prepare=functools.partial(_rollback_params, state),
+        )
+    except _ApiError as exc:
+        return exc.response()
+    return JSONResponse({"status": "ok", "job": job.to_public()}, status_code=202)
+
+
+def _rollback_params(state: ServerState | VaultRuntime) -> dict[str, object]:
+    """Store op part: bind the rollback to the verified checkpoint for the live
+    graph generation, or refuse when there is no rollback evidence."""
     from okto_neuron.cli import kg as kg_cli
     from okto_neuron.config import VaultConfig
     from okto_neuron.curation.orchestrate import rollback_candidate
 
+    generation = state.vault.store.generation()
     backend_name = kg_cli._resolve_pinned_backend(state.vault_path)
     storage_config = VaultConfig.load(state.vault_path).storage
     candidate = rollback_candidate(state.vault_path, backend_name, storage_config)
     if not generation or candidate is None:
-        return _err(
+        raise _ApiError(
             409,
             "rollback_unavailable",
             f"missing verified rollback evidence: no rollback candidate for backend "
             f"{backend_name!r} at generation {generation or 'missing'}",
         )
-    job = _jobs.submit(
-        state,
-        "rollback",
-        label="rollback",
-        params={"from_generation": generation},
-    )
-    return JSONResponse({"status": "ok", "job": job.to_public()}, status_code=202)
+    return {"from_generation": generation}
 
 
 async def api_curation_heal(request: Request) -> JSONResponse:
@@ -6858,13 +7223,13 @@ async def api_curation_heal(request: Request) -> JSONResponse:
     brief (~1s) added latency on any read in flight during the final atomic swap (it is
     served against the reopened graph, not 503'd). Returns 202 + the job; poll
     GET /api/v1/curation/rebuild/status?kind=heal."""
-    return _submit_rebuild_family(request, "heal", "heal")
+    return await _submit_rebuild_family(request, "heal", "heal")
 
 
 async def api_curation_reembed(request: Request) -> JSONResponse:
     """Submit an in-process vectors-only reembed (no LLM re-extraction). Same
     fresh-build + atomic-swap pattern as rebuild. Returns 202 + the job."""
-    return _submit_rebuild_family(request, "reembed", "reembed")
+    return await _submit_rebuild_family(request, "reembed", "reembed")
 
 
 async def api_curation_rebuild_status(request: Request) -> JSONResponse:
@@ -6893,16 +7258,9 @@ async def api_curation_rebuild_status(request: Request) -> JSONResponse:
         "reembed": _REEMBED_STATE_FILE,
         "rollback": _ROLLBACK_STATE_FILE,
     }.get(kind, _REBUILD_STATE_FILE)
-    state_path = state.vault_path / ".marginalia" / state_file
-    phase_payload: dict = {"phase": "idle"}
-    try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            phase_payload = data
-    except FileNotFoundError:
-        pass
-    except Exception:  # noqa: BLE001
-        phase_payload = {"phase": "unknown"}
+    phase_payload = await store_io(
+        _read_phase_file, state.vault_path / ".marginalia" / state_file
+    )
     return JSONResponse(
         {
             "status": "ok",
@@ -6915,6 +7273,17 @@ async def api_curation_rebuild_status(request: Request) -> JSONResponse:
             "phase": phase_payload,
         }
     )
+
+
+def _read_phase_file(state_path: Path) -> dict:
+    """Store op: one maintenance phase sidecar (idle when absent)."""
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"phase": "idle"}
+    except Exception:  # noqa: BLE001
+        return {"phase": "unknown"}
+    return data if isinstance(data, dict) else {"phase": "idle"}
 
 
 # --------------------------- web-UI (built SPA) ---------------------------

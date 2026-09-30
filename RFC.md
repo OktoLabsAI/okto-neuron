@@ -289,6 +289,15 @@ runtime explicitly; each runtime owns its queues, jobs, locks, and sidecars, whi
 leases the matching Ladybug handle for the operation. This is request routing, not cross-vault
 query fanout. No `MultiVault`, authority-overlay, or catalog-federation API has shipped.
 
+REST, MCP and `/health` share one asyncio event loop, so no handler may do store, sidecar or
+YAML I/O on it. Every such call goes through one bounded store executor
+(`server/_store_io.py`, `store_io`; `[server] store_workers` in `okto-neuron.toml`, default 4),
+which also collapses concurrent identical full scans (upkeep predicates, graph stats, integrity
+summary, ledger runs/summary) into one execution with `single_flight`. LLM extraction and
+answer synthesis, query embedding and re-embed stay on the default executor so a slow model
+call never holds a store worker. `tests/server/test_event_loop_guard.py` fails any route or MCP
+tool that blocks the loop for more than 50 ms against a deliberately slow store.
+
 Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
 symlink/path safety, fences new leases, drains existing work, releases the owned handle, and
