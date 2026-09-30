@@ -374,6 +374,28 @@ vocabulary, shared-argument pairs, argument signatures and samples are one `Pred
 (`predicates.build_predicate_stats`), which candidate generation accepts through `stats=` instead of
 rescanning the graph.
 
+The companion review queue lives in `.marginalia/review_queue.sqlite` (stdlib `sqlite3`, WAL,
+`synchronous=FULL`), not in `review_queue.json`. The JSON file was rewritten whole on every enqueue and
+acknowledge and re-parsed whole on every `ReviewQueue` construction (137 MB for about 2,000 items, 97% of it
+embeddings). Tables: `entries(seq, candidate_id UNIQUE, kind, reason, created_at, payload, entry_sha256)` with the
+payload stored WITHOUT the embedding, and `embeddings(candidate_id, dim, vec)` holding the vector as
+little-endian float64, so the round trip is bit-exact. `entry_sha256` (what `resolution_scope` hands a sealed
+plan) is still the sha256 of the full entry record with the embedding restored, byte-for-byte the JSON-era
+value, and every path that materialises the embedding re-checks it. Each enqueue or acknowledge is one
+`BEGIN IMMEDIATE` transaction on its own connection (about 0.6 ms); `ReviewQueue` construction reads nothing.
+A vault at `marginalia_yaml_version: 1` keeps `review_queue.json` and its queue is refused
+(`ReviewQueueMigrationRequired`) until the explicit migration runs; nothing migrates implicitly. The migration
+(`consolidate/review_queue_migration.py`) loads the source with the old validating loader (any refusal aborts,
+nothing is skipped or rewritten), writes a verified `review_queue.json.bak-v1` that is never overwritten or
+deleted, bumps the yaml to version 2, builds and verifies a temp SQLite file (counts equal, and every row's
+`entry_sha256` recomputed from the SQLite row equals the source entry's), replaces it atomically and only then
+renames the source to `review_queue.json.migrated`. Version 2 is the forward-compat guard: 0.3.1 supports
+`(1,)` and exits 4 (`ConfigVersionUnsupported`) on a migrated vault, verified in the tests against the real
+released 0.3.1 wheel; the bump comes before the data work so a crash can never leave 0.3.1 able to open a
+half-migrated vault. Rollback regenerates the JSON from SQLite (or restores the literal backup), moves the
+SQLite file aside and lowers the yaml to 1 last; yaml 1 always means the JSON is the truth. New vaults are
+created at version 2.
+
 Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. `GrafxStore` therefore passes `buffer_budget_bytes` to
 `okto_grafx.connect`: `storage.buffer_budget` in the vault yaml (bytes or a string such as `256MiB`,

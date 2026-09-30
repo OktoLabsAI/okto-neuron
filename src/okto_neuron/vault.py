@@ -721,8 +721,10 @@ class Vault:
             import uuid
 
             storage["vault_id"] = uuid.uuid4().hex
+        from okto_neuron.config._vault import CURRENT_YAML_VERSION
+
         config = {
-            "marginalia_yaml_version": 1,
+            "marginalia_yaml_version": CURRENT_YAML_VERSION,
             "vault_id": root.name,
             "federation_opt_in": False,
             "packs": list(packs),

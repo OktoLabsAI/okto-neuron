@@ -198,22 +198,16 @@ def _write_grafx_batched(store: Any, nodes: list[Any], edges: list[Any]) -> None
 
 def _write_review_queue(vault_path: Path, shape: Shape) -> None:
     from okto_neuron.consolidate import NodeCandidate
-    from okto_neuron.consolidate.review_queue import ReviewQueue, _NodeEntry
+    from okto_neuron.consolidate.review_queue import ReviewQueue
 
     queue = ReviewQueue(vault_path / ".marginalia", store=None)  # type: ignore[arg-type]
-    entries: dict[str, Any] = {}
     for index in range(shape.review_items):
         candidate = NodeCandidate(
             type=_ENTITY_TYPES[index % len(_ENTITY_TYPES)],
             title=f"Synthetic review candidate {index}",
             facets={"block_id": f"block:{index % shape.blocks:04d}"},
         )
-        entries[candidate.candidate_id] = _NodeEntry(
-            candidate=candidate,
-            reason="low_confidence" if index % 3 else "contradiction",
-            correlations=(),
-        )
-    queue._save(entries)
+        queue.enqueue(candidate, "low_confidence" if index % 3 else "contradiction")
 
 
 def build_synthetic_vault(path: Path, *, backend: str = "grafx", shape: Shape = FULL) -> Path:

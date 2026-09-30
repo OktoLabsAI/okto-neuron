@@ -3202,8 +3202,10 @@ def _write_snapshot_vault_config(
         import uuid
 
         storage["vault_id"] = uuid.uuid4().hex
+    from okto_neuron.config._vault import CURRENT_YAML_VERSION
+
     config = {
-        "marginalia_yaml_version": 1,
+        "marginalia_yaml_version": CURRENT_YAML_VERSION,
         "vault_id": vault_path.name,
         "federation_opt_in": False,
         "packs": list(manifest.packs),

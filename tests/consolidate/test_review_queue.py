@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
+
 import json
+import sqlite3
 
 import pytest
 
-import okto_neuron.consolidate.review_queue as review_queue_module
+import okto_neuron.consolidate.review_queue_sqlite as review_queue_sqlite_module
 from okto_neuron.companion import Correlation, ReviewItemNotFoundError
 from okto_neuron.consolidate import EdgeCandidate, NodeCandidate
 from okto_neuron.consolidate.relation_gate import (
@@ -17,10 +20,22 @@ from okto_neuron.consolidate.relation_gate import (
     SourceGrounding,
     TopologyObject,
 )
+from okto_neuron.config._vault import vault_yaml_version
 from okto_neuron.consolidate.review_queue import (
     PinnedRelationProposal,
     RelationReviewItem,
     ReviewQueue,
+    _NodeEntry,
+    _relation_proposal_to_json,
+    entry_digest,
+)
+from okto_neuron.consolidate.review_queue_migration import (
+    ReviewQueueMigrationError,
+    migrate,
+)
+from okto_neuron.consolidate.review_queue_sqlite import (
+    ReviewQueueMigrationRequired,
+    SqliteQueueStore,
 )
 from okto_neuron.predicates.admission import PredicateAdmissionDecision
 from okto_neuron.store import InMemoryStore
@@ -178,9 +193,17 @@ def test_persists_across_reopen(tmp_path) -> None:
     assert items[0].correlations[0].target_id == "n1"
 
 
-def test_legacy_untagged_node_row_remains_readable(tmp_path) -> None:
-    qdir = tmp_path / ".marginalia"
-    qdir.mkdir()
+def _v1_vault(tmp_path, *, version: int = 1):
+    root = tmp_path / "vault"
+    (root / ".marginalia").mkdir(parents=True)
+    (root / "okto-neuron.yaml").write_text(
+        f"marginalia_yaml_version: {version}\nvault_id: t\n", encoding="utf-8"
+    )
+    return root, root / ".marginalia"
+
+
+def test_legacy_untagged_node_row_migrates_and_keeps_its_digest(tmp_path) -> None:
+    root, qdir = _v1_vault(tmp_path)
     candidate = _cand(title="legacy")
     (qdir / "review_queue.json").write_text(
         json.dumps(
@@ -196,35 +219,20 @@ def test_legacy_untagged_node_row_remains_readable(tmp_path) -> None:
         ),
         encoding="utf-8",
     )
+    json_era_digest = entry_digest(
+        _NodeEntry(candidate=candidate, reason="low_confidence", correlations=()).to_json()
+    )
 
+    with pytest.raises(ReviewQueueMigrationRequired):
+        ReviewQueue(qdir, InMemoryStore())
+    migrate(root)
     queue = ReviewQueue(qdir, InMemoryStore())
 
     assert queue.list()[0].candidate_id == candidate.candidate_id
     assert queue.candidates() == [candidate]
-
-
-def test_new_node_rows_are_explicitly_tagged(tmp_path) -> None:
-    queue = ReviewQueue(tmp_path / ".marginalia", InMemoryStore())
-    queue.enqueue(_cand(), "low_confidence")
-
-    payload = json.loads(queue.path.read_text(encoding="utf-8"))
-
-    assert payload["entries"][0]["kind"] == "node"
-
-
-def test_resolution_scope_binds_the_complete_persisted_entry(tmp_path) -> None:
-    qdir = tmp_path / ".marginalia"
-    candidate = NodeCandidate(
-        type="Claim",
-        title="same identity",
-        content="same content",
-        facets={"predicate": "first"},
-        embedding=(0.1, 0.2),
-    )
-    queue = ReviewQueue(qdir, InMemoryStore())
-    queue.enqueue(candidate, "low_confidence")
-
     first = queue.resolution_scope(candidate.candidate_id)
+    assert first["entry_sha256"] == json_era_digest
+    assert first["queue_file"] == "review_queue.json"
     assert ReviewQueue(qdir, InMemoryStore()).resolution_scope(candidate.candidate_id) == first
 
     changed = candidate.model_copy(update={"facets": {"predicate": "second"}})
@@ -434,24 +442,31 @@ def test_relation_enqueue_rejects_literal_with_topology_dst_ref(tmp_path) -> Non
 
 @pytest.mark.parametrize("corruption", ["unknown_kind", "unknown_field", "duplicate"])
 def test_relation_rows_fail_closed_on_corrupt_framing(tmp_path, corruption: str) -> None:
-    qdir = tmp_path / ".marginalia"
-    queue = ReviewQueue(qdir, InMemoryStore())
-    queue.enqueue_relation(
-        _relation_candidate(),
-        "queue_grounding",
-        _pinned_relation_proposal("queue_grounding"),
-    )
-    payload = json.loads(queue.path.read_text(encoding="utf-8"))
+    root, qdir = _v1_vault(tmp_path)
+    record = {
+        "kind": "relation",
+        "candidate": _relation_candidate().model_dump(mode="json"),
+        "reason": "queue_grounding",
+        "pinned_proposal": _relation_proposal_to_json(_pinned_relation_proposal("queue_grounding")),
+    }
+    entries = [record]
     if corruption == "unknown_kind":
-        payload["entries"][0]["kind"] = "edge"
+        entries = [{**record, "kind": "edge"}]
     elif corruption == "unknown_field":
-        payload["entries"][0]["untrusted"] = True
+        entries = [{**record, "untrusted": True}]
     else:
-        payload["entries"].append(dict(payload["entries"][0]))
-    queue.path.write_text(json.dumps(payload), encoding="utf-8")
+        entries = [record, dict(record)]
+    source = qdir / "review_queue.json"
+    source.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+    before = source.read_bytes()
 
-    with pytest.raises(ValueError):
-        ReviewQueue(qdir, InMemoryStore())
+    with pytest.raises(ReviewQueueMigrationError):
+        migrate(root)
+
+    # refused loudly: the source is intact and nothing was written
+    assert source.read_bytes() == before
+    assert not (qdir / "review_queue.sqlite").exists()
+    assert vault_yaml_version(root) == 1
 
 
 def test_relation_rows_fail_closed_on_corrupt_semantic_type(tmp_path) -> None:
@@ -462,12 +477,16 @@ def test_relation_rows_fail_closed_on_corrupt_semantic_type(tmp_path) -> None:
         "queue_grounding",
         _pinned_relation_proposal("queue_grounding"),
     )
-    payload = json.loads(queue.path.read_text(encoding="utf-8"))
-    payload["entries"][0]["pinned_proposal"]["useful"] = "yes"
-    queue.path.write_text(json.dumps(payload), encoding="utf-8")
+    (row,) = SqliteQueueStore(qdir).rows()
+    payload = json.loads(row.payload)
+    payload["pinned_proposal"]["useful"] = "yes"
+    with sqlite3.connect(queue.path) as connection:
+        connection.execute(
+            "UPDATE entries SET payload = ? WHERE seq = ?", (json.dumps(payload), row.seq)
+        )
 
     with pytest.raises(ValueError, match="useful must be boolean"):
-        ReviewQueue(qdir, InMemoryStore())
+        ReviewQueue(qdir, InMemoryStore()).list_relations()
 
 
 def test_claim_facets_and_embedding_survive_reopen(tmp_path) -> None:
@@ -498,81 +517,64 @@ def test_claim_facets_and_embedding_survive_reopen(tmp_path) -> None:
     assert store.get_node(claim.candidate_id) is None
 
 
-def test_replace_failure_preserves_previous_queue_file_and_memory(
+def test_failed_write_rolls_back_and_keeps_the_previous_queue(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     qdir = tmp_path / ".marginalia"
     queue = ReviewQueue(qdir, InMemoryStore())
     first = _cand(title="first")
-    second = _cand(title="second")
     queue.enqueue(first, "low_confidence")
-    before = queue.path.read_bytes()
 
-    def fail_replace(source, target) -> None:
-        raise OSError("replace failed")
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
 
-    monkeypatch.setattr(review_queue_module.os, "replace", fail_replace)
+    monkeypatch.setattr(review_queue_sqlite_module, "pack_embedding", fail)
+    with pytest.raises(OSError, match="disk full"):
+        queue.enqueue(
+            NodeCandidate(type="Concept", title="second", embedding=(0.5, 0.25)),
+            "low_confidence",
+        )
+    monkeypatch.undo()
 
-    with pytest.raises(OSError, match="replace failed"):
-        queue.enqueue(second, "low_confidence")
-
-    assert queue.path.read_bytes() == before
-    assert [item.candidate_id for item in queue.list()] == [first.candidate_id]
     assert [item.candidate_id for item in ReviewQueue(qdir, InMemoryStore()).list()] == [
         first.candidate_id
     ]
-    assert list(qdir.glob(".review_queue.json.*.tmp")) == []
 
 
-def test_atomic_save_fsyncs_file_and_directory(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-    real_fsync = review_queue_module.os.fsync
-
-    def record_fsync(fd: int) -> None:
-        calls.append(fd)
-        real_fsync(fd)
-
-    monkeypatch.setattr(review_queue_module.os, "fsync", record_fsync)
-
-    ReviewQueue(tmp_path / ".marginalia", InMemoryStore()).enqueue(
-        _cand(title="durable"),
-        "low_confidence",
-    )
-
-    assert len(calls) == 2
-
-
-def test_directory_fsync_failure_keeps_memory_coherent_with_replaced_file(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_sqlite_pragmas_are_wal_and_full_sync(tmp_path) -> None:
     qdir = tmp_path / ".marginalia"
-    queue = ReviewQueue(qdir, InMemoryStore())
-    candidate = _cand(title="replaced-before-directory-fsync")
-    calls = 0
-    real_fsync = review_queue_module.os.fsync
+    ReviewQueue(qdir, InMemoryStore()).enqueue(_cand(), "low_confidence")
+    connection = review_queue_sqlite_module.connect(qdir / "review_queue.sqlite", create=False)
+    try:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+    finally:
+        connection.close()
 
-    def fail_directory_fsync(fd: int) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("directory fsync failed")
-        real_fsync(fd)
 
-    monkeypatch.setattr(review_queue_module.os, "fsync", fail_directory_fsync)
+def test_concurrent_enqueue_from_threads_loses_nothing(tmp_path) -> None:
+    import threading
 
-    with pytest.raises(OSError, match="directory fsync failed"):
-        queue.enqueue(candidate, "low_confidence")
+    qdir = tmp_path / ".marginalia"
+    errors: list[BaseException] = []
 
-    assert [item.candidate_id for item in queue.list()] == [candidate.candidate_id]
-    assert [item.candidate_id for item in ReviewQueue(qdir, InMemoryStore()).list()] == [
-        candidate.candidate_id
-    ]
-    assert list(qdir.glob(".review_queue.json.*.tmp")) == []
+    def work(start: int) -> None:
+        try:
+            queue = ReviewQueue(qdir, InMemoryStore())
+            for index in range(start, start + 25):
+                queue.enqueue(_cand(title=f"t{index}"), "low_confidence")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(n * 25,)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(ReviewQueue(qdir, InMemoryStore())) == 100
 
 
 def test_acknowledge_unknown_id_raises(tmp_path) -> None:

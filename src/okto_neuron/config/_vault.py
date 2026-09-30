@@ -29,7 +29,11 @@ from okto_neuron.config._capacity import DEFAULT_PARALLEL_CAPABLE_MODELS
 from okto_neuron.config._app_config import default_app_home
 from okto_neuron.errors import ConfigNotFound, ConfigParseError, ConfigVersionUnsupported
 
-SUPPORTED_YAML_VERSIONS = (1,)
+# Version 2 marks a vault whose review queue lives in SQLite (#14). An older
+# binary (supported: 1) refuses such a vault loudly instead of silently
+# ignoring the SQLite queue and writing a stale review_queue.json beside it.
+SUPPORTED_YAML_VERSIONS = (1, 2)
+CURRENT_YAML_VERSION = 2
 _WARNED_MISSING_VERSION: set[Path] = set()
 
 
@@ -42,6 +46,64 @@ def _config_file_for(path: Path | str) -> Path:
     if is_vault_config_filename(candidate.name):
         return candidate
     return vault_config_path(candidate)
+
+
+_YAML_VERSION_LINE = re.compile(r"^marginalia_yaml_version:[ \t]*[0-9]*[ \t]*(#.*)?$", re.MULTILINE)
+
+
+def vault_yaml_version(vault_path: Path | str) -> int | None:
+    """Return the vault's ``marginalia_yaml_version`` without validating the file.
+
+    ``None`` when the vault has no config file at all; a config without the key
+    is version 1 (the loader's own rule). Raises nothing for a malformed file
+    body beyond what ``yaml`` raises, so callers can gate cheaply.
+    """
+
+    config_path = _config_file_for(vault_path)
+    if not config_path.is_file():
+        return None
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return None
+    found = data.get("marginalia_yaml_version", 1)
+    return found if isinstance(found, int) and not isinstance(found, bool) else None
+
+
+def set_vault_yaml_version(vault_path: Path | str, version: int) -> None:
+    """Rewrite only the ``marginalia_yaml_version`` line, atomically.
+
+    Every other byte of the file (comments, key order) is preserved; the key is
+    prepended when absent. Temp file + fsync + ``os.replace`` + directory fsync.
+    """
+
+    config_path = _config_file_for(vault_path)
+    text = config_path.read_text(encoding="utf-8")
+    line = f"marginalia_yaml_version: {version}"
+    if _YAML_VERSION_LINE.search(text):
+        updated = _YAML_VERSION_LINE.sub(line, text, count=1)
+    else:
+        updated = f"{line}\n{text}"
+    temp = config_path.with_name(f".{config_path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, config_path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    directory_fd = os.open(config_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    if vault_yaml_version(vault_path) != version:
+        raise ConfigParseError(
+            config_path,
+            cause=ValueError(f"marginalia_yaml_version did not persist as {version}"),
+        )
 
 
 def _yaml_error_line(error: yaml.YAMLError) -> int | None:
@@ -1836,7 +1898,8 @@ class VaultConfig(BaseModel):
 
         raw = cls.load_raw(vault_path)
         compact = {key: value for key, value in raw.items() if key not in cls.WRITABLE_BLOCKS}
-        compact["marginalia_yaml_version"] = 1
+        # Preserve the vault's own version: it decides the review-queue layout.
+        compact["marginalia_yaml_version"] = raw.get("marginalia_yaml_version", 1)
         compact["inherits_application_defaults"] = True
         config_path = _config_file_for(vault_path)
         config_path.write_text(yaml.safe_dump(compact, sort_keys=False), encoding="utf-8")

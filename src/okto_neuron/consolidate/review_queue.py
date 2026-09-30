@@ -5,8 +5,10 @@ that interrupts the user: a candidate that the confidence gate could not commit
 (low confidence, or a contradiction) is parked here with its reason and the
 correlations the graph talked back with, and waits for curation.
 
-Persistence is JSON under ``<dir>/review_queue.json`` (``<dir>`` is typically a
-vault's ``.marginalia/``), so the queue survives restarts. The full candidate
+Persistence is SQLite under ``<dir>/review_queue.sqlite`` (``<dir>`` is typically a
+vault's ``.marginalia/``; see ``review_queue_sqlite``), so the queue survives
+restarts. Vaults at config version 1 still hold ``review_queue.json`` and are
+moved over only by the explicit ``kg review-queue migrate``. The full candidate
 and its pinned review evidence are stored. Legacy rows have no ``kind`` and
 continue to mean ``node``. New relation rows are tagged ``relation`` and are
 deliberately read/acknowledge only: graph-writing resolution remains an
@@ -31,11 +33,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TypeAlias
-from uuid import uuid4
 
 from okto_neuron.companion import (
     Correlation,
@@ -55,6 +55,15 @@ from okto_neuron.consolidate.relation_gate import (
     decide_relation,
 )
 from okto_neuron.predicates.admission import PredicateAdmissionDecision
+from okto_neuron.config._vault import vault_yaml_version
+from okto_neuron.consolidate.review_queue_sqlite import (
+    ReviewQueueCorruption,
+    ReviewQueueMigrationRequired,
+    SqliteQueueStore,
+    StoredRow,
+    decode_cursor,
+    encode_cursor,
+)
 from okto_neuron.store.protocol import GraphStore
 
 QUEUE_FILENAME = "review_queue.json"
@@ -603,85 +612,168 @@ def _confidence_of(correlations: tuple[Correlation, ...]) -> float:
     return max(c.score for c in correlations)
 
 
+def entry_digest(record: dict) -> str:
+    """The ``entry_sha256`` of one entry record: the digest a sealed plan pins."""
+
+    encoded = json.dumps(
+        record,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def parse_legacy_entry(record: object) -> _Entry:
+    """Validate one ``review_queue.json`` record exactly as the JSON-era loader did."""
+
+    if not isinstance(record, dict):
+        raise ValueError("review queue entry must be an object")
+    kind = record.get("kind", "node")
+    if kind == "node":
+        return _NodeEntry.from_json(record)
+    if kind == "relation":
+        return _RelationEntry.from_json(record)
+    raise ValueError(f"unknown review queue entry kind: {kind!r}")
+
+
+def load_legacy_records(path: Path) -> list[dict]:
+    """Parse ``review_queue.json`` into its raw record list (migration input)."""
+
+    data = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        parse_constant=_reject_nonfinite_json,
+    )
+    _require_record_fields(
+        data,
+        required={"entries"},
+        optional=set(),
+        name="review queue",
+    )
+    assert isinstance(data, dict)
+    records = data["entries"]
+    if not isinstance(records, list):
+        raise ValueError("review queue entries must be a list")
+    return records
+
+
+def load_legacy_entries(path: Path) -> dict[str, _Entry]:
+    """Validated entries of ``review_queue.json`` keyed by id (dup id is an error)."""
+
+    loaded: dict[str, _Entry] = {}
+    for index, record in enumerate(load_legacy_records(path)):
+        try:
+            entry = parse_legacy_entry(record)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"review queue entry #{index} refused: {exc}") from exc
+        candidate_id = _entry_id(entry)
+        if candidate_id in loaded:
+            raise ValueError(f"duplicate review queue candidate id: {candidate_id}")
+        loaded[candidate_id] = entry
+    return loaded
+
+
+def split_entry(entry: _Entry) -> tuple[dict, tuple[float, ...] | None, str]:
+    """``(payload record without embedding, embedding, entry_sha256)`` for storage.
+
+    The digest is over the FULL record (embedding included), identical to the
+    JSON era's ``resolution_scope`` digest.
+    """
+
+    record = entry.to_json()
+    digest = entry_digest(record)
+    candidate = record["candidate"]
+    embedding = candidate.get("embedding") if record["kind"] == "node" else None
+    if embedding is None:
+        return record, None, digest
+    payload = dict(record)
+    payload["candidate"] = {**candidate, "embedding": None}
+    return payload, tuple(embedding), digest
+
+
+def join_record(row: StoredRow) -> dict:
+    """Rebuild the full entry record (embedding restored) from a stored row."""
+
+    record = json.loads(row.payload, parse_constant=_reject_nonfinite_json)
+    if row.embedding is not None:
+        record["candidate"]["embedding"] = list(row.embedding)
+    return record
+
+
+def _vault_root_of(directory: Path) -> Path | None:
+    return directory.parent if directory.name == ".marginalia" else None
+
+
 @dataclass
 class ReviewQueue:
     """Persistent queue of parked candidates, keyed by ``candidate_id``.
 
-    ``dir`` holds the JSON file; ``store`` is the graph the resolve actions act
-    on. Re-opening with the same ``dir`` restores the queue.
+    ``dir`` holds ``review_queue.sqlite`` (see ``review_queue_sqlite``); ``store``
+    is the graph the resolve actions act on. Construction reads nothing. A vault
+    that still uses ``review_queue.json`` (config version 1) is refused with
+    ``ReviewQueueMigrationRequired``: the queue never migrates implicitly, the
+    explicit ``kg review-queue migrate`` does.
     """
 
     dir: Path
     store: GraphStore
-    _entries: dict[str, _Entry] = field(default_factory=dict, init=False)
+    _rows: SqliteQueueStore = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.dir = Path(self.dir)
-        self._load()
+        self._rows = SqliteQueueStore(self.dir)
+        self._require_current_layout()
 
-    # ── persistence ────────────────────────────────────────────────────────────
+    # ── layout gate ──────────────────────────────────────────────────────────
     @property
     def path(self) -> Path:
+        """The SQLite file backing this queue."""
+        return self._rows.path
+
+    @property
+    def legacy_path(self) -> Path:
         return self.dir / QUEUE_FILENAME
 
-    def _load(self) -> None:
-        self._entries = {}
-        if not self.path.exists():
-            return
-        data = json.loads(
-            self.path.read_text(encoding="utf-8"),
-            parse_constant=_reject_nonfinite_json,
+    def _require_current_layout(self) -> None:
+        root = _vault_root_of(self.dir)
+        remedy = (
+            "run `okto-neuron kg review-queue migrate --vault "
+            f"{root.name if root is not None else '<name>'}`"
         )
-        _require_record_fields(
-            data,
-            required={"entries"},
-            optional=set(),
-            name="review queue",
+        if root is not None and vault_yaml_version(root) == 1:
+            raise ReviewQueueMigrationRequired(
+                f"review queue uses the legacy JSON layout (config version 1); {remedy}",
+                vault_path=root,
+            )
+        if not self._rows.exists() and self.legacy_path.exists():
+            raise ReviewQueueMigrationRequired(
+                f"{QUEUE_FILENAME} exists but no SQLite queue does; {remedy}",
+                file_path=self.legacy_path,
+            )
+
+    # ── row <-> entry ────────────────────────────────────────────────────────
+    @staticmethod
+    def _entry_from_row(row: StoredRow, *, verify: bool) -> _Entry:
+        """Rebuild an entry. ``verify`` recomputes the digest over the full record."""
+
+        record = join_record(row)
+        if verify and entry_digest(record) != row.entry_sha256:
+            raise ReviewQueueCorruption(
+                "review queue row failed its entry_sha256 check "
+                f"(seq {row.seq}, kind {row.kind})"
+            )
+        return parse_legacy_entry(record)
+
+    def _put(self, entry: _Entry) -> None:
+        payload, embedding, digest = split_entry(entry)
+        self._rows.put(
+            candidate_id=_entry_id(entry),
+            kind=payload["kind"],
+            reason=entry.reason,
+            payload=json.dumps(payload, sort_keys=True, allow_nan=False),
+            entry_sha256=digest,
+            embedding=embedding,
         )
-        assert isinstance(data, dict)
-        records = data["entries"]
-        if not isinstance(records, list):
-            raise ValueError("review queue entries must be a list")
-        loaded: dict[str, _Entry] = {}
-        for record in records:
-            if not isinstance(record, dict):
-                raise ValueError("review queue entry must be an object")
-            kind = record.get("kind", "node")
-            if kind == "node":
-                entry: _Entry = _NodeEntry.from_json(record)
-            elif kind == "relation":
-                entry = _RelationEntry.from_json(record)
-            else:
-                raise ValueError(f"unknown review queue entry kind: {kind!r}")
-            candidate_id = _entry_id(entry)
-            if candidate_id in loaded:
-                raise ValueError(f"duplicate review queue candidate id: {candidate_id}")
-            loaded[candidate_id] = entry
-        self._entries = loaded
-
-    def _save(self, entries: dict[str, _Entry]) -> None:
-        """Atomically replace the file and keep memory coherent with that replacement."""
-
-        self.dir.mkdir(parents=True, exist_ok=True)
-        payload = {"entries": [entry.to_json() for entry in entries.values()]}
-        encoded = (json.dumps(payload, indent=2, allow_nan=False) + "\n").encode()
-        temp_path = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
-        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "wb", closefd=True) as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, self.path)
-            # The namespace now exposes the new file. Publish the same state in
-            # memory before the directory durability flush; if that flush fails,
-            # the caller sees the error without a stale in-process snapshot that
-            # could overwrite the already-replaced file on its next mutation.
-            self._entries = entries
-            _fsync_directory(self.dir)
-        except BaseException:
-            temp_path.unlink(missing_ok=True)
-            raise
 
     # ── surface ──────────────────────────────────────────────────────────────
     def enqueue(
@@ -697,12 +789,7 @@ class ReviewQueue:
             reason=reason,
             correlations=tuple(correlations),
         )
-        entries = dict(self._entries)
-        existing = entries.get(candidate.candidate_id)
-        if isinstance(existing, _RelationEntry):
-            raise ValueError("candidate id is already occupied by a relation review entry")
-        entries[candidate.candidate_id] = entry
-        self._save(entries)
+        self._put(entry)
         return entry.to_item()
 
     def enqueue_relation(
@@ -718,93 +805,108 @@ class ReviewQueue:
             reason=reason,
             pinned_proposal=pinned_proposal,
         )
-        entries = dict(self._entries)
-        existing = entries.get(entry.candidate_id)
-        if isinstance(existing, _NodeEntry):
-            raise ValueError("candidate id is already occupied by a node review entry")
-        entries[entry.candidate_id] = entry
-        self._save(entries)
+        self._put(entry)
         return entry.to_item()
 
     def list(self) -> list[ReviewItem]:
         """Legacy node-only list; relation entries use :meth:`list_relations`."""
 
         return [
-            entry.to_item() for entry in self._entries.values() if isinstance(entry, _NodeEntry)
+            self._entry_from_row(row, verify=False).to_item()
+            for row in self._rows.rows(kind="node")
         ]
 
     def list_relations(self) -> list[RelationReviewItem]:
         """All parked relations with their exact reason and pinned proposal."""
 
         return [
-            entry.to_item() for entry in self._entries.values() if isinstance(entry, _RelationEntry)
+            self._entry_from_row(row, verify=False).to_item()
+            for row in self._rows.rows(kind="relation")
         ]
+
+    def page(
+        self, limit: int, cursor: str | None = None
+    ) -> tuple[list[ReviewQueueItem], str | None, int]:
+        """One page ``(items, next_cursor, total)``: nodes first, then relations.
+
+        ``cursor`` is the opaque value a previous page returned; ``ValueError`` on
+        a malformed one. ``limit=0`` returns no items, only the total.
+        """
+
+        after = decode_cursor(cursor) if cursor else None
+        total = self._rows.count()
+        if limit <= 0:
+            return [], None, total
+        rows = self._rows.rows(after=after, limit=limit + 1)
+        more = len(rows) > limit
+        rows = rows[:limit]
+        items = [self._entry_from_row(row, verify=False).to_item() for row in rows]
+        next_cursor = encode_cursor(rows[-1].kind, rows[-1].seq) if more else None
+        return items, next_cursor, total
 
     def read(self, candidate_id: str) -> ReviewQueueItem:
         """Return one full kind-appropriate projection without changing it."""
 
-        entry = self._entries.get(candidate_id)
-        if entry is None:
+        row = self._rows.get(candidate_id, with_embedding=False)
+        if row is None:
             raise ReviewItemNotFoundError(f"no review item with id {candidate_id!r}")
-        return entry.to_item()
+        return self._entry_from_row(row, verify=False).to_item()
 
     def candidates(self) -> list[NodeCandidate]:
         """Full parked node candidates for legacy judge-driven curation jobs."""
 
         return [
-            entry.candidate for entry in self._entries.values() if isinstance(entry, _NodeEntry)
+            self._entry_from_row(row, verify=True).candidate  # type: ignore[union-attr]
+            for row in self._rows.rows(kind="node", with_embedding=True)
         ]
+
+    def get_candidate(self, candidate_id: str) -> NodeCandidate | None:
+        """The full (embedding included, digest-verified) node candidate, or None."""
+
+        row = self._rows.get(candidate_id, with_embedding=True)
+        if row is None or row.kind != "node":
+            return None
+        return self._entry_from_row(row, verify=True).candidate  # type: ignore[union-attr]
 
     def resolution_scope(self, candidate_id: str) -> dict[str, str]:
         """Bind a manual resolution plan to the exact persisted queue entry."""
 
-        entry = self._entries.get(candidate_id)
-        if entry is None:
+        row = self._rows.get(candidate_id, with_embedding=True)
+        if row is None:
             raise ReviewItemNotFoundError(f"no review item with id {candidate_id!r}")
-        if isinstance(entry, _RelationEntry):
+        if row.kind == "relation":
             raise ValueError(
                 "relation review items are read/acknowledge only; "
                 "graph resolution belongs to the orchestrator"
             )
-        encoded = json.dumps(
-            entry.to_json(),
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        self._entry_from_row(row, verify=True)
         return {
+            # The legacy name is kept on purpose: in-flight sealed plans compare
+            # this scope verbatim, and the digest below is unchanged.
             "queue_file": QUEUE_FILENAME,
             "candidate_id": candidate_id,
-            "entry_sha256": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+            "entry_sha256": row.entry_sha256,
         }
 
     def __len__(self) -> int:
-        return len(self._entries)
+        return self._rows.count()
 
     def acknowledge(self, candidate_id: str) -> None:
         """Remove a resolved item only after its owning durability boundary passes."""
 
-        if candidate_id not in self._entries:
+        if not self._rows.delete(candidate_id):
             raise ReviewItemNotFoundError(f"no review item with id {candidate_id!r}")
-        entries = dict(self._entries)
-        del entries[candidate_id]
-        self._save(entries)
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        directory_fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        if os.name == "nt":
-            return
-        raise
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
 
 
 __all__ = [
+    "ReviewQueueCorruption",
+    "ReviewQueueMigrationRequired",
+    "entry_digest",
+    "join_record",
+    "load_legacy_entries",
+    "load_legacy_records",
+    "parse_legacy_entry",
+    "split_entry",
     "PinnedRelationDirection",
     "PinnedRelationProposal",
     "QUEUE_FILENAME",

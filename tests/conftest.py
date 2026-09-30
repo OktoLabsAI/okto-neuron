@@ -25,6 +25,29 @@ from okto_neuron.vault import Vault
 
 
 @pytest.fixture(autouse=True)
+def _review_queue_layout_gate_is_not_under_test(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Treat a hand-written ``marginalia_yaml_version: 1`` fixture as a v2 vault.
+
+    Many tests overwrite a vault's yaml with a minimal version-1 body just to set
+    one option, then exercise the review queue. Since #14 a version-1 vault's
+    queue is refused until ``kg review-queue migrate``; that gate has its own
+    tests, which opt out by defining ``REAL_QUEUE_GATE = True`` at module level.
+    """
+    if getattr(request.module, "REAL_QUEUE_GATE", False):
+        return
+    from okto_neuron.consolidate import review_queue as review_queue_module
+
+    real = review_queue_module.vault_yaml_version
+    monkeypatch.setattr(
+        review_queue_module,
+        "vault_yaml_version",
+        lambda root: 2 if real(root) == 1 else real(root),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_inherited_legacy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start every test without pre-0.3.0 ``MARGINALIA_*`` variables.
 

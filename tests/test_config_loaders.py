@@ -571,7 +571,7 @@ def test_vault_config_unknown_version_raises_typed_error(tmp_path: Path) -> None
 
     assert raised.value.file_path == config_path.resolve()
     assert raised.value.found_version == 99
-    assert raised.value.supported_versions == (1,)
+    assert raised.value.supported_versions == (1, 2)
 
 
 def test_vault_config_missing_file_raises_config_not_found(tmp_path: Path) -> None:
