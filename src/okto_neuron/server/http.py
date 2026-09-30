@@ -1017,6 +1017,15 @@ async def api_status(request: Request) -> JSONResponse:
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
+def _grafx_buffer_budget(state: ServerState | VaultRuntime, vault_path: Path) -> int | None:
+    """Buffer budget of the vault's open grafx store, None when not open / not grafx."""
+    handle = (
+        state.vault_pool.peek(vault_path) if isinstance(state, ServerState) else state.vault
+    )
+    value = getattr(getattr(handle, "store", None), "buffer_budget_bytes", None)
+    return value if isinstance(value, int) else None
+
+
 def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
     """Store op: discover runtimes, read integrity verdicts and backend pins."""
     now = time.time()
@@ -1142,6 +1151,7 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
         {
             "path": str(runtime.vault_path),
             "backend": resolve_vault_backend(runtime.vault_path),
+            "grafx_buffer_budget_bytes": _grafx_buffer_budget(state, runtime.vault_path),
             "draining": runtime.draining,
             "ingest": iq.snapshot(runtime)["summary"],
             "curation": _jobs.snapshot(runtime)["summary"],

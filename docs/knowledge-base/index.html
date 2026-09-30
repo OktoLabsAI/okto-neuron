@@ -520,6 +520,13 @@ retryable error (<code>index_view_changed</code>), and <code>GrafxStore</code> r
 jittered backoff from 10 ms to 200 ms, 2 s total) so <code>get_node</code>, <code>get_nodes</code> and <code>list_*</code> never
 surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
 exhausted budget reaches the caller as <code>GraphBackendError</code> with <code>retryable=True</code>.</p>
+<p>Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
+on a 179 MB production graph) exceeds it. <code>GrafxStore</code> therefore passes <code>buffer_budget_bytes</code> to
+<code>okto_grafx.connect</code>: <code>storage.buffer_budget</code> in the vault yaml (bytes or a string such as <code>256MiB</code>,
+16 MiB to 8 GiB; <code>defaults.yaml</code> supplies it when the vault inherits application defaults), else
+max(256 MiB, 1.5 x the graph size) capped at 1 GiB. The open is logged at INFO with the graph size,
+the chosen budget and its source, and <code>/api/v1/status</code> reports it per vault as
+<code>grafx_buffer_budget_bytes</code>. Neuron stays on grafx exclusive mode; no sharing option is involved.</p>
 <p>One process at a time writes a vault. The daemon takes a per-vault writer lease
 (<code>&lt;vault&gt;/.okto-neuron-writer.lock</code>, an OS file lock that dies with its holder, never deleted;
 one JSON line records pid, process start token, role, operation, endpoint and time) for every
@@ -14844,6 +14851,18 @@ exponential backoff from <code>backoff_base_ms</code> (default 50ms) up to
 <code>backoff_cap_ms</code> (default 2000ms), bounded by <code>max_attempts</code> (default 8)
 and a wall-clock <code>total_cap_s</code> ceiling (default 30s), whichever is hit
 first. A losing writer re-reads the winning row rather than overwriting it.</li>
+<li><strong>Buffer pool budget.</strong> Grafx's own pool defaults to 64 MiB, which thrashes
+on a graph near 180 MB. Okto Neuron passes <code>buffer_budget_bytes</code> to
+<code>okto_grafx.connect</code> from <code>storage.buffer_budget</code> in the vault yaml (an
+integer byte count or a string such as <code>256MiB</code>; accepted range 16 MiB to
+8 GiB). A vault with <code>inherits_application_defaults: true</code> picks it up from
+<code>defaults.yaml</code> (<code>storage: {backend: grafx, buffer_budget: 512MiB}</code>) when it
+does not set its own. Unset, the budget is computed at open as
+max(256 MiB, 1.5 x current graph size), capped at 1 GiB. The open logs the
+vault name, graph size, chosen budget and its source (<code>default</code> or
+<code>config</code>), and <code>GET /api/v1/status</code> reports <code>grafx_buffer_budget_bytes</code> in
+each vault's block. Staged rebuild/heal/reembed copies read the same vault
+yaml. Grafx stays in exclusive mode.</li>
 <li><strong>Checkpoint.</strong> <code>GrafxStore.checkpoint()</code> currently reports itself as a
 no-op in <code>BackendCapabilities</code> (<code>checkpoint_is_noop=True</code>). A direct probe
 against the underlying <code>okto_grafx.Database.checkpoint()</code> (bypassing that

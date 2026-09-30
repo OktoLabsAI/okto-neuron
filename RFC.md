@@ -328,6 +328,14 @@ jittered backoff from 10 ms to 200 ms, 2 s total) so `get_node`, `get_nodes` and
 surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
 exhausted budget reaches the caller as `GraphBackendError` with `retryable=True`.
 
+Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
+on a 179 MB production graph) exceeds it. `GrafxStore` therefore passes `buffer_budget_bytes` to
+`okto_grafx.connect`: `storage.buffer_budget` in the vault yaml (bytes or a string such as `256MiB`,
+16 MiB to 8 GiB; `defaults.yaml` supplies it when the vault inherits application defaults), else
+max(256 MiB, 1.5 x the graph size) capped at 1 GiB. The open is logged at INFO with the graph size,
+the chosen budget and its source, and `/api/v1/status` reports it per vault as
+`grafx_buffer_budget_bytes`. Neuron stays on grafx exclusive mode; no sharing option is involved.
+
 One process at a time writes a vault. The daemon takes a per-vault writer lease
 (`<vault>/.okto-neuron-writer.lock`, an OS file lock that dies with its holder, never deleted;
 one JSON line records pid, process start token, role, operation, endpoint and time) for every

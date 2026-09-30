@@ -226,6 +226,36 @@ class RetryConfig(BaseModel):
     total_cap_s: float = Field(default=30, ge=0)
 
 
+_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1000, "mb": 1000**2, "gb": 1000**3,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3,
+}
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
+
+#: Bounds for an explicit ``storage.buffer_budget`` (grafx buffer pool).
+BUFFER_BUDGET_MIN_BYTES = 16 * 1024**2
+BUFFER_BUDGET_MAX_BYTES = 8 * 1024**3
+
+
+def parse_byte_size(value: object) -> int:
+    """Parse ``268435456`` or ``"256MiB"`` / ``"1.5GiB"`` / ``"512MB"`` into bytes."""
+    if isinstance(value, bool):
+        raise ValueError("a size must be bytes (int) or a string like '256MiB'")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        match = _SIZE_RE.match(value)
+        if match is not None:
+            unit = _SIZE_UNITS.get((match.group(2) or "b").lower())
+            if unit is not None:
+                return int(float(match.group(1)) * unit)
+    raise ValueError(
+        f"invalid size {value!r}: use bytes or a string like '256MiB' "
+        "(units: B, KB, MB, GB, KiB, MiB, GiB)"
+    )
+
+
 class GrafxStorageConfig(BaseModel):
     """Storage backend metadata for the (not-yet-shipped) Grafx backend."""
 
@@ -234,6 +264,23 @@ class GrafxStorageConfig(BaseModel):
     backend: Literal["grafx"]
     reason: str | None = None
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    buffer_budget: int | None = None
+    """Grafx buffer-pool size (``buffer_budget_bytes`` on ``okto_grafx.connect``).
+    Bytes or a string such as ``256MiB``; 16 MiB to 8 GiB. ``None`` (default)
+    means computed: max(256 MiB, 1.5 x graph size), capped at 1 GiB."""
+
+    @field_validator("buffer_budget", mode="before")
+    @classmethod
+    def _v_buffer_budget(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        size = parse_byte_size(value)
+        if not BUFFER_BUDGET_MIN_BYTES <= size <= BUFFER_BUDGET_MAX_BYTES:
+            raise ValueError(
+                f"buffer_budget must be between {BUFFER_BUDGET_MIN_BYTES} (16MiB) and "
+                f"{BUFFER_BUDGET_MAX_BYTES} (8GiB) bytes, got {size}"
+            )
+        return size
 
 
 class Neo4jStorageConfig(BaseModel):

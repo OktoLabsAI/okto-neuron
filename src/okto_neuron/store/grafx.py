@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
@@ -155,6 +156,58 @@ class GrafxWriteExhausted(GraphWriteExhausted):
     """
 
     default_message = "graph write failed: retry budget exhausted under sustained write conflict"
+
+
+_LOG = logging.getLogger("okto_neuron.store.grafx")
+
+#: Default grafx buffer pool: max(256 MiB, 1.5 x graph size), capped at 1 GiB.
+#: grafx's own default is 64 MiB, which thrashes on a ~180 MB graph.
+BUFFER_BUDGET_FLOOR_BYTES = 256 * 1024**2
+BUFFER_BUDGET_CAP_BYTES = 1024**3
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for entry in path.rglob("*"):
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def default_buffer_budget(graph_size_bytes: int) -> int:
+    """max(256 MiB, 1.5 x ``graph_size_bytes``), capped at 1 GiB."""
+    return min(
+        BUFFER_BUDGET_CAP_BYTES,
+        max(BUFFER_BUDGET_FLOOR_BYTES, int(graph_size_bytes * 1.5)),
+    )
+
+
+def _resolve_buffer_budget(config: Any, vault_path: Path, graph_path: Path) -> tuple[int, int, str]:
+    """Return ``(budget_bytes, graph_size_bytes, source)``.
+
+    ``source`` is ``"config"`` when ``storage.buffer_budget`` is set (directly
+    on ``config``, or, for a staged/rebuild open that carries no config, in the
+    vault's own yaml, which already folds in ``defaults.yaml`` inheritance),
+    else ``"default"``.
+    """
+    size = _dir_size_bytes(graph_path) if graph_path.exists() else 0
+    configured = getattr(config, "buffer_budget", None)
+    if configured is None and config is None:
+        try:
+            from okto_neuron.config import VaultConfig
+
+            configured = getattr(VaultConfig.load(vault_path).storage, "buffer_budget", None)
+        except Exception:
+            configured = None
+    if configured is not None:
+        return int(configured), size, "config"
+    return default_buffer_budget(size), size, "default"
 
 
 def _resolve_retry_policy(config: Any) -> RetryConfig:
@@ -416,7 +469,23 @@ class GrafxStore:
             self.graph_path = given / _GRAPH_DIR_NAME
         self._closed = False
         self._retry_policy = _resolve_retry_policy(config)
-        self._db = grafx.connect(self.graph_path, descriptor_revalidation="strict")
+        budget, graph_size, source = _resolve_buffer_budget(
+            config, self.vault_path, self.graph_path
+        )
+        self.buffer_budget_bytes = budget
+        self.buffer_budget_source = source
+        _LOG.info(
+            "grafx open: vault=%s graph_bytes=%d buffer_budget_bytes=%d source=%s",
+            self.vault_path.name,
+            graph_size,
+            budget,
+            source,
+        )
+        self._db = grafx.connect(
+            self.graph_path,
+            descriptor_revalidation="strict",
+            buffer_budget_bytes=budget,
+        )
 
         fresh = not self._db.catalog.catalog.table_definitions
         configured_dim = _resolve_configured_dim(self.vault_path)
