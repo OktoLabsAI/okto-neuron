@@ -389,7 +389,13 @@ def v031(tmp_path_factory: pytest.TempPathFactory) -> dict:
     )
     home = base / "home"
     home.mkdir()
-    env = {k: v for k, v in os.environ.items() if "MLFLOW" not in k}
+    # PYTHONPATH & co. would make the 0.3.1 venv import the tree under test instead of
+    # the released wheel (it then scaffolds yaml 2 and the guard test proves nothing).
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if "MLFLOW" not in k and k not in {"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV"}
+    }
     env["HOME"] = str(home)
     version = subprocess.run(
         [str(venv / "bin" / "python"), "-c", "import importlib.metadata as m;print(m.version('okto-neuron'))"],
@@ -399,6 +405,14 @@ def v031(tmp_path_factory: pytest.TempPathFactory) -> dict:
         env=env,
     ).stdout.strip()
     assert version == "0.3.1"
+    origin = subprocess.run(
+        [str(venv / "bin" / "python"), "-c", "import okto_neuron;print(okto_neuron.__file__)"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    ).stdout.strip()
+    assert origin.startswith(str(venv)), f"0.3.1 venv imports okto_neuron from {origin}, not its wheel"
     return {"bin": str(venv / "bin" / "okto-neuron"), "env": env, "base": base}
 
 
