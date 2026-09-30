@@ -139,6 +139,9 @@ export interface GraphStats {
   edge_types: GraphTypeCount[]
   total_nodes: number
   total_edges: number
+  // Served from the daemon's maintained projection: may lag a write by one rebuild.
+  stale?: boolean
+  rebuilding?: boolean
 }
 
 // --- Config ---

@@ -4,6 +4,7 @@
 // wheel and Vite's documented /api proxy behave identically. Bare server routes
 // remain only for CLI/backward compatibility.
 import { apiFetch, qs } from './http'
+import { fetchGraphStats } from './graph-stats'
 
 // ── P1: health + dashboard ──────────────────────────────────────────────────--
 export interface HealthResponse {
@@ -25,7 +26,7 @@ export interface GraphStatsLite {
   total_edges: number
 }
 export function getGraphStats(): Promise<GraphStatsLite> {
-  return apiFetch<GraphStatsLite>('/graph/stats')
+  return fetchGraphStats()
 }
 
 // ── ADR 0040: explicit semantic-quality audit ───────────────────────────────
@@ -347,6 +348,9 @@ export interface PredicateUpkeepSnapshot {
   last_propose: CurationJob | null
   last_apply: CurationJob | null
   worker_active: boolean
+  // Served from the daemon's maintained projection: the vocabulary size may lag a write.
+  stale?: boolean
+  rebuilding?: boolean
 }
 
 export function getPredicateUpkeep(): Promise<PredicateUpkeepSnapshot> {
