@@ -72,3 +72,12 @@ def test_replay_is_repeatable_on_one_instance(name: str, tmp_path: Path) -> None
     second = capture(ledger, IDS["runs"])
     first.pop("size_after"), second.pop("size_after")
     assert first == second
+
+
+@pytest.mark.parametrize("name", ["clean", "damaged", "torn_tail"])
+def test_ingest_run_records_equal_the_scan_filtered_to_run_rows(name: str, tmp_path: Path) -> None:
+    """The offset-based run-row reader answers exactly what a whole-file scan would."""
+    ledger, _ = _load(name, tmp_path)
+    by_scan = list(ledger.scan(kinds=frozenset({"ingest_run"})).parsed_records)
+    assert by_scan and ledger.ingest_run_records() == by_scan
+    assert CandidateLedger(tmp_path / "absent").ingest_run_records() == []

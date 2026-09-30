@@ -2728,6 +2728,17 @@ class CandidateLedger:
                 if isinstance(record, dict):
                     yield record
 
+    def ingest_run_records(self) -> list[dict[str, Any]]:
+        """Every ``ingest_run`` row in ledger order, read by offset.
+
+        Same rows as ``scan(kinds={"ingest_run"}).parsed_records`` (malformed lines
+        are skipped the same way) but the cost follows the number of runs, not the
+        size of the ledger.
+        """
+        if not self.path.exists():
+            return []
+        return self._indexed_records(kinds={"ingest_run"})
+
     def records(self) -> list[dict[str, Any]]:
         """Every parseable record as a list (the whole ledger: prefer :meth:`iter_records`)."""
         return list(self.iter_records())
