@@ -212,6 +212,15 @@ class VaultPool:
                     f"vault pool is at capacity ({self.max_open} open vaults); "
                     "use a scoped lease so an idle handle can be evicted",
                 )
+        from okto_neuron.consolidate.review_queue import layout_refusal
+
+        refusal = layout_refusal(key)
+        if refusal is not None:
+            # Refuse THIS vault only: no handle lease, no graph open, no write.
+            raise VaultPoolError(
+                "review_queue_migration_required",
+                f"{refusal['detail']}; remedy: {refusal['remedy']}",
+            )
         handle_lease = self._acquire_handle_lease_locked(key)
         try:
             vault = Vault.open(key)

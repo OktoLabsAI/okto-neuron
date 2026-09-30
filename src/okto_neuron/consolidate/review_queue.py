@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TypeAlias
@@ -700,6 +701,54 @@ def join_record(row: StoredRow) -> dict:
     return record
 
 
+def layout_refusal(vault_root: Path | str) -> dict[str, str] | None:
+    """Why a daemon must not serve ``vault_root`` yet, or ``None`` when it may.
+
+    A vault still at ``marginalia_yaml_version: 1`` keeps ``review_queue.json``
+    and is older-binary territory until ``kg review-queue migrate`` runs. The
+    check only reads the yaml; it never writes anything.
+    """
+
+    root = Path(vault_root)
+    try:
+        version = vault_yaml_version(root)
+    except Exception:  # noqa: BLE001 - a broken yaml is the open path's error to report
+        return None
+    if version != 1:
+        return None
+    remedy = f"okto-neuron kg review-queue migrate --vault {root.name}"
+    return {
+        "code": "review_queue_migration_required",
+        "path": str(root),
+        "detail": (
+            "this vault still stores its review queue as review_queue.json "
+            "(marginalia_yaml_version 1); it is not served until it is migrated"
+        ),
+        "remedy": remedy,
+    }
+
+
+_REFUSAL_LOGGED: set[Path] = set()
+
+
+def log_layout_refusal_once(vault_root: Path, refusal: dict[str, str]) -> None:
+    """One WARNING per vault and process for a refused v1 vault (status polls repeat)."""
+
+    if vault_root in _REFUSAL_LOGGED:
+        return
+    _REFUSAL_LOGGED.add(vault_root)
+    logging.getLogger(__name__).warning(
+        "refusing vault %s: %s; remedy: %s",
+        vault_root.name,
+        refusal["detail"],
+        refusal["remedy"],
+    )
+
+
+def clear_layout_refusal_log(vault_root: Path) -> None:
+    _REFUSAL_LOGGED.discard(vault_root)
+
+
 def _vault_root_of(directory: Path) -> Path | None:
     return directory.parent if directory.name == ".marginalia" else None
 
@@ -899,6 +948,9 @@ class ReviewQueue:
 
 
 __all__ = [
+    "layout_refusal",
+    "log_layout_refusal_once",
+    "clear_layout_refusal_log",
     "ReviewQueueCorruption",
     "ReviewQueueMigrationRequired",
     "entry_digest",

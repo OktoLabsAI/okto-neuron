@@ -184,6 +184,6 @@ def test_review_queue_and_resolve_review_still_permitted_from_loopback(
         reset_state_for_tests()
 
     assert listing.status_code == 200, listing.text
-    assert listing.json() == {"status": "ok", "items": []}
+    assert listing.json() == {"status": "ok", "items": [], "next_cursor": None, "total": 0}
     assert resolve.status_code == 404, resolve.text
     assert resolve.json()["error"] == "review_item_not_found"

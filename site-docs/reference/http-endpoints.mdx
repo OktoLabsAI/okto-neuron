@@ -197,6 +197,8 @@ Route order is load-bearing. The versioned routes are registered first, then the
 
 ## Loopback restriction is per handler
 
+`GET /api/v1/review-queue` (and `/review-queue`) takes an optional `limit` and `cursor`. Without `limit` it returns the whole queue and sends a `Deprecation: true` header. `limit=0` returns no items and just the `total`. A `limit` from 1 to 1000 returns that many items plus an opaque `next_cursor` (null on the last page); the body is `{status, items, next_cursor, total}`. A vault whose review queue has not been migrated yet is refused on its own: its routes answer 409 `review_queue_migration_required`, and `/api/v1/status` shows the vault under `vaults[].review_queue` with the `okto-neuron kg review-queue migrate --vault <name>` remedy, while the daemon keeps serving its other vaults.
+
 The loopback restriction is not a property of a block. It is a check inside individual handlers, so a bare route and a versioned route can both be restricted. `POST /add` refuses non-loopback callers with 403 because it materializes content into the vault. `/review-queue` refuses them with 403 through either of its two paths.
 
 ## POST /api/v1/curation/rollback

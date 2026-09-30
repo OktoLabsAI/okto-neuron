@@ -191,7 +191,11 @@ def _write_kg_init_vault_config(
     """
     from okto_neuron.config import VaultConfig
 
+    from okto_neuron.config._vault import CURRENT_YAML_VERSION
+
     config = VaultConfig.default().model_dump(mode="json", exclude_none=True)
+    # Born at the current layout; default()'s v1 would be refused by the daemon (#14).
+    config["marginalia_yaml_version"] = CURRENT_YAML_VERSION
     storage: dict[str, object] = {"backend": backend}
     if backend in ("ladybug", "grafx"):
         storage["reason"] = None

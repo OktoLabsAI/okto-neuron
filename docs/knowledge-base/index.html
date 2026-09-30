@@ -582,7 +582,19 @@ renames the source to <code>review_queue.json.migrated</code>. Version 2 is the 
 released 0.3.1 wheel; the bump comes before the data work so a crash can never leave 0.3.1 able to open a
 half-migrated vault. Rollback regenerates the JSON from SQLite (or restores the literal backup), moves the
 SQLite file aside and lowers the yaml to 1 last; yaml 1 always means the JSON is the truth. New vaults are
-created at version 2.</p>
+created at version 2 (every scaffold path: <code>Vault.init</code>/<code>scaffold</code>, <code>init</code>, <code>vault create</code>, <code>onboard</code>,
+<code>kg init</code>, <code>kg snapshot load</code>, the daemon's <code>POST /api/v1/vaults</code>, and the default config <code>_open_vault</code> writes
+for a yaml-less directory; a test opens each one through the daemon's own runtime path).</p>
+<p><code>GET /api/v1/review-queue</code> (and the bare <code>/review-queue</code>) pages the queue: with no <code>limit</code> it returns the full
+list as before and carries a <code>Deprecation: true</code> header; <code>limit=0</code> returns <code>items: []</code> and the <code>total</code>
+without any evidence fetch; <code>limit</code> 1..1000 returns that many items (nodes by insertion order, then relations)
+with an opaque <code>next_cursor</code>. The body is <code>{status, items, next_cursor, total}</code> and only the page's evidence
+blocks go to <code>get_nodes</code>. The daemon refuses a version-1 vault alone: <code>ServerState.runtime_for</code> checks the yaml
+(read-only) BEFORE it takes the writer lease, so nothing in the vault changes (no lease file, no yaml, no
+SQLite); other vaults keep serving. <code>/api/v1/status</code> lists the vault under <code>vaults[].review_queue</code> with
+<code>state: migration_required</code> and the remedy (<code>okto-neuron kg review-queue migrate --vault &lt;name&gt;</code>), adds a
+<code>review_queue_migration_required</code> degraded reason, the log carries one WARNING per vault, and requests scoped to
+it answer 409 <code>review_queue_migration_required</code>.</p>
 <p>Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. <code>GrafxStore</code> therefore passes <code>buffer_budget_bytes</code> to
 <code>okto_grafx.connect</code>: <code>storage.buffer_budget</code> in the vault yaml (bytes or a string such as <code>256MiB</code>,

@@ -8810,6 +8810,13 @@ class Companion:
         queue = self._review_queue()
         return [*queue.list(), *queue.list_relations()]
 
+    def review_queue_page(
+        self, limit: int, cursor: str | None = None
+    ) -> tuple[list[ReviewItem | "RelationReviewItem"], str | None, int]:
+        """One page of node then relation reviews: ``(items, next_cursor, total)``."""
+
+        return self._review_queue().page(limit, cursor)
+
     def resolve_review(self, candidate_id: str, action: ReviewAction) -> CandidateOutcome:
         """Act on a parked node candidate (commit / discard / merge).
 
@@ -8925,10 +8932,7 @@ class Companion:
                         "relation review items are read/acknowledge only; "
                         "graph resolution belongs to the orchestrator"
                     )
-                candidate = next(
-                    (value for value in queue.candidates() if value.candidate_id == candidate_id),
-                    None,
-                )
+                candidate = queue.get_candidate(candidate_id)
                 if candidate is None:
                     raise ValueError("manual review queue lost its full candidate")
                 fingerprints = self._semantic_fingerprints()

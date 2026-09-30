@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from okto_neuron._compat import vault_config_path
-from okto_neuron.config._vault import IndexConfig, VaultConfig
+from okto_neuron.config._vault import CURRENT_YAML_VERSION, IndexConfig, VaultConfig
 from okto_neuron.errors import (
     OktoNeuronError,
     VaultNotFoundError,
@@ -184,6 +184,9 @@ def _write_default_config_if_absent(vault_path: Path) -> None:
     if config_path.exists():
         return
     config = VaultConfig.default().model_dump(mode="json", exclude_none=True)
+    # A new vault is born at the current layout (SQLite review queue): the v1
+    # baseline of ``default()`` would be refused by the daemon's own gate (#14).
+    config["marginalia_yaml_version"] = CURRENT_YAML_VERSION
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     os.chmod(config_path, 0o644)
 

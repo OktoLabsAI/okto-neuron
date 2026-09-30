@@ -394,7 +394,20 @@ renames the source to `review_queue.json.migrated`. Version 2 is the forward-com
 released 0.3.1 wheel; the bump comes before the data work so a crash can never leave 0.3.1 able to open a
 half-migrated vault. Rollback regenerates the JSON from SQLite (or restores the literal backup), moves the
 SQLite file aside and lowers the yaml to 1 last; yaml 1 always means the JSON is the truth. New vaults are
-created at version 2.
+created at version 2 (every scaffold path: `Vault.init`/`scaffold`, `init`, `vault create`, `onboard`,
+`kg init`, `kg snapshot load`, the daemon's `POST /api/v1/vaults`, and the default config `_open_vault` writes
+for a yaml-less directory; a test opens each one through the daemon's own runtime path).
+
+`GET /api/v1/review-queue` (and the bare `/review-queue`) pages the queue: with no `limit` it returns the full
+list as before and carries a `Deprecation: true` header; `limit=0` returns `items: []` and the `total`
+without any evidence fetch; `limit` 1..1000 returns that many items (nodes by insertion order, then relations)
+with an opaque `next_cursor`. The body is `{status, items, next_cursor, total}` and only the page's evidence
+blocks go to `get_nodes`. The daemon refuses a version-1 vault alone: `ServerState.runtime_for` checks the yaml
+(read-only) BEFORE it takes the writer lease, so nothing in the vault changes (no lease file, no yaml, no
+SQLite); other vaults keep serving. `/api/v1/status` lists the vault under `vaults[].review_queue` with
+`state: migration_required` and the remedy (`okto-neuron kg review-queue migrate --vault <name>`), adds a
+`review_queue_migration_required` degraded reason, the log carries one WARNING per vault, and requests scoped to
+it answer 409 `review_queue_migration_required`.
 
 Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. `GrafxStore` therefore passes `buffer_budget_bytes` to

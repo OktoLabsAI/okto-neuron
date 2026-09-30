@@ -465,6 +465,11 @@ class ServerState:
     threads (issue #13), so two requests for a new path must still agree on ONE
     runtime (and therefore one writer lock)."""
     _busy_logged: set[Path] = field(default_factory=set, init=False, repr=False)
+    # Vaults discovery refused because their review queue is still v1 (#14):
+    # no runtime, no lease, no write; shown in /api/v1/status until migrated.
+    _queue_refused: dict[Path, dict[str, str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
     """Vaults already reported busy (another process holds the writer lease)."""
     _closed: bool = field(default=False, init=False, repr=False)
 
@@ -559,6 +564,10 @@ class ServerState:
                     "vault_fenced",
                     f"vault runtime is unavailable after deletion or maintenance: {key}",
                 )
+            if runtime is None and vault is None and key.is_dir():
+                # BEFORE the writer lease: a v1 vault is refused untouched (the
+                # lease creates .okto-neuron-writer.lock inside it). Only reads yaml.
+                self._refuse_v1_layout(key)
             if runtime is None and key.is_dir():
                 # Raises VaultPoolError("vault_busy") when a CLI holds the vault.
                 acquire_daemon_writer_lease(key)
@@ -576,6 +585,29 @@ class ServerState:
                 _ingest_queue.rehydrate_queue(runtime)
                 _jobs.rehydrate_jobs(runtime)
             return runtime
+
+    def _refuse_v1_layout(self, key: Path) -> None:
+        from okto_neuron.consolidate.review_queue import (
+            clear_layout_refusal_log,
+            layout_refusal,
+            log_layout_refusal_once,
+        )
+
+        refusal = layout_refusal(key)
+        if refusal is None:
+            self._queue_refused.pop(key, None)
+            clear_layout_refusal_log(key)
+            return
+        self._queue_refused[key] = refusal
+        log_layout_refusal_once(key, refusal)
+        raise VaultPoolError(
+            refusal["code"], f"{refusal['detail']}; remedy: {refusal['remedy']}"
+        )
+
+    def queue_refusals(self) -> dict[Path, dict[str, str]]:
+        """Vaults refused for a v1 review queue that have no runtime (snapshot)."""
+
+        return dict(self._queue_refused)
 
     @property
     def active_runtime(self) -> VaultRuntime | None:
@@ -604,6 +636,8 @@ class ServerState:
                     try:
                         self.runtime_for(entry.path)
                     except VaultPoolError as exc:
+                        if exc.code == "review_queue_migration_required":
+                            continue  # refused alone; logged once, shown in status
                         if exc.code != "vault_busy":
                             raise
                         # One busy vault must not break the others; the next

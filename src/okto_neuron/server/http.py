@@ -81,6 +81,7 @@ from okto_neuron.server._store_io import (
     single_flight,
     store_io,
 )
+from okto_neuron.consolidate.review_queue_sqlite import ReviewQueueMigrationRequired
 from okto_neuron.server._vault_pool import VaultPoolError, acquire_daemon_writer_lease
 from okto_neuron.store.writer_lease import degraded_leases, held_writer_lease
 from okto_neuron.server.lifecycle import request_id as bind_request_id
@@ -1017,6 +1018,23 @@ async def api_status(request: Request) -> JSONResponse:
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
+def _queue_layout_refusal(vault_path: Path) -> dict[str, str] | None:
+    """Per-vault refusal state for a vault whose review queue is still JSON (#14)."""
+
+    from okto_neuron.consolidate.review_queue import (
+        clear_layout_refusal_log,
+        layout_refusal,
+        log_layout_refusal_once,
+    )
+
+    refusal = layout_refusal(vault_path)
+    if refusal is None:
+        clear_layout_refusal_log(vault_path)
+        return None
+    log_layout_refusal_once(vault_path, refusal)
+    return {"state": "migration_required", **refusal}
+
+
 def _grafx_buffer_budget(state: ServerState | VaultRuntime, vault_path: Path) -> int | None:
     """Buffer budget of the vault's open grafx store, None when not open / not grafx."""
     handle = (
@@ -1147,6 +1165,14 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
         if application_scope
         else iq.snapshot(state)["summary"]
     )
+    queue_refusals = {
+        runtime.vault_path: _queue_layout_refusal(runtime.vault_path) for runtime in runtimes
+    }
+    for refused_path, refusal in sorted(queue_refusals.items()):
+        if refusal is not None:
+            reasons.append(
+                f"review_queue_migration_required: {refused_path.name}: {refusal['remedy']}"
+            )
     vault_summaries = [
         {
             "path": str(runtime.vault_path),
@@ -1157,9 +1183,27 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
             "curation": _jobs.snapshot(runtime)["summary"],
             "maintenance": bool(runtime.maintenance_tasks),
             "integrity": integrity,
+            # A v1 vault is refused (no open, no writes) until explicitly migrated.
+            "review_queue": queue_refusals[runtime.vault_path]
+            or {"state": "ok", "code": None, "remedy": None},
         }
         for runtime, integrity in zip(runtimes, integrity_summaries, strict=True)
     ]
+
+    if application_scope:
+        for refused_path, refusal in sorted(state.queue_refusals().items()):
+            if refused_path in queue_refusals:
+                continue
+            reasons.append(
+                f"review_queue_migration_required: {refused_path.name}: {refusal['remedy']}"
+            )
+            vault_summaries.append(
+                {
+                    "path": str(refused_path),
+                    "refused": True,
+                    "review_queue": {"state": "migration_required", **refusal},
+                }
+            )
 
     status = "degraded" if reasons else "ok"
     payload: dict[str, Any] = {
@@ -2766,14 +2810,34 @@ async def ask(request: Request) -> JSONResponse:
     )
 
 
+REVIEW_QUEUE_MAX_LIMIT = 1000
+
+
 async def review_queue(request: Request) -> JSONResponse:
     state = get_state()
     if not remote_config_allowed(request):
         return _err(403, "forbidden", "review queue is restricted to loopback callers")
     if state.shutting_down:
         return _draining_response()
+    raw_limit = request.query_params.get("limit")
+    cursor = request.query_params.get("cursor") or None
+    limit: int | None = None
+    if raw_limit is not None:
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return _err(400, "bad_request", "limit must be a non-negative integer")
+        if limit < 0:
+            return _err(400, "bad_request", "limit must be a non-negative integer")
+        limit = min(limit, REVIEW_QUEUE_MAX_LIMIT)
+    elif cursor is not None:
+        return _err(400, "bad_request", "cursor requires limit")
     try:
-        body = await store_io(encode_op, _review_queue_body, state)
+        body = await store_io(encode_op, _review_queue_body, state, limit, cursor)
+    except ReviewQueueMigrationRequired as exc:
+        return _err(409, "review_queue_migration_required", str(exc))
+    except ValueError as exc:
+        return _err(400, "bad_request", str(exc))
     except VaultClosedError as exc:
         return _err(503, "vault_closed", str(exc))
     except OktoNeuronError as exc:
@@ -2782,20 +2846,43 @@ async def review_queue(request: Request) -> JSONResponse:
         _LOG.exception("unexpected review_queue failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
 
-    return json_bytes_response(body)
+    # A request without ``limit`` keeps the full-list behaviour for clients that
+    # predate pagination; it is deprecated and will be removed.
+    headers = {"Deprecation": "true"} if limit is None else None
+    return json_bytes_response(body, headers=headers)
 
 
-def _review_queue_body(state: ServerState | VaultRuntime) -> dict[str, Any]:
-    return {"status": "ok", "items": _review_queue_payload(state)}
+def _review_queue_body(
+    state: ServerState | VaultRuntime, limit: int | None = None, cursor: str | None = None
+) -> dict[str, Any]:
+    companion = _companion(state)
+    if limit is None:
+        items = companion.review_queue_all()
+        next_cursor = None
+        total = len(items)
+    else:
+        items, next_cursor, total = companion.review_queue_page(limit, cursor)
+    return {
+        "status": "ok",
+        "items": _review_queue_items_payload(state, items),
+        "next_cursor": next_cursor,
+        "total": total,
+    }
 
 
 def _review_queue_payload(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
-    """Store op: parse the review queue and attach source evidence.
+    """The full list with source evidence (kept for callers of the un-paged shape)."""
+    return _review_queue_body(state)["items"]
+
+
+def _review_queue_items_payload(
+    state: ServerState | VaultRuntime, items: list[Any]
+) -> list[dict[str, Any]]:
+    """Store op: attach source evidence to ``items``.
 
     Every evidence Block is fetched with ONE ``get_nodes`` batch per request
-    instead of one ``get_node`` round trip per item (thousands on a large queue).
+    instead of one ``get_node`` round trip per item; a page only fetches its own.
     """
-    items = _companion(state).review_queue_all()
     payloads = [_review_item_payload(state, item) for item in items]
     block_ids = [
         str(payload["source_evidence"]["block_id"])
