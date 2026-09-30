@@ -218,3 +218,32 @@ def test_scan_does_not_copy_a_torn_tail_above_the_cap(
 
     monkeypatch.setattr(mod, "_SCAN_TAIL_CAP", TORN_BYTES)  # exactly at the cap: copied
     assert ledger.scan().file_sha256 == hashlib.sha256(ledger.path.read_bytes()).hexdigest()
+
+
+def test_over_cap_torn_tail_counts_like_an_under_cap_one(tmp_path: Path) -> None:
+    """15 MiB (copied) and 17 MiB (over the 16 MiB cap, not read) count identically."""
+    results = {}
+    for name, tail_bytes in (("under", 15 * 1024 * 1024), ("over", 17 * 1024 * 1024)):
+        directory = tmp_path / name
+        directory.mkdir()
+        _sidecar_cache_drop()
+        ledger = CandidateLedger(directory)
+        run = ledger.start_run(document_id="d", source="s", blocks_total=1, model="m")
+        head = b'{"kind":"candidate","run_id":"' + run.encode() + b'","candidate_id":"torn","p":"'
+        with ledger.path.open("ab") as fh:
+            fh.write(head + b"x" * (tail_bytes - len(head)))
+        scan = ledger.scan()
+        results[name] = scan
+        assert scan.file_size_bytes == ledger.path.stat().st_size
+    under, over = results["under"], results["over"]
+    for field in (
+        "malformed_line_count",
+        "nonempty_lines",
+        "total_lines",
+        "trailing_partial",
+        "unterminated_final_line",
+        "completeness_status",
+        "completeness_reason",
+    ):
+        assert getattr(under, field) == getattr(over, field), field
+    assert under.file_sha256 is not None and over.file_sha256 is None
