@@ -1092,6 +1092,22 @@ def _merge_index_tail(index: _LedgerOffsetIndex, path: Path) -> None:
     _refresh_index_completeness(index)
 
 
+_CANCEL_CHECK_BYTES = 4 * 1024 * 1024  # how often a cancellable build looks at its flag
+
+
+class _BuildCancelled(Exception):
+    """A background index build was asked to stop; its partial state is discarded."""
+
+
+_BUILD_CANCEL = threading.local()  # set only by CandidateLedger.prewarm, per thread
+
+
+def _raise_if_cancelled() -> None:
+    cancelled = getattr(_BUILD_CANCEL, "fn", None)
+    if cancelled is not None and cancelled():
+        raise _BuildCancelled
+
+
 def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex:
     index = _LedgerOffsetIndex(
         signature=(0, 0, 0, b""),
@@ -1113,8 +1129,12 @@ def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetInde
         cut = _last_line_end(handle, os.fstat(handle.fileno()).st_size)
     try:
         handle.seek(0)
+        next_check = _CANCEL_CHECK_BYTES
         while handle.tell() < cut:
             offset = handle.tell()
+            if offset >= next_check:
+                next_check = offset + _CANCEL_CHECK_BYTES
+                _raise_if_cancelled()
             raw = handle.readline()
             if not raw:
                 break
@@ -1636,7 +1656,11 @@ class _Sidecar:
         An unterminated tail stays uncovered.
         """
         handle.seek(self.size)
+        next_check = self.size + _CANCEL_CHECK_BYTES
         while limit is None or self.size < limit:
+            if self.size >= next_check:
+                next_check = self.size + _CANCEL_CHECK_BYTES
+                _raise_if_cancelled()
             raw = handle.readline()
             if not raw or not raw.endswith(b"\n"):
                 return
@@ -2000,6 +2024,8 @@ class CandidateLedger:
         try:
             work = work or _Sidecar()
             work.catch_up(handle, reader, limit=cut)
+        except _BuildCancelled:
+            return False  # asked to stop: nothing remembered, nothing published
         except Exception as exc:  # noqa: BLE001 - remembered and logged; never published
             reason = f"{type(exc).__name__}: {str(exc)[:200]}"
             _snapshot_failure_record(key, signature, reason)
@@ -2141,10 +2167,19 @@ class CandidateLedger:
         """
         if not self.path.exists():
             return
-        self._prepare_sidecar()
-        if cancelled is not None and cancelled():
+        # The streaming loops of both builds look at ``cancelled`` every few MiB and
+        # discard their partial state when it is set, so a stop never waits for a
+        # whole cold pass. Only this thread sees the flag; readers are unaffected.
+        _BUILD_CANCEL.fn = cancelled
+        try:
+            self._prepare_sidecar()
+            if cancelled is not None and cancelled():
+                return
+            self._offset_index()
+        except _BuildCancelled:
             return
-        self._offset_index()
+        finally:
+            _BUILD_CANCEL.fn = None
 
     def _offset_index(self) -> _LedgerOffsetIndex | None:
         if not self.path.exists():
