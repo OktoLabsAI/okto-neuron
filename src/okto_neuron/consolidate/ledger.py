@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import threading
 import uuid
@@ -32,6 +33,10 @@ except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
 LEDGER_FILENAME = "candidate-ledger.jsonl"
+_LOG = logging.getLogger(__name__)
+# A crash-torn tail is copied under the lock so scan() can report it exactly; a tail
+# bigger than this (one absurd row) is reported but not read.
+_SCAN_TAIL_CAP = 16 * 1024 * 1024
 FRESH_REBUILD_MATERIALIZATION_SCOPE = "fresh_rebuild.v1"
 # v2 (ADR 0015 D3.1): candidate rows no longer inline embedding vectors —
 # they store ``embedding_dim`` instead. Vectors live only in the graph store.
@@ -920,6 +925,7 @@ class _Snapshot:
     size: int
     cut: int
     tail: bytes
+    tail_skipped: bool = False  # the torn tail exceeded _SCAN_TAIL_CAP and was not copied
 
 
 class _PrefixReader(io.RawIOBase):
@@ -2525,9 +2531,17 @@ class CandidateLedger:
             size = os.fstat(handle.fileno()).st_size
             cut = _last_line_end(handle, size)
             handle.seek(cut)
-            tail = handle.read(size - cut) if size > cut else b""
+            skipped = size - cut > _SCAN_TAIL_CAP
+            tail = handle.read(size - cut) if 0 < size - cut and not skipped else b""
+        if skipped:
+            _LOG.warning(
+                "candidate ledger ends in a %d-byte unterminated tail (over the %d-byte read cap); "
+                "it is reported as a trailing partial record but not read",
+                size - cut,
+                _SCAN_TAIL_CAP,
+            )
         try:
-            yield _Snapshot(handle, size, cut, tail)
+            yield _Snapshot(handle, size, cut, tail, skipped)
         finally:
             handle.close()
 
@@ -2657,6 +2671,19 @@ class CandidateLedger:
                 else:
                     unrecognized_version_record_count += 1
 
+        tail_unread = snap.size - snap.cut if snap.tail_skipped else 0
+        if tail_unread:
+            # Over-cap torn tail: counted as one unread partial row; its bytes are
+            # neither parsed nor hashed, so there is no whole-file digest to offer.
+            line_number += 1
+            nonempty_lines += 1
+            final_nonempty_line_number = line_number
+            malformed_line_count += 1
+            malformed_line_numbers.add(line_number)
+            if len(malformed) < max_malformed_samples:
+                malformed.append(MalformedLedgerLine(line_number, "tail_over_read_cap", "", False))
+            file_size += tail_unread
+            last_byte = b"\x00"
         unterminated_final_line = bool(file_size) and last_byte not in (b"\n", b"\r")
 
         trailing_partial = bool(
@@ -2696,7 +2723,7 @@ class CandidateLedger:
             trailing_partial_line_number=(final_nonempty_line_number if trailing_partial else None),
             ledger_versions=tuple(sorted(ledger_versions)),
             file_size_bytes=file_size,
-            file_sha256=digest.hexdigest(),
+            file_sha256=None if tail_unread else digest.hexdigest(),
             completeness_status=completeness_status,
             completeness_reason=completeness_reason,
         )
