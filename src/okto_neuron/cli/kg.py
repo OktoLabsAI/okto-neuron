@@ -1699,7 +1699,7 @@ def _kg_reembed_owned(vault_path: Path, ownership: RebuildLockHandle) -> int:
                 vault_path, backend_name, _load_storage_config(vault_path)
             )
             try:
-                nodes = list(live_store.list_nodes())
+                nodes = list(live_store.list_nodes(include_embedding=True))
                 edges = list(live_store.list_edges())
             finally:
                 live_store.close()

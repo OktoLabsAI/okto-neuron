@@ -1043,7 +1043,11 @@ class Vault:
         return hits
 
     def _scoped_nodes(self, scope: ExportScope) -> list[object]:
-        nodes = list(self.store.list_nodes())
+        nodes = list(
+            self.store.list_nodes(include_embedding=True)
+            if scope.include_embeddings
+            else self.store.list_nodes()
+        )
         if scope.node_types is not None:
             allowed_types = set(scope.node_types)
             nodes = [node for node in nodes if getattr(node, "type", None) in allowed_types]

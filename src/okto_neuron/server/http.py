@@ -2550,7 +2550,7 @@ def _finding_payload(state: ServerState, finding: Any) -> dict[str, Any]:
 
 def _finding_subject(state: ServerState, finding: Any) -> dict[str, Any]:
     evidence_id = finding.evidence_claim_ids[0]
-    node = _store(state).get_node(evidence_id)
+    node = _store(state).get_node(evidence_id, include_embedding=False)
     facets = dict(getattr(node, "facets", {}) or {}) if node else {}
     node_type = str(getattr(node, "type", "")) if node else ""
     if node_type == "Block":
@@ -3192,7 +3192,7 @@ async def api_node_detail(request: Request) -> JSONResponse:
 
 def _node_detail_payload(state: ServerState | VaultRuntime, node_id: str) -> dict[str, Any]:
     """Store op: one node, its edges, provenance, and equivalence canonical."""
-    node = _store(state).get_node(node_id)
+    node = _store(state).get_node(node_id, include_embedding=False)
     if node is None or str(getattr(node, "type", "")) not in CLOSED_NODE_TYPES or is_infra(node):
         raise _ApiError(404, "not_found", f"node not found: {node_id}")
     out_edges = [
@@ -3204,7 +3204,7 @@ def _node_detail_payload(state: ServerState | VaultRuntime, node_id: str) -> dic
     provenance = _provenance_payload(state, node)
     block = None
     if provenance and provenance.get("block_id"):
-        block_node = _store(state).get_node(provenance["block_id"])
+        block_node = _store(state).get_node(provenance["block_id"], include_embedding=False)
         if block_node is not None:
             block = {
                 "id": str(block_node.id),
@@ -3493,7 +3493,7 @@ def _neighbors_payload(
 ) -> dict[str, Any]:
     """Store op: capped BFS neighbourhood (see :func:`api_node_neighbors`)."""
     store = _store(state)
-    seed_node = store.get_node(seed)
+    seed_node = store.get_node(seed, include_embedding=False)
     # 404 mirrors api_node_detail: missing OR hidden (not closed / infra).
     # The seed is exempt from the structural filter for the same reason
     # api_node_detail is — the caller navigated to this id on purpose, so a
@@ -3528,7 +3528,7 @@ def _neighbors_payload(
             if other not in kept:
                 if len(kept) >= limit:
                     continue  # node cap hit — skip new nodes (keep edges among kept)
-                other_node = store.get_node(other)
+                other_node = store.get_node(other, include_embedding=False)
                 if not _admit(other_node):
                     continue
                 kept[other] = other_node

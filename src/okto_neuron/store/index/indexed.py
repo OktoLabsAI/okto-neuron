@@ -48,14 +48,16 @@ class IndexedStore:
     def add_edge(self, edge: Edge) -> None:
         self._store.add_edge(edge)
 
-    def get_node(self, node_id: str) -> Optional[Node]:
-        return self._store.get_node(node_id)
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
+        return self._store.get_node(node_id, include_embedding=include_embedding)
 
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
-        return self._store.get_nodes(node_ids)
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Node]:
+        return self._store.get_nodes(node_ids, include_embedding=include_embedding)
 
-    def list_nodes(self, type: Optional[str] = None) -> Iterable[Node]:
-        return self._store.list_nodes(type=type)
+    def list_nodes(
+        self, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
+        return self._store.list_nodes(type=type, include_embedding=include_embedding)
 
     def list_edges(
         self,

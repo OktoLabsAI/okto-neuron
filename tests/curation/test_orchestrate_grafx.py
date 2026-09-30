@@ -196,7 +196,7 @@ def _read_back(vault_path: Path) -> tuple[list[Node], list[Edge]]:
     graph_backend, _index_backend, storage_config = _read_pinned_backends(vault_path)
     store = _open_graph_store(vault_path, graph_backend, storage_config)
     try:
-        nodes = sorted(store.list_nodes(), key=lambda n: n.id)
+        nodes = sorted(store.list_nodes(include_embedding=True), key=lambda n: n.id)
         edges = sorted(store.list_edges(), key=lambda e: e.id)
     finally:
         store.close()

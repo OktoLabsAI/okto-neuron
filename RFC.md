@@ -328,6 +328,15 @@ jittered backoff from 10 ms to 200 ms, 2 s total) so `get_node`, `get_nodes` and
 surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
 exhausted budget reaches the caller as `GraphBackendError` with `retryable=True`.
 
+Node reads take `include_embedding`. `list_nodes` and `get_nodes` default to `False`: the vector column is
+not selected at all (grafx and ladybug drop `n.embedding` from the `RETURN`, the neo4j mixin returns a map
+projection without it), so a scan of a 4096-dimension vault no longer drags every vector through the engine
+and starves the writer. `get_node` defaults to `True` because it is the read-modify-write read and a single
+vector is cheap. Callers that use vectors or write a node back pass `True`: vector ranking, reembed, rebuild
+and heal copies, snapshot dump, index rebuild and generation stamps, reconcile clustering, resolve similarity,
+and the companion's supersede/detach/revert helper. Edges carry no vector. A backend registered through the
+`marginalia.graph_backends` entry point must accept the new keyword.
+
 Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. `GrafxStore` therefore passes `buffer_budget_bytes` to
 `okto_grafx.connect`: `storage.buffer_budget` in the vault yaml (bytes or a string such as `256MiB`,

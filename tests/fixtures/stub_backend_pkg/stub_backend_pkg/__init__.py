@@ -126,10 +126,10 @@ class StubGraphStore:
             require_same_edge_identity(existing, edge)
         self._edges[edge.id] = edge
 
-    def get_node(self, node_id: str) -> Optional[Node]:
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
         return self._nodes.get(node_id)
 
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Node]:
         result: list[Node] = []
         for node_id in dict.fromkeys(node_ids):
             node = self._nodes.get(node_id)
@@ -137,7 +137,9 @@ class StubGraphStore:
                 result.append(node)
         return result
 
-    def list_nodes(self, type: Optional[str] = None) -> Iterable[Node]:
+    def list_nodes(
+        self, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
         for n in sorted(self._nodes.values(), key=lambda n: n.id):
             if type is None or n.type == type:
                 yield n

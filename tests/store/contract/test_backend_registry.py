@@ -31,11 +31,11 @@ class _GraphStoreMissingAddEdge:
     longer isolate the one member this fixture means to omit)."""
 
     def add_node(self, node): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):
@@ -62,11 +62,11 @@ class _GraphStoreIncompatibleAddEdge:
 
     def add_node(self, node): ...
     def add_edge(self, edge, extra_required_arg): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):
@@ -95,11 +95,11 @@ class _GraphStoreMissingIsClosed:
 
     def add_node(self, node): ...
     def add_edge(self, edge): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):
@@ -126,11 +126,11 @@ class _GraphStoreIsClosedAsMethod:
 
     def add_node(self, node): ...
     def add_edge(self, edge): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):

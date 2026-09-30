@@ -65,12 +65,31 @@ class DriftReport:
 class GraphStore(Protocol):
     def add_node(self, node: Node) -> None: ...
     def add_edge(self, edge: Edge) -> None: ...
-    def get_node(self, node_id: str) -> Optional[Node]: ...
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
-        """Batch read in input order; duplicates collapse, missing ids are skipped."""
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
+        """One node. ``include_embedding`` defaults to True: a single read is cheap and
+        this is the read-modify-write path (``add_node`` of a node read back must keep
+        its vector). Pass False to skip the vector column."""
         ...
 
-    def list_nodes(self, type: Optional[str] = None) -> Iterable[Node]: ...
+    def get_nodes(
+        self, node_ids: Iterable[str], include_embedding: bool = False
+    ) -> list[Node]:
+        """Batch read in input order; duplicates collapse, missing ids are skipped.
+
+        ``include_embedding`` defaults to False: the vector column is not selected and
+        every returned node has ``embedding=None``. Pass True only where the vectors are
+        used (ranking, reembed, snapshot) or where the node is written back.
+        """
+        ...
+
+    def list_nodes(
+        self, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
+        """All nodes (optionally one type). ``include_embedding`` as in :meth:`get_nodes`.
+
+        Edges carry no vector, so ``list_edges`` has no such switch."""
+        ...
+
     def list_edges(
         self, src: Optional[str] = None, dst: Optional[str] = None, type: Optional[str] = None
     ) -> Iterable[Edge]: ...

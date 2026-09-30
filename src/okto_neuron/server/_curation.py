@@ -2586,7 +2586,7 @@ def run_heal(state: "ServerState", job: Any) -> dict:
         # Read the LIVE graph through the daemon's own handle (still open — NO second
         # handle). This is the source the deterministic copy folds.
         job.progress("reading")
-        nodes = list(state.vault.store.list_nodes())
+        nodes = list(state.vault.store.list_nodes(include_embedding=True))
         edges = list(state.vault.store.list_edges())
         # Bootstrap the tmp graph at the EXISTING vectors' width (the copy preserves
         # embeddings VERBATIM, so the fixed-width vector column must match the copied
@@ -2837,7 +2837,7 @@ def run_reembed(state: "ServerState", job: Any) -> dict:
         # Read the LIVE graph through the daemon's own handle (still open — no second
         # handle): list nodes/edges to replay through the embedder.
         job.progress("reading")
-        nodes = list(state.vault.store.list_nodes())
+        nodes = list(state.vault.store.list_nodes(include_embedding=True))
         edges = list(state.vault.store.list_edges())
 
         staging_port.discard(tmp_graph_path)

@@ -58,7 +58,9 @@ def _nodes_by_id(store: "GraphStore", node_ids) -> "dict[str, Node]":
     """One batched ``get_nodes`` read keyed by id; a missing id is simply absent,
     so ``.get(id)`` reproduces ``store.get_node(id)``'s ``None``."""
     ids = [node_id for node_id in node_ids if node_id]
-    return {node.id: node for node in store.get_nodes(ids)} if ids else {}
+    # include_embedding: the claims read here are written back (supersede/detach/revert);
+    # a vector-less read followed by add_node would erase the stored embedding.
+    return {node.id: node for node in store.get_nodes(ids, include_embedding=True)} if ids else {}
 
 
 def _claim_object_ids(claims) -> list[str]:

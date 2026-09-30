@@ -28,6 +28,17 @@ from okto_neuron.core.schema import Edge, Node
 from okto_neuron.store import schema
 
 
+_NODE_PROPS_NO_VECTOR = (
+    ".id, .type, .title, .content, .tags, .facets, .provenance, .created_at, .schema_version"
+)
+
+
+def _node_return(include_embedding: bool) -> str:
+    """``RETURN`` expression for a node: the whole node, or a map projection that
+    leaves the vector property out (the query shape changes, nothing is filtered after)."""
+    return "n" if include_embedding else f"n {{{_NODE_PROPS_NO_VECTOR}}} AS n"
+
+
 class _ReadPrimitive(Protocol):
     """Structural shape a concrete backend must supply for this mixin to work."""
 
@@ -63,28 +74,35 @@ class GenerationScopedBackendMixin:
     #: exactly like `GrafxStore.list_nodes` excludes `schema.SCHEMA_METADATA_NODE_ID`.
     _metadata_node_id: str = schema.SCHEMA_METADATA_NODE_ID
 
-    def get_node(self: _ReadPrimitive, node_id: str) -> Optional[Node]:
+    def get_node(
+        self: _ReadPrimitive, node_id: str, include_embedding: bool = True
+    ) -> Optional[Node]:
         rows = self._run_read(
-            "MATCH (n:Node {id: $id, vault_id: $vault_id, _generation: $generation}) RETURN n",
+            "MATCH (n:Node {id: $id, vault_id: $vault_id, _generation: $generation}) "
+            f"RETURN {_node_return(include_embedding)}",
             {"id": node_id, "vault_id": self.vault_id, "generation": self._generation_tag},
         )
         if not rows:
             return None
         return self._node_from_row(rows[0])
 
-    def get_nodes(self: _ReadPrimitive, node_ids: Iterable[str]) -> list[Node]:
+    def get_nodes(
+        self: _ReadPrimitive, node_ids: Iterable[str], include_embedding: bool = False
+    ) -> list[Node]:
         ids = list(dict.fromkeys(node_ids))
         if not ids:
             return []
         rows = self._run_read(
             "MATCH (n:Node) WHERE n.id IN $ids AND n.vault_id = $vault_id "
-            "AND n._generation = $generation RETURN n",
+            f"AND n._generation = $generation RETURN {_node_return(include_embedding)}",
             {"ids": ids, "vault_id": self.vault_id, "generation": self._generation_tag},
         )
         by_id = {str(row["n"]["id"]): self._node_from_row(row) for row in rows}  # type: ignore[index]
         return [by_id[i] for i in ids if i in by_id]
 
-    def list_nodes(self: _ReadPrimitive, type: Optional[str] = None) -> Iterable[Node]:
+    def list_nodes(
+        self: _ReadPrimitive, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
         params: dict[str, object] = {
             "vault_id": self.vault_id,
             "generation": self._generation_tag,
@@ -99,7 +117,10 @@ class GenerationScopedBackendMixin:
             clauses.append("n.type = $type")
             params["type"] = type
         where = " AND ".join(clauses)
-        rows = self._run_read(f"MATCH (n:Node) WHERE {where} RETURN n ORDER BY n.id", params)
+        rows = self._run_read(
+            f"MATCH (n:Node) WHERE {where} RETURN {_node_return(include_embedding)} ORDER BY n.id",
+            params,
+        )
         return [self._node_from_row(row) for row in rows]
 
     def list_edges(

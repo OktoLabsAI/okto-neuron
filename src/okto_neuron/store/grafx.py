@@ -367,11 +367,18 @@ SET n.type = $type,
     n.embedding = $embedding
 """
 
-_NODE_READ_COLUMNS = (
+_NODE_READ_COLUMNS_NO_VECTOR = (
     "n.id AS id, n.type AS type, n.title AS title, n.content AS content, "
     "n.tags AS tags, n.facets AS facets, n.provenance AS provenance, "
-    "n.created_at AS created_at, n.embedding AS embedding"
+    "n.created_at AS created_at"
 )
+_NODE_READ_COLUMNS = _NODE_READ_COLUMNS_NO_VECTOR + ", n.embedding AS embedding"
+
+
+def _node_columns(include_embedding: bool) -> str:
+    """The projection itself changes: a default read never selects the vector column."""
+    return _NODE_READ_COLUMNS if include_embedding else _NODE_READ_COLUMNS_NO_VECTOR
+
 
 _EDGE_READ_COLUMNS = (
     "e.id AS id, e.type AS type, e.src AS src, e.dst AS dst, "
@@ -587,17 +594,17 @@ class GrafxStore:
 
         self._run_with_retry(attempt)
 
-    def get_node(self, node_id: str) -> Optional[Node]:
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
         self._ensure_open()
         rows = self._query(
-            f"MATCH (n:Node {{id: $id}}) RETURN {_NODE_READ_COLUMNS}",
+            f"MATCH (n:Node {{id: $id}}) RETURN {_node_columns(include_embedding)}",
             {"id": node_id},
         )
         if not rows:
             return None
         return self._node_from_row(rows[0])
 
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Node]:
         self._ensure_open()
         ids = list(dict.fromkeys(node_ids))
         if not ids:
@@ -606,24 +613,27 @@ class GrafxStore:
         for start in range(0, len(ids), _ID_QUERY_BATCH):
             batch = ids[start : start + _ID_QUERY_BATCH]
             rows = self._query(
-                f"MATCH (n:Node) WHERE n.id IN $ids RETURN {_NODE_READ_COLUMNS}",
+                f"MATCH (n:Node) WHERE n.id IN $ids RETURN {_node_columns(include_embedding)}",
                 {"ids": batch},
             )
             by_id.update({row["id"]: self._node_from_row(row) for row in rows})
         return [by_id[i] for i in ids if i in by_id]
 
-    def list_nodes(self, type: Optional[str] = None) -> Iterable[Node]:
+    def list_nodes(
+        self, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
         self._ensure_open()
+        columns = _node_columns(include_embedding)
         if type is None:
             rows = self._query(
                 f"MATCH (n:Node) WHERE n.id <> $metadata_id "
-                f"RETURN {_NODE_READ_COLUMNS} ORDER BY n.id",
+                f"RETURN {columns} ORDER BY n.id",
                 {"metadata_id": schema.SCHEMA_METADATA_NODE_ID},
             )
         else:
             rows = self._query(
                 f"MATCH (n:Node) WHERE n.id <> $metadata_id AND n.type = $type "
-                f"RETURN {_NODE_READ_COLUMNS} ORDER BY n.id",
+                f"RETURN {columns} ORDER BY n.id",
                 {"metadata_id": schema.SCHEMA_METADATA_NODE_ID, "type": type},
             )
         return (self._node_from_row(row) for row in rows)
@@ -991,7 +1001,7 @@ class GrafxStore:
         }
 
     def _node_from_row(self, row: Mapping[str, object]) -> Node:
-        embedding_value = row.get("embedding")
+        embedding_value = row.get("embedding")  # absent when the projection omitted it
         embedding = list(embedding_value.values) if embedding_value is not None else None  # type: ignore[union-attr]
         tags_raw = row.get("tags")
         tags = _json_load(tags_raw) if tags_raw else []

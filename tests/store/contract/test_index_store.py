@@ -16,7 +16,7 @@ TOL = 1e-9
 
 def _vector_leg(index, store, query_embedding, node_type):
     pairs = list(index.scan_vectors(type=node_type))
-    nodes = store.get_nodes([node_id for node_id, _ in pairs])
+    nodes = store.get_nodes([node_id for node_id, _ in pairs], include_embedding=True)
     scored = []
     for node in nodes:
         score = _cosine(query_embedding, node.embedding) * node_quality_weight(node)

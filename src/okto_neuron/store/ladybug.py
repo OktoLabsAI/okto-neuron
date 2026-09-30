@@ -249,13 +249,13 @@ class LadybugStore:
             return None
         return _edge_from_row(rows[0])
 
-    def get_node(self, node_id: str) -> Optional[Node]:
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
         self._ensure_open()
+        columns = _node_columns(include_embedding)
         rows = self._fetch_rows(
-            """
-            MATCH (n:Node {id: $id})
-            RETURN n.id, n.type, n.title, n.content, n.tags, n.facets,
-                   n.provenance, n.created_at, n.embedding
+            f"""
+            MATCH (n:Node {{id: $id}})
+            RETURN {columns}
             """,
             {"id": node_id},
         )
@@ -263,43 +263,44 @@ class LadybugStore:
             return None
         return _node_from_row(rows[0])
 
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Node]:
         self._ensure_open()
+        columns = _node_columns(include_embedding)
         ids = list(dict.fromkeys(node_ids))
         if not ids:
             return []
         rows = self._fetch_rows(
-            """
+            f"""
             MATCH (n:Node)
             WHERE n.id IN $ids
-            RETURN n.id, n.type, n.title, n.content, n.tags, n.facets,
-                   n.provenance, n.created_at, n.embedding
+            RETURN {columns}
             """,
             {"ids": ids},
         )
         by_id = {node.id: node for node in (_node_from_row(row) for row in rows)}
         return [by_id[i] for i in ids if i in by_id]
 
-    def list_nodes(self, type: Optional[str] = None) -> Iterable[Node]:
+    def list_nodes(
+        self, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
         self._ensure_open()
+        columns = _node_columns(include_embedding)
         if type is None:
             rows = self._fetch_rows(
-                """
+                f"""
                 MATCH (n:Node)
                 WHERE n.id <> $metadata_id
-                RETURN n.id, n.type, n.title, n.content, n.tags, n.facets,
-                       n.provenance, n.created_at, n.embedding
+                RETURN {columns}
                 ORDER BY n.id
                 """,
                 {"metadata_id": schema.SCHEMA_METADATA_NODE_ID},
             )
         else:
             rows = self._fetch_rows(
-                """
+                f"""
                 MATCH (n:Node)
                 WHERE n.id <> $metadata_id AND n.type = $type
-                RETURN n.id, n.type, n.title, n.content, n.tags, n.facets,
-                       n.provenance, n.created_at, n.embedding
+                RETURN {columns}
                 ORDER BY n.id
                 """,
                 {"metadata_id": schema.SCHEMA_METADATA_NODE_ID, "type": type},
@@ -566,6 +567,16 @@ def _same_node_payload(existing: Node, proposed: Node) -> bool:
     )
 
 
+_NODE_COLUMNS_NO_VECTOR = (
+    "n.id, n.type, n.title, n.content, n.tags, n.facets, n.provenance, n.created_at"
+)
+
+
+def _node_columns(include_embedding: bool) -> str:
+    """The projection itself changes: a default read never selects the vector column."""
+    return _NODE_COLUMNS_NO_VECTOR + (", n.embedding" if include_embedding else "")
+
+
 def _node_from_row(row: object) -> Node:
     values = _row_values(row)
     data: dict[str, object] = {
@@ -576,7 +587,7 @@ def _node_from_row(row: object) -> Node:
         "tags": values[4] or [],
         "facets": _json_load(values[5]),
         "provenance": Provenance.model_validate(_json_load(values[6])),
-        "embedding": values[8],
+        "embedding": values[8] if len(values) > 8 else None,
     }
     created_at = values[7]
     if created_at is not None:

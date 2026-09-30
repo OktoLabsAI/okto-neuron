@@ -153,7 +153,7 @@ def find_similar(
     embedder = embedder or get_provider()
     cand_vec = _candidate_vector(candidate, embedder)
     scored: list[tuple[float, Node]] = []
-    for node in store.list_nodes(type=candidate.type):
+    for node in store.list_nodes(type=candidate.type, include_embedding=True):
         if node.id == candidate.candidate_id or is_infra(node):
             continue
         score = _cosine(cand_vec, _node_vector(node, embedder))

@@ -1356,7 +1356,7 @@ def test_run_reembed_grafx_recomputes_vectors(tmp_path: Path) -> None:
             assert not st.vault.store.is_closed
             ids = {n.id for n in st.vault.store.list_nodes()}
             assert {"n1", "n2"} <= ids
-            for node in st.vault.store.list_nodes():
+            for node in st.vault.store.list_nodes(include_embedding=True):
                 assert node.embedding is not None
                 assert len(node.embedding) == 384
                 assert any(node.embedding), "vector was not recomputed"

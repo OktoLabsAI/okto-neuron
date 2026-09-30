@@ -350,7 +350,7 @@ def adjudicate_cluster(
     'same' iff ≥1 survives; confidence = min surviving member confidence."""
     # One batched read (was one get_node per member); member order, duplicate
     # ids and missing-id skips are preserved.
-    fetched = {n.id: n for n in store.get_nodes(cluster.member_ids)}
+    fetched = {n.id: n for n in store.get_nodes(cluster.member_ids, include_embedding=True)}
     members = [fetched[mid] for mid in cluster.member_ids if mid in fetched]
     if len(members) < 2:
         return ClusterVerdict(

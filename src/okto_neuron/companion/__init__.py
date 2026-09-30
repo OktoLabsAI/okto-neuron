@@ -9484,22 +9484,29 @@ class _PlanningGraphOverlay:
             raise ValueError("planned edge has a missing endpoint")
         self._edges[str(edge.id)] = edge
 
-    def get_node(self, node_id: str) -> Any:
-        return self._nodes.get(node_id) or self._base.get_node(node_id)
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Any:
+        return self._nodes.get(node_id) or self._base.get_node(
+            node_id, include_embedding=include_embedding
+        )
 
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Any]:
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Any]:
         """``get_node`` per id, with the base reads batched into one call: input
         order, duplicates collapsed, missing ids skipped (the protocol contract)."""
         ids = list(dict.fromkeys(node_ids))
         base = {
             str(node.id): node
-            for node in self._base.get_nodes([i for i in ids if i not in self._nodes])
+            for node in self._base.get_nodes(
+                [i for i in ids if i not in self._nodes], include_embedding=include_embedding
+            )
         }
         found = (self._nodes.get(node_id) or base.get(node_id) for node_id in ids)
         return [node for node in found if node is not None]
 
-    def list_nodes(self, type: str | None = None) -> list[Any]:
-        nodes = {str(node.id): node for node in self._base.list_nodes(type=type)}
+    def list_nodes(self, type: str | None = None, include_embedding: bool = False) -> list[Any]:
+        nodes = {
+            str(node.id): node
+            for node in self._base.list_nodes(type=type, include_embedding=include_embedding)
+        }
         for node in self._nodes.values():
             if type is None or node.type == type:
                 nodes[str(node.id)] = node
