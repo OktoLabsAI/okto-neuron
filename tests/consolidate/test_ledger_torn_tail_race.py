@@ -194,3 +194,27 @@ def test_old_offset_index_rebuild_never_reads_stale_tail_bytes(
     assert race.fired == 1
     assert _ids(rows) == ["c-0", "c-1", "c-2", "late"]  # never the torn row's stale bytes
     assert json.loads(ledger.path.read_bytes().splitlines()[-1])["candidate_id"] == "late"
+
+
+def test_scan_does_not_copy_a_torn_tail_above_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    ledger, _run, _torn, cut = _torn_ledger(tmp_path)
+    size = ledger.path.stat().st_size
+    assert size - cut == TORN_BYTES
+    monkeypatch.setattr(mod, "_SCAN_TAIL_CAP", TORN_BYTES - 1)
+
+    with caplog.at_level("WARNING", logger=mod.__name__):
+        scan = ledger.scan()
+
+    assert _ids(scan.parsed_records) == ["c-0", "c-1", "c-2"]  # rows up to the last newline
+    assert scan.trailing_partial is True and scan.unterminated_final_line is True
+    assert scan.completeness_status == "incomplete"
+    assert scan.file_sha256 is None  # no claim about bytes that were never read
+    assert scan.file_size_bytes == size  # the snapshot size is known without reading
+    assert scan.malformed_line_count == 1
+    assert [m.reason for m in scan.malformed_lines] == ["tail_over_read_cap"]
+    assert any(f"{TORN_BYTES}-byte unterminated tail" in r.getMessage() for r in caplog.records)
+
+    monkeypatch.setattr(mod, "_SCAN_TAIL_CAP", TORN_BYTES)  # exactly at the cap: copied
+    assert ledger.scan().file_sha256 == hashlib.sha256(ledger.path.read_bytes()).hexdigest()

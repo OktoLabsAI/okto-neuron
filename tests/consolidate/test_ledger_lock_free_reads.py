@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import threading
 import time
@@ -26,7 +27,9 @@ from okto_neuron.consolidate.ledger import (
 )
 from tests.support._ledger_synth import _text, build_synthetic_ledger
 
-_P99_BOUND_S = 0.050
+_P99_BOUND_S = 0.050  # gate: a reader in a child process must not hold the flock
+_DIAGNOSTIC_P99_BOUND_S = 0.100  # in-process readers also compete for the GIL
+_MIN_SAMPLES = 20
 
 
 class Appender(threading.Thread):
@@ -105,28 +108,50 @@ def ledger_dir(source_ledger: Path, tmp_path: Path) -> Path:
     return target
 
 
-def _run_under_appends(directory: Path, work: Any, repeats: int = 5) -> tuple[Appender, list[Any]]:
+def _diag(appender: Appender) -> str:
+    """What a reader of a failure needs to tell a latency regression from a busy host."""
+    lat = appender.latencies
+    load = ", ".join(f"{x:.1f}" for x in os.getloadavg())
+    return (
+        f"append p99={appender.p99() * 1000:.1f} ms max={max(lat) * 1000:.1f} ms "
+        f"samples={len(lat)} loadavg(1/5/15m)={load}"
+    )
+
+
+def _until_enough_samples(appender: Appender, step: Any, deadline_s: float) -> list[Any]:
+    """Run ``step`` until >= 20 appends have landed; fail clearly if the deadline wins."""
+    deadline = time.monotonic() + deadline_s
+    results = []
+    while True:
+        results.append(step())
+        if len(appender.latencies) >= _MIN_SAMPLES:
+            return results
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"only {len(appender.latencies)} appends landed within the {deadline_s:.0f} s "
+                f"deadline (need {_MIN_SAMPLES}); {_diag(appender) if appender.latencies else ''}"
+            )
+
+
+def _run_under_appends(
+    directory: Path, work: Any, *, deadline_s: float = 10.0
+) -> tuple[Appender, list[Any]]:
+    """Run ``work`` repeatedly in this process while a thread appends."""
     appender = Appender(directory)
     appender.start()
     time.sleep(0.05)
-    results = []
     try:
-        for _ in range(repeats):
-            results.append(work())
+        results = _until_enough_samples(appender, work, deadline_s)
     finally:
         appender.stop.set()
         appender.join(timeout=30)
     assert appender.error is None
-    assert len(appender.latencies) > 5
     return appender, results
 
 
-def test_scan_does_not_stall_appends_and_returns_its_snapshot(ledger_dir: Path) -> None:
+def test_scan_returns_its_snapshot_while_appends_continue(ledger_dir: Path) -> None:
     ledger = CandidateLedger(ledger_dir)
     appender, results = _run_under_appends(ledger_dir, ledger.scan)
-    # in-process the parse competes for the GIL, so only a loose bound here; the
-    # flock itself is timed against a reader in a child process below
-    assert appender.p99() < 10 * _P99_BOUND_S, appender.p99()
     path = ledger_dir / LEDGER_FILENAME
     for scan in results:
         rows, digest = _prefix_truth(path, scan.file_size_bytes)
@@ -142,13 +167,31 @@ def test_scan_does_not_stall_appends_and_returns_its_snapshot(ledger_dir: Path) 
     assert after == list(range(appender.count))
 
 
-def test_iter_records_in_a_thread_returns_while_appends_continue(ledger_dir: Path) -> None:
+def test_iter_records_returns_a_prefix_while_appends_continue(ledger_dir: Path) -> None:
     ledger = CandidateLedger(ledger_dir)
     appender, results = _run_under_appends(
-        ledger_dir, lambda: sum(1 for _ in ledger.iter_records())
+        ledger_dir,
+        lambda: [
+            r["candidate_id"]
+            for r in ledger.iter_records()
+            if "live" in str(r.get("candidate_id", ""))
+        ],
     )
-    assert appender.p99() < 10 * _P99_BOUND_S, appender.p99()
-    assert all(n > 0 for n in results)
+    for ids in results:
+        live = [int(x.split("-")[1]) for x in ids]
+        assert live == list(range(len(live)))  # a contiguous prefix of the appends
+
+
+@pytest.mark.slow
+@pytest.mark.perf
+@pytest.mark.parametrize("reader", ["scan", "iter_records"])
+def test_in_thread_reader_append_p99_diagnostic(ledger_dir: Path, reader: str) -> None:
+    """Diagnostic, not the gate: same-process readers also compete for the GIL."""
+    ledger = CandidateLedger(ledger_dir)
+    work = ledger.scan if reader == "scan" else lambda: sum(1 for _ in ledger.iter_records())
+    appender, _ = _run_under_appends(ledger_dir, work)
+    print(f"[{reader} in-thread] {_diag(appender)}")
+    assert appender.p99() < _DIAGNOSTIC_P99_BOUND_S, f"{reader}: {_diag(appender)}"
 
 
 _CHILD = r"""
@@ -176,13 +219,13 @@ for _ in range(repeats):
 """
 
 
-def _reader_process(directory: Path, mode: str, repeats: int = 4) -> Appender:
-    """Appends run here; the rebuilding reader runs in a child process.
+def _reader_process(directory: Path, mode: str, *, deadline_s: float = 10.0) -> Appender:
+    """Appends run here; the reader runs in child processes.
 
     A child keeps the GIL out of the measurement: what is timed is the ledger's
-    flock, the thing a reader in another process (or thread) could hold.
+    flock, the thing a reader in another process (or thread) could hold. Children
+    are started back to back until >= 20 appends have landed.
     """
-    import os
     import subprocess
     import sys
 
@@ -192,31 +235,34 @@ def _reader_process(directory: Path, mode: str, repeats: int = 4) -> Appender:
     appender = Appender(directory)
     appender.start()
     time.sleep(0.05)
-    try:
+
+    def child() -> None:
         subprocess.run(
-            [sys.executable, "-c", _CHILD, str(directory), mode, str(repeats)],
+            [sys.executable, "-c", _CHILD, str(directory), mode, "2"],
             env=env,
             check=True,
             capture_output=True,
             text=True,
         )
+
+    try:
+        _until_enough_samples(appender, child, deadline_s)
     finally:
         appender.stop.set()
         appender.join(timeout=30)
     assert appender.error is None
-    assert len(appender.latencies) > 20
     return appender
 
 
 @pytest.mark.parametrize("mode", ["scan", "iter_records"])
 def test_reader_process_does_not_stall_appends(ledger_dir: Path, mode: str) -> None:
     appender = _reader_process(ledger_dir, mode)
-    assert appender.p99() < _P99_BOUND_S, (mode, appender.p99())
+    assert appender.p99() < _P99_BOUND_S, f"{mode}: {_diag(appender)}"
 
 
 def test_index_rebuild_does_not_stall_appends(ledger_dir: Path) -> None:
     appender = _reader_process(ledger_dir, "index_rebuild")
-    assert appender.p99() < _P99_BOUND_S, appender.p99()
+    assert appender.p99() < _P99_BOUND_S, _diag(appender)
     # the rebuilt index equals a fresh scan even though appends landed mid-rebuild
     from tests.consolidate.test_ledger_index import assert_index_is_truth
 
@@ -226,7 +272,7 @@ def test_index_rebuild_does_not_stall_appends(ledger_dir: Path) -> None:
 
 def test_old_offset_index_rebuild_does_not_stall_appends(ledger_dir: Path) -> None:
     appender = _reader_process(ledger_dir, "offset_rebuild")
-    assert appender.p99() < _P99_BOUND_S, appender.p99()
+    assert appender.p99() < _P99_BOUND_S, _diag(appender)
 
 
 def test_torn_tail_at_the_snapshot_boundary_stops_at_the_last_complete_line(
@@ -277,7 +323,7 @@ def test_append_p99_on_a_300mb_ledger(
             _sidecar_cache_drop()
             return len(ledger.unreceipted_commit_plans())
 
-        appender, _ = _run_under_appends(directory, work, repeats=2)
-        assert appender.p99() < _P99_BOUND_S, (reader, appender.p99(), max(appender.latencies))
+        appender, _ = _run_under_appends(directory, work, deadline_s=120.0)
+        assert appender.p99() < _P99_BOUND_S, f"{reader}: {_diag(appender)}"
     finally:
         shutil.rmtree(directory, ignore_errors=True)
