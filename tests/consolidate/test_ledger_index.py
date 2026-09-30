@@ -494,7 +494,14 @@ def test_run_readers_do_not_scan_the_whole_ledger(
         reads.append(run_id)
         return original(self, run_id)
 
+    original_reduced = ledger_mod._RunView.reduced_records
+
+    def spy_reduced(self: Any, run_id: str) -> Any:
+        reads.append(run_id)
+        return original_reduced(self, run_id)
+
     monkeypatch.setattr(ledger_mod._RunView, "records", spy)
+    monkeypatch.setattr(ledger_mod._RunView, "reduced_records", spy_reduced)
     top = ledger.run_summaries(limit=1)
     assert len(top) == 1 and len(reads) == 1  # only the newest run's span was read
     reads.clear()

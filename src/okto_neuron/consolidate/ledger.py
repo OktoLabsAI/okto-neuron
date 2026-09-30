@@ -1824,6 +1824,7 @@ def _sidecar_cache_drop(path: Path | None = None) -> None:
             _SNAPSHOT_FAILURES.clear()
         else:
             _SNAPSHOT_FAILURES.pop(str(path.resolve()), None)
+    _reduced_runs_drop(None if path is None else str(path.resolve()))
 
 
 def _write_sidecar_file(path: Path, payload: bytes) -> None:
@@ -1898,12 +1899,35 @@ def extraction_unit_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Rows the run summaries only COUNT by kind. _summarize_runs and _progress_from_records
+# never read their content, so a reduced copy (kind and run_id) is exactly equivalent and
+# spares re-parsing a commit plan of tens of MiB on every poll.
+_COUNTED_ONLY_KINDS = frozenset({"commit_plan", "commit_record"})
+_REDUCED_RUN_MAX_ENTRIES = 64
+_REDUCED_RUN_MAX_BYTES = 128 * 1024 * 1024  # raw bytes of the rows kept, across all runs
+_REDUCED_RUN_ENTRY_MAX_BYTES = 32 * 1024 * 1024  # a run above this is read but not cached
+_REDUCED_RUNS: OrderedDict[tuple[str, str], tuple[int, int, list[dict[str, Any]], int]] = (
+    OrderedDict()
+)
+_REDUCED_RUNS_GUARD = threading.Lock()
+
+
+def _reduced_runs_drop(path_key: str | None = None) -> None:
+    with _REDUCED_RUNS_GUARD:
+        if path_key is None:
+            _REDUCED_RUNS.clear()
+            return
+        for key in [k for k in _REDUCED_RUNS if k[0] == path_key]:
+            del _REDUCED_RUNS[key]
+
+
 class _RunView:
     """Offset-based reads of one ledger run at a time, under the ledger lock."""
 
-    def __init__(self, state: _Sidecar, handle: Any) -> None:
+    def __init__(self, state: _Sidecar, handle: Any, path_key: str = "") -> None:
         self.state = state
         self._handle = handle
+        self._path_key = path_key
 
     def order(self) -> list[str]:
         return self.state.run_order()
@@ -1929,6 +1953,57 @@ class _RunView:
                 continue
             if isinstance(record, dict) and str(record.get("run_id") or "") == run_id:
                 rows.append(record)
+        return rows
+
+    def reduced_records(self, run_id: str) -> list[dict[str, Any]]:
+        """The run's rows for the kind-counting summaries, without re-reading old bytes.
+
+        Counted-only rows (:data:`_COUNTED_ONLY_KINDS`) come back as ``{"kind", "run_id"}``.
+        The result is cached per run with the span it covers; the ledger is append-only,
+        so a run whose span has not grown costs nothing, and one that grew parses only the
+        bytes appended since. Callers must not mutate the returned list.
+        """
+        assert self.state.runs is not None
+        entry = self.state.runs.get(run_id)
+        if entry is None:
+            return []
+        first, end = entry["first"], entry["end"]
+        key = (self._path_key, run_id)
+        with _REDUCED_RUNS_GUARD:
+            cached = _REDUCED_RUNS.get(key) if self._path_key else None
+            if cached is not None:
+                _REDUCED_RUNS.move_to_end(key)
+        start, rows, kept = first, [], 0
+        if cached is not None and cached[0] == first and cached[1] <= end:
+            if cached[1] == end:
+                return cached[2]
+            start, rows, kept = cached[1], list(cached[2]), cached[3]
+        self._handle.seek(start)
+        while self._handle.tell() < end:
+            raw = self._handle.readline()
+            if not raw:
+                break
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict) or str(record.get("run_id") or "") != run_id:
+                continue
+            kind = str(record.get("kind") or "")
+            if kind in _COUNTED_ONLY_KINDS:
+                rows.append({"kind": kind, "run_id": run_id})
+            else:
+                rows.append(record)
+                kept += len(raw)
+        if self._path_key and kept <= _REDUCED_RUN_ENTRY_MAX_BYTES:
+            with _REDUCED_RUNS_GUARD:
+                _REDUCED_RUNS[key] = (first, end, rows, kept)
+                _REDUCED_RUNS.move_to_end(key)
+                while len(_REDUCED_RUNS) > _REDUCED_RUN_MAX_ENTRIES or (
+                    len(_REDUCED_RUNS) > 1
+                    and sum(entry[3] for entry in _REDUCED_RUNS.values()) > _REDUCED_RUN_MAX_BYTES
+                ):
+                    _REDUCED_RUNS.popitem(last=False)
         return rows
 
 
@@ -2079,6 +2154,7 @@ class CandidateLedger:
                         runs={run_id: dict(entry) for run_id, entry in state.runs.items()},
                     ),
                     self.path.open("rb"),
+                    str(self.path.resolve()),
                 )
         if view is None:
             yield None
@@ -3570,7 +3646,7 @@ class CandidateLedger:
                 rows = {
                     row["run_id"]: row
                     for row in _summarize_runs(
-                        record for run_id in ids for record in view.records(run_id)
+                        record for run_id in ids for record in view.reduced_records(run_id)
                     )
                 }
                 return [rows[run_id] for run_id in ids]
@@ -3588,7 +3664,7 @@ class CandidateLedger:
                 )
                 row = None
                 if records and run_id in view.order()[:500]:
-                    row = _summarize_runs(view.records(run_id))[0]
+                    row = _summarize_runs(records)[0]
                 return _run_detail_payload(records, row)
         records = [record for record in self.iter_records() if record.get("run_id") == run_id]
         if not records:
@@ -3629,7 +3705,7 @@ class CandidateLedger:
                     selected = order[0] if order else None
                 if selected is None:
                     return None
-                run_records = view.records(selected)
+                run_records = view.reduced_records(selected)
                 run = _summarize_runs(run_records)[0] if run_records else None
                 if not run_records:
                     return None
