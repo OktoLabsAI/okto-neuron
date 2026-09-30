@@ -258,10 +258,12 @@ def _ranked_bridge_claims(
         if edge.type in ("rdf:subject", "rdf:object"):
             claim_ids.add(edge.src)
     claims: list["Node"] = []
+    # One batched read over the (scan-capped) candidate ids, not a get_node each.
+    fetched = {n.id: n for n in store.get_nodes([cid for cid in claim_ids if cid != seed_id])}
     for cid in claim_ids:
         if cid == seed_id:
             continue
-        node = store.get_node(cid)
+        node = fetched.get(cid)
         if node is None or node.type != "Claim":
             continue
         if not _passes_gates(node):
@@ -683,8 +685,9 @@ def _bridge_claim_seed(
         for edge in store.list_edges(dst=subject_id):
             if edge.type in ("rdf:subject", "rdf:object") and edge.src != seed.id:
                 sibling_ids.add(edge.src)
+        fetched = {n.id: n for n in store.get_nodes(sibling_ids)}
         for sid in sibling_ids:
-            node = store.get_node(sid)
+            node = fetched.get(sid)
             if node is None or node.type != "Claim":
                 continue
             if not _passes_gates(node):
