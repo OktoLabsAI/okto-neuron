@@ -192,6 +192,8 @@ validation, so the errors raised for a damaged ledger are the ones it always rai
 
 Known limits. Callers that need the index itself (plan validation, resume, receipts, index checkpoint) still run the in-lock sync. They run inside the semantic writer lease where no concurrent appender exists, and the startup prewarm makes their cold case rare. If an end-to-end ingest shows a stall there, this is reopened. The prewarm covers only the vaults that are open when the daemon starts; a vault opened later pays its cold build on its first read.
 
+The lock-held catch-up of the index is bounded by the inline tail (8 MiB) plus the bytes appended between the gap check and the lock. Measured at most 8.36 MB in a single lock-held section under sustained appends of about 18 MB/s, and 13.8 KB at a realistic ingest rate.
+
 ### Agentic workflow shape
 
 The first version is not "many agents." It is one durable workflow with worker roles:
