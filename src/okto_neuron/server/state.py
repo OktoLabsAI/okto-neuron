@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Final, Iterator, Opti
 
 import logging
 
+from okto_neuron.server.lifecycle import shutdown_phase
 from okto_neuron.server._vault_pool import (
     VaultLease,
     VaultPool,
@@ -787,9 +788,11 @@ class ServerState:
         if self._closed:
             return
         self._closed = True
-        self.vault_pool.close_all()
+        with shutdown_phase("store_close"):
+            self.vault_pool.close_all()
         # Stores are closed; only now let another process write these vaults.
-        release_all_writer_leases()
+        with shutdown_phase("writer_lease_release"):
+            release_all_writer_leases()
 
     def switch_vault(self, vault: Vault, vault_path: Path) -> None:
         """Change only the deprecated unscoped compatibility fallback.

@@ -1551,6 +1551,48 @@ _DEFAULT_DRAIN_TIMEOUT = 30.0
 """Seconds we wait for in-flight requests to finish on SIGTERM/SIGINT."""
 
 
+_SHUTDOWN_LOG = logging.getLogger("okto_neuron.server.shutdown")
+_SHUTDOWN_HARD_DEADLINE: float | None = None
+
+
+def set_shutdown_hard_deadline(deadline: float | None) -> None:
+    """Record the absolute (monotonic) hard deadline ``shutdown.phase`` reports against."""
+    global _SHUTDOWN_HARD_DEADLINE
+    _SHUTDOWN_HARD_DEADLINE = deadline
+
+
+@contextlib.contextmanager
+def shutdown_phase(name: str, **fields: Any) -> Iterator[dict[str, Any]]:
+    """Log one ``shutdown.phase`` line (name, duration_ms, remaining_s, status).
+
+    The yielded dict lets a phase attach extra ``key=value`` detail (for example
+    ``result``) that is included in the line. An exception is logged with
+    ``status=error`` and re-raised.
+    """
+    started = time.monotonic()
+    detail: dict[str, Any] = dict(fields)
+    status = "ok"
+    try:
+        yield detail
+    except BaseException:
+        status = "error"
+        raise
+    finally:
+        now = time.monotonic()
+        hard = _SHUTDOWN_HARD_DEADLINE
+        remaining = max(0.0, hard - now) if hard is not None else -1.0
+        extra = "".join(f" {key}={value}" for key, value in detail.items())
+        _SHUTDOWN_LOG.info(
+            "shutdown.phase name=%s duration_ms=%d remaining_s=%.1f status=%s%s",
+            name,
+            int((now - started) * 1000),
+            remaining,
+            status,
+            extra,
+            extra={"component": "server", "event": "shutdown.phase", "phase": name},
+        )
+
+
 class GracefulShutdown:
     """Cross-transport coordinator for SIGTERM-clean shutdown.
 

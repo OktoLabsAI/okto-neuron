@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Generic, TypeVar
 
 from okto_neuron.errors import OktoNeuronError
+from okto_neuron.server.lifecycle import shutdown_phase
 from okto_neuron.store.handle_lease import (
     VaultHandleLease,
     acquire_vault_handle_lease,
@@ -438,7 +439,7 @@ class VaultPool:
     def close_all(self) -> None:
         """Close every pooled handle once. Idempotent; used after task drain."""
         with self._lock:
-            vaults = list(self._vaults.values())
+            vaults = list(self._vaults.items())
             handle_leases = list(self._handle_leases.values())
             self._vaults.clear()
             self._handle_leases.clear()
@@ -447,10 +448,12 @@ class VaultPool:
             self._legacy_pins.clear()
             self._fenced.clear()
             self._refresh_snapshot_locked()
-        for vault in vaults:
-            self._close(vault)
-        for handle_lease in handle_leases:
-            handle_lease.release()
+        for path, vault in vaults:
+            with shutdown_phase("vault_close", vault=path.name):
+                self._close(vault)
+        with shutdown_phase("handle_lease_release", leases=len(handle_leases)):
+            for handle_lease in handle_leases:
+                handle_lease.release()
 
     def paths(self) -> list[Path]:
         """Return an eventual-consistency path snapshot without taking the lock."""
