@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -15,6 +17,7 @@ import pytest
 import okto_neuron
 from okto_neuron.consolidate.ledger import (
     LEDGER_FILENAME,
+    LEDGER_INDEX_FILENAME,
     CandidateLedger,
     _stream_lines,
 )
@@ -130,18 +133,26 @@ if mode == "iter_records":
     n = sum(1 for _ in ledger.iter_records())
 elif mode == "scan_runs":
     n = ledger.scan(kinds=frozenset({"ingest_run"})).nonempty_lines
+elif mode == "unreceipted":
+    n = len(ledger.unreceipted_commit_plans())
+elif mode == "run_summaries":
+    n = len(ledger.run_summaries(limit=50))
+elif mode == "run_progress":
+    n = 1 if ledger.run_progress_summary(None, limit=12) is not None else 0
+elif mode == "run_detail":
+    n = 1 if ledger.run_detail(sys.argv[3]) is not None else 0
 else:
     raise SystemExit("unknown mode " + mode)
 print(json.dumps({"base": base, "peak": rss(), "n": n}))
 """
 
 
-def probe(directory: Path, mode: str) -> dict[str, int]:
+def probe(directory: Path, mode: str, run_id: str = "") -> dict[str, int]:
     """Run one reader in a fresh interpreter and report its peak-RSS growth."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(okto_neuron.__file__).resolve().parent.parent)
     out = subprocess.run(
-        [sys.executable, "-c", _PROBE, str(directory), mode],
+        [sys.executable, "-c", _PROBE, str(directory), mode, run_id],
         env=env,
         capture_output=True,
         text=True,
@@ -149,6 +160,13 @@ def probe(directory: Path, mode: str) -> dict[str, int]:
     )
     row = json.loads(out.stdout.strip().splitlines()[-1])
     return {"growth": row["peak"] - row["base"], "n": row["n"]}
+
+
+_MODES = ["iter_records", "scan_runs", "unreceipted", "run_summaries", "run_progress", "run_detail"]
+
+
+def _newest_run(directory: Path) -> str:
+    return CandidateLedger(directory).run_summaries(limit=1)[0]["run_id"]
 
 
 @pytest.fixture(scope="module")
@@ -161,10 +179,41 @@ def quick_ledger(tmp_path_factory: pytest.TempPathFactory) -> Path:
 _QUICK_BOUND = 40 * 1024 * 1024
 
 
-@pytest.mark.parametrize("mode", ["iter_records", "scan_runs"])
-def test_streaming_readers_stay_bounded_on_a_25mb_ledger(quick_ledger: Path, mode: str) -> None:
+@pytest.mark.parametrize("mode", _MODES)
+def test_readers_stay_bounded_on_a_25mb_ledger(quick_ledger: Path, mode: str) -> None:
     size = (quick_ledger / LEDGER_FILENAME).stat().st_size
     assert size >= 25_000_000
-    result = probe(quick_ledger, mode)
+    result = probe(quick_ledger, mode, _newest_run(quick_ledger))
     assert result["n"] > 0
     assert result["growth"] < _QUICK_BOUND, (mode, result, size)
+
+
+@pytest.mark.parametrize("mode", ["unreceipted", "run_summaries"])
+def test_cold_index_rebuild_stays_bounded(quick_ledger: Path, mode: str) -> None:
+    """No sidecar: the index is rebuilt by one streaming scan, still bounded."""
+    (quick_ledger / LEDGER_INDEX_FILENAME).unlink(missing_ok=True)
+    result = probe(quick_ledger, mode, "")
+    assert result["n"] > 0
+    assert result["growth"] < _QUICK_BOUND, (mode, result)
+    assert (quick_ledger / LEDGER_INDEX_FILENAME).is_file()  # and it is written back
+
+
+@pytest.fixture(scope="module")
+def big_ledger(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    directory = tmp_path_factory.mktemp("big-ledger", numbered=True)
+    try:
+        build_synthetic_ledger(directory, target_bytes=300_000_000, row_chars=16_000)
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.mark.slow
+@pytest.mark.perf
+@pytest.mark.parametrize("mode", _MODES)
+def test_readers_stay_bounded_on_a_300mb_ledger(big_ledger: Path, mode: str) -> None:
+    """Opt-in (``-m slow``): a 300 MB ledger never costs more than 100 MB over baseline."""
+    assert (big_ledger / LEDGER_FILENAME).stat().st_size >= 300_000_000
+    result = probe(big_ledger, mode, _newest_run(big_ledger))
+    assert result["n"] > 0
+    assert result["growth"] < 100 * 1024 * 1024, (mode, result)
