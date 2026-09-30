@@ -1947,8 +1947,16 @@ class CandidateLedger:
         try:
             work = work or _Sidecar()
             work.catch_up(handle, reader, limit=cut)
+        except Exception as exc:  # noqa: BLE001 - logged; the in-lock sync rebuilds instead
+            _LOG.info(
+                "candidate ledger index: snapshot pass failed (%s: %s); "
+                "falling back to the in-lock sync",
+                type(exc).__name__,
+                exc,
+            )
+            return
         except BaseException:
-            return  # the in-lock sync rebuilds if this snapshot pass could not finish
+            return  # cancelled mid-pass: the in-lock sync rebuilds
         finally:
             reader.close()
             handle.close()
