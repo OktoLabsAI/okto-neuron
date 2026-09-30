@@ -144,3 +144,17 @@ test('switching vault drops the previous vault data and ignores its late respons
   assert.equal(query.getState().data.n, 2)
   assert.equal(calls.n, 2)
 })
+
+test('subscribing while the tab is hidden sends nothing and sets no timer', async () => {
+  const env = makeEnv()
+  env.hidden = true
+  const { query, calls, release } = make({ responses: [{ status: 'ok', n: 1 }], env })
+  const unsubs = [1, 2].map(() => query.subscribe(() => {}))
+  await release()
+  assert.equal(calls.n, 0)
+  assert.equal(env.timers.size, 0)
+  env.setHidden(false)
+  await release()
+  assert.equal(calls.n, 1, 'one request on becoming visible, shared by both subscribers')
+  unsubs.forEach((u) => u())
+})

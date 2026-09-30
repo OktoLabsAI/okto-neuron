@@ -6,12 +6,11 @@ import { ChevronDown, ChevronRight, Wrench } from 'lucide-react'
 import { Badge } from '@/components/ui'
 import {
   getHealth,
-  getGraphStats,
   getScheduler,
   type HealthResponse,
-  type GraphStatsLite,
   type SchedulerStatus,
 } from '@/services/curation-api'
+import { useGraphStats } from '@/services/graph-stats'
 import { CurationDashboard } from './CurationDashboard'
 import type { Attention } from './useAttention'
 
@@ -34,7 +33,7 @@ export function CurationOverview({
   onGoMaintenance: () => void
 }) {
   const [health, setHealth] = useState<HealthResponse | null>(null)
-  const [stats, setStats] = useState<GraphStatsLite | null>(null)
+  const { stats } = useGraphStats()
   const [sched, setSched] = useState<SchedulerStatus | null>(null)
   const [showDetails, setShowDetails] = useState(false)
 
@@ -42,24 +41,28 @@ export function CurationOverview({
     let cancelled = false
     async function load() {
       try {
-        const [h, s, sc] = await Promise.all([
+        const [h, sc] = await Promise.all([
           getHealth().catch(() => null),
-          getGraphStats().catch(() => null),
           getScheduler().catch(() => null),
         ])
         if (cancelled) return
         setHealth(h)
-        setStats(s)
         setSched(sc)
       } catch {
         /* transient */
       }
     }
-    load()
-    const t = setInterval(load, 30000)
+    // Hidden tabs do not poll; the next visibility change refreshes.
+    const tick = () => {
+      if (document.visibilityState !== 'hidden') void load()
+    }
+    tick()
+    const t = setInterval(tick, 30000)
+    document.addEventListener('visibilitychange', tick)
     return () => {
       cancelled = true
       clearInterval(t)
+      document.removeEventListener('visibilitychange', tick)
     }
   }, [])
 

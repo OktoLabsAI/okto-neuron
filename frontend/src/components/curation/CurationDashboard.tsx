@@ -6,19 +6,18 @@ import { GitMerge, RefreshCw, Search } from 'lucide-react'
 import { Spinner, ErrorBox, Badge } from '@/components/ui'
 import {
   getHealth,
-  getGraphStats,
   getCurationJobs,
   getScheduler,
   getJob,
   predicateUpkeepApply,
   predicateUpkeepPropose,
   type HealthResponse,
-  type GraphStatsLite,
   type JobsSnapshot,
   type SchedulerStatus,
   type CurationJob,
   type PredicateUpkeepSnapshot,
 } from '@/services/curation-api'
+import { useGraphStats } from '@/services/graph-stats'
 import { refreshPredicateSnapshot, usePredicateSnapshot } from '@/services/predicate-snapshot'
 
 function Stat({ label, value }: { label: string; value: string | number }) {
@@ -249,7 +248,8 @@ export function CurationDashboard({
   onNavigate?: (tab: string) => void
 }) {
   const [health, setHealth] = useState<HealthResponse | null>(null)
-  const [stats, setStats] = useState<GraphStatsLite | null>(null)
+  // Shared graph-stats query (same poll as the Overview), not a per-component request.
+  const { stats } = useGraphStats()
   const [jobs, setJobs] = useState<JobsSnapshot | null>(null)
   const [sched, setSched] = useState<SchedulerStatus | null>(null)
   // Shared predicate query: one timer for every panel, paused while the tab is hidden.
@@ -265,14 +265,12 @@ export function CurationDashboard({
     setLoading(true)
     setError(null)
     try {
-      const [h, s, j, sc] = await Promise.all([
+      const [h, j, sc] = await Promise.all([
         getHealth(),
-        getGraphStats(),
         getCurationJobs(),
         getScheduler(),
       ])
       setHealth(h)
-      setStats(s)
       setJobs(j)
       setSched(sc)
     } catch (e) {
