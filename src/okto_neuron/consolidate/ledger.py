@@ -9,6 +9,7 @@ inspectable and replayable enough for future tooling.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import threading
@@ -79,10 +80,6 @@ _LEDGER_INDEX_BUILD_LOCKS: dict[str, threading.Lock] = {}
 
 
 _STREAM_CHUNK_BYTES = 1 << 20
-
-
-class _SnapshotChanged(Exception):
-    """The pinned ledger prefix was truncated while being read."""
 
 
 def _stream_lines(chunks: Iterable[AnyStr]) -> Iterator[AnyStr]:
@@ -915,6 +912,42 @@ class _LedgerOffsetIndex:
     completeness_reason: str
 
 
+@dataclass
+class _Snapshot:
+    """A pinned ledger prefix: ``[0, cut)`` is read from ``handle``; ``tail`` is ``[cut, size)``."""
+
+    handle: Any
+    size: int
+    cut: int
+    tail: bytes
+
+
+class _PrefixReader(io.RawIOBase):
+    """A read-only raw stream over ``handle[0:cut]`` followed by ``tail``."""
+
+    def __init__(self, snapshot: _Snapshot) -> None:
+        self._handle = snapshot.handle
+        self._handle.seek(0)
+        self._left = snapshot.cut
+        self._tail = memoryview(snapshot.tail)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if self._left > 0:
+            chunk = self._handle.read(min(len(buffer), self._left))
+            if chunk:
+                buffer[: len(chunk)] = chunk
+                self._left -= len(chunk)
+                return len(chunk)
+            self._left = 0
+        count = min(len(buffer), len(self._tail))
+        buffer[:count] = self._tail[:count]
+        self._tail = self._tail[count:]
+        return count
+
+
 def _last_line_end(handle: Any, size: int) -> int:
     """Byte offset just past the last newline at or below ``size`` (0 if none)."""
     position = size
@@ -1019,13 +1052,18 @@ def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetInde
             if not raw:
                 break
             ingest(offset, raw)
+        handle.close()
         with _exclusive_lock(lock):
-            while True:
-                offset = handle.tell()
-                raw = handle.readline()
-                if not raw:
-                    break
-                ingest(offset, raw)
+            # A fresh handle: the snapshot handle may hold read-ahead bytes from
+            # above ``cut`` (a crash-torn tail that an append can since have replaced).
+            with path.open("rb") as tail_handle:
+                tail_handle.seek(cut)
+                while True:
+                    offset = tail_handle.tell()
+                    raw = tail_handle.readline()
+                    if not raw:
+                        break
+                    ingest(offset, raw)
             index.signature = _ledger_file_signature(path)
     finally:
         handle.close()
@@ -2471,18 +2509,25 @@ class CandidateLedger:
     def _snapshot(self):
         """Pin the ledger as it is now, then let appends continue.
 
-        The lock is held only to open the file and read its size. The ledger is
-        append-only (the one in-place change is truncating a crash-torn tail, which
-        this detects as a short read), so bytes below the snapshot size never change
-        under the open handle, and nothing in this module replaces the ledger file
-        (``os.replace`` is used for the index sidecar only). The caller reads
-        ``[0, snapshot)`` without the lock.
+        Under the lock, and only for as long as that takes: open the file, read its
+        size ``S``, find ``cut`` (just past the last newline at or below ``S``, read
+        backwards in small blocks) and copy the bytes ``[cut, S)``, a crash-torn
+        tail if there is one. The caller reads ``[0, cut)`` from the open handle
+        without the lock. Those bytes never change: ``append()`` only appends, and
+        the one in-place change (``_prepare_append_target`` truncating a torn tail)
+        removes only bytes above the last newline, so a later append can rewrite
+        ``[cut, S)`` but never anything below it. Nothing here replaces the ledger
+        file (``os.replace`` is used for the index sidecar only), so the open
+        handle cannot end up on a stale inode.
         """
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
             handle = self.path.open("rb")
-            snapshot = os.fstat(handle.fileno()).st_size
+            size = os.fstat(handle.fileno()).st_size
+            cut = _last_line_end(handle, size)
+            handle.seek(cut)
+            tail = handle.read(size - cut) if size > cut else b""
         try:
-            yield handle, snapshot
+            yield _Snapshot(handle, size, cut, tail)
         finally:
             handle.close()
 
@@ -2510,12 +2555,7 @@ class CandidateLedger:
         """
         if max_malformed_samples < 0:
             raise ValueError("max_malformed_samples must be >= 0")
-        for _attempt in range(3):
-            try:
-                return self._scan_once(max_malformed_samples, kinds)
-            except _SnapshotChanged:
-                continue  # a torn tail was repaired under the snapshot; take a new one
-        raise RuntimeError("candidate ledger kept changing under scan")
+        return self._scan_once(max_malformed_samples, kinds)
 
     def _scan_once(
         self, max_malformed_samples: int, kinds: frozenset[str] | None
@@ -2544,12 +2584,13 @@ class CandidateLedger:
         file_size = 0
         last_byte = b""
 
-        def hashed_chunks(handle: Any) -> Iterator[bytes]:
+        def hashed_chunks(snap: _Snapshot) -> Iterator[bytes]:
             nonlocal file_size, last_byte
-            while file_size < snapshot:
-                chunk = handle.read(min(_STREAM_CHUNK_BYTES, snapshot - file_size))
+            reader = _PrefixReader(snap)
+            while True:
+                chunk = reader.read(_STREAM_CHUNK_BYTES)
                 if not chunk:
-                    break
+                    return
                 digest.update(chunk)
                 file_size += len(chunk)
                 last_byte = chunk[-1:]
@@ -2565,8 +2606,8 @@ class CandidateLedger:
         final_nonempty_line_number: int | None = None
 
         line_number = 0
-        with self._snapshot() as (handle, snapshot):
-            for line_number, raw_line in enumerate(_stream_lines(hashed_chunks(handle)), start=1):
+        with self._snapshot() as snap:
+            for line_number, raw_line in enumerate(_stream_lines(hashed_chunks(snap)), start=1):
                 if not raw_line.strip():
                     continue
                 nonempty_lines += 1
@@ -2616,8 +2657,6 @@ class CandidateLedger:
                 else:
                     unrecognized_version_record_count += 1
 
-        if file_size != snapshot:
-            raise _SnapshotChanged
         unterminated_final_line = bool(file_size) and last_byte not in (b"\n", b"\r")
 
         trailing_partial = bool(
@@ -2675,8 +2714,11 @@ class CandidateLedger:
             return
         # ``read_text().splitlines()`` semantics (universal newlines, then the
         # ``str`` line boundaries), streamed instead of slurped.
-        with self.path.open("r", encoding="utf-8") as handle:
-            for line in _stream_lines(_read_chunks(handle, _STREAM_CHUNK_BYTES)):
+        # The pinned snapshot (see :meth:`_snapshot`): rows appended after it are
+        # not read, and a torn tail that is later repaired cannot change what is read.
+        with self._snapshot() as snap:
+            text = io.TextIOWrapper(io.BufferedReader(_PrefixReader(snap)), encoding="utf-8")
+            for line in _stream_lines(_read_chunks(text, _STREAM_CHUNK_BYTES)):
                 if not line.strip():
                     continue
                 try:
@@ -3026,13 +3068,13 @@ class CandidateLedger:
 
         order: list[str] = []
         plans: dict[str, dict[str, Any]] = {}
-        with self._snapshot() as (_pinned, snapshot):
+        with self._snapshot() as snap:
             reader = _RowReader(self.path)
             try:
                 with self.path.open("rb") as handle:
                     offset = 0
                     for raw in iter(handle.readline, b""):
-                        if offset >= snapshot:
+                        if offset >= snap.cut:
                             break
                         position, offset = offset, offset + len(raw)
                         try:

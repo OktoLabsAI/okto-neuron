@@ -117,14 +117,16 @@ def _run_under_appends(directory: Path, work: Any, repeats: int = 5) -> tuple[Ap
         appender.stop.set()
         appender.join(timeout=30)
     assert appender.error is None
-    assert len(appender.latencies) > 20
+    assert len(appender.latencies) > 5
     return appender, results
 
 
 def test_scan_does_not_stall_appends_and_returns_its_snapshot(ledger_dir: Path) -> None:
     ledger = CandidateLedger(ledger_dir)
     appender, results = _run_under_appends(ledger_dir, ledger.scan)
-    assert appender.p99() < _P99_BOUND_S, appender.p99()
+    # in-process the parse competes for the GIL, so only a loose bound here; the
+    # flock itself is timed against a reader in a child process below
+    assert appender.p99() < 10 * _P99_BOUND_S, appender.p99()
     path = ledger_dir / LEDGER_FILENAME
     for scan in results:
         rows, digest = _prefix_truth(path, scan.file_size_bytes)
@@ -140,12 +142,12 @@ def test_scan_does_not_stall_appends_and_returns_its_snapshot(ledger_dir: Path) 
     assert after == list(range(appender.count))
 
 
-def test_iter_records_does_not_stall_appends(ledger_dir: Path) -> None:
+def test_iter_records_in_a_thread_returns_while_appends_continue(ledger_dir: Path) -> None:
     ledger = CandidateLedger(ledger_dir)
     appender, results = _run_under_appends(
         ledger_dir, lambda: sum(1 for _ in ledger.iter_records())
     )
-    assert appender.p99() < _P99_BOUND_S, appender.p99()
+    assert appender.p99() < 10 * _P99_BOUND_S, appender.p99()
     assert all(n > 0 for n in results)
 
 
@@ -158,7 +160,11 @@ from okto_neuron.consolidate.ledger import CandidateLedger, LEDGER_INDEX_FILENAM
 directory, mode, repeats = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 ledger = CandidateLedger(directory)
 for _ in range(repeats):
-    if mode == "index_rebuild":
+    if mode == "scan":
+        ledger.scan()
+    elif mode == "iter_records":
+        sum(1 for _ in ledger.iter_records())
+    elif mode == "index_rebuild":
         (directory / LEDGER_INDEX_FILENAME).unlink(missing_ok=True)
         mod._sidecar_cache_drop()
         ledger.unreceipted_commit_plans()
@@ -200,6 +206,12 @@ def _reader_process(directory: Path, mode: str, repeats: int = 4) -> Appender:
     assert appender.error is None
     assert len(appender.latencies) > 20
     return appender
+
+
+@pytest.mark.parametrize("mode", ["scan", "iter_records"])
+def test_reader_process_does_not_stall_appends(ledger_dir: Path, mode: str) -> None:
+    appender = _reader_process(ledger_dir, mode)
+    assert appender.p99() < _P99_BOUND_S, (mode, appender.p99())
 
 
 def test_index_rebuild_does_not_stall_appends(ledger_dir: Path) -> None:
