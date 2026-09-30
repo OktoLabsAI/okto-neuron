@@ -58,6 +58,7 @@ from okto_neuron.onboarding import (
     write_user_env_secret,
 )
 from okto_neuron.schema.support.finding import Finding
+from okto_neuron.store.vault_writer import vault_writer
 from okto_neuron.vault import Vault
 from okto_neuron.vault_registry import (
     AmbiguousVaultNameError,
@@ -390,17 +391,19 @@ def vault_create(
             storage_uri, allow_remote_db=allow_remote_db, yes=allow_remote_db, interactive=False
         )
     pack_list = [pack.strip() for pack in packs.split(",") if pack.strip()]
-    Vault.scaffold(
-        path,
-        packs=pack_list,
-        embedder=embedder,
-        allow_external_sources=True,
-        backend=backend,
-        storage_uri=storage_uri,
-        storage_credential_env=storage_credential_env,
-        storage_database=storage_database,
-        storage_allow_remote=allow_remote_db,
-    )
+    # A new path: nobody else holds it, so this takes the lease instead of refusing.
+    with vault_writer(path, "vault create"):
+        Vault.scaffold(
+            path,
+            packs=pack_list,
+            embedder=embedder,
+            allow_external_sources=True,
+            backend=backend,
+            storage_uri=storage_uri,
+            storage_credential_env=storage_credential_env,
+            storage_database=storage_database,
+            storage_allow_remote=allow_remote_db,
+        )
     mark_managed_vault(path, name=name)
     if make_current:
         set_default_vault(path)
@@ -1144,16 +1147,7 @@ def init(
     if wipe and (vault_config_path(path)).exists():
         from click.core import ParameterSource
 
-        from okto_neuron.server.lifecycle import _process_alive, read_pid
         from okto_neuron.store.vault import wipe_vault
-
-        pid = read_pid(path)
-        if pid is not None and _process_alive(pid):
-            click.echo(
-                f"server is running (pid {pid}); stop it first: uv run kg stop --vault {path}",
-                err=True,
-            )
-            ctx.exit(1)
 
         # A wipe deliberately resets the vault, so only the backend *name* is
         # validated here (registry lookup) — the existing pin on disk is about
@@ -1166,18 +1160,21 @@ def init(
             or ctx.get_parameter_source("embedder") == ParameterSource.COMMANDLINE
             or ctx.get_parameter_source("backend") == ParameterSource.COMMANDLINE
         )
-        wipe_vault(path, keep_config=not explicit_flags)
-        if explicit_flags:
-            Vault.init(
-                path,
-                packs=pack_list,
-                embedding_provider=embedder,
-                backend=backend,
-                storage_uri=storage_uri,
-                storage_credential_env=storage_credential_env,
-                storage_database=storage_database,
-                storage_allow_remote=allow_remote_db,
-            )
+        # Refused (exit 5) while the daemon writes this vault: it names the
+        # daemon pid and points at POST /api/v1/reset.
+        with vault_writer(path, "init --wipe"):
+            wipe_vault(path, keep_config=not explicit_flags)
+            if explicit_flags:
+                Vault.init(
+                    path,
+                    packs=pack_list,
+                    embedding_provider=embedder,
+                    backend=backend,
+                    storage_uri=storage_uri,
+                    storage_credential_env=storage_credential_env,
+                    storage_database=storage_database,
+                    storage_allow_remote=allow_remote_db,
+                )
         click.echo(f"wiped vault at {path}")
         return
 
@@ -1185,16 +1182,17 @@ def init(
     # accept_experimental (deprecated) is intentionally unused below: no
     # backend is D-12-gated any more, so the flag is accepted-and-ignored
     # for CLI compatibility with old scripts.
-    Vault.init(
-        path,
-        packs=pack_list,
-        embedding_provider=embedder,
-        backend=backend,
-        storage_uri=storage_uri,
-        storage_credential_env=storage_credential_env,
-        storage_database=storage_database,
-        storage_allow_remote=allow_remote_db,
-    )
+    with vault_writer(path, "init"):
+        Vault.init(
+            path,
+            packs=pack_list,
+            embedding_provider=embedder,
+            backend=backend,
+            storage_uri=storage_uri,
+            storage_credential_env=storage_credential_env,
+            storage_database=storage_database,
+            storage_allow_remote=allow_remote_db,
+        )
     click.echo(f"initialized vault at {path}")
 
 
@@ -1381,6 +1379,11 @@ def onboard(
         storage_database=storage_database,
         storage_allow_remote=allow_remote_db,
     )
+    if not dry_run:
+        # Every write below (okto-neuron.yaml patches) needs the writer lease:
+        # refused with exit 5 while the daemon holds it (PATCH /api/v1/config is
+        # the running-daemon equivalent). Released when the command's context closes.
+        ctx.with_resource(vault_writer(vault_path, "onboard"))
     raw_state = _llm_config_state(vault_path)
     if raw_state in {"configured", "disabled"} and not reconfigure and not disable_llm:
         if _onboarding_config_flags_supplied(
@@ -2806,13 +2809,14 @@ def kg_pilot(vault_path: Path, report_dir: Path) -> None:
         click.echo(f"vault is missing okto-neuron.yaml: {root}", err=True)
         raise click.exceptions.Exit(2)
 
-    opened = Vault.open(root)
-    ingest_count = _ingest_markdown(opened)
-    drift_envelope = _drift_envelope(
-        opened,
-        mode="on-query",
-        detector_names=list(DETECTOR_NAMES),
-    )
+    with vault_writer(root, "pilot"):
+        opened = Vault.open(root)
+        ingest_count = _ingest_markdown(opened)
+        drift_envelope = _drift_envelope(
+            opened,
+            mode="on-query",
+            detector_names=list(DETECTOR_NAMES),
+        )
     passed = int(drift_envelope["total"]) >= 1
     timestamp = datetime.now(timezone.utc)
     payload = {
@@ -3184,24 +3188,25 @@ def watch(vault_path: Path, run_once: bool, poll_seconds: float | None) -> None:
         click.echo(f"vault is missing okto-neuron.yaml: {root}", err=True)
         raise click.exceptions.Exit(2)
 
-    vault = Vault.open(root)
-    companion = Companion(vault)
-    try:
-        if run_once:
-            results = process_once(root, companion)
-            click.echo(f"processed {len(results)} file(s)")
-            return
-        interval = DEFAULT_POLL_SECONDS if poll_seconds is None else poll_seconds
-        inbox = root / ".marginalia" / "incoming"
-        click.echo(f"watching {inbox} (poll {interval}s); ctrl-c to stop")
+    with vault_writer(root, "watch"):
+        vault = Vault.open(root)
+        companion = Companion(vault)
         try:
-            for results in watch_loop(root, companion, poll_seconds=interval):
-                if results:
-                    click.echo(f"processed {len(results)} file(s)")
-        except KeyboardInterrupt:
-            click.echo("stopped")
-    finally:
-        vault.close()
+            if run_once:
+                results = process_once(root, companion)
+                click.echo(f"processed {len(results)} file(s)")
+                return
+            interval = DEFAULT_POLL_SECONDS if poll_seconds is None else poll_seconds
+            inbox = root / ".marginalia" / "incoming"
+            click.echo(f"watching {inbox} (poll {interval}s); ctrl-c to stop")
+            try:
+                for results in watch_loop(root, companion, poll_seconds=interval):
+                    if results:
+                        click.echo(f"processed {len(results)} file(s)")
+            except KeyboardInterrupt:
+                click.echo("stopped")
+        finally:
+            vault.close()
 
 
 # ── watch-folder CLI group (ADR 0025) ─────────────────────────────────────────

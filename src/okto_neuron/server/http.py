@@ -477,8 +477,10 @@ def _vault_open_warning(vault_path: Path, exc: EmbeddingDimMismatch) -> dict[str
         "path": str(resolved),
         "detail": exc.user_message(),
         "remedy": (
-            f"Run `okto-neuron kg reembed {resolved}` to rebuild vectors at the "
-            "configured embedding width, or switch to another vault."
+            "Rebuild vectors at the configured embedding width through the running "
+            "daemon (POST /api/v1/curation/reembed, or the Curation page in the UI); "
+            "`okto-neuron kg reembed` is refused while the daemon holds the vault. "
+            "Or switch to another vault."
         ),
     }
 

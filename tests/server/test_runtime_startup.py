@@ -54,7 +54,7 @@ def test_startup_vault_open_degrades_on_embedding_dim_mismatch(
     assert warning is not None
     assert warning["code"] == "embedding_dim_mismatch"
     assert warning["path"] == str(vault_path.resolve(strict=False))
-    assert "okto-neuron kg reembed" in str(warning["remedy"])
+    assert "/api/v1/curation/reembed" in str(warning["remedy"])
 
 
 def test_dependency_warmup_discovers_vaults_without_opening_graphs(
