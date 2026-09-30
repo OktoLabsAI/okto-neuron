@@ -905,9 +905,15 @@ class LedgerScanResult:
 
 @dataclass
 class _LedgerOffsetIndex:
-    """Validated, memory-bounded routing metadata for one immutable file size."""
+    """Validated, memory-bounded routing metadata for the ledger prefix ``[0, cut)``.
 
-    signature: tuple[int, int, int, int]
+    ``signature`` is ``(device, inode, cut, anchor)`` where ``anchor`` is the last
+    ``_INDEX_ANCHOR_BYTES`` bytes below ``cut``. The index stays valid while the
+    same file still holds those bytes, however much has been appended beyond
+    ``cut``; rows beyond it are folded in by a short tail merge.
+    """
+
+    signature: tuple[int, int, int, bytes]
     offsets_by_kind: dict[str, list[tuple[int, int]]]
     offsets_by_run_kind: dict[tuple[str, str], list[tuple[int, int]]]
     node_identity_by_id: dict[str, tuple[str, str]]
@@ -915,6 +921,8 @@ class _LedgerOffsetIndex:
     latest_candidate_run: dict[str, str]
     completeness_status: LedgerCompleteness
     completeness_reason: str
+    malformed: int = 0
+    unrecognized_versions: int = 0
 
 
 @dataclass
@@ -968,9 +976,30 @@ def _last_line_end(handle: Any, size: int) -> int:
     return 0
 
 
-def _ledger_file_signature(path: Path) -> tuple[int, int, int, int]:
-    stat = path.stat()
-    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+_INDEX_ANCHOR_BYTES = 4096
+
+
+def _read_anchor(fd: int, cut: int) -> bytes:
+    """The last bytes below ``cut``, read unbuffered so they are never a stale copy."""
+    start = max(0, cut - _INDEX_ANCHOR_BYTES)
+    return os.pread(fd, cut - start, start)
+
+
+def _prefix_signature(handle: Any, cut: int) -> tuple[int, int, int, bytes]:
+    stat = os.fstat(handle.fileno())
+    return (stat.st_dev, stat.st_ino, cut, _read_anchor(handle.fileno(), cut))
+
+
+def _prefix_holds(signature: tuple[int, int, int, bytes], handle: Any) -> bool:
+    """True when the open file still starts with the prefix ``signature`` describes."""
+    dev, ino, cut, anchor = signature
+    stat = os.fstat(handle.fileno())
+    return (
+        stat.st_dev == dev
+        and stat.st_ino == ino
+        and stat.st_size >= cut
+        and _read_anchor(handle.fileno(), cut) == anchor
+    )
 
 
 def _index_candidate_identity(
@@ -997,51 +1026,83 @@ def _index_candidate_identity(
         index.ambiguous_node_ids.add(candidate_id)
 
 
+def _ingest_index_row(index: _LedgerOffsetIndex, offset: int, raw: bytes) -> None:
+    if not raw.strip():
+        return
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        index.malformed += 1
+        return
+    if not isinstance(record, dict):
+        index.malformed += 1
+        return
+    version = record.get("ledger_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in _ACCEPTED_LEDGER_VERSIONS
+    ):
+        index.unrecognized_versions += 1
+    kind = str(record.get("kind") or "")
+    if not kind:
+        return
+    location = (offset, len(raw))
+    index.offsets_by_kind.setdefault(kind, []).append(location)
+    run_id = str(record.get("run_id") or "")
+    if run_id:
+        index.offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
+    if kind == "candidate":
+        _index_candidate_identity(index, record)
+
+
+def _refresh_index_completeness(index: _LedgerOffsetIndex) -> None:
+    reasons: list[str] = []
+    if index.malformed:
+        reasons.append("malformed_ledger_lines")
+    if index.unrecognized_versions:
+        reasons.append("unrecognized_ledger_versions")
+    if reasons:
+        index.completeness_status = "incomplete"
+        index.completeness_reason = "+".join(reasons)
+    else:
+        index.completeness_status = "complete"
+        index.completeness_reason = (
+            "all_nonempty_lines_parsed" if any(index.offsets_by_kind.values()) else "empty_ledger"
+        )
+
+
+def _merge_index_tail(index: _LedgerOffsetIndex, path: Path) -> None:
+    """Fold every row from ``index``'s cut to the end of the file into ``index``.
+
+    The ledger lock must be held (the tail then cannot change underneath). A fresh
+    handle is used on purpose: a handle opened earlier may hold read-ahead bytes
+    from above the cut (a crash-torn tail that an append can since have replaced).
+    """
+    cut = index.signature[2]
+    with path.open("rb") as handle:
+        handle.seek(cut)
+        while True:
+            offset = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                break
+            _ingest_index_row(index, offset, raw)
+        index.signature = _prefix_signature(handle, handle.tell())
+    _refresh_index_completeness(index)
+
+
 def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex:
-    offsets_by_kind: dict[str, list[tuple[int, int]]] = {}
-    offsets_by_run_kind: dict[tuple[str, str], list[tuple[int, int]]] = {}
-    malformed = 0
-    unrecognized_versions = 0
     index = _LedgerOffsetIndex(
-        signature=(0, 0, 0, 0),
-        offsets_by_kind=offsets_by_kind,
-        offsets_by_run_kind=offsets_by_run_kind,
+        signature=(0, 0, 0, b""),
+        offsets_by_kind={},
+        offsets_by_run_kind={},
         node_identity_by_id={},
         ambiguous_node_ids=set(),
         latest_candidate_run={},
         completeness_status="complete",
         completeness_reason="empty_ledger",
     )
-
-    def ingest(offset: int, raw: bytes) -> None:
-        nonlocal malformed, unrecognized_versions
-        if not raw.strip():
-            return
-        try:
-            record = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            malformed += 1
-            return
-        if not isinstance(record, dict):
-            malformed += 1
-            return
-        version = record.get("ledger_version")
-        if (
-            not isinstance(version, int)
-            or isinstance(version, bool)
-            or version not in _ACCEPTED_LEDGER_VERSIONS
-        ):
-            unrecognized_versions += 1
-        kind = str(record.get("kind") or "")
-        if not kind:
-            return
-        location = (offset, len(raw))
-        offsets_by_kind.setdefault(kind, []).append(location)
-        run_id = str(record.get("run_id") or "")
-        if run_id:
-            offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
-        if kind == "candidate":
-            _index_candidate_identity(index, record)
 
     # Snapshot under the lock, stream the bulk without it, then take the lock only
     # to fold in what was appended meanwhile. The file is append-only, so bytes
@@ -1057,32 +1118,16 @@ def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetInde
             raw = handle.readline()
             if not raw:
                 break
-            ingest(offset, raw)
+            _ingest_index_row(index, offset, raw)
+        # The index so far covers exactly [0, cut): its signature says so even while
+        # appends keep landing; the tail merge below advances it.
+        index.signature = _prefix_signature(handle, cut)
+    except BaseException:
         handle.close()
-        with _exclusive_lock(lock):
-            # A fresh handle: the snapshot handle may hold read-ahead bytes from
-            # above ``cut`` (a crash-torn tail that an append can since have replaced).
-            with path.open("rb") as tail_handle:
-                tail_handle.seek(cut)
-                while True:
-                    offset = tail_handle.tell()
-                    raw = tail_handle.readline()
-                    if not raw:
-                        break
-                    ingest(offset, raw)
-            index.signature = _ledger_file_signature(path)
-    finally:
-        handle.close()
-    reasons: list[str] = []
-    if malformed:
-        reasons.append("malformed_ledger_lines")
-    if unrecognized_versions:
-        reasons.append("unrecognized_ledger_versions")
-    if reasons:
-        index.completeness_status = "incomplete"
-        index.completeness_reason = "+".join(reasons)
-    elif any(offsets_by_kind.values()):
-        index.completeness_reason = "all_nonempty_lines_parsed"
+        raise
+    handle.close()
+    with _exclusive_lock(lock):
+        _merge_index_tail(index, path)
     return index
 
 
@@ -1091,57 +1136,114 @@ def _invalidate_ledger_offset_index(path: Path) -> None:
         _LEDGER_INDEXES.pop(str(path.resolve()), None)
 
 
-def _get_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex:
+def _pin_ledger_offset_index(
+    directory: Path, path: Path
+) -> tuple[_LedgerOffsetIndex, int, Any] | None:
+    """Return ``(index, cut, handle)``: the offset index and an open handle on the ledger.
+
+    Every indexed row below ``cut`` lies in an immutable prefix of the ledger that
+    ``handle`` reads without any lock. The index is brought up to date with the
+    file by a short tail merge under the ledger lock (or rebuilt when the file no
+    longer starts with the prefix it was built from), so an append landing while a
+    reader works can only add rows beyond ``cut``; it never invalidates the
+    snapshot. ``None`` when the ledger does not exist. The caller closes ``handle``.
+    """
     key = str(path.resolve())
-    signature = _ledger_file_signature(path)
-    with _LEDGER_INDEXES_GUARD:
-        cached = _LEDGER_INDEXES.get(key)
-        if cached is not None and cached.signature == signature:
-            _LEDGER_INDEXES.move_to_end(key)
-            return cached
-        build_lock = _LEDGER_INDEX_BUILD_LOCKS.setdefault(key, threading.Lock())
-    with build_lock:
-        signature = _ledger_file_signature(path)
+    lock = directory / ".candidate-ledger.lock"
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return None
+    try:
         with _LEDGER_INDEXES_GUARD:
             cached = _LEDGER_INDEXES.get(key)
-            if cached is not None and cached.signature == signature:
+            build_lock = _LEDGER_INDEX_BUILD_LOCKS.setdefault(key, threading.Lock())
+        if cached is not None:
+            signature = cached.signature  # one atomic read: cut and anchor agree
+            if (
+                _prefix_holds(signature, handle)
+                and os.fstat(handle.fileno()).st_size == signature[2]
+            ):
+                with _LEDGER_INDEXES_GUARD:
+                    if _LEDGER_INDEXES.get(key) is cached:
+                        _LEDGER_INDEXES.move_to_end(key)
+                return cached, signature[2], handle
+        with build_lock:
+            with _LEDGER_INDEXES_GUARD:
+                cached = _LEDGER_INDEXES.get(key)
+            if cached is not None:
+                with _exclusive_lock(lock):
+                    size = os.fstat(handle.fileno()).st_size
+                    if (
+                        _prefix_holds(cached.signature, handle)
+                        and size - cached.signature[2] <= _SIDECAR_INLINE_TAIL
+                    ):
+                        try:
+                            # Ledger lock held: no append (hence no in-place extension
+                            # of this index) can run concurrently.
+                            _merge_index_tail(cached, path)
+                        except BaseException:
+                            _invalidate_ledger_offset_index(path)  # half-merged: never reuse
+                            raise
+                        with _LEDGER_INDEXES_GUARD:
+                            _LEDGER_INDEXES.move_to_end(key)
+                        return cached, cached.signature[2], handle
+            built = _build_ledger_offset_index(directory, path)
+            cut = built.signature[2]  # the snapshot this reader holds
+            with _LEDGER_INDEXES_GUARD:
+                _LEDGER_INDEXES[key] = built
                 _LEDGER_INDEXES.move_to_end(key)
-                return cached
-        built = _build_ledger_offset_index(directory, path)
-        with _LEDGER_INDEXES_GUARD:
-            _LEDGER_INDEXES[key] = built
-            _LEDGER_INDEXES.move_to_end(key)
-            while len(_LEDGER_INDEXES) > _LEDGER_INDEX_CACHE_SIZE:
-                _LEDGER_INDEXES.popitem(last=False)
-        return built
+                while len(_LEDGER_INDEXES) > _LEDGER_INDEX_CACHE_SIZE:
+                    _LEDGER_INDEXES.popitem(last=False)
+            return built, cut, handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _get_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex | None:
+    pinned = _pin_ledger_offset_index(directory, path)
+    if pinned is None:
+        return None
+    index, _cut, handle = pinned
+    handle.close()
+    return index
 
 
 def _extend_ledger_offset_index(
     path: Path,
     *,
-    previous_signature: tuple[int, int, int, int] | None,
-    current_signature: tuple[int, int, int, int],
     offset: int,
-    length: int,
+    encoded: bytes,
     record: dict[str, Any],
 ) -> None:
+    """Fold a row this process just appended (ledger lock held) into a cached index.
+
+    Only an index that ends exactly where the row starts is extended; one that lags
+    (another process appended) is left alone: readers catch it up from the file.
+    """
     key = str(path.resolve())
     with _LEDGER_INDEXES_GUARD:
         index = _LEDGER_INDEXES.get(key)
         if index is None:
             return
-        if previous_signature is None or index.signature != previous_signature:
-            _LEDGER_INDEXES.pop(key, None)
+        dev, ino, cut, anchor = index.signature
+        if cut != offset:
             return
         kind = str(record.get("kind") or "")
-        location = (offset, length)
+        location = (offset, len(encoded))
         index.offsets_by_kind.setdefault(kind, []).append(location)
         run_id = str(record.get("run_id") or "")
         if run_id:
             index.offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
         if kind == "candidate":
             _index_candidate_identity(index, record)
-        index.signature = current_signature
+        index.signature = (
+            dev,
+            ino,
+            cut + len(encoded),
+            (anchor + encoded)[-_INDEX_ANCHOR_BYTES:],
+        )
         _LEDGER_INDEXES.move_to_end(key)
 
 
@@ -1938,8 +2040,12 @@ class CandidateLedger:
                 if record_offset != 0 or repaired_tail:
                     return  # an existing ledger is indexed lazily by its first reader
                 state = _Sidecar()
-            elif repaired_tail or state.size != record_offset:
-                _sidecar_cache_drop(self.path)  # gap: catch up (or rebuild) on next use
+            elif repaired_tail or state.size > record_offset:
+                _sidecar_cache_drop(self.path)  # rewritten below the cut: rebuild on next use
+                return
+            elif state.size < record_offset:
+                # Another process appended: the state is still valid for [0, size) and
+                # the next reader folds in the tail (the anchor check catches divergence).
                 return
             reader = _RowReader(self.path)
             try:
@@ -1965,44 +2071,39 @@ class CandidateLedger:
     ) -> list[dict[str, Any]]:
         """Parse only indexed rows needed by one operational query."""
 
-        for _attempt in range(2):
-            index = self._offset_index()
-            if index is None:
-                return []
-            if run_ids is None:
-                locations = [
-                    location for kind in kinds for location in index.offsets_by_kind.get(kind, ())
-                ]
-            else:
-                locations = [
-                    location
-                    for run_id in run_ids
-                    for kind in kinds
-                    for location in index.offsets_by_run_kind.get((run_id, kind), ())
-                ]
-            locations.sort()
-            with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
-                if _ledger_file_signature(self.path) != index.signature:
-                    _invalidate_ledger_offset_index(self.path)
+        pinned = _pin_ledger_offset_index(Path(self.dir), self.path)
+        if pinned is None:
+            return []
+        index, cut, handle = pinned
+        # Every indexed row below ``cut`` lies in a prefix that never changes
+        # (append-only), so the rows are read without holding the ledger lock; rows
+        # appended after this snapshot are simply not part of it.
+        if run_ids is None:
+            locations = [
+                location for kind in kinds for location in index.offsets_by_kind.get(kind, ())
+            ]
+        else:
+            locations = [
+                location
+                for run_id in run_ids
+                for kind in kinds
+                for location in index.offsets_by_run_kind.get((run_id, kind), ())
+            ]
+        locations = sorted(loc for loc in locations if loc[0] + loc[1] <= cut)
+        records: list[dict[str, Any]] = []
+        with handle:
+            for offset, length in locations:
+                handle.seek(offset)
+                try:
+                    record = json.loads(handle.read(length).decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
                     continue
-                handle = self.path.open("rb")
-            # The indexed rows lie below the verified size and never change
-            # (append-only), so they are read without holding the ledger lock.
-            records: list[dict[str, Any]] = []
-            with handle:
-                for offset, length in locations:
-                    handle.seek(offset)
-                    try:
-                        record = json.loads(handle.read(length).decode("utf-8"))
-                    except (UnicodeDecodeError, ValueError):
-                        continue
-                    if not isinstance(record, dict) or record.get("kind") not in kinds:
-                        continue
-                    if run_ids is not None and str(record.get("run_id") or "") not in run_ids:
-                        continue
-                    records.append(record)
-            return records
-        raise RuntimeError("candidate ledger changed continuously while reading its index")
+                if not isinstance(record, dict) or record.get("kind") not in kinds:
+                    continue
+                if run_ids is not None and str(record.get("run_id") or "") not in run_ids:
+                    continue
+                records.append(record)
+        return records
 
     def _require_complete_index(self, *, purpose: str) -> _LedgerOffsetIndex | None:
         index = self._offset_index()
@@ -2406,7 +2507,6 @@ class CandidateLedger:
             "plan_abandoned",
             "integrity_outcome",
         } or (kind == "ingest_run" and str(record.get("state") or "") != "started")
-        previous_signature = _ledger_file_signature(self.path) if self.path.exists() else None
         record_offset = 0
         with _exclusive_lock(self.dir / ".candidate-ledger.lock"):
             with self.path.open("a+b") as fh:
@@ -2420,16 +2520,13 @@ class CandidateLedger:
                 if durable or repaired_tail:
                     fh.flush()
                     os.fsync(fh.fileno())
-            current_signature = _ledger_file_signature(self.path)
             if repaired_tail:
                 _invalidate_ledger_offset_index(self.path)
             else:
                 _extend_ledger_offset_index(
                     self.path,
-                    previous_signature=previous_signature,
-                    current_signature=current_signature,
                     offset=record_offset,
-                    length=len(encoded),
+                    encoded=encoded,
                     record=record,
                 )
             self._sidecar_after_append(record_offset, encoded, record, repaired_tail=repaired_tail)

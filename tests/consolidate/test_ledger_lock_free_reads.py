@@ -324,6 +324,8 @@ def test_append_p99_on_a_300mb_ledger(
             return len(ledger.unreceipted_commit_plans())
 
         appender, _ = _run_under_appends(directory, work, deadline_s=120.0)
-        assert appender.p99() < _P99_BOUND_S, f"{reader}: {_diag(appender)}"
+        # In-thread diagnostic (the reader shares the GIL): the child-process test is the gate.
+        print(f"[{reader} in-thread 300mb] {_diag(appender)}")
+        assert appender.p99() < _DIAGNOSTIC_P99_BOUND_S, f"{reader}: {_diag(appender)}"
     finally:
         shutil.rmtree(directory, ignore_errors=True)
