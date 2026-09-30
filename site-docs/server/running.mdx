@@ -114,13 +114,13 @@ okto-neuron stop
 When it finds a running pid it tells you what it is about to do:
 
 ```text
-stopping okto-neuron server (pid=41207); waiting up to 30.0s for drain, then escalating automatically
+stopping okto-neuron server (pid=41207); waiting up to 30.0s for drain plus the store-close budget (no automatic escalation; use --force to skip the drain)
 stopped okto-neuron server (pid=41207)
 ```
 
-The drain window is `--timeout` ([/reference/cli/server-commands](/reference/cli/server-commands) carries its default). Halfway through the drain window, capped at ten seconds, a server that has not stopped receives the same signal a second time, which the runtime treats as an explicit force request, so you never have to look up the pid and signal it yourself. If the stop fails, the lifecycle error goes to stderr and the command exits 1.
+The drain window is `--timeout` ([/reference/cli/server-commands](/reference/cli/server-commands) carries its default). `stop` sends one request and never escalates on its own; `okto-neuron stop --force` sends the force request. A slow drain is not cut short at ten seconds. If the stop fails, the lifecycle error goes to stderr and the command exits 1.
 
-The server's own drain after SIGTERM is capped at 30 seconds: both Uvicorn servers and every per-vault worker drain before pooled handles close. A second signal during that drain exits immediately.
+The server's own drain after SIGTERM is capped at 30 seconds, or at `--timeout` when the stop came from `okto-neuron stop`: both Uvicorn servers and every per-vault worker drain before pooled handles close. After the drain budget the server reserves a close budget of `max(5 s, 25%)` so the stores still close even when a worker is stuck. Each phase is logged as `shutdown.phase` with its duration. A second SIGTERM or Ctrl-C during the drain exits immediately.
 
 ## No login or reboot persistence
 

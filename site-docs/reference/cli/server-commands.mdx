@@ -135,7 +135,7 @@ The `Stop:` line is always the literal `okto-neuron stop`; the helper that build
 ## okto-neuron stop
 
 ```bash
-okto-neuron stop [--vault PATH] [--timeout SECONDS]
+okto-neuron stop [--vault PATH] [--timeout SECONDS] [--force]
 ```
 
 <ParamField path="--vault" type="path">
@@ -143,7 +143,11 @@ Legacy daemon lock root. The help text notes new application daemons do not requ
 </ParamField>
 
 <ParamField path="--timeout" type="float" default="30.0">
-Seconds to wait for shutdown.
+The daemon's drain budget in seconds. It gets a further close budget of `max(5 s, 25%)` to close its stores, and `stop` waits for both.
+</ParamField>
+
+<ParamField path="--force" type="boolean">
+Send the force request: skip the drain and exit now. The stores are not closed.
 </ParamField>
 
 ### How the lock root is chosen
@@ -167,15 +171,15 @@ Discovery ignores stale or unprovable PID metadata, so a dead legacy PID file do
 When the chosen root has a readable PID, `stop` announces itself before signalling:
 
 ```text
-stopping okto-neuron server (pid=41234); waiting up to 30.0s for drain, then escalating automatically
+stopping okto-neuron server (pid=41234); waiting up to 30.0s for drain plus the store-close budget (no automatic escalation; use --force to skip the drain)
 stopped okto-neuron server (pid=41234)
 ```
 
 The final line prints the PID that `stop_server` returned.
 
-### Escalation and failure
+### Failure and --force
 
-`stop_server` signals the verified owner with SIGTERM, then polls the PID record until it is gone or changed. Escalation fires once at `min(10.0, max(0.1, timeout / 2.0))` seconds after the start: a versioned daemon gets the same signal a second time, which the runtime treats as an explicit force request; a legacy target on POSIX gets SIGKILL. Transient, inconclusive identity reads keep the wait going rather than aborting it.
+`stop_server` sends one request to the verified owner and polls the PID record until it is gone or changed. It never escalates on its own. The request carries `--timeout` as the drain budget; the wait is that plus the close budget plus a short grace. `--force` sends the force request instead (a legacy target on POSIX gets SIGKILL). An identity read that is unavailable, or that differs while the owner still holds the lock, keeps the wait going rather than aborting it.
 
 New-format daemons are never signalled by raw PID: `send_stop` validates the random owner identity and the process-birth fingerprint, and the daemon signals itself.
 
@@ -184,7 +188,7 @@ A clean stop removes the PID record. On Windows the daemon closes the record bef
 If the deadline passes, `stop_server` raises `LifecycleError`, which `stop` prints to stderr before exiting 1:
 
 ```text
-server did not exit within 30.0s (pid=41234, pid_file=/Users/you/.marginalia/runtime/...)
+server did not exit within 42.5s (pid=41234, pid_file=/Users/you/.marginalia/runtime/...)
 ```
 
 `LifecycleError` from the initial signal attempt (for example, the owner is already gone) exits 1 the same way.

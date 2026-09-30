@@ -373,6 +373,26 @@ so one busy vault never hides the others. The lease is released only at shutdown
 stores are closed and before the pid file is removed, and on managed delete just before the
 directory is removed (re-acquired if the delete rolls back).
 
+`okto-neuron stop` sends one request and never escalates. The request carries `--timeout` as the
+daemon's drain budget (default 30 s); the daemon reserves a further close budget of `max(5 s, 25%
+of the drain budget)`, and `stop` waits for both plus a short exit grace. `stop --force` sends the
+force request instead. The watcher delivers only the first request and forced ones, so a second
+`stop` is not read as the operator's second signal, while a real second SIGTERM or Ctrl-C still
+forces. An identity read that is unavailable or differs while the lock is still held is polled
+through, never reported as an error. Inside the daemon, when the drain budget runs out the workers
+and queued executor calls are cancelled and the stores STILL close inside the close budget, from a
+dedicated thread so a wedged executor cannot block it. Every grafx statement, transaction and
+health probe runs under an in-flight counter (`store/_inflight.py`), and the close refuses new
+calls and waits for running ones. A thread parked in an LLM or network wait holds no grafx call,
+so the close goes ahead around it. If a grafx call is still running at the hard deadline (drain
+plus close budget), the daemon does not close under it: it logs `store close skipped: N grafx
+calls in flight, relying on WAL recovery`, flushes telemetry and logs, and exits; the next open
+recovers from the WAL. The order is store close, then writer-lease release, then the pid file.
+Every phase logs `shutdown.phase name=... duration_ms=... remaining_s=...` (each vault's close
+included) and a final `shutdown.summary` line. The ladybug and neo4j adapters do not count their
+native calls yet, so they need `store/_inflight.py` before the daemon's clean-close path can
+serve them.
+
 Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
 symlink/path safety, fences new leases, drains existing work, releases the owned handle, and
