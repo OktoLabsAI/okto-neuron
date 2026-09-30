@@ -315,7 +315,8 @@ def _ledger_materialized_semantic_fingerprints(
 
     starts: dict[str, dict[str, Any]] = {}
     latest_by_document: dict[str, dict[str, str]] = {}
-    scan = CandidateLedger(Path(vault_path) / ".marginalia").scan()
+    # Only run rows are read below; kinds= keeps every other row out of memory.
+    scan = CandidateLedger(Path(vault_path) / ".marginalia").scan(kinds=frozenset({"ingest_run"}))
     for record in scan.parsed_records:
         if record.get("ledger_version") not in _ACCEPTED_LEDGER_VERSIONS:
             continue

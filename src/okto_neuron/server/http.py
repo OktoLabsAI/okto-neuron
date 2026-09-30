@@ -3855,7 +3855,8 @@ def _semantic_governance_payload(state: Any) -> dict[str, Any]:
         else None
     )
 
-    scan = CandidateLedger(vault_path / ".marginalia").scan()
+    # Only run rows are read below; kinds= keeps every other row out of memory.
+    scan = CandidateLedger(vault_path / ".marginalia").scan(kinds=frozenset({"ingest_run"}))
     starts: dict[str, dict[str, Any]] = {}
     completed_runs: list[dict[str, str]] = []
     latest_by_document: dict[str, dict[str, str]] = {}
