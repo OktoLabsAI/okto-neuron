@@ -81,7 +81,8 @@ from okto_neuron.server._store_io import (
     single_flight,
     store_io,
 )
-from okto_neuron.server._vault_pool import VaultPoolError
+from okto_neuron.server._vault_pool import VaultPoolError, acquire_daemon_writer_lease
+from okto_neuron.store.writer_lease import degraded_leases, held_writer_lease
 from okto_neuron.server.lifecycle import request_id as bind_request_id
 from okto_neuron.server.state import (
     ServerState,
@@ -1126,6 +1127,10 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
             f"progress for up to {worst:.0f}s; a stuck model call may be holding the vault's "
             "writer lock"
         )
+    # 6. Writer lease degraded: the filesystem has no working flock, so nothing
+    #    stops a CLI from writing this vault while the daemon serves it.
+    for lease_vault, lease_reason in sorted(degraded_leases().items()):
+        reasons.append(f"writer_lease_degraded: {lease_vault.name}: {lease_reason}")
     ingest_summary = (
         _aggregate_ingest_summaries(runtimes)
         if application_scope
@@ -1605,6 +1610,14 @@ async def _run_blocking_to_completion(
             return None, exc, deferred_cancellation
 
 
+def _release_writer_lease(path: Path) -> bool:
+    lease = held_writer_lease(path)
+    if lease is None:
+        return False
+    lease.release()
+    return True
+
+
 async def api_vault_delete(request: Request) -> JSONResponse:
     """Delete one idle configured-root vault after exact confirmation."""
 
@@ -1663,6 +1676,7 @@ async def api_vault_delete(request: Request) -> JSONResponse:
     released = False
     default_cleared = False
     filesystem_deleted = False
+    lease_released = False
     deferred_cancellation: asyncio.CancelledError | None = None
     failure_response: JSONResponse | None = None
     try:
@@ -1705,6 +1719,8 @@ async def api_vault_delete(request: Request) -> JSONResponse:
                 raise RuntimeError(
                     guard_error or "vault identity changed immediately before deletion"
                 )
+            # The store is closed; free the writer lease before the rmtree.
+            lease_released = _release_writer_lease(entry.path)
             _, deletion_error, deferred_cancellation = await _run_blocking_to_completion(
                 lambda: state.run_application_mutation(lambda: shutil.rmtree(entry.path)),
                 deferred_cancellation,
@@ -1742,6 +1758,13 @@ async def api_vault_delete(request: Request) -> JSONResponse:
                 identity_after = None
                 rollback_error = f"rollback validation failed: {exc}"
             intact = identity_after is not None and identity_after.id == entry.id
+            if intact and lease_released:
+                try:
+                    await store_io(acquire_daemon_writer_lease, entry.path)
+                except Exception:  # noqa: BLE001
+                    intact = False
+                    rollback_error = "could not re-acquire the writer lease after failed deletion"
+                    _LOG.exception("could not re-acquire writer lease for %s", entry.path)
             if intact and not released:
                 rollback_usable = True
             elif intact:

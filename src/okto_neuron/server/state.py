@@ -24,9 +24,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Final, Iterator, Optional
 
-from okto_neuron.server._vault_pool import VaultLease, VaultPool, VaultPoolError
+import logging
+
+from okto_neuron.server._vault_pool import (
+    VaultLease,
+    VaultPool,
+    VaultPoolError,
+    acquire_daemon_writer_lease,
+)
+from okto_neuron.store.writer_lease import release_all as release_all_writer_leases
 from okto_neuron.store.handle_lease import VaultHandleLease
 from okto_neuron.vault import Vault
+
+_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from okto_neuron.server.lifecycle import GracefulShutdown
@@ -453,6 +463,8 @@ class ServerState:
     """Guards ``_vault_runtimes``. Runtime resolution runs on store-executor
     threads (issue #13), so two requests for a new path must still agree on ONE
     runtime (and therefore one writer lock)."""
+    _busy_logged: set[Path] = field(default_factory=set, init=False, repr=False)
+    """Vaults already reported busy (another process holds the writer lease)."""
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -546,6 +558,9 @@ class ServerState:
                     "vault_fenced",
                     f"vault runtime is unavailable after deletion or maintenance: {key}",
                 )
+            if runtime is None and key.is_dir():
+                # Raises VaultPoolError("vault_busy") when a CLI holds the vault.
+                acquire_daemon_writer_lease(key)
             if vault is not None:
                 self.vault_pool.adopt(vault, key, pin=False)
             if runtime is None:
@@ -585,7 +600,18 @@ class ServerState:
                     key = entry.path.resolve(strict=False)
                     if key not in self._vault_runtimes and self.vault_pool.is_fenced(key):
                         continue
-                    self.runtime_for(entry.path)
+                    try:
+                        self.runtime_for(entry.path)
+                    except VaultPoolError as exc:
+                        if exc.code != "vault_busy":
+                            raise
+                        # One busy vault must not break the others; the next
+                        # discovery pass retries it. Log once per vault.
+                        if key not in self._busy_logged:
+                            self._busy_logged.add(key)
+                            _LOG.warning("skipping busy vault %s for now: %s", key.name, exc)
+                        continue
+                    self._busy_logged.discard(key)
                 self._migrate_legacy_targeted_jobs()
         # No lock for the snapshot itself: copying the dict is atomic under the
         # GIL, and the event loop must never wait behind a thread that holds the
@@ -762,6 +788,8 @@ class ServerState:
             return
         self._closed = True
         self.vault_pool.close_all()
+        # Stores are closed; only now let another process write these vaults.
+        release_all_writer_leases()
 
     def switch_vault(self, vault: Vault, vault_path: Path) -> None:
         """Change only the deprecated unscoped compatibility fallback.

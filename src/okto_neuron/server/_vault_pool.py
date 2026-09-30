@@ -22,6 +22,11 @@ from okto_neuron.store.handle_lease import (
     VaultHandleLease,
     acquire_vault_handle_lease,
 )
+from okto_neuron.store.writer_lease import (
+    WriterLease,
+    WriterLeaseHeld,
+    acquire_writer_lease,
+)
 from okto_neuron.vault import Vault
 
 
@@ -29,12 +34,27 @@ class VaultPoolError(OktoNeuronError):
     """A vault could not be served or released from the pool.
 
     Stable ``code`` values are ``pool_full``, ``open_failed``, ``vault_fenced``,
-    ``vault_in_use``, and ``legacy_pinned``.
+    ``vault_in_use``, ``vault_busy`` (another process holds the vault's writer
+    lease), and ``legacy_pinned``.
     """
 
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
+
+
+def acquire_daemon_writer_lease(path: Path | str) -> WriterLease:
+    """Take (idempotently, without waiting) the writer lease for a vault this daemon serves.
+
+    The daemon holds it for the life of the process: idle eviction and handle
+    closes never release it (only shutdown and managed delete do). Another
+    process holding it surfaces as ``VaultPoolError("vault_busy")`` naming the
+    holder's pid and operation.
+    """
+    try:
+        return acquire_writer_lease(path, role="daemon", operation="serve")
+    except WriterLeaseHeld as exc:
+        raise VaultPoolError("vault_busy", exc.message) from exc
 
 
 def _is_live(vault: Vault) -> bool:
@@ -123,6 +143,8 @@ class VaultPool:
             pass
 
     def _acquire_handle_lease_locked(self, key: Path) -> VaultHandleLease:
+        # Lock order: writer lease, then the graph-handle lease.
+        acquire_daemon_writer_lease(key)
         existing = self._handle_leases.get(key)
         if existing is not None and existing.held:
             return existing
@@ -435,4 +457,4 @@ class VaultPool:
         return list(self._paths_snapshot)
 
 
-__all__ = ["VaultLease", "VaultPool", "VaultPoolError"]
+__all__ = ["VaultLease", "VaultPool", "VaultPoolError", "acquire_daemon_writer_lease"]

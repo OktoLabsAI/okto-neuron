@@ -44,7 +44,11 @@ from okto_neuron.server._store_io import (
     store_io,
     wait_executors_idle_async,
 )
-from okto_neuron.server._vault_pool import VaultLease, VaultPoolError
+from okto_neuron.server._vault_pool import (
+    VaultLease,
+    VaultPoolError,
+    acquire_daemon_writer_lease,
+)
 from okto_neuron.server.http import build_rest_app
 from okto_neuron.server.lifecycle import GracefulShutdown
 from okto_neuron.server.state import (
@@ -539,6 +543,16 @@ def _open_startup_vault(
     if vault_path is None:
         return None, None, None
     resolved = Path(vault_path).expanduser().resolve(strict=False)
+    try:
+        acquire_daemon_writer_lease(resolved)
+    except VaultPoolError as exc:
+        _LOG.warning("startup fallback vault is busy; starting the application without it: %s", exc)
+        return None, None, {
+            "code": exc.code,
+            "path": str(resolved),
+            "detail": str(exc),
+            "remedy": "Stop the process holding the vault, then select it again.",
+        }
     try:
         return Vault.open(resolved), resolved, None
     except EmbeddingDimMismatch as exc:
