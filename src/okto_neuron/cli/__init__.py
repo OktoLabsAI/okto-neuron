@@ -1368,8 +1368,16 @@ def onboard(
             interactive=interactive,
         )
 
+    target = _onboarding_target(vault_ref, interactive=interactive)
+    if not dry_run:
+        # The writer lease is the first vault-touching step: refused with exit 5
+        # while the daemon holds it, before the backend-pin check, the default-vault
+        # switch, scaffolding or any okto-neuron.yaml patch (PATCH /api/v1/config is
+        # the running-daemon equivalent). Released when the command's context closes.
+        ctx.with_resource(vault_writer(target.resolve(strict=False), "onboard"))
+
     vault_path, created = _onboarding_vault(
-        vault_ref,
+        target,
         interactive=interactive,
         dry_run=dry_run,
         backend=backend,
@@ -1379,11 +1387,6 @@ def onboard(
         storage_database=storage_database,
         storage_allow_remote=allow_remote_db,
     )
-    if not dry_run:
-        # Every write below (okto-neuron.yaml patches) needs the writer lease:
-        # refused with exit 5 while the daemon holds it (PATCH /api/v1/config is
-        # the running-daemon equivalent). Released when the command's context closes.
-        ctx.with_resource(vault_writer(vault_path, "onboard"))
     raw_state = _llm_config_state(vault_path)
     if raw_state in {"configured", "disabled"} and not reconfigure and not disable_llm:
         if _onboarding_config_flags_supplied(
@@ -1716,8 +1719,19 @@ def _prompt_onboarding_neo4j_storage(
     return uri, credential_env, database
 
 
+def _onboarding_target(vault_ref: str | None, *, interactive: bool) -> Path:
+    """Resolve which vault path onboarding targets, with no side effects on it."""
+    if vault_ref:
+        return resolve_vault_reference(vault_ref)
+    current = resolve_vault_reference(None)
+    if is_vault(current):
+        return current
+    name = click.prompt("Vault name", default="mynotes") if interactive else "mynotes"
+    return vault_path_for_name(name)
+
+
 def _onboarding_vault(
-    vault_ref: str | None,
+    target: Path,
     *,
     interactive: bool,
     dry_run: bool = False,
@@ -1735,16 +1749,6 @@ def _onboarding_vault(
     storage_database: str | None = None,
     storage_allow_remote: bool = False,
 ) -> tuple[Path, bool]:
-    if vault_ref:
-        target = resolve_vault_reference(vault_ref)
-    else:
-        current = resolve_vault_reference(None)
-        if is_vault(current):
-            target = current
-        else:
-            name = click.prompt("Vault name", default="mynotes") if interactive else "mynotes"
-            target = vault_path_for_name(name)
-
     # Validates the backend name unconditionally, and (only when `target`
     # already has a okto-neuron.yaml) enforces that `backend` matches its
     # existing pin — covers both branches below, including dry-run.

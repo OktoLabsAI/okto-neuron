@@ -334,7 +334,7 @@ one JSON line records pid, process start token, role, operation, endpoint and ti
 vault it serves and keeps it for the life of the process, idle eviction included. A CLI command
 that writes (`watch`, `pilot`, `init --wipe`, `kg init` on an existing vault, `kg rebuild`,
 `reembed`, `reindex`, `reconcile propose/apply/review confirm/review reject/heal`,
-`snapshot dump`, `onboard`) takes the lease or refuses with exit 5 while the daemon holds it,
+`snapshot dump`, `onboard`, which takes it before the backend-pin check or any default-vault or config write) takes the lease or refuses with exit 5 while the daemon holds it,
 naming the daemon pid and the API call that does the same thing, or telling you to stop the
 daemon first; it never proxies. `init` on a new path, `vault create` and `snapshot load` take
 the lease themselves. Readers (`review list`, `quality *`, `snapshot verify`) take no lease. A

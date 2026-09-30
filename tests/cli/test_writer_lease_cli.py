@@ -279,6 +279,46 @@ def test_new_path_commands_succeed_and_take_the_lease(
     assert "kg init" in seen
 
 
+def test_refused_onboard_changes_nothing_not_even_the_default_vault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lease is onboard's first step: it beats the backend-pin check and set_default_vault.
+
+    The argv deliberately asks for a backend the vault is not pinned to; if the
+    pin check ran first this would exit 11 (VaultBackendMismatch), not 5.
+    """
+    from okto_neuron.vault_registry import set_default_vault
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for name in ("OKTO_NEURON_CONFIG", "OKTO_NEURON_VAULT", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    vault = make_vault(tmp_path)
+    other = tmp_path / "other-default"
+    other.mkdir()
+    set_default_vault(other)
+    config_files = {str(p): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    assert any(b"default_vault" in raw for raw in config_files.values())
+
+    holder = spawn_holder(vault)
+    try:
+        before = tree_hashes(vault)
+        result = invoke(
+            ["onboard", "--vault", str(vault), "--backend", "grafx", "--disable-llm",
+             "--non-interactive"]
+        )
+        assert result.exit_code == 5, (result.output, result.stderr)
+        assert f"daemon pid {holder.pid}" in result.stderr, result.stderr
+        assert tree_hashes(vault) == before
+        assert {str(p): p.read_bytes() for p in home.rglob("*") if p.is_file()} == config_files
+        assert str(other.resolve()) in next(
+            raw for raw in config_files.values() if b"default_vault" in raw
+        ).decode()
+    finally:
+        stop_holder(holder)
+
+
 def test_onboard_dry_run_takes_no_lease_and_is_not_refused(tmp_path: Path) -> None:
     vault = make_vault(tmp_path)
     holder = spawn_holder(vault)

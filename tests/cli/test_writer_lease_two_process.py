@@ -163,7 +163,7 @@ def _guarded_argv(vault: Path, scratch: Path) -> dict[str, list[str]]:
         "review reject": ["kg", "reconcile", "review", "reject", "cid", v],
         "reconcile heal": ["kg", "reconcile", "heal", v],
         "snapshot dump": ["kg", "snapshot", "dump", v, str(scratch / "snap")],
-        "onboard": ["onboard", "--vault", v, "--backend", "grafx", "--disable-llm",
+        "onboard": ["onboard", "--vault", v, "--backend", "ladybug", "--disable-llm",
                     "--non-interactive"],
     }
 
