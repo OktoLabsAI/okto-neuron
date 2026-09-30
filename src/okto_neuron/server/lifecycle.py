@@ -58,6 +58,9 @@ PID_RELATIVE = Path(".marginalia") / "server.pid"
 SIGNAL_RELATIVE = Path(".marginalia") / "server.signal"
 """Instance-targeted stop request consumed by the PID-file owner."""
 
+OUTCOME_RELATIVE = Path(".marginalia") / "server.outcome"
+"""Final status a daemon leaves when its store close was skipped (read once by ``stop``)."""
+
 PID_RECORD_VERSION = 1
 _PID_FILE_LIMIT = 16 * 1024
 _PID_LOCK_OFFSET = _PID_FILE_LIMIT
@@ -103,6 +106,66 @@ def pid_file_path(root: Path) -> Path:
 def signal_file_path(root: Path) -> Path:
     """Return the instance-targeted stop-request path for a lifecycle ``root``."""
     return Path(root) / SIGNAL_RELATIVE
+
+
+def outcome_file_path(root: Path) -> Path:
+    """Return the shutdown-outcome file path for a lifecycle ``root``."""
+    return Path(root) / OUTCOME_RELATIVE
+
+
+_OUTCOME_ROOT: Path | None = None
+
+
+def write_close_skipped_outcome(calls_in_flight: dict[str, int]) -> None:
+    """Record, just before a hard exit, that the store close was skipped.
+
+    Best effort (the exit path must not raise): ``stop`` reads and removes the
+    file to report exit code 3 instead of plain success.
+    """
+    root = _OUTCOME_ROOT
+    if root is None:
+        return
+    payload = {
+        "outcome": "close_skipped",
+        "pid": os.getpid(),
+        "calls_in_flight": sum(calls_in_flight.values()),
+        "vaults": sorted(name for name, count in calls_in_flight.items() if count),
+    }
+    try:
+        path = outcome_file_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        _LOG.warning("could not write the shutdown outcome file", exc_info=True)
+
+
+def consume_stop_outcome(root: Path, pid: int) -> dict[str, Any] | None:
+    """Read and remove the outcome file left by daemon ``pid``.
+
+    Returns the payload only when it is well-formed, says ``close_skipped`` and
+    belongs to ``pid``. A missing, corrupt or stale (other pid) file yields
+    ``None``; any file found is removed so it cannot leak into a later stop.
+    """
+    path = outcome_file_path(root)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    _remove_path(path, what="shutdown-outcome file")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("outcome") != "close_skipped"
+        or payload.get("pid") != pid
+        or not isinstance(payload.get("calls_in_flight"), int)
+    ):
+        return None
+    return payload
 
 
 @dataclass(frozen=True)
@@ -603,10 +666,13 @@ class PidFile:
             )
             _write_pid_fd(fd, record)
             _remove_path(signal_file_path(self.vault), what="stop-request file")
+            _remove_path(outcome_file_path(self.vault), what="shutdown-outcome file")
             self._fd = fd
             self._record = record
             self._owned = True
             if self._pid == os.getpid():
+                global _OUTCOME_ROOT
+                _OUTCOME_ROOT = self.vault
                 self._start_signal_watcher()
             return
         raise LifecycleError(f"could not atomically acquire daemon lock at {self.path}")

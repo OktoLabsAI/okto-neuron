@@ -388,6 +388,11 @@ so the close goes ahead around it. If a grafx call is still running at the hard 
 plus close budget), the daemon does not close under it: it logs `store close skipped: N grafx
 calls in flight, relying on WAL recovery`, flushes telemetry and logs, and exits; the next open
 recovers from the WAL. The order is store close, then writer-lease release, then the pid file.
+Before that hard exit the daemon writes `.marginalia/server.outcome` (`outcome=close_skipped`, its pid, the
+calls in flight and the vault names) next to the pid file; `okto-neuron stop` reads and removes it, prints
+`stopped, but the store close was skipped (N grafx calls in flight); the next start recovers from the
+WAL` and exits 3. A stop that closed the stores exits 0; a file from another pid, or a corrupt one, is
+ignored and removed.
 Every phase logs `shutdown.phase name=... duration_ms=... remaining_s=...` (each vault's close
 included) and a final `shutdown.summary` line. The ladybug and neo4j adapters do not count their
 native calls yet, so they need `store/_inflight.py` before the daemon's clean-close path can

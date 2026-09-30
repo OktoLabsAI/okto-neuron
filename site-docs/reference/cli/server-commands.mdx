@@ -193,6 +193,16 @@ server did not exit within 42.5s (pid=41234, pid_file=/Users/you/.marginalia/run
 
 `LifecycleError` from the initial signal attempt (for example, the owner is already gone) exits 1 the same way.
 
+### Exit code 3: stopped without closing the store
+
+If the daemon reaches its hard deadline with grafx calls still running, it does not close the store under them. Before exiting it writes `.marginalia/server.outcome` next to the PID file; `stop` reads and removes that file and prints to stderr:
+
+```text
+stopped, but the store close was skipped (1 grafx calls in flight); the next start recovers from the WAL
+```
+
+then exits 3. No data is lost (the next open recovers from the WAL), but this is not a clean stop. A stop that closed the stores exits 0. An outcome file left by a different PID, or a corrupt one, is ignored and removed.
+
 ## okto-neuron status
 
 ```bash

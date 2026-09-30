@@ -25,6 +25,8 @@ when a flag file exists.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import os
 import signal
@@ -41,7 +43,12 @@ import pytest
 
 pytest.importorskip("okto_grafx")
 
-from okto_neuron.server.lifecycle import read_pid  # noqa: E402
+from okto_neuron.server.lifecycle import (  # noqa: E402
+    consume_stop_outcome,
+    outcome_file_path,
+    read_pid,
+    write_close_skipped_outcome,
+)
 from okto_neuron.store.grafx import GrafxStore  # noqa: E402
 from okto_neuron.store.integrity import AuditStatus, audit_graph  # noqa: E402
 from okto_neuron.vault import Vault  # noqa: E402
@@ -53,6 +60,17 @@ NODES_PER_ADD = 3
 SHARED_NODES = 2
 CLOSE_BUDGET_S = 2.0
 DRAIN_S = 1.0
+
+# sha256 of GrafxStore._execute_write's source with whitespace normalised. The
+# serve wrapper below carries a copy of that body; if production changes, the
+# copy must change with it.
+_EXECUTE_WRITE_SHA256 = "cc0ebd889f4eaf1ef1c5ed73c2e2b1fcec52d83d860101a7c06ec0136249b68b"
+
+
+def test_parked_execute_write_copy_tracks_production() -> None:
+    source = " ".join(inspect.getsource(GrafxStore._execute_write).split())
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    assert digest == _EXECUTE_WRITE_SHA256, "production _execute_write changed; update the parked copy"
 
 _SERVE = textwrap.dedent(
     """
@@ -228,6 +246,12 @@ def test_write_parked_before_commit_is_absent_and_committed_writes_survive(tmp_p
         daemon.kill()
 
     assert code == 1, log
+    assert stop.returncode == 3, stop.stdout + stop.stderr
+    assert (
+        "stopped, but the store close was skipped (1 grafx calls in flight); "
+        "the next start recovers from the WAL"
+    ) in stop.stdout + stop.stderr
+    assert not outcome_file_path(daemon.runtime_root).exists(), "stop must consume the outcome file"
     assert "store close skipped: 1 grafx calls in flight, relying on WAL recovery" in log
     assert "store_closed=false outcome=close_skipped" in log
     assert "id" not in parked_result, "the parked write must never be acked"
@@ -238,6 +262,34 @@ def test_write_parked_before_commit_is_absent_and_committed_writes_survive(tmp_p
     assert docs == set(committed), f"unexpected documents: {docs - set(committed)}"
     assert edges == edges_before, "an uncommitted write left edges behind"
     assert nodes == nodes_total_before, "an uncommitted write left nodes behind"
+
+
+def test_stop_outcome_file_handling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from okto_neuron.server import lifecycle
+
+    path = outcome_file_path(tmp_path)
+    assert consume_stop_outcome(tmp_path, 42) is None  # missing
+
+    monkeypatch.setattr(lifecycle, "_OUTCOME_ROOT", tmp_path)
+    monkeypatch.setattr(os, "getpid", lambda: 42)
+    write_close_skipped_outcome({"vault-a": 2, "vault-b": 0})
+    monkeypatch.undo()
+    assert path.exists()
+    payload = consume_stop_outcome(tmp_path, 42)
+    assert payload is not None and payload["calls_in_flight"] == 2
+    assert payload["vaults"] == ["vault-a"]
+    assert not path.exists(), "consumed file must be removed"
+
+    path.write_text(json.dumps({"outcome": "close_skipped", "pid": 7, "calls_in_flight": 1}))
+    assert consume_stop_outcome(tmp_path, 42) is None  # stale: another pid
+    assert not path.exists(), "a stale file is removed too"
+
+    path.write_text("{not json")
+    assert consume_stop_outcome(tmp_path, 42) is None  # corrupt
+    assert not path.exists()
+
+    path.write_text(json.dumps({"outcome": "closed", "pid": 42, "calls_in_flight": 0}))
+    assert consume_stop_outcome(tmp_path, 42) is None  # wrong outcome
 
 
 def _live_edges(daemon: _Daemon) -> int:

@@ -3158,7 +3158,12 @@ def dev(
 )
 def stop(vault: Path | None, timeout: float, force: bool) -> None:
     """Stop the application daemon."""
-    from okto_neuron.server.lifecycle import LifecycleError, read_pid, stop_server
+    from okto_neuron.server.lifecycle import (
+        LifecycleError,
+        consume_stop_outcome,
+        read_pid,
+        stop_server,
+    )
 
     application_root = _server_lock_root()
     if read_pid(application_root) is not None:
@@ -3181,6 +3186,14 @@ def stop(vault: Path | None, timeout: float, force: bool) -> None:
     except LifecycleError as exc:
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(1) from exc
+    skipped = consume_stop_outcome(resolved, pid)
+    if skipped is not None:
+        click.echo(
+            f"stopped, but the store close was skipped ({skipped['calls_in_flight']} grafx "
+            "calls in flight); the next start recovers from the WAL",
+            err=True,
+        )
+        raise click.exceptions.Exit(3)
     click.echo(f"stopped okto-neuron server (pid={pid})")
 
 

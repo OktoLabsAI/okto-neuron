@@ -512,6 +512,10 @@ async def _graceful_shutdown(
             orchestrator.request_force_shutdown()
             rest_server.force_exit = True
             mcp_server.force_exit = True
+            if blocked:
+                from okto_neuron.server.lifecycle import write_close_skipped_outcome
+
+                write_close_skipped_outcome(inflight)
             log_summary()
             force_process_exit(1)
             raise _ShutdownDeadlineExpired(str(summary["outcome"]))
