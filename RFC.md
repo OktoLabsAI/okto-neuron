@@ -310,6 +310,14 @@ drain deadline) before vault handles close, then cancel anything still queued. T
 exceptions remain: the graph swap at the end of rebuild/heal/reembed jobs runs on the loop as
 one no-await block (reads see a short latency blip, never a half-swapped graph), and the
 companion-triage LLM fan-out uses its own thread pool inside a job runner.
+Model calls are bounded so a wedged endpoint cannot hold a vault's writer lock: a completion
+defaults to a 300 s deadline with SDK retries off (retry policy is ours: one retry, backing off
+2 s after a timeout), `llm.curation_call_timeout_s` defaults to 600 s and puts every judge call
+in the killable helper process, and a curation job watchdog (`curation.job_stall_timeout_s`,
+default 900 s) fails a read-only job that reports no progress and shows `curation_job_stalled`,
+with `elapsed_s` and `last_progress_at` per job, on `/api/v1/status`. Reconcile-propose keeps
+its writer lock across model calls: the lock is what pins one verified graph generation for the
+whole pass, and the pass only checks that generation at its start.
 `tests/server/test_event_loop_guard.py` fails any route or MCP tool that blocks the loop for
 more than 50 ms against a deliberately slow store, and `test_no_default_executor.py` fails on
 any new default-executor offload.
