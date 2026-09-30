@@ -41,8 +41,14 @@ class IndexedStore:
     def index(self) -> IndexStore:
         return self._index
 
-    def add_node(self, node: Node) -> None:
-        self._store.add_node(node)
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
+        if clear_embedding:
+            self._store.add_node(node, clear_embedding=True)
+            # The index keeps a record's vector when the node has none, so an
+            # explicit clear drops the record first.
+            self._index.delete(node.id)
+        else:
+            self._store.add_node(node)
         self._index.upsert(node)
 
     def add_edge(self, edge: Edge) -> None:

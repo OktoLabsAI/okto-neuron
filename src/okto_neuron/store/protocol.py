@@ -63,7 +63,16 @@ class DriftReport:
 
 @runtime_checkable
 class GraphStore(Protocol):
-    def add_node(self, node: Node) -> None: ...
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
+        """Insert or replace a node.
+
+        A node whose ``embedding`` is None PRESERVES the vector already stored for that
+        id (a node read without its vector and written back keeps it). Pass
+        ``clear_embedding=True`` to erase a stored vector on purpose. A new node with
+        ``embedding=None`` simply has none.
+        """
+        ...
+
     def add_edge(self, edge: Edge) -> None: ...
     def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
         """One node. ``include_embedding`` defaults to True: a single read is cheap and

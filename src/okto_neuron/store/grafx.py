@@ -367,6 +367,10 @@ SET n.type = $type,
     n.embedding = $embedding
 """
 
+# Upsert that leaves the stored vector alone (a node written with embedding=None).
+_NODE_MERGE_SQL_KEEP_VECTOR = _NODE_MERGE_SQL.replace(",\n    n.embedding = $embedding", "")
+assert _NODE_MERGE_SQL_KEEP_VECTOR != _NODE_MERGE_SQL
+
 _NODE_READ_COLUMNS_NO_VECTOR = (
     "n.id AS id, n.type AS type, n.title AS title, n.content AS content, "
     "n.tags AS tags, n.facets AS facets, n.provenance AS provenance, "
@@ -563,17 +567,27 @@ class GrafxStore:
     def is_closed(self) -> bool:
         return self._closed
 
-    def add_node(self, node: Node) -> None:
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
         self._ensure_open()
         require_writable_node_type(node.type)
+        keep_vector = node.embedding is None and not clear_embedding
 
         def attempt() -> None:
             existing = self.get_node(node.id)
-            if existing is not None and _same_node_payload(existing, node):
+            effective = (
+                node.model_copy(update={"embedding": existing.embedding})
+                if keep_vector and existing is not None
+                else node
+            )
+            if existing is not None and _same_node_payload(existing, effective):
                 return
             created_at = existing.created_at if existing is not None else node.created_at
             params = self._node_write_params(node, created_at=created_at)
-            self._execute_write(_NODE_MERGE_SQL, params)
+            if keep_vector:
+                params.pop("embedding")
+                self._execute_write(_NODE_MERGE_SQL_KEEP_VECTOR, params)
+            else:
+                self._execute_write(_NODE_MERGE_SQL, params)
 
         self._run_with_retry(attempt)
 

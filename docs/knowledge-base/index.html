@@ -528,6 +528,14 @@ vector is cheap. Callers that use vectors or write a node back pass <code>True</
 and heal copies, snapshot dump, index rebuild and generation stamps, reconcile clustering, resolve similarity,
 and the companion's supersede/detach/revert helper. Edges carry no vector. A backend registered through the
 <code>marginalia.graph_backends</code> entry point must accept the new keyword.</p>
+<p>Writes are the other half of that contract. <code>add_node</code> on a node whose <code>embedding</code> is <code>None</code> PRESERVES
+the vector already stored for that id (grafx, ladybug and neo4j use an upsert statement without the
+<code>embedding</code> SET; the in-memory store, <code>IndexedStore</code>'s index and the companion planning overlay keep the
+existing vector), so a node read without its vector and written back can no longer erase it. Erasing is
+explicit: <code>add_node(node, clear_embedding=True)</code>. A new node with no vector simply has none, and the
+graph generation digest does not change when a vector is preserved. No in-tree caller clears a vector
+today: the copy paths (reembed, rebuild, heal, snapshot load) write into fresh stores. A backend
+registered through the entry point must honour the same semantics and accept <code>clear_embedding</code>.</p>
 <p>Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. <code>GrafxStore</code> therefore passes <code>buffer_budget_bytes</code> to
 <code>okto_grafx.connect</code>: <code>storage.buffer_budget</code> in the vault yaml (bytes or a string such as <code>256MiB</code>,

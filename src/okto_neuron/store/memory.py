@@ -18,13 +18,16 @@ class InMemoryStore:
         self._edges: dict[str, Edge] = {}
         self._closed = False
 
-    def add_node(self, node: Node) -> None:
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
         require_writable_node_type(node.type)
         existing = self._nodes.get(node.id)
         if existing is not None:
             # Mirror LadybugStore: created_at is immutable once a node id
             # exists, regardless of whether the rest of the payload changed.
-            node = node.model_copy(update={"created_at": existing.created_at})
+            update: dict[str, object] = {"created_at": existing.created_at}
+            if node.embedding is None and not clear_embedding:
+                update["embedding"] = existing.embedding  # upsert keeps the stored vector
+            node = node.model_copy(update=update)
         self._nodes[node.id] = node
 
     def add_edge(self, edge: Edge) -> None:

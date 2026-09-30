@@ -9476,7 +9476,13 @@ class _PlanningGraphOverlay:
     def planned_edges(self) -> tuple[Any, ...]:
         return tuple(self._edges[edge_id] for edge_id in sorted(self._edges))
 
-    def add_node(self, node: Any) -> None:
+    def add_node(self, node: Any, clear_embedding: bool = False) -> None:
+        if getattr(node, "embedding", None) is None and not clear_embedding:
+            # Same upsert contract as the store: no vector on the node keeps the one
+            # the planned-or-stored node already has.
+            current = self.get_node(str(node.id))
+            if current is not None and getattr(current, "embedding", None) is not None:
+                node = node.model_copy(update={"embedding": current.embedding})
         self._nodes[str(node.id)] = node
 
     def add_edge(self, edge: Any) -> None:

@@ -107,13 +107,16 @@ class StubGraphStore:
         tmp_path.write_text(json.dumps(payload), encoding="utf-8")
         tmp_path.replace(self._state_path)
 
-    def add_node(self, node: Node) -> None:
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
         require_writable_node_type(node.type)
         existing = self._nodes.get(node.id)
         if existing is not None:
             # created_at is immutable once a node id exists, matching the
             # invariant both in-tree stores (Ladybug, InMemoryStore) enforce.
-            node = node.model_copy(update={"created_at": existing.created_at})
+            update: dict[str, object] = {"created_at": existing.created_at}
+            if node.embedding is None and not clear_embedding:
+                update["embedding"] = existing.embedding
+            node = node.model_copy(update=update)
         self._nodes[node.id] = node
 
     def add_edge(self, edge: Edge) -> None:

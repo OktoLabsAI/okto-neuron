@@ -172,15 +172,23 @@ class LadybugStore:
 
         return self._semantic_write_epoch
 
-    def add_node(self, node: Node) -> None:
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
         self._ensure_open()
         require_writable_node_type(node.type)
         existing = self.get_node(node.id)
-        if existing is not None and _same_node_payload(existing, node):
+        keep_vector = node.embedding is None and not clear_embedding
+        effective = (
+            node.model_copy(update={"embedding": existing.embedding})
+            if keep_vector and existing is not None
+            else node
+        )
+        if existing is not None and _same_node_payload(existing, effective):
             return
         params = _node_params(node)
         if existing is not None:
             params["created_at"] = existing.created_at
+        if keep_vector:
+            params.pop("embedding")
         self._execute(
             """
             MERGE (n:Node {id: $id})
@@ -191,9 +199,9 @@ class LadybugStore:
                 n.facets = $facets,
                 n.provenance = $provenance,
                 n.created_at = $created_at,
-                n.schema_version = $schema_version,
-                n.embedding = $embedding
-            """,
+                n.schema_version = $schema_version"""
+            + ("" if keep_vector else ",\n                n.embedding = $embedding")
+            + "\n            ",
             params,
         )
 
