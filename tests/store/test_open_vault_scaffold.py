@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from okto_neuron.config._vault import CURRENT_YAML_VERSION
 from okto_neuron.store import vault as vault_module
 from okto_neuron.store.index.indexed import IndexedStore
 from okto_neuron.store.ladybug import LadybugStore, VaultConnection
@@ -44,7 +45,7 @@ def test_open_vault_scaffolds_and_bootstraps_on_first_call(tmp_path: Path) -> No
         assert config_path.is_file()
         config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert config["federation_opt_in"] is False
-        assert config["marginalia_yaml_version"] == 1
+        assert config["marginalia_yaml_version"] == CURRENT_YAML_VERSION
 
         assert (vault_path / "graph.lbug").exists()
     finally:
