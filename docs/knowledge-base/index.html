@@ -14768,11 +14768,12 @@ the default and retired its D-12 experimental-consent gate.</p>
 disclosures still apply and are worth knowing even though they are no
 longer consent-gated:</p>
 <ul>
-<li><strong>Pre-alpha on-disk format.</strong> <code>okto-grafx</code> is pinned <code>&gt;=0.0.4,&lt;0.1</code>. The
+<li><strong>Pre-alpha on-disk format.</strong> <code>okto-grafx</code> is pinned <code>&gt;=0.0.7,&lt;0.1</code>. The
 directory format (<code>graph.grafx/</code>) can change between patch releases inside
 that range. Do not treat a Grafx vault as a long-term archival format yet.
 (0.0.4 verified identical behavior to 0.0.3 on the contract suite and full
-acceptance run — D-91.)</li>
+acceptance run — D-91. The floor is 0.0.7, the release the verification
+and production daemon now run.)</li>
 <li><strong>License.</strong> Okto Grafx ships under the Elastic License 2.0 plus an Okto
 Labs Addendum. It is not OSI-approved. Okto Neuron itself remains under its
 own license; using Grafx as a storage backend is the permitted &quot;application

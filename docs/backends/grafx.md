@@ -14,11 +14,12 @@ Grafx is no longer gated behind `--accept-experimental` on any surface. Two
 disclosures still apply and are worth knowing even though they are no
 longer consent-gated:
 
-- **Pre-alpha on-disk format.** `okto-grafx` is pinned `>=0.0.4,<0.1`. The
+- **Pre-alpha on-disk format.** `okto-grafx` is pinned `>=0.0.7,<0.1`. The
   directory format (`graph.grafx/`) can change between patch releases inside
   that range. Do not treat a Grafx vault as a long-term archival format yet.
   (0.0.4 verified identical behavior to 0.0.3 on the contract suite and full
-  acceptance run — D-91.)
+  acceptance run — D-91. The floor is 0.0.7, the release the verification
+  and production daemon now run.)
 - **License.** Okto Grafx ships under the Elastic License 2.0 plus an Okto
   Labs Addendum. It is not OSI-approved. Okto Neuron itself remains under its
   own license; using Grafx as a storage backend is the permitted "application
