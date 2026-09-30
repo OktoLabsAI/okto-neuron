@@ -1269,6 +1269,44 @@ _SIDECAR_CHECKPOINT_BYTES = 4 * 1024 * 1024
 _SIDECAR_CACHE_SIZE = 8
 _SIDECAR_INLINE_TAIL = 8 * 1024 * 1024  # catch up under the lock only up to this much
 _SIDECARS_GUARD = threading.Lock()
+_SNAPSHOT_FAILURES: OrderedDict[str, tuple[tuple[int, str], str]] = OrderedDict()
+_SNAPSHOT_FAILURES_GUARD = threading.Lock()
+_SNAPSHOT_FAILURES_MAX = 64
+
+
+def _snapshot_signature(handle: Any, cut: int) -> tuple[int, str]:
+    """``(cut, sha256 of the last anchor-sized block below cut)``: names a ledger prefix."""
+    start = max(0, cut - _SIDECAR_ANCHOR_BYTES)
+    handle.seek(start)
+    return cut, hashlib.sha256(handle.read(cut - start)).hexdigest()
+
+
+def _snapshot_failure_record(key: str, signature: tuple[int, str], reason: str) -> None:
+    with _SNAPSHOT_FAILURES_GUARD:
+        _SNAPSHOT_FAILURES[key] = (signature, reason)
+        _SNAPSHOT_FAILURES.move_to_end(key)
+        while len(_SNAPSHOT_FAILURES) > _SNAPSHOT_FAILURES_MAX:
+            _SNAPSHOT_FAILURES.popitem(last=False)
+
+
+def _snapshot_failure_reason(key: str, signature: tuple[int, str]) -> str | None:
+    """The remembered reason if this exact prefix already failed, else ``None``."""
+    with _SNAPSHOT_FAILURES_GUARD:
+        entry = _SNAPSHOT_FAILURES.get(key)
+    return entry[1] if entry is not None and entry[0] == signature else None
+
+
+def _snapshot_failure_current(key: str) -> str | None:
+    with _SNAPSHOT_FAILURES_GUARD:
+        entry = _SNAPSHOT_FAILURES.get(key)
+    return entry[1] if entry is not None else None
+
+
+def _snapshot_failure_clear(key: str) -> None:
+    with _SNAPSHOT_FAILURES_GUARD:
+        _SNAPSHOT_FAILURES.pop(key, None)
+
+
 _SIDECARS: OrderedDict[str, "_Sidecar"] = OrderedDict()
 _PLAN_ROW_KINDS = frozenset({"commit_plan", "operation_receipt", "commit_record", "plan_abandoned"})
 _RECEIPT_STATUSES = frozenset({"applied", "already_present", "dead_lettered", "failed", "aborted"})
@@ -1757,6 +1795,11 @@ def _sidecar_cache_drop(path: Path | None = None) -> None:
             _SIDECARS.clear()
         else:
             _SIDECARS.pop(str(path.resolve()), None)
+    with _SNAPSHOT_FAILURES_GUARD:
+        if path is None:
+            _SNAPSHOT_FAILURES.clear()
+        else:
+            _SNAPSHOT_FAILURES.pop(str(path.resolve()), None)
 
 
 def _write_sidecar_file(path: Path, payload: bytes) -> None:
@@ -1918,13 +1961,18 @@ class CandidateLedger:
         self._persist_sidecar(state)
         return state
 
-    def _prepare_sidecar(self) -> None:
+    def _prepare_sidecar(self) -> bool:
         """Bring the in-process index near the ledger's size without a long lock hold.
 
         A state that is current, or a few MiB behind, is left for the in-lock
         :meth:`_sync_sidecar` to finish. Anything else (no usable state, or far
         behind) is scanned from a snapshot with no lock held and then published;
         the caller's in-lock sync only folds in the rows appended meanwhile.
+
+        Returns ``False`` when that snapshot pass failed, or already failed on this
+        exact ledger prefix (a failure is remembered per snapshot signature and not
+        retried until the file changes past it). A failed pass is discarded whole:
+        its half-applied state is never published.
         """
         path = self.path
         key = str(path.resolve())
@@ -1933,36 +1981,49 @@ class CandidateLedger:
             try:
                 size = path.stat().st_size
             except FileNotFoundError:
-                return
+                return True
             cached = _sidecar_cache_get(key)
             candidate = cached if cached is not None else self._load_sidecar_file()
             with path.open("rb") as probe:
                 usable = candidate is not None and candidate.matches(probe, size)
             if usable and candidate is not None and size - candidate.size <= _SIDECAR_INLINE_TAIL:
-                return
+                _snapshot_failure_clear(key)
+                return True
             work = candidate if usable and cached is None else None
             handle = path.open("rb")
             cut = _last_line_end(handle, size)
+            signature = _snapshot_signature(handle, cut)
+            if _snapshot_failure_reason(key, signature) is not None:
+                handle.close()
+                return False
         reader = _RowReader(path)
         try:
             work = work or _Sidecar()
             work.catch_up(handle, reader, limit=cut)
-        except Exception as exc:  # noqa: BLE001 - logged; the in-lock sync rebuilds instead
+        except Exception as exc:  # noqa: BLE001 - remembered and logged; never published
+            reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+            _snapshot_failure_record(key, signature, reason)
             _LOG.info(
-                "candidate ledger index: snapshot pass failed (%s: %s); "
-                "falling back to the in-lock sync",
-                type(exc).__name__,
-                exc,
+                "candidate ledger index: snapshot pass failed (%s); not retried until "
+                "the ledger changes past %d bytes",
+                reason,
+                cut,
             )
-            return
+            return False
         except BaseException:
-            return  # cancelled mid-pass: the in-lock sync rebuilds
+            return False  # cancelled mid-pass: nothing remembered, nothing published
         finally:
             reader.close()
             handle.close()
+        _snapshot_failure_clear(key)
         with _exclusive_lock(lock):
             if _sidecar_cache_get(key) is cached:
                 _sidecar_cache_put(key, work)
+        return True
+
+    def index_degraded_reason(self) -> str | None:
+        """Why the index is being bypassed for this ledger, or ``None`` when it is not."""
+        return _snapshot_failure_current(str(self.path.resolve()))
 
     @contextmanager
     def _run_view(self):
@@ -1973,7 +2034,11 @@ class CandidateLedger:
         ``utf-8`` rejects (their historic behavior is defined by that reader),
         or ends in an unterminated row the index does not cover.
         """
-        self._prepare_sidecar()
+        if not self._prepare_sidecar():
+            # The lock-free pass failed: answer from the streaming readers rather than
+            # rebuilding the whole index under the ledger lock.
+            yield None
+            return
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
             state = self._sync_sidecar()
             if state is None or state.exotic or state.uncovered:
@@ -3536,7 +3601,11 @@ class CandidateLedger:
         ]
         if not run_records:
             return None
-        return _progress_from_records(run, run_records, limit=limit)
+        progress = _progress_from_records(run, run_records, limit=limit)
+        degraded = self.index_degraded_reason()
+        if degraded is not None:
+            progress["ledger_index_degraded"] = degraded
+        return progress
 
 
 def _summarize_runs(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
