@@ -1,24 +1,38 @@
 """Loop guard (issue #13): no REST route or MCP tool may block the event loop.
 
-REST (:7777) and MCP (:8201) share ONE asyncio loop with ``/health``. These
-tests run the real Starlette app and the real FastMCP tool handlers on the test's
-own loop against a real vault whose store and vault-file entry points are made
-slow (every call sleeps ``SLOW_S``). A heartbeat task measures how long the loop
-goes without running it; any store, sidecar or YAML call made ON the loop shows
-up as a gap of at least ``SLOW_S`` and fails the test. Work correctly routed
-through ``store_io`` (or another executor) sleeps on a worker thread and leaves
-the heartbeat untouched.
+REST (:7777) and MCP (:8201) share ONE asyncio loop with ``/health``. The guard is
+structural, not a stopwatch: the real Starlette app and the real FastMCP tool
+handlers run on the test's own loop against a real vault, while the blocking
+entry points are wrapped with recorders that note whether each call ran on the
+event-loop thread. The entry points are the ``IndexedStore`` facade (every
+public method), the sidecar/YAML/JSON loaders and writers (``_jobs``/
+``_ingest_queue`` persist, ``VaultConfig``/``OktoNeuronConfig`` loaders, the vault
+registry and its markers, ``ReviewQueue``, ``CandidateLedger``), ``VaultPool``
+lease/open, and the raw file primitives (``Path.read_text``/``write_text``/
+``open``/..., ``os.replace``, ``builtins.open``) for any path under the test's
+scratch directory, which catches helpers nobody listed. Every call recorded on
+the loop thread fails the test, unless it is listed in ``_ALLOWED_ON_LOOP`` with
+a reason.
 
-The REST cases are parametrized from ``http._routes()`` itself, so a new route
-is covered automatically. ``_ROUTE_EXEMPT`` lists the (documented) exceptions.
+The REST cases are parametrized from ``http._routes()`` itself and the MCP test
+enumerates the server's own tool list, so a new route or tool is covered
+automatically. A heartbeat task stays only as a coarse 1 s smoke test for the
+unknown unknowns; no per-route millisecond budget remains, so load on the host
+cannot flake it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import builtins
 import functools
+import inspect
+import os
 import re
+import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,26 +51,16 @@ from okto_neuron.server import runtime as runtime_mod
 from okto_neuron.server._vault_pool import VaultPool
 from okto_neuron.server.state import get_server_state, init_state, reset_state_for_tests
 
-SLOW_S = 0.2
-"""Every patched store / vault-file call sleeps this long on whatever thread runs it."""
-MAX_LOOP_BLOCK_S = 0.05
-"""The loop may never go longer than this without running the heartbeat."""
+SMOKE_LOOP_BLOCK_S = 1.0
+"""Coarse heartbeat smoke limit: catches a stall the recorders do not know about."""
 _HEARTBEAT_S = 0.005
 
 # Routes deliberately not exercised here, with the reason.
 _ROUTE_EXEMPT: dict[tuple[str, str], str] = {}
 
-# Routes that close and reopen the Ladybug handle. Ladybug's native open/close
-# holds the GIL for ~60-80 ms on a WORKER thread, which the heartbeat sees even
-# though no loop callback runs long (asyncio debug, slow_callback_duration=20 ms,
-# reports none). They get a looser budget that still catches any patched store
-# call made on the loop (each one sleeps SLOW_S = 200 ms).
-_GIL_BOUND_BUDGET_S = 0.15
-_GIL_BOUND_ROUTES: dict[tuple[str, str], str] = {
-    ("POST", "/api/v1/reset"): "wipe + reopen of the Ladybug graph on a store worker",
-    ("POST", "/api/v1/embedding/reembed"): "releases (closes) the Ladybug handle on a worker",
-    ("POST", "/api/v1/vaults/reembed"): "same re-embed coordinator as /embedding/reembed",
-}
+# Recorded labels that are allowed to run on the loop thread, with the reason.
+# A label is matched as a prefix. Keep this empty unless the call is deliberate.
+_ALLOWED_ON_LOOP: dict[str, str] = {}
 
 # Request bodies for routes whose empty-body path would stop at validation before
 # reaching any store work. Everything else gets ``{}`` (or no body for GET).
@@ -126,55 +130,151 @@ def _route_cases() -> list[tuple[str, str]]:
     return cases
 
 
-class _SlowStore:
-    """Delegate every store method, sleeping ``SLOW_S`` first."""
-
-    def __init__(self, inner: Any) -> None:
-        object.__setattr__(self, "_inner", inner)
-
-    def __getattr__(self, name: str) -> Any:
-        value = getattr(self._inner, name)
-        if not callable(value) or name.startswith("__"):
-            return value
-
-        @functools.wraps(value)
-        def _slow(*args: Any, **kwargs: Any) -> Any:
-            time.sleep(SLOW_S)
-            return value(*args, **kwargs)
-
-        return _slow
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        setattr(self._inner, name, value)
+_VAULT_POOL_BLOCKING = frozenset(
+    {
+        "lease",
+        "get_or_open",
+        "adopt",
+        "claim_fenced_ownership",
+        "install_fenced",
+        "release_path",
+        "close_all",
+    }
+)
 
 
-def _slow_fn(fn: Callable[..., Any]) -> Callable[..., Any]:
+class _LoopRecorder:
+    """Records every wrapped call made on the event-loop thread while ``active``."""
+
+    def __init__(self, scratch_root: Path) -> None:
+        self.loop_thread = threading.get_ident()
+        self.active = False
+        self.calls: list[str] = []
+        self.root = str(scratch_root)
+
+    def hit(self, label: str) -> None:
+        if not self.active or threading.get_ident() != self.loop_thread:
+            return
+        where = "?"
+        for frame in reversed(traceback.extract_stack()[:-2]):
+            if "okto_neuron" in frame.filename and "test_event_loop_guard" not in frame.filename:
+                where = f"{Path(frame.filename).name}:{frame.lineno} {frame.name}"
+                break
+        self.calls.append(f"{label} <- {where}")
+
+    def under_root(self, target: Any) -> bool:
+        try:
+            return os.fspath(target).startswith(self.root)
+        except TypeError:
+            return False
+
+    def violations(self) -> list[str]:
+        return [
+            call
+            for call in self.calls
+            if not any(call.startswith(prefix) for prefix in _ALLOWED_ON_LOOP)
+        ]
+
+
+def _recording(fn: Callable[..., Any], label: str, rec: _LoopRecorder) -> Callable[..., Any]:
     @functools.wraps(fn)
-    def _slow(*args: Any, **kwargs: Any) -> Any:
-        time.sleep(SLOW_S)
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        rec.hit(label)
         return fn(*args, **kwargs)
 
-    return _slow
+    return _wrapped
 
 
-def _make_everything_slow(monkeypatch: pytest.MonkeyPatch, vault: Vault) -> None:
-    """Slow down the store and the vault-file/YAML entry points a handler uses."""
+def _record_class(
+    monkeypatch: pytest.MonkeyPatch,
+    cls: type,
+    rec: _LoopRecorder,
+    only: frozenset[str] | None = None,
+) -> None:
+    """Wrap every public function, classmethod and staticmethod defined on ``cls``
+    (or only the names in ``only``)."""
+    for name, attr in list(vars(cls).items()):
+        if name.startswith("_") or (only is not None and name not in only):
+            continue
+        label = f"{cls.__name__}.{name}"
+        if isinstance(attr, classmethod):
+            wrapped: Any = classmethod(_recording(attr.__func__, label, rec))
+        elif isinstance(attr, staticmethod):
+            wrapped = staticmethod(_recording(attr.__func__, label, rec))
+        elif inspect.isfunction(attr):
+            wrapped = _recording(attr, label, rec)
+        else:
+            continue
+        monkeypatch.setattr(cls, name, wrapped)
+
+
+def _record_function_everywhere(
+    monkeypatch: pytest.MonkeyPatch, fn: Callable[..., Any], label: str, rec: _LoopRecorder
+) -> None:
+    """Replace ``fn`` with a recorder in every okto_neuron module that imported it."""
+    wrapper = _recording(fn, label, rec)
+    for module in list(sys.modules.values()):
+        if not getattr(module, "__name__", "").startswith("okto_neuron"):
+            continue
+        for attr, value in list(vars(module).items()):
+            if value is fn:
+                monkeypatch.setattr(module, attr, wrapper)
+
+
+def _instrument(monkeypatch: pytest.MonkeyPatch, rec: _LoopRecorder) -> None:
+    """Install recorders on the blocking entry points (see the module docstring)."""
     import okto_neuron.vault_registry as registry
     from okto_neuron.config import VaultConfig
+    from okto_neuron.config._app_config import OktoNeuronConfig
+    from okto_neuron.consolidate.ledger import CandidateLedger
+    from okto_neuron.consolidate.review_queue import ReviewQueue
+    from okto_neuron.store.index.indexed import IndexedStore
 
-    monkeypatch.setattr(vault, "store", _SlowStore(vault.store))
-    slow_list_vaults = _slow_fn(registry.list_vaults)
-    monkeypatch.setattr(registry, "list_vaults", slow_list_vaults)
-    monkeypatch.setattr(http_mod, "list_vaults", slow_list_vaults)
-    monkeypatch.setattr(VaultConfig, "load", classmethod(_slow_fn(VaultConfig.load.__func__)))
-    monkeypatch.setattr(
+    for cls in (
+        IndexedStore,
         VaultConfig,
-        "load_application_defaults",
-        classmethod(_slow_fn(VaultConfig.load_application_defaults.__func__)),
-    )
-    monkeypatch.setattr(_jobs, "persist", _slow_fn(_jobs.persist))
-    monkeypatch.setattr(iq, "persist", _slow_fn(iq.persist))
-    monkeypatch.setattr(VaultPool, "lease", _slow_fn(VaultPool.lease))
+        OktoNeuronConfig,
+        ReviewQueue,
+        CandidateLedger,
+    ):
+        _record_class(monkeypatch, cls, rec)
+    # VaultPool: only the calls that open, lease or close a vault. peek, is_fenced,
+    # lease_count and paths are in-memory bookkeeping under a lock, not blocking I/O.
+    _record_class(monkeypatch, VaultPool, rec, only=_VAULT_POOL_BLOCKING)
+    for fn in (_jobs.persist, iq.persist):
+        _record_function_everywhere(monkeypatch, fn, f"{fn.__module__}.{fn.__name__}", rec)
+    for name, fn in list(vars(registry).items()):
+        if not name.startswith("_") and inspect.isfunction(fn) and fn.__module__ == registry.__name__:
+            _record_function_everywhere(monkeypatch, fn, f"vault_registry.{name}", rec)
+
+    # Raw file primitives, recorded only for paths under the scratch directory, so a
+    # helper that reads or writes a sidecar without going through a listed entry
+    # point is still caught.
+    for name in ("read_text", "read_bytes", "write_text", "write_bytes", "open"):
+        original = getattr(Path, name)
+
+        def _path_wrapper(self: Path, *args: Any, _o: Any = original, _n: str = name, **kw: Any):
+            if rec.under_root(self):
+                rec.hit(f"Path.{_n}({self.name})")
+            return _o(self, *args, **kw)
+
+        monkeypatch.setattr(Path, name, _path_wrapper)
+
+    real_open = builtins.open
+    real_replace = os.replace
+
+    def _open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        if not isinstance(file, int) and rec.under_root(file):
+            rec.hit(f"open({Path(os.fspath(file)).name})")
+        return real_open(file, *args, **kwargs)
+
+    def _replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+        if rec.under_root(dst):
+            rec.hit(f"os.replace({Path(os.fspath(dst)).name})")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _open)
+    monkeypatch.setattr(os, "replace", _replace)
 
 
 class _LoopMonitor:
@@ -236,9 +336,10 @@ def guarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         http_mod, "_companion", lambda state: Companion(state.vault, provider=StubLLM())
     )
     state = init_state(vault, Path(vault.path))
-    _make_everything_slow(monkeypatch, vault)
+    recorder = _LoopRecorder(tmp_path)
+    _instrument(monkeypatch, recorder)
     try:
-        yield state, Path(vault.path)
+        yield state, Path(vault.path), recorder
     finally:
         reset_state_for_tests()
 
@@ -265,7 +366,7 @@ def _fill(value: Any, vault_path: Path) -> Any:
 async def test_rest_route_never_blocks_event_loop(guarded, method: str, path: str) -> None:
     if (method, path) in _ROUTE_EXEMPT:
         pytest.skip(_ROUTE_EXEMPT[(method, path)])
-    state, vault_path = guarded
+    state, vault_path, rec = guarded
     url = re.sub(r"\{(\w+)\}", lambda match: f"guard-{match.group(1)}", path)
     body = _fill(_BODIES.get((method, path), {}), vault_path)
     kwargs: dict[str, Any] = {} if method == "GET" else {"json": body}
@@ -273,19 +374,27 @@ async def test_rest_route_never_blocks_event_loop(guarded, method: str, path: st
     app = http_mod.build_rest_app(state)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50123))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
-        # Warm-up: first-call lazy imports are a one-off cost, not a store call;
-        # every patched store/vault-file call stays slow on every request.
+        # Warm-up: first-call lazy imports and lazily created state are a one-off
+        # cost; the measured request is the second one.
         await client.request(method, url, timeout=120, **kwargs)
         await _settle_background(state)
-        async with _LoopMonitor() as monitor:
-            response = await client.request(method, url, timeout=120, **kwargs)
+        rec.calls.clear()
+        rec.active = True
+        try:
+            async with _LoopMonitor() as monitor:
+                response = await client.request(method, url, timeout=120, **kwargs)
+        finally:
+            rec.active = False
         await _settle_background(state)
 
     assert response.status_code < 600
-    budget = _GIL_BOUND_BUDGET_S if (method, path) in _GIL_BOUND_ROUTES else MAX_LOOP_BLOCK_S
-    assert monitor.max_gap < budget, (
-        f"{method} {path} blocked the event loop for {monitor.max_gap * 1000:.0f} ms "
-        f"(status {response.status_code}); route its store/vault-file work through store_io"
+    assert not rec.violations(), (
+        f"{method} {path} ran blocking calls on the event loop thread "
+        f"(status {response.status_code}); route them through store_io:\n  "
+        + "\n  ".join(rec.violations())
+    )
+    assert monitor.max_gap < SMOKE_LOOP_BLOCK_S, (
+        f"{method} {path} starved the event loop heartbeat for {monitor.max_gap * 1000:.0f} ms"
     )
 
 
@@ -311,7 +420,7 @@ async def test_every_mcp_tool_never_blocks_event_loop(
 ) -> None:
     from fastmcp import Client
 
-    state, _vault_path = guarded
+    state, _vault_path, rec = guarded
     monkeypatch.setattr(
         http_mod, "companion_for", lambda vault: Companion(vault, provider=StubLLM())
     )
@@ -324,12 +433,22 @@ async def test_every_mcp_tool_never_blocks_event_loop(
             # Warm-up for first-call imports, then the measured call.
             await client.call_tool(name, warm_args, raise_on_error=False)
             await _settle_background(state)
-            async with _LoopMonitor() as monitor:
-                result = await client.call_tool(name, args, raise_on_error=False)
+            rec.calls.clear()
+            rec.active = True
+            try:
+                async with _LoopMonitor() as monitor:
+                    result = await client.call_tool(name, args, raise_on_error=False)
+            finally:
+                rec.active = False
             await _settle_background(state)
             assert not result.is_error, f"MCP tool {name} failed: {result.content}"
-            assert monitor.max_gap < MAX_LOOP_BLOCK_S, (
-                f"MCP tool {name} blocked the event loop for {monitor.max_gap * 1000:.0f} ms"
+            assert not rec.violations(), (
+                f"MCP tool {name} ran blocking calls on the event loop thread:\n  "
+                + "\n  ".join(rec.violations())
+            )
+            assert monitor.max_gap < SMOKE_LOOP_BLOCK_S, (
+                f"MCP tool {name} starved the event loop heartbeat "
+                f"for {monitor.max_gap * 1000:.0f} ms"
             )
 
 
@@ -341,7 +460,7 @@ async def test_concurrent_predicate_polls_share_one_scan_and_health_stays_fast(
     keeps answering quickly on the same loop."""
     import okto_neuron.predicates as predicates
 
-    state, _vault_path = guarded
+    state, _vault_path, _rec = guarded
     http_mod._PREDICATE_VOCAB_CACHE.clear()
     scans: list[float] = []
     real_collect = predicates.collect_predicate_vocabulary
@@ -373,7 +492,7 @@ async def test_concurrent_predicate_polls_share_one_scan_and_health_stays_fast(
     assert len({response.json()["vocabulary_size"] for response in responses}) == 1
     assert len(scans) == 1, f"expected one shared scan, saw {len(scans)}"
     assert len(health_latencies) >= 5
-    assert max(health_latencies) < 0.1, f"/health max {max(health_latencies) * 1000:.0f} ms"
+    assert max(health_latencies) < SMOKE_LOOP_BLOCK_S, f"/health max {max(health_latencies) * 1000:.0f} ms"
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +626,7 @@ async def test_big_payload_is_never_serialised_on_the_loop(
 
     patch, url = _BIG_CASES[case]
     patch(monkeypatch)
-    state, _vault_path = guarded
+    state, _vault_path, _rec = guarded
 
     real_dumps = json.dumps
     calls: list[tuple[bool, int]] = []
