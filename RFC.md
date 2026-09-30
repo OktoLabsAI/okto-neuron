@@ -321,6 +321,12 @@ whole pass, and the pass only checks that generation at its start.
 `tests/server/test_event_loop_guard.py` fails any route or MCP tool that blocks the loop for
 more than 50 ms against a deliberately slow store, and `test_no_default_executor.py` fails on
 any new default-executor offload.
+Graph reads on grafx retry a transient driver error inside the store adapter: when another
+process publishes a commit between grafx's view snapshot and its exact read, the driver raises a
+retryable error (`index_view_changed`), and `GrafxStore` retries the read (at most 6 attempts,
+jittered backoff from 10 ms to 200 ms, 2 s total) so `get_node`, `get_nodes` and `list_*` never
+surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
+exhausted budget reaches the caller as `GraphBackendError` with `retryable=True`.
 
 Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and

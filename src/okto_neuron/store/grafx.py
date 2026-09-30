@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +107,15 @@ from okto_neuron.store.integrity import EdgeAdjacencyObservation
 from okto_neuron.store.protocol import BackendHealth, DriftReport, RecoveryStatus
 
 _T = TypeVar("_T")
+
+#: Bounded retry policy for READS that hit a retryable grafx error (for example
+#: ``index_view_changed`` when another process publishes a commit between the
+#: view snapshot and the exact read). Deliberately small: a view change heals on
+#: the next attempt, so this adds at most ~2 s to a pathological read and
+#: nothing to a healthy one. Writes keep the D-10 policy in ``_retry_policy``.
+_READ_RETRY_POLICY = RetryConfig(
+    max_attempts=6, backoff_base_ms=10, backoff_cap_ms=200, total_cap_s=2.0
+)
 
 
 class _IdentityRow(TypedDict):
@@ -127,6 +137,11 @@ _EMBED_SPACE_NAME = "node_embed"
 
 #: Preserves Ladybug's `DOUBLE[dim]` fidelity; Grafx's own default is float32.
 _EMBED_STORAGE_DTYPE = "float64"
+
+
+def _read_retry_sleep(seconds: float) -> None:
+    """Indirection so tests can observe/skip the read-retry backoff."""
+    time.sleep(seconds)
 
 
 class GrafxWriteExhausted(GraphWriteExhausted):
@@ -778,15 +793,30 @@ class GrafxStore:
         translating before the retry loop would make every write look
         non-retryable. Writes are translated after retry gives up instead.
         """
-        try:
+        def read() -> list[dict[str, Any]]:
             if params is None:
                 # list_edge_adjacency passes no parameters; _db.execute treats
                 # them as optional and so must this wrapper.
                 return self._db.execute(statement).dictionaries()
             return self._db.execute(statement, params).dictionaries()
+
+        try:
+            # Reads are idempotent, so a driver-flagged retryable failure is
+            # retried here with jittered backoff; callers never see a transient
+            # view change. Anything not flagged retryable surfaces immediately.
+            return retry_with_backoff(
+                read,
+                policy=_READ_RETRY_POLICY,
+                is_retryable=lambda exc: bool(getattr(exc, "retryable", False)),
+                sleep=_read_retry_sleep,
+            )
         except grafx_errors.GrafxError as exc:
             raise GraphBackendError(
-                str(exc), backend="grafx", vault_path=self.vault_path, cause=exc
+                str(exc),
+                backend="grafx",
+                vault_path=self.vault_path,
+                cause=exc,
+                retryable=bool(getattr(exc, "retryable", False)),
             ) from exc
 
     def _execute_write(self, statement: str, params: Mapping[str, object]) -> None:

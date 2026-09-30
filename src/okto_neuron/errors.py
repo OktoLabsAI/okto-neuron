@@ -451,8 +451,14 @@ class GraphBackendError(OktoNeuronError):
         vault_path: PathInput | None = None,
         file_path: PathInput | None = None,
         cause: Exception | None = None,
+        retryable: bool = False,
     ) -> None:
         self.backend = backend
+        # True when the driver itself flagged the failure transient (for grafx,
+        # ``GrafxError.retryable``: e.g. ``index_view_changed`` after another
+        # process published a commit). A caller may retry; a False value never
+        # heals by repeating the call.
+        self.retryable = retryable
         if message is not None and backend:
             message = f"{backend} backend: {message}"
         super().__init__(message, vault_path=vault_path, file_path=file_path, cause=cause)
