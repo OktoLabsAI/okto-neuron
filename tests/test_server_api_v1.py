@@ -24,6 +24,7 @@ from starlette.testclient import TestClient
 from okto_neuron import Vault
 from okto_neuron._internal.infra import INFRA_FACET
 from okto_neuron.companion import Companion
+from okto_neuron.config._vault import DEFAULT_CURATION_CALL_TIMEOUT_S
 from okto_neuron.consolidate import NodeCandidate
 from okto_neuron.consolidate.ledger import CandidateLedger
 from okto_neuron.core.schema import Edge, Node
@@ -1455,7 +1456,7 @@ def test_config_get_exposes_adr0015_knobs(client: TestClient) -> None:
     assert r.status_code == 200, r.text
     cons = r.json()["consolidation"]
     assert cons["curation_max_concurrent"] == 1
-    assert cons["curation_call_timeout_s"] is None
+    assert cons["curation_call_timeout_s"] == DEFAULT_CURATION_CALL_TIMEOUT_S  # issue #24
     assert cons["curation_batch_size"] == 1
     assert cons["prefilter"]["enabled"] is False
     assert cons["prefilter"]["established_entity_fastpath"] is True
