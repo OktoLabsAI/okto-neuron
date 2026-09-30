@@ -346,6 +346,18 @@ is re-entrant, so its own jobs never contend with it. On a filesystem without wo
 for that vault and the daemon logs a startup warning naming it, because nothing then stops a
 second writer. Lock order is writer lease, then `.graph-handle.lock`, then engine locks.
 
+On the CLI side, every writer goes through one helper (`store/vault_writer.py::vault_writer`)
+that takes the lease before the command opens the vault and releases it on exit. A refusal prints
+`cannot <operation>: this vault is being written by daemon pid <pid> (serve)`, then either the
+API call on the running daemon (`POST /api/v1/reset`, `/api/v1/curation/rebuild`, `reembed`,
+`heal`, `/api/v1/reconcile/propose|apply|review/confirm|review/reject`, `PATCH /api/v1/config`)
+or `stop the daemon first (okto-neuron stop)`; a CLI holder gets "wait for it to finish". The
+per-vault pid check in `kg rebuild`/`reembed`/`reindex`/`snapshot dump` and the `init --wipe`
+pid probe are gone: the lease is the only gate. `kg reconcile review list` reads the review queue
+and the authority index straight from their JSON files and never opens the graph store, so it
+runs while the daemon holds the lease. The `.graph-handle.lock`, `.marginalia/.bootstrap.lock`
+and `reembed.state.json` left behind by a failed 0.3.1 `kg reembed` are ignored by the guard.
+
 The daemon takes the lease before it registers a runtime, opens a startup vault or opens a pooled
 handle. If a CLI command holds it, the request gets a 409 `vault_busy` naming the holder's pid
 and operation, and vault discovery skips that vault (logged once) and retries on its next pass,
