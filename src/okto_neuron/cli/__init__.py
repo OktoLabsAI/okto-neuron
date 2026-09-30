@@ -946,6 +946,47 @@ def kg_reconcile_review_group() -> None:
     """
 
 
+@kg_group.group("review-queue")
+def kg_review_queue_group() -> None:
+    """Review queue storage: migrate review_queue.json to SQLite, or roll back."""
+
+
+@kg_review_queue_group.command("migrate")
+@click.option("--vault", type=click.Path(path_type=Path), help="Vault name or path to target.")
+@click.option("--dry-run", is_flag=True, help="Verify the migration without writing anything.")
+@click.option(
+    "--rollback",
+    is_flag=True,
+    help="Regenerate review_queue.json from SQLite and set the vault back to yaml version 1.",
+)
+@click.option(
+    "--restore-backup",
+    is_flag=True,
+    help="Roll back by restoring the literal review_queue.json.bak-v1 (drops later changes).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+@click.pass_context
+def kg_review_queue_migrate_command(
+    ctx: click.Context,
+    vault: Path | None,
+    dry_run: bool,
+    rollback: bool,
+    restore_backup: bool,
+    as_json: bool,
+) -> None:
+    """Migrate a vault's review queue to SQLite (idempotent, resumable, verified)."""
+    ctx.exit(
+        _run_kg_command(
+            "kg_review_queue_migrate",
+            vault,
+            dry_run=dry_run,
+            rollback=rollback,
+            restore_backup=restore_backup,
+            as_json=as_json,
+        )
+    )
+
+
 @kg_reconcile_review_group.command("list")
 @click.argument("vault", required=False, type=click.Path(path_type=Path))
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")

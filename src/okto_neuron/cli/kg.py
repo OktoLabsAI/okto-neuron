@@ -3316,6 +3316,61 @@ def kg_snapshot_load(
         return 0
 
 
+def kg_review_queue_migrate(
+    vault: Path | None,
+    *,
+    dry_run: bool = False,
+    rollback: bool = False,
+    restore_backup: bool = False,
+    as_json: bool = False,
+) -> int:
+    """Move a vault's review queue between ``review_queue.json`` and SQLite (#14).
+
+    ``--dry-run`` reads and verifies only and writes nothing in the vault, so it
+    takes no lease. Migrate and both rollback modes hold the vault's writer lease
+    (exit 5 while a daemon or another command holds it).
+    """
+    from okto_neuron.consolidate import review_queue_migration as migration
+
+    chosen = [name for name, on in (("--dry-run", dry_run), ("--rollback", rollback), ("--restore-backup", restore_backup)) if on]
+    if len(chosen) > 1:
+        raise click.UsageError(f"{' and '.join(chosen)} are mutually exclusive")
+    vault_path = _resolve_rebuild_vault(vault)
+    if not vault_path.is_dir():
+        raise migration.ReviewQueueMigrationError(f"vault not found: {vault_path}", vault_path=vault_path)
+
+    def run() -> "migration.MigrationReport":
+        if rollback or restore_backup:
+            return migration.rollback(vault_path, restore_backup=restore_backup)
+        return migration.migrate(vault_path, dry_run=dry_run)
+
+    if dry_run:
+        report = run()
+    else:
+        operation = "review-queue rollback" if rollback or restore_backup else "review-queue migrate"
+        with vault_writer(vault_path, operation):
+            report = run()
+
+    if as_json:
+        click.echo(json.dumps(report.as_dict(), indent=2))
+        return 0
+    click.echo(f"review-queue {report.action}: {report.outcome} ({report.seconds}s)")
+    if report.source_count or report.migrated_count:
+        click.echo(
+            f"  entries: source={report.source_count} sqlite={report.migrated_count} "
+            f"(nodes={report.nodes}, relations={report.relations}) hash-equal={report.hash_equal}"
+        )
+    if report.source_bytes or report.sqlite_bytes:
+        click.echo(f"  bytes: json={report.source_bytes} sqlite={report.sqlite_bytes}")
+    if report.backup:
+        click.echo(f"  backup: {report.backup}")
+    for note in report.notes:
+        click.echo(f"  {note}")
+    if report.dry_run:
+        click.echo("  dry run: nothing was written")
+    return 0
+
+
 __all__ = [
     "kg_init",
     "kg_rebuild",
@@ -3325,6 +3380,7 @@ __all__ = [
     "kg_reconcile_review_list",
     "kg_reconcile_review_confirm",
     "kg_reconcile_review_reject",
+    "kg_review_queue_migrate",
     "kg_reconcile_heal",
     "kg_snapshot_dump",
     "kg_snapshot_verify",
