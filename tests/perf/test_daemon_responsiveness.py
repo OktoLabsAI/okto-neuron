@@ -11,7 +11,8 @@ replays the pages' poll mix, and measures what a user and an agent feel:
 Fails when ``/health`` p99 >= 100 ms or MCP connect p99 >= 1 s.
 
 Skipped unless ``OKTO_NEURON_PERF=1`` (and deselected by ``-m 'not perf'``).
-CI (a dedicated, non-blocking job; the grafx fixture is cached between runs)::
+CI runs it nightly and on demand in ``.github/workflows/daemon-perf.yml`` (never
+on push/PR; the grafx fixture is cached between runs), equivalent to::
 
     OKTO_NEURON_PERF=1 OKTO_NEURON_PERF_CACHE=$RUNNER_TEMP/okto-neuron-perf \\
       uv run --extra ladybug --extra grafx python -m pytest -m perf -s \\

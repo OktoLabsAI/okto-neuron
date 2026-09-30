@@ -1,0 +1,68 @@
+name: daemon-perf
+
+# Real-server responsiveness load test (issues #13 / #18). Starts
+# `okto-neuron serve` on free ports against a synthetic real-scale vault
+# (4k nodes / 13k edges / 2.5k Claims / 2k review items), replays the web UI's
+# poll mix, and fails when /health p99 >= 100 ms or MCP connect+list_vaults
+# p99 >= 1 s (thresholds live in tests/perf/test_daemon_responsiveness.py).
+#
+# Nightly and on demand only: it measures wall-clock latency on a shared
+# runner, so it is informative rather than a merge gate, and it never runs on
+# push/PR. The synthetic vault is built once through batched grafx write
+# transactions and cached; the key hashes the generator and the lockfile (the
+# grafx version decides the on-disk format), so either change rebuilds it.
+
+on:
+  schedule:
+    # 04:41 UTC daily.
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_s:
+        description: "Seconds to replay the poll mix"
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  responsiveness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+
+      - name: Verify committed lockfile
+        run: uv lock --check
+
+      - name: Restore or build the synthetic vault cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/okto-neuron-perf
+          key: daemon-perf-vault-${{ runner.os }}-${{ hashFiles('tests/perf/_synthetic_vault.py', 'uv.lock') }}
+
+      - name: Run the responsiveness load test
+        env:
+          OKTO_NEURON_PERF: "1"
+          OKTO_NEURON_PERF_CACHE: ${{ runner.temp }}/okto-neuron-perf
+          OKTO_NEURON_PERF_DURATION_S: ${{ inputs.duration_s || '60' }}
+          OKTO_NEURON_PERF_REPORT: ${{ runner.temp }}/daemon-perf-report.json
+        run: |
+          set -euo pipefail
+          uv run --extra ladybug --extra grafx python -m pytest -m perf -s -q \
+            -p no:cacheprovider tests/perf/test_daemon_responsiveness.py
+
+      - name: Upload the latency report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: daemon-perf-report
+          path: ${{ runner.temp }}/daemon-perf-report.json
+          if-no-files-found: warn
