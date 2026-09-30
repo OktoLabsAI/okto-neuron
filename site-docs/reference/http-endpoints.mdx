@@ -253,6 +253,20 @@ Three further asymmetries are worth knowing before you read a response:
 - `degree` means different things on the two graph endpoints. On `/api/v1/graph` it is computed over the full filtered subgraph before the cap. On `/neighbors` it is computed only within the returned set.
 - On `/api/v1/graph/stats`, `total_nodes` counts visible nodes only, while `total_edges` counts every edge with no filtering. They do not describe one population.
 
+## Maintained projection reads
+
+`GET /api/v1/graph/stats` and `GET /api/v1/upkeep/predicates` never scan the graph themselves. They read one projection per vault that the daemon rebuilds in the background after writes, so they answer at once even on a large vault.
+
+| Situation | Response |
+| --- | --- |
+| No projection yet (first read after start, no usable sidecar) | `202` with `{"status": "building"}`; the first rebuild starts. Poll again. |
+| Projection current | `200` with the existing body plus `"stale": false, "rebuilding": false` (graph stats also carry `projection_age_s`). |
+| A write happened since it was built | `200` with the last projection and `"stale": true, "rebuilding": true` until the rebuild finishes. |
+
+Counts can therefore lag a write by one rebuild (at least `[server] projection_min_interval_s`, default 5 s, after the previous rebuild ended). A projection older than `[server] projection_max_age_s` (default 600 s) is stale even without a local write, which covers writes from another process.
+
+`POST /api/v1/upkeep/rebuild-stats` forces a rebuild now and answers `202` with `{"status": "rebuilding", "started": true|false}` (`false`: one was already running and will rescan once more). `okto-neuron upkeep rebuild-stats` calls it. The route is restricted to loopback callers like the other upkeep routes.
+
 ## Response bodies
 
 Response fields are documented here only where a CLI `--format json` or `--json` path dumps them, or where the handler's return was read directly. Field sets may change without notice while Okto Neuron is prerelease (0.3.1).

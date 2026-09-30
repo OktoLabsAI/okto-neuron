@@ -83,6 +83,22 @@ DEFAULT_HOST = "127.0.0.1"
 _LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def _configure_projection() -> None:
+    """``[server] projection_min_interval_s`` / ``projection_max_age_s`` (defaults 5 s / 600 s);
+    a broken app config falls back to the defaults, like the executor sizes."""
+    from okto_neuron.config import OktoNeuronConfig
+    from okto_neuron.server import _projection
+
+    try:
+        server = OktoNeuronConfig.load().server
+        _projection.configure(
+            min_interval_s=float(server.projection_min_interval_s),
+            max_age_s=float(server.projection_max_age_s),
+        )
+    except Exception as exc:  # noqa: BLE001 - startup must not die on this knob
+        _LOG.warning("could not read [server] projection settings (%s); using defaults", exc)
+
+
 def _configured_executor_workers() -> tuple[int, int]:
     """``[server] store_workers`` / ``job_workers`` from ``okto-neuron.toml``
     (defaults 4 and 2).
@@ -264,6 +280,12 @@ def _runtime_tasks(state: ServerState) -> set[asyncio.Task]:
     return tasks
 
 
+def _projection_tasks() -> set[asyncio.Task]:
+    from okto_neuron.server._projection import projection_tasks
+
+    return set(projection_tasks())
+
+
 def _runtime_writer_locks(state: ServerState) -> tuple[asyncio.Lock, ...]:
     """Return every distinct writer lock that must be clear before pool close."""
     locks = [state.writer_lock]
@@ -377,7 +399,7 @@ async def _graceful_shutdown(
             for task in (scheduler_task, folder_watch_task):
                 if task is not None and not task.done():
                     task.cancel()
-            owned_tasks |= _runtime_tasks(state)
+            owned_tasks |= _runtime_tasks(state) | _projection_tasks()
             for task in (scheduler_task, folder_watch_task):
                 if task is not None:
                     owned_tasks.add(task)
@@ -2158,6 +2180,7 @@ async def _run_async(
     # blocks the loop that serves /health, REST and MCP. Shut down in the
     # ``finally`` below after the vaults close.
     configure_executors(*_configured_executor_workers())
+    _configure_projection()
 
     # Pin the configured LLM providers' lazy imports (litellm, boto3) into this
     # process NOW, while the launch-time environment is intact — see the helper's

@@ -73,6 +73,14 @@ class ServerSettings(BaseModel):
     """Threads in the daemon's bounded job executor: curation job runners,
     ingest/remember extraction, answer synthesis and re-embed. Kept apart from
     the store executor so long jobs never starve UI reads."""
+    projection_min_interval_s: float = Field(default=5.0, ge=0.0, le=3600.0)
+    """Minimum seconds between two rebuilds of a vault's maintained projection (predicate
+    stats + graph counts behind ``GET /api/v1/graph/stats`` and ``/api/v1/upkeep/predicates``),
+    measured from the end of the previous one. Writes inside the window collapse into one
+    follow-up rebuild."""
+    projection_max_age_s: float = Field(default=600.0, ge=1.0, le=86400.0)
+    """A projection older than this counts as stale even if no write went through this
+    process (covers writes from another process, which cannot move the in-process counter)."""
 
 
 class OktoNeuronConfig(BaseModel):

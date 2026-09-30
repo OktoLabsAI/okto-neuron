@@ -68,7 +68,7 @@ from okto_neuron.semantic_quality import (
     evaluate_ledger_scan as evaluate_semantic_ledger_scan,
 )
 from okto_neuron.semantic_quality import evaluate_store as evaluate_semantic_quality
-from okto_neuron.server import _curation, _jobs, _scheduler
+from okto_neuron.server import _curation, _jobs, _projection, _scheduler
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
@@ -3069,14 +3069,8 @@ def _matches_query(node: Any, q: str) -> bool:
 # facet also marks relation endpoints the companion auto-promoted (companion
 # Fix A), which are genuine entities ("Naturgy", "Itau VISA", a person's name).
 # Hiding those would be far worse than the noise being removed.
-_STRUCTURAL_CLAIM_PREDICATES: Final = frozenset({"has_heading", "has_tag", "links_to"})
-
-
-def _is_structural_claim(node: Any) -> bool:
-    if str(getattr(node, "type", "")) != "Claim":
-        return False
-    facets = getattr(node, "facets", None) or {}
-    return facets.get("P") in _STRUCTURAL_CLAIM_PREDICATES
+_STRUCTURAL_CLAIM_PREDICATES: Final = _projection.STRUCTURAL_CLAIM_PREDICATES
+_is_structural_claim = _projection.is_structural_claim
 
 
 def _include_structural(request: Request) -> bool:
@@ -3576,55 +3570,35 @@ async def api_graph_stats(request: Request) -> JSONResponse:
     """Counts for the filter controls: node-type counts (closed schema) + the
     open-vocabulary edge-type counts, plus totals.
 
-    A full node+edge scan: concurrent polls of the same vault share one scan."""
+    Served from the vault's maintained projection (``server/_projection.py``): it never
+    scans the graph itself. The body carries ``stale`` and ``rebuilding`` flags next to the
+    counts; a vault with no projection yet answers 202 ``{"status": "building"}``."""
     state = get_state()
     if state.shutting_down:
         return _draining_response()
     include_structural = _include_structural(request)
-    body = await _graph_read_shared(
-        "graph-stats",
-        ("graph_stats", str(state.vault_path), include_structural),
-        _graph_stats_payload,
-        state,
-        include_structural,
-    )
-    return body
-
-
-def _graph_stats_payload(
-    state: ServerState | VaultRuntime, include_structural: bool
-) -> dict[str, Any]:
-    """Store op: node-type and edge-type census over the whole graph."""
-    node_counts: dict[str, int] = {t: 0 for t in CLOSED_NODE_TYPES}
-    edge_counts: dict[str, int] = {}
-    total_nodes = 0
-    total_edges = 0
-    store = _store(state)
-    for node in store.list_nodes():
-        if is_infra(node) or (not include_structural and _is_structural_claim(node)):
-            continue
-        t = str(getattr(node, "type", ""))
-        if t in node_counts:
-            node_counts[t] += 1
-            total_nodes += 1
-    for edge in store.list_edges():
-        et = str(getattr(edge, "type", ""))
-        edge_counts[et] = edge_counts.get(et, 0) + 1
-        total_edges += 1
-
-    node_types = [
-        {"type": t, "count": node_counts[t]}
-        for t in (*_PRIMITIVE_TYPES, *_SUPPORT_TYPES)
-        if node_counts[t] > 0
-    ]
-    edge_types = [{"type": t, "count": edge_counts[t]} for t in sorted(edge_counts)]
-    return {
-        "status": "ok",
-        "node_types": node_types,
-        "edge_types": edge_types,
-        "total_nodes": total_nodes,
-        "total_edges": total_edges,
-    }
+    try:
+        read = await _projection.manager_for(state.vault_path).read(state)
+    except VaultClosedError as exc:
+        return _err(503, "vault_closed", str(exc))
+    except OktoNeuronError as exc:
+        return _err(500, "graph_read_failed", str(exc))
+    except Exception:  # noqa: BLE001
+        _LOG.exception("unexpected graph-stats failure")
+        return _internal_error()
+    if read.projection is None:
+        return JSONResponse({"status": "building"}, status_code=202)
+    # The counts arrive pre-encoded from the worker that built them; only the small flag
+    # fields are encoded here, then spliced in.
+    tail = encode_json(
+        {
+            "stale": read.stale,
+            "rebuilding": read.rebuilding,
+            "projection_age_s": round(max(0.0, time.time() - read.projection.built_at), 1),
+        }
+    )[1:]
+    body = read.projection.graph_stats_json[include_structural]
+    return json_bytes_response(body[:-1] + b"," + tail)
 
 
 async def api_graph_integrity(request: Request) -> JSONResponse:
@@ -6862,6 +6836,21 @@ def _upkeep_gate(request: Request) -> JSONResponse | None:
     return None
 
 
+async def api_upkeep_rebuild_stats(request: Request) -> JSONResponse:
+    """Rebuild the vault's maintained projection now (predicate stats + graph counts).
+
+    Read-only on the graph. Answers 202 at once: the rebuild runs on the job executor, skips
+    the usual spacing, and joins the one already in flight when there is one (``started`` is
+    false then, and the running rebuild rescans once more). Poll ``GET /api/v1/graph/stats``
+    or ``/api/v1/upkeep/predicates`` for ``rebuilding: false``."""
+    gate = _upkeep_gate(request)
+    if gate is not None:
+        return gate
+    state = get_state()
+    started = _projection.manager_for(state.vault_path).ensure(state, force=True)
+    return JSONResponse({"status": "rebuilding", "started": started}, status_code=202)
+
+
 async def api_predicate_upkeep_propose(request: Request) -> JSONResponse:
     """Submit a READ-ONLY predicate canonicalization proposal job."""
     gate = _upkeep_gate(request)
@@ -6916,37 +6905,25 @@ async def api_companion_triage(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "job": job.to_public()})
 
 
-_PREDICATE_VOCAB_CACHE: dict[str, tuple[float, int]] = {}
-_PREDICATE_VOCAB_TTL_S = 60.0
-
-
-def _predicate_vocabulary_size(state: "ServerState") -> int:
-    """Full edge+claim scan — heavy on Ladybug; cached per vault for 60s."""
-    from okto_neuron.predicates import collect_predicate_vocabulary
-
-    key = str(state.vault_path)
-    now = time.time()
-    cached = _PREDICATE_VOCAB_CACHE.get(key)
-    if cached is not None and now - cached[0] < _PREDICATE_VOCAB_TTL_S:
-        return cached[1]
-    size = len(collect_predicate_vocabulary(state.vault.store))
-    _PREDICATE_VOCAB_CACHE[key] = (now, size)
-    return size
-
-
 async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
     """Predicate alias index snapshot grouped by status.
 
-    The UI polls this every few seconds from several panels. The alias-index
-    read and the vocabulary scan run as ONE single-flight store op per vault,
-    so concurrent polls share a single execution instead of piling up scans."""
+    The UI polls this every few seconds from several panels. The vocabulary size comes from
+    the vault's maintained projection (``server/_projection.py``), never from a scan here:
+    the body carries ``stale``/``rebuilding`` next to it, and a vault with no projection yet
+    answers 202 ``{"status": "building"}``. The alias-index read is ONE single-flight store
+    op per vault, so concurrent polls share a single execution."""
     gate = _upkeep_gate(request)
     if gate is not None:
         return gate
 
     state = get_state()
     try:
-        records_json, counts, vocabulary_size = await single_flight(
+        read = await _projection.manager_for(state.vault_path).read(state)
+        if read.projection is None:
+            return JSONResponse({"status": "building"}, status_code=202)
+        vocabulary_size = len(read.projection.stats.vocabulary)
+        records_json, counts = await single_flight(
             ("predicate_snapshot", str(state.vault_path)),
             _predicate_snapshot,
             state,
@@ -6959,7 +6936,14 @@ async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
     last_apply = _jobs.latest_of_kind(state, "predicate-apply")
     # The big part (the records) arrives pre-encoded from the worker; only the
     # small job/worker fields are encoded here, then spliced in key order.
-    head = encode_json({"status": "ok", "vocabulary_size": vocabulary_size})[:-1]
+    head = encode_json(
+        {
+            "status": "ok",
+            "vocabulary_size": vocabulary_size,
+            "stale": read.stale,
+            "rebuilding": read.rebuilding,
+        }
+    )[:-1]
     tail = encode_json(
         {
             "counts": counts,
@@ -6973,11 +6957,9 @@ async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
 
 def _predicate_snapshot(
     state: ServerState | VaultRuntime,
-) -> tuple[bytes, dict[str, int], int]:
-    """Store op: alias records grouped by status, encoded, + counts + vocabulary
-    size (60 s cache)."""
+) -> tuple[bytes, dict[str, int]]:
+    """Store op: alias records grouped by status, encoded, + counts."""
     records = _curation.predicate_alias_index(state).records()
-    vocabulary_size = _predicate_vocabulary_size(state)
     grouped: dict[str, list[dict[str, Any]]] = {
         "auto": [],
         "confirmed": [],
@@ -6987,7 +6969,7 @@ def _predicate_snapshot(
     for record in records:
         grouped.setdefault(record.status, []).append(_curation.predicate_record_row(record))
     counts = {status: len(rows) for status, rows in grouped.items()}
-    return encode_json(grouped), counts, vocabulary_size
+    return encode_json(grouped), counts
 
 
 def _set_predicate_record_status(
@@ -7522,6 +7504,11 @@ def _routes() -> list[Route]:
         Route(
             "/api/v1/reconcile/review/reject",
             api_reconcile_review_reject,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/v1/upkeep/rebuild-stats",
+            api_upkeep_rebuild_stats,
             methods=["POST"],
         ),
         Route(

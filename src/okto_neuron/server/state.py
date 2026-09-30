@@ -889,6 +889,9 @@ def init_state(
 def reset_state_for_tests() -> None:
     """Drop the module singleton; close any underlying vault. Test-only."""
     global _STATE
+    from okto_neuron.server import _projection
+
+    _projection.reset_for_tests()
     if _STATE is not None:
         # A store-executor call abandoned by a cancelled request (or a worker
         # task torn down with its test loop) may still be inside the graph;

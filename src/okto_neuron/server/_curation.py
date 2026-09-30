@@ -1242,10 +1242,8 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
 
     Runs against the SWEEP TARGET's handle/config/alias-index (the active
     vault, or a POOLED vault when the scheduler tagged this job — issue #5)."""
-    from okto_neuron.predicates import (
-        collect_predicate_vocabulary,
-        generate_predicate_candidates,
-    )
+    from okto_neuron.predicates import generate_predicate_candidates
+    from okto_neuron.server import _projection
     from okto_neuron.server._vault_pool import VaultPoolError
 
     try:
@@ -1256,9 +1254,11 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
     store = vault.store
     index = predicate_alias_index(state, vault_path=vault_path)
 
-    job.progress("scanning predicate vocabulary")
-    vocabulary = collect_predicate_vocabulary(store)
-    vocabulary_size = len(vocabulary)
+    # ONE set-based read of the graph, shared with the UI endpoints: the vault's maintained
+    # projection (joined or built here), not a vocabulary scan plus a candidate scan.
+    job.progress("reading predicate stats")
+    stats = _projection.manager_for(vault_path).stats_for_job(store)
+    vocabulary_size = len(stats.vocabulary)
     if not cfg.upkeep.enabled:
         return _predicate_propose_empty(
             vocabulary_size=vocabulary_size,
@@ -1267,8 +1267,9 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
 
     job.progress("generating predicate candidates")
     candidates = generate_predicate_candidates(
-        store,
+        None,
         vault.embedder,
+        stats=stats,
         alias_index=index,
         judged_pairs=_job_judged_pairs(job),
         cluster_threshold=cfg.upkeep.cluster_threshold,

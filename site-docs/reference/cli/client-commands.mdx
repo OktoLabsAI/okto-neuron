@@ -372,6 +372,14 @@ Resolves the path, resolves the vault, then sends `DELETE /api/v1/folder-watch/r
 
 The manifest sidecar is left in place; its historical hashes are harmless.
 
+## upkeep rebuild-stats
+
+```bash
+okto-neuron upkeep rebuild-stats [--vault NAME_OR_PATH] [--endpoint URL] [--timeout SECONDS]
+```
+
+Asks the running daemon to rebuild the vault's maintained projection (predicate stats and graph counts) now, instead of waiting for the next write or the max-age backstop. It POSTs `{}` to `/api/v1/upkeep/rebuild-stats` and returns at once; the rebuild runs in the background. It prints `rebuild started`, or `a rebuild is already running; it will rescan once more when it finishes`. Poll `GET /api/v1/graph/stats` for `"rebuilding": false`. See [/reference/http-endpoints](/reference/http-endpoints).
+
 ## Related
 
 <CardGroup cols={2}>

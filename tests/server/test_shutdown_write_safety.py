@@ -379,10 +379,24 @@ def test_pid_record_advertises_the_outcome_capability(tmp_path: Path) -> None:
 
 def _live_edges(daemon: _Daemon) -> int:
     """Edge count through the daemon's own API (no second writer handle)."""
-    with urllib.request.urlopen(f"{daemon.base}/api/v1/graph/stats", timeout=10) as response:
-        stats = json.loads(response.read())
-    assert isinstance(stats["total_edges"], int), stats
-    return stats["total_edges"]
+    # The counts come from the maintained projection: force a rebuild, then wait until it is
+    # current (stale and rebuilding both false).
+    rebuild = urllib.request.Request(
+        f"{daemon.base}/api/v1/upkeep/rebuild-stats", data=b"{}",
+        headers={"content-type": "application/json"}, method="POST",
+    )
+    with urllib.request.urlopen(rebuild, timeout=10) as response:
+        assert response.status == 202
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        with urllib.request.urlopen(f"{daemon.base}/api/v1/graph/stats", timeout=10) as response:
+            stats = json.loads(response.read())
+            settled = response.status == 200 and not stats.get("stale") and not stats.get("rebuilding")
+        if settled:
+            assert isinstance(stats["total_edges"], int), stats
+            return stats["total_edges"]
+        time.sleep(0.1)
+    pytest.fail("graph stats never settled")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal semantics")

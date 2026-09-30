@@ -2630,6 +2630,29 @@ def add(file: Path, vault: Path | None, endpoint: str | None, timeout: float) ->
     click.echo(f"added {document_id} ({chunks} chunks)")
 
 
+@app.group("upkeep")
+def upkeep_group() -> None:
+    """Upkeep of the derived read models the daemon maintains per vault."""
+
+
+@upkeep_group.command("rebuild-stats")
+@click.option("--vault", type=click.Path(path_type=Path), help="Vault name or path to target.")
+@_endpoint_option
+@_timeout_option
+def upkeep_rebuild_stats(vault: Path | None, endpoint: str | None, timeout: float) -> None:
+    """Rebuild the vault's maintained projection (predicate stats and graph counts).
+
+    Asks the running server to rescan now instead of waiting for the next write or the
+    max-age backstop. It answers at once: the rebuild runs in the background, and
+    ``GET /api/v1/graph/stats`` reports ``"rebuilding": false`` when it is done.
+    """
+    body = _run_thin_client(endpoint, timeout, "/api/v1/upkeep/rebuild-stats", {}, vault=vault)
+    if body.get("started"):
+        click.echo("rebuild started")
+    else:
+        click.echo("a rebuild is already running; it will rescan once more when it finishes")
+
+
 @app.command("query")
 @click.argument("text")
 @click.option("--vault", type=click.Path(path_type=Path), help="Vault name or path to target.")

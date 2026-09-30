@@ -302,14 +302,31 @@ Large responses (review queue, graph and node reads, ledger, predicate snapshot,
 authority lists, drift and quality reports) are JSON-encoded on the worker, in pieces so the
 GIL is released between elements (a single `json.dumps` of a multi-megabyte payload would hold
 it for the whole call), and returned as pre-encoded bytes identical to `JSONResponse`.
-Single-flight caches those bytes. `single_flight` collapses concurrent identical full scans (upkeep predicates, graph stats,
-integrity summary, ledger runs/summary) into one execution. Long jobs never occupy a store
+Single-flight caches those bytes. `single_flight` collapses concurrent identical full scans (integrity summary, ledger
+runs/summary) into one execution; the upkeep-predicates and graph-stats reads no longer scan at all (next paragraph). Long jobs never occupy a store
 worker, so they cannot starve UI reads; the JobExecutor is also where a separate worker
 process will plug in. On shutdown both pools finish calls already executing (bounded by the
 drain deadline) before vault handles close, then cancel anything still queued. Two deliberate
 exceptions remain: the graph swap at the end of rebuild/heal/reembed jobs runs on the loop as
 one no-await block (reads see a short latency blip, never a half-swapped graph), and the
 companion-triage LLM fan-out uses its own thread pool inside a job runner.
+
+`GET /api/v1/upkeep/predicates` and `GET /api/v1/graph/stats` read one maintained projection per vault
+(`server/_projection.py`): the predicate stats (`PredicateStats`) and the node/edge census for both
+`include_structural` variants, built together from set-based scans that read no vectors. It is current
+while `(store.generation(), instance_token, write_seq)` is unchanged (see `IndexedStore`). A read never
+waits for a rebuild: it returns the last projection with `stale` and `rebuilding` flags (response fields
+added, none removed), and a vault with no projection yet answers HTTP 202 `{"status": "building"}` and
+starts the first build. At most one rebuild per vault runs, on the JobExecutor, plus one pending: a
+rebuild that finishes with the key moved runs once more, at least `[server] projection_min_interval_s`
+(default 5 s) after the previous one ended; a projection older than `[server] projection_max_age_s`
+(default 600 s) counts as stale even without a local write, which covers writes from another process.
+`POST /api/v1/upkeep/rebuild-stats` (and `okto-neuron upkeep rebuild-stats`) forces a rescan now and
+answers 202. The projection is persisted to `.marginalia/vault-projection.json` (version 1) through the
+store executor; one restored from an earlier process is served as stale until the first rebuild, and a
+missing, corrupt or old-version file just means a cold start. A predicate-propose job takes its stats from
+the same projection, joining a build in flight, instead of scanning the graph twice. The old 60 s
+vocabulary cache is gone.
 Model calls are bounded so a wedged endpoint cannot hold a vault's writer lock: a completion
 defaults to a 300 s deadline with SDK retries off (retry policy is ours: one retry, backing off
 2 s after a timeout), `llm.curation_call_timeout_s` defaults to 600 s and puts every judge call

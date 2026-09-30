@@ -456,21 +456,21 @@ async def test_every_mcp_tool_never_blocks_event_loop(
 async def test_concurrent_predicate_polls_share_one_scan_and_health_stays_fast(
     guarded, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """30 concurrent upkeep polls collapse into ONE vocabulary scan while /health
-    keeps answering quickly on the same loop."""
-    import okto_neuron.predicates as predicates
+    """30 concurrent upkeep polls on a cold vault collapse into ONE rebuild (they answer 202
+    meanwhile, never waiting on it) while /health keeps answering quickly on the same loop;
+    once built, every poll is a cheap 200 with no further scan."""
+    from okto_neuron.server import _projection
 
     state, _vault_path, _rec = guarded
-    http_mod._PREDICATE_VOCAB_CACHE.clear()
     scans: list[float] = []
-    real_collect = predicates.collect_predicate_vocabulary
+    real_build = _projection.build_predicate_stats
 
-    def _counting_collect(store: Any) -> Any:
+    def _counting_build(store: Any) -> Any:
         scans.append(time.perf_counter())
         time.sleep(0.5)
-        return real_collect(store)
+        return real_build(store)
 
-    monkeypatch.setattr(predicates, "collect_predicate_vocabulary", _counting_collect)
+    monkeypatch.setattr(_projection, "build_predicate_stats", _counting_build)
 
     app = http_mod.build_rest_app(state)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50124))
@@ -486,11 +486,27 @@ async def test_concurrent_predicate_polls_share_one_scan_and_health_stays_fast(
             health_latencies.append(time.perf_counter() - started)
             assert health.status_code == 200
             await asyncio.sleep(0.02)
-        responses = await asyncio.gather(*polls)
+        first = await asyncio.gather(*polls)
+        assert {r.status_code for r in first} == {202}, "a cold vault must answer 202 at once"
+        assert all(r.json() == {"status": "building"} for r in first)
 
-    assert all(response.status_code == 200 for response in responses)
-    assert len({response.json()["vocabulary_size"] for response in responses}) == 1
-    assert len(scans) == 1, f"expected one shared scan, saw {len(scans)}"
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            final = await client.get("/api/v1/upkeep/predicates", timeout=60)
+            if final.status_code == 200 and not final.json()["rebuilding"]:
+                break
+            started = time.perf_counter()  # the rebuild is running: /health must stay quick
+            assert (await client.get("/health", timeout=10)).status_code == 200
+            health_latencies.append(time.perf_counter() - started)
+            await asyncio.sleep(0.02)
+        assert final.status_code == 200, final.text[:200]
+        later = await asyncio.gather(
+            *[client.get("/api/v1/upkeep/predicates", timeout=60) for _ in range(30)]
+        )
+
+    assert all(r.status_code == 200 and r.json()["stale"] is False for r in later)
+    assert len({r.json()["vocabulary_size"] for r in later}) == 1
+    assert len(scans) == 1, f"expected one shared rebuild, saw {len(scans)}"
     assert len(health_latencies) >= 5
     assert max(health_latencies) < SMOKE_LOOP_BLOCK_S, f"/health max {max(health_latencies) * 1000:.0f} ms"
 
@@ -561,11 +577,10 @@ def _patch_graph_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     body = {"status": "ok", "nodes": _big_rows(), "total": _BIG_ITEMS}
     for name in ("_nodes_list_payload", "_graph_payload", "_neighbors_payload"):
         monkeypatch.setattr(http_mod, name, lambda *args, _b=body, **kwargs: _b)
-    monkeypatch.setattr(
-        http_mod,
-        "_graph_stats_payload",
-        lambda *args, _b={"status": "ok", "node_types": _big_rows(), "edge_types": []}: _b,
-    )
+    from okto_neuron.server import _projection
+
+    big = {"status": "ok", "node_types": _big_rows(), "edge_types": []}
+    monkeypatch.setattr(_projection, "compute_graph_stats", lambda store: {False: big, True: big})
 
 
 def _patch_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -597,8 +612,9 @@ def _patch_predicates(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         http_mod._curation, "predicate_record_row", lambda record: dict(record.row)
     )
-    monkeypatch.setattr(http_mod, "_predicate_vocabulary_size", lambda state: 1)
 
+
+_PROJECTION_CASES = frozenset({"graph_stats", "predicate_snapshot"})
 
 _BIG_CASES: dict[str, tuple[Callable[[pytest.MonkeyPatch], None], str]] = {
     "review_queue": (_patch_review, "/api/v1/review-queue"),
@@ -641,6 +657,13 @@ async def test_big_payload_is_never_serialised_on_the_loop(
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50125))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         monkeypatch.setattr(json, "dumps", _recording_dumps)
+        if case in _PROJECTION_CASES:
+            # The projection is built on a worker (its big body is encoded there); the
+            # request then only splices the flags in.
+            from okto_neuron.server import _projection
+            from okto_neuron.server._store_io import store_io
+
+            await store_io(_projection.manager_for(state.vault_path).build, state.vault.store)
         response = await client.get(url, timeout=300)
         monkeypatch.setattr(json, "dumps", real_dumps)
 
