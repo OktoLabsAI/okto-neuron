@@ -16,6 +16,7 @@ import {
   type ReviewBatchAction,
   type ReviewAction,
 } from '@/services/curation-api'
+import { appendPage, REVIEW_PAGE_SIZE } from '@/lib/review-queue'
 
 const ACTIONS: ReviewAction[] = ['commit', 'discard', 'merge']
 const TYPES = ['Agent', 'Concept', 'Place', 'InformationObject', 'Activity']
@@ -65,6 +66,9 @@ export function CompanionReviewView() {
   const [items, setItems] = useState<CompanionReviewItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [total, setTotal] = useState<number | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [typeFilter, setTypeFilter] = useState('all')
   const [confidenceFilter, setConfidenceFilter] = useState<ConfidenceBucket>('all')
@@ -81,11 +85,32 @@ export function CompanionReviewView() {
     setLoading(true)
     setError(null)
     try {
-      setItems((await getReviewQueue()).items)
+      // First page only; "Load more" appends. A refresh (after an action) restarts from page 1.
+      const resp = await getReviewQueue({ limit: REVIEW_PAGE_SIZE })
+      setItems(resp.items)
+      setNextCursor(resp.next_cursor ?? null)
+      setTotal(resp.total)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function loadMore() {
+    if (!nextCursor || loadingMore) return
+    setLoadingMore(true)
+    setError(null)
+    try {
+      const resp = await getReviewQueue({ limit: REVIEW_PAGE_SIZE, cursor: nextCursor })
+      setItems((prev) => appendPage(prev, resp.items))
+      setNextCursor(resp.next_cursor ?? null)
+      setTotal(resp.total)
+    } catch (e) {
+      // 409 review_queue_migration_required carries the remedy in its message; 400 means a stale cursor.
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoadingMore(false)
     }
   }
 
@@ -236,8 +261,8 @@ export function CompanionReviewView() {
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-medium text-surface-200">Companion review queue</h2>
-            <Badge tone={items.length > 0 ? 'warn' : 'default'}>
-              {items.length} total
+            <Badge tone={(total ?? items.length) > 0 ? 'warn' : 'default'}>
+              {total ?? items.length} total
             </Badge>
             {filteredItems.length !== items.length && (
               <Badge>{filteredItems.length} filtered</Badge>
@@ -459,6 +484,22 @@ export function CompanionReviewView() {
               Next
             </button>
           </div>
+        </div>
+      )}
+
+      {nextCursor && (
+        <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-surface-500">
+          <span>
+            Loaded {items.length}
+            {total !== null ? ` of ${total}` : ''}
+          </span>
+          <button
+            onClick={loadMore}
+            disabled={loadingMore || loading}
+            className="rounded-md border border-surface-700 px-2.5 py-1 text-surface-300 hover:bg-surface-800 disabled:opacity-50"
+          >
+            {loadingMore ? '...' : 'Load more'}
+          </button>
         </div>
       )}
 

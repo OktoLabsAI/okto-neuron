@@ -1,12 +1,12 @@
 // Single source for "what needs the user's decision" — combines the three
-// review-queue GETs (all file-backed and cheap) plus the last-heal timestamp so
+// review-queue GETs (the companion one is limit=0, total only) plus the last-heal timestamp so
 // the Overview hero, the Review tab badge, and the heal nudge agree. The predicate
 // snapshot comes from the shared predicate query (services/predicate-snapshot.ts),
 // not from a timer of its own.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   getReconcileQueue,
-  getReviewQueue,
+  getReviewQueueTotal,
   getRebuildStatus,
   type PredicateUpkeepSnapshot,
 } from '@/services/curation-api'
@@ -40,12 +40,12 @@ export function useAttention(pollMs = 15000): { attention: Attention; refresh: (
       try {
         const [recon, companion, heal] = await Promise.all([
           getReconcileQueue().catch(() => null),
-          getReviewQueue().catch(() => null),
+          getReviewQueueTotal().catch(() => null),
           getRebuildStatus('heal').catch(() => null),
         ])
         setQueues({
           entityMerges: recon?.entries.length ?? 0,
-          nodeCandidates: companion?.items.length ?? 0,
+          nodeCandidates: companion ?? 0,
           lastHealDone:
             heal?.last_heal?.status === 'done' ? (heal.last_heal.finished_at ?? 0) : 0,
         })

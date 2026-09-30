@@ -5,6 +5,7 @@
 // remain only for CLI/backward compatibility.
 import { apiFetch, qs } from './http'
 import { fetchGraphStats } from './graph-stats'
+import { reviewQueueQuery } from '@/lib/review-queue'
 
 // ── P1: health + dashboard ──────────────────────────────────────────────────--
 export interface HealthResponse {
@@ -218,9 +219,22 @@ export interface CompanionReviewItem {
 export interface ReviewQueueResponse {
   status: string
   items: CompanionReviewItem[]
+  /** Opaque cursor for the next page; null on the last page. */
+  next_cursor: string | null
+  /** Size of the whole queue, independent of the page. */
+  total: number
 }
-export function getReviewQueue(): Promise<ReviewQueueResponse> {
-  return apiFetch<ReviewQueueResponse>('/review-queue')
+// Always paginated: a call without `limit` would make the server return the full list (deprecated).
+// Errors: 400 bad limit/cursor, 409 review_queue_migration_required (message carries the remedy).
+export function getReviewQueue(opts: {
+  limit: number
+  cursor?: string | null
+}): Promise<ReviewQueueResponse> {
+  return apiFetch<ReviewQueueResponse>(`/review-queue${reviewQueueQuery(opts)}`)
+}
+/** Queue size only (limit=0): what the attention badge uses. */
+export async function getReviewQueueTotal(): Promise<number> {
+  return (await getReviewQueue({ limit: 0 })).total
 }
 export type ReviewAction = 'commit' | 'discard' | 'merge'
 export type ReviewBatchAction = 'commit' | 'discard'
