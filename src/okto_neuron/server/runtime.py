@@ -36,6 +36,7 @@ from okto_neuron.llm._cli_provider import kill_active_cli_processes
 from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._prewarm import start_ledger_prewarm
 from okto_neuron.server._store_io import (
     DEFAULT_JOB_WORKERS,
     DEFAULT_STORE_WORKERS,
@@ -2313,6 +2314,8 @@ async def _run_async(
     )
     if ready_event is not None:
         ready_event.set()
+    # After readiness: warm the ledger indexes of the vaults that opened (#14).
+    start_ledger_prewarm(state)
 
     # Both servers share Uvicorn's logger. Filter only the MCP task's duplicate
     # lifecycle INFO records; every warning/error still passes through.

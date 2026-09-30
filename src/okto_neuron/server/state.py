@@ -118,6 +118,8 @@ class VaultRuntime:
     curation_worker_active: bool = False
     curation_worker_task: "asyncio.Task | None" = field(default=None, repr=False)
     maintenance_tasks: "set[asyncio.Task]" = field(default_factory=set, repr=False)
+    # Startup ledger-index warm-up; not busy work, but shutdown must see it.
+    prewarm_task: "asyncio.Task | None" = field(default=None, repr=False)
     last_ingest_at: float | None = None
     last_sweep_at: float | None = None
     last_sweep_outcome: dict | None = None
@@ -713,6 +715,8 @@ class ServerState:
                 if task is not None:
                     tasks.add(task)
             tasks.update(runtime.maintenance_tasks)
+            if runtime.prewarm_task is not None:
+                tasks.add(runtime.prewarm_task)
         return tasks
 
     @property

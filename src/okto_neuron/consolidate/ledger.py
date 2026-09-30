@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AnyStr, Iterable, Iterator, Literal
+from typing import Any, AnyStr, Callable, Iterable, Iterator, Literal
 
 try:  # POSIX
     import fcntl
@@ -2130,6 +2130,21 @@ class CandidateLedger:
             self._persist_sidecar(state)
         except Exception:  # noqa: BLE001 - cache maintenance must not fail a durable append
             _sidecar_cache_drop(self.path)
+
+    def prewarm(self, cancelled: Callable[[], bool] | None = None) -> None:
+        """Build the in-process sidecar state and the offset index ahead of the first reader.
+
+        Both entry points are the ones a first reader uses, so this only moves
+        the cold build earlier; it never changes what a read returns. ``cancelled``
+        is checked between the two builds so a daemon that is stopping skips the
+        second one. The index is a cache: a failed pass is left to the readers.
+        """
+        if not self.path.exists():
+            return
+        self._prepare_sidecar()
+        if cancelled is not None and cancelled():
+            return
+        self._offset_index()
 
     def _offset_index(self) -> _LedgerOffsetIndex | None:
         if not self.path.exists():
