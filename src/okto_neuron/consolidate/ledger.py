@@ -8,6 +8,7 @@ inspectable and replayable enough for future tooling.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -2088,7 +2089,12 @@ class CandidateLedger:
             if usable and candidate is not None and size - candidate.size <= _SIDECAR_INLINE_TAIL:
                 _snapshot_failure_clear(key)
                 return True
-            work = candidate if usable and cached is None else None
+            # A state loaded from the file is ours alone; the cached one is shared with
+            # appends made under this lock, so extend a copy (the sidecar is small) and
+            # publish it only if the cache entry is still the one it was forked from.
+            work = None
+            if usable and candidate is not None:
+                work = candidate if cached is None else copy.deepcopy(candidate)
             handle = path.open("rb")
             cut = _last_line_end(handle, size)
             signature = _snapshot_signature(handle, cut)
