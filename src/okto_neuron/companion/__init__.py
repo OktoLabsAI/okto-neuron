@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from functools import wraps
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -1037,6 +1037,20 @@ def _semantic_relation_replay_index(
             signatures.pop(key, None)
             ambiguous.add(key)
     return indexed
+
+
+def _claims_for_contradiction_scan(
+    store: "GraphStore", candidates: "list[NodeCandidate]"
+) -> "list[Node] | None":
+    """One ``list_nodes("Claim")`` shared by a batch of ``resolve()`` calls.
+
+    ``find_contradictions`` otherwise re-reads every Claim once per Claim
+    candidate. The two resolve loops in ``remember`` only read the store, so one
+    snapshot taken right before a loop is what each call would have seen. ``None``
+    when the batch holds no Claim candidate (nothing would scan)."""
+    if not any(candidate.type == "Claim" for candidate in candidates):
+        return None
+    return list(store.list_nodes(type="Claim"))
 
 
 def _verdict_telemetry(verdict: object) -> dict[str, object]:
@@ -5244,8 +5258,11 @@ class Companion:
         # it too — the keep-alive is worthless if the phase's first silent
         # stretch already outlasts the client's idle timer.
         pairs = []
+        claim_snapshot = _claims_for_contradiction_scan(store, node_candidates)
         for candidate in node_candidates:
-            pairs.append((candidate, resolve(candidate, store, embedder=embedder)))
+            pairs.append(
+                (candidate, resolve(candidate, store, embedder=embedder, claims=claim_snapshot))
+            )
             _emit_substage("committing")
         for candidate, outcome in pairs:
             if outcome.correlations:
@@ -5620,10 +5637,14 @@ class Companion:
                 {"merged_into": post_curator_node_merges},
             )
         curator_audit_counts = {"commit": 0, "queue": 0, "abstain": 0}
+        claim_snapshot = _claims_for_contradiction_scan(
+            store,
+            [c for c in raw_node_candidates if c.candidate_id not in curated_node_ids],
+        )
         for candidate in raw_node_candidates:
             if candidate.candidate_id in curated_node_ids:
                 continue
-            outcome = resolve(candidate, store, embedder=embedder)
+            outcome = resolve(candidate, store, embedder=embedder, claims=claim_snapshot)
             target_ref = node_merge_targets.get(candidate.candidate_id)
             audit_reason = (
                 "candidate remapped to an existing/surviving node before the final node gate"
@@ -9465,6 +9486,17 @@ class _PlanningGraphOverlay:
 
     def get_node(self, node_id: str) -> Any:
         return self._nodes.get(node_id) or self._base.get_node(node_id)
+
+    def get_nodes(self, node_ids: Iterable[str]) -> list[Any]:
+        """``get_node`` per id, with the base reads batched into one call: input
+        order, duplicates collapsed, missing ids skipped (the protocol contract)."""
+        ids = list(dict.fromkeys(node_ids))
+        base = {
+            str(node.id): node
+            for node in self._base.get_nodes([i for i in ids if i not in self._nodes])
+        }
+        found = (self._nodes.get(node_id) or base.get(node_id) for node_id in ids)
+        return [node for node in found if node is not None]
 
     def list_nodes(self, type: str | None = None) -> list[Any]:
         nodes = {str(node.id): node for node in self._base.list_nodes(type=type)}

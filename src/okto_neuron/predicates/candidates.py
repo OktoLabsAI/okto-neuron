@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Iterable, Protocol
 
-from okto_neuron.core.schema import Node
+from okto_neuron.core.schema import Edge, Node
 from okto_neuron.store.protocol import GraphStore
 
 from .index import PredicateAliasIndex
@@ -75,8 +75,13 @@ class _StoreSnapshot:
 
 
 def collect_predicate_vocabulary(store: GraphStore) -> Counter[str]:
-    """Count edge types and Claim ``P`` facets."""
-    return _scan_store(store).vocabulary
+    """Count edge types and Claim ``P`` facets.
+
+    Two store reads (one ``list_edges``, one ``list_nodes("Claim")``) regardless of
+    graph size: the vocabulary needs no endpoint, signature or sample lookups.
+    """
+    edge_rows, claim_rows = _predicate_rows(store)
+    return _vocabulary(edge_rows, claim_rows)
 
 
 def shared_argument_evidence(
@@ -85,11 +90,11 @@ def shared_argument_evidence(
     predicate_b: str,
 ) -> SharedArgumentEvidence:
     """Count same-order and swapped-order shared S/O pairs for two predicates."""
-    snapshot = _scan_store(store)
+    edge_rows, claim_rows = _predicate_rows(store)
     return _shared_argument_evidence_from_counts(
         predicate_a,
         predicate_b,
-        snapshot.argument_pairs,
+        _argument_pairs(edge_rows, claim_rows),
     )
 
 
@@ -161,38 +166,93 @@ def generate_predicate_candidates(
     return candidates[:max_pairs]
 
 
-def _scan_store(store: GraphStore) -> _StoreSnapshot:
-    vocabulary: Counter[str] = Counter()
-    argument_pairs: dict[str, Counter[tuple[str, str]]] = {}
-    signatures: dict[str, Counter[tuple[str, str]]] = {}
-    samples: dict[str, list[PredicateSample]] = {}
+_EdgeRow = tuple[str, Edge]
+_ClaimRow = tuple[str, Node, dict]
 
+
+def _predicate_rows(store: GraphStore) -> tuple[list[_EdgeRow], list[_ClaimRow]]:
+    """One ``list_edges`` and one ``list_nodes("Claim")``, keeping only rows that
+    carry a predicate, in store order."""
+    edge_rows: list[_EdgeRow] = []
     for edge in store.list_edges():
         predicate = str(getattr(edge, "type", "") or "").strip()
-        if not predicate:
-            continue
-        vocabulary[predicate] += 1
-        argument_pairs.setdefault(predicate, Counter())[(str(edge.src), str(edge.dst))] += 1
-        src_type = _node_type(store.get_node(str(edge.src)))
-        dst_type = _node_type(store.get_node(str(edge.dst)))
-        signatures.setdefault(predicate, Counter())[(src_type, dst_type)] += 1
-
+        if predicate:
+            edge_rows.append((predicate, edge))
+    claim_rows: list[_ClaimRow] = []
     for claim in store.list_nodes(type="Claim"):
         facets = dict(getattr(claim, "facets", {}) or {})
         predicate = str(facets.get("P") or "").strip()
-        if not predicate:
-            continue
+        if predicate:
+            claim_rows.append((predicate, claim, facets))
+    return edge_rows, claim_rows
+
+
+def _vocabulary(edge_rows: list[_EdgeRow], claim_rows: list[_ClaimRow]) -> Counter[str]:
+    vocabulary: Counter[str] = Counter()
+    for predicate, _edge in edge_rows:
         vocabulary[predicate] += 1
+    for predicate, _claim, _facets in claim_rows:
+        vocabulary[predicate] += 1
+    return vocabulary
+
+
+def _argument_pairs(
+    edge_rows: list[_EdgeRow], claim_rows: list[_ClaimRow]
+) -> dict[str, Counter[tuple[str, str]]]:
+    argument_pairs: dict[str, Counter[tuple[str, str]]] = {}
+    for predicate, edge in edge_rows:
+        argument_pairs.setdefault(predicate, Counter())[(str(edge.src), str(edge.dst))] += 1
+    for predicate, _claim, facets in claim_rows:
         pair = _claim_argument_pair(facets)
         if pair is not None:
             argument_pairs.setdefault(predicate, Counter())[pair] += 1
-            signatures.setdefault(predicate, Counter())[_claim_signature(store, facets)] += 1
-        if len(samples.setdefault(predicate, [])) < 3:
-            samples[predicate].append(_claim_sample(store, claim, facets))
+    return argument_pairs
+
+
+def _scan_store(store: GraphStore) -> _StoreSnapshot:
+    """Full snapshot for candidate generation, set-based: the two row scans plus
+    ONE ``get_nodes`` over every endpoint, Claim argument and sample Block id."""
+    edge_rows, claim_rows = _predicate_rows(store)
+
+    sample_rows: list[_ClaimRow] = []
+    sampled_per_predicate: Counter[str] = Counter()
+    for row in claim_rows:
+        if sampled_per_predicate[row[0]] < 3:
+            sampled_per_predicate[row[0]] += 1
+            sample_rows.append(row)
+
+    wanted: list[str] = []
+    for _predicate, edge in edge_rows:
+        wanted.append(str(edge.src))
+        wanted.append(str(edge.dst))
+    for _predicate, _claim, facets in claim_rows:
+        if _claim_argument_pair(facets) is None:
+            continue
+        if facets.get("S_id"):
+            wanted.append(str(facets["S_id"]))
+        if facets.get("O_id"):
+            wanted.append(str(facets["O_id"]))
+    for _predicate, _claim, facets in sample_rows:
+        if not _claim_excerpt(facets) and facets.get("block_id"):
+            wanted.append(str(facets["block_id"]))
+    nodes = {node.id: node for node in store.get_nodes(wanted)} if wanted else {}
+
+    signatures: dict[str, Counter[tuple[str, str]]] = {}
+    for predicate, edge in edge_rows:
+        src_type = _node_type(nodes.get(str(edge.src)))
+        dst_type = _node_type(nodes.get(str(edge.dst)))
+        signatures.setdefault(predicate, Counter())[(src_type, dst_type)] += 1
+    for predicate, _claim, facets in claim_rows:
+        if _claim_argument_pair(facets) is not None:
+            signatures.setdefault(predicate, Counter())[_claim_signature(nodes, facets)] += 1
+
+    samples: dict[str, list[PredicateSample]] = {}
+    for predicate, claim, facets in sample_rows:
+        samples.setdefault(predicate, []).append(_claim_sample(nodes, claim, facets))
 
     return _StoreSnapshot(
-        vocabulary=vocabulary,
-        argument_pairs=argument_pairs,
+        vocabulary=_vocabulary(edge_rows, claim_rows),
+        argument_pairs=_argument_pairs(edge_rows, claim_rows),
         signatures=signatures,
         samples={pred: tuple(items) for pred, items in samples.items()},
     )
@@ -210,23 +270,25 @@ def _claim_argument_pair(facets: dict) -> tuple[str, str] | None:
     return str(subject), str(obj)
 
 
-def _claim_signature(store: GraphStore, facets: dict) -> tuple[str, str]:
+def _claim_signature(nodes: dict[str, Node], facets: dict) -> tuple[str, str]:
     subject_id = facets.get("S_id")
     object_id = facets.get("O_id")
-    subject_type = _node_type(store.get_node(str(subject_id))) if subject_id else "literal"
+    subject_type = _node_type(nodes.get(str(subject_id))) if subject_id else "literal"
     if object_id:
-        object_type = _node_type(store.get_node(str(object_id)))
+        object_type = _node_type(nodes.get(str(object_id)))
     else:
         object_type = "literal"
     return subject_type, object_type
 
 
-def _claim_sample(store: GraphStore, claim: Node, facets: dict) -> PredicateSample:
-    excerpt = (
-        facets.get("source_excerpt") or facets.get("excerpt") or facets.get("source_text") or ""
-    )
+def _claim_excerpt(facets: dict) -> object:
+    return facets.get("source_excerpt") or facets.get("excerpt") or facets.get("source_text") or ""
+
+
+def _claim_sample(nodes: dict[str, Node], claim: Node, facets: dict) -> PredicateSample:
+    excerpt = _claim_excerpt(facets)
     if not excerpt and facets.get("block_id"):
-        block = store.get_node(str(facets["block_id"]))
+        block = nodes.get(str(facets["block_id"]))
         excerpt = getattr(block, "content", "") if block else ""
     return PredicateSample(
         claim_id=str(claim.id),

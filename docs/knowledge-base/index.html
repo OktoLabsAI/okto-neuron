@@ -15320,6 +15320,42 @@ mapped at the store boundary.</li>
 <li><code>get_nodes</code> was the only <code>IN $list</code> site in <code>store/grafx.py</code>, but the other
 backends (<code>ladybug</code>, <code>neo4j</code>) have not been swept for the same shape.</li>
 </ul>
+<h2 id="docs__read-path-and-unified-retrieval--addendum--2026-09-30-set-based-store-reads-11">Addendum — 2026-09-30: set-based store reads (#11)</h2>
+<p>Several library loops read the graph one node at a time: a <code>get_node</code> per edge
+endpoint, per Claim argument or per candidate id. On Grafx every <code>get_node</code> is
+its own read transaction, so the cost grows with the graph, not with the
+answer. The predicate vocabulary scan was the worst case: it resolved both
+endpoints of every edge and the arguments of every Claim just to return a
+<code>Counter</code> of predicate names.</p>
+<p>The rule now is to read sets, not ids: collect the ids first, then make one
+<code>GraphStore.get_nodes</code> call (Grafx splits it into <code>_ID_QUERY_BATCH</code> chunks) and
+look nodes up in a dict. A missing id is simply absent, which keeps the old
+<code>get_node(...) is None</code> handling. Where a scan was repeated per item, it is
+read once before the loop.</p>
+<ul>
+<li><code>predicates.collect_predicate_vocabulary</code> makes two reads, one <code>list_edges()</code>
+and one <code>list_nodes(&quot;Claim&quot;)</code>, with no node lookups. <code>shared_argument_evidence</code>
+makes the same two. <code>generate_predicate_candidates</code> adds a single <code>get_nodes</code>
+over every endpoint, Claim argument and sample Block id. The outputs match the
+old per-node scan byte for byte, including dict and <code>Counter</code> insertion order.
+<code>tests/predicates/test_candidates_batch_reads.py</code> checks this against a copy
+of the old scan on the in-memory, Grafx and Ladybug backends.</li>
+<li>The sub-chunk detach and revert passes in <code>companion/_incremental.py</code> read
+their blocks in one call. Each block's derived Claims and their object nodes
+also come back in one call per block.</li>
+<li><code>subgraph</code> reads bridging and sibling Claims in one call. The bridge scan cap
+still bounds how many ids get read.</li>
+<li><code>migrate.bridge_edges.ensure_source_mentions</code> reads the committed nodes and
+their Documents in two calls.</li>
+<li><code>reconcile.propose.adjudicate_cluster</code> reads cluster members in one call.</li>
+<li><code>resolve.find_contradictions</code> and <code>resolve.resolve</code> take an optional
+<code>claims=</code> snapshot, and the two resolve loops in <code>Companion.remember</code> read
+the Claim list once per loop, not once per Claim candidate.</li>
+</ul>
+<p>On a synthetic Grafx store (4,000 nodes, 13,000 edges, 2,500 Claims, local
+laptop), <code>collect_predicate_vocabulary</code> went from a 53.6 s median to 0.39 s,
+and the full candidate scan from 50.0 s to 0.70 s, with identical outputs.
+These are synthetic numbers, not a measurement of any real vault.</p>
 </div></div></div><div class="doc" id="docs__eval-gates"><div class="doc-head" onclick="toggleDoc(this.parentNode)"><span class="chev">▶</span><div class="meta"><div class="dt">Eval gates — the canonical Definition-of-Done for the graph-native arc</div><div class="ds">The three ship gates every graph-native task is judged against: Gate 1 the deterministic floor (provenance byte-hash + hard-recall@k + extraction-completeness + claim-coverage over a frozen vault — the ONLY CI blocker), Gate 2 multi-run A/B significance (the 5-condition REAL rule, N&gt;=5, laptop-only, where flip-default decisions are made), Gate 3 the cost-budget tier tag (tier-1 read-path vs tier-2 re-ingest). Plus the 2026-07-07 run-validity guards: daemon boot-warm of provider dependencies and the harness abort on 3 consecutive ask transport failures, born from an A/B that measured nothing because a venv re-sync pruned litellm under the running daemon.</div></div><a class="src" href="../../docs/eval-gates.md" onclick="event.stopPropagation()">docs/eval-gates.md</a></div><div class="doc-body"><div class="md"><h1 id="docs__eval-gates--eval-gates--the-canonical-definition-of-done-for-the-graph-native-arc">Eval gates — the canonical Definition-of-Done for the graph-native arc</h1>
 <blockquote>
 <p>ADR 0019 Phase-0 / GN-8. One shared set of ship gates so every task in the
