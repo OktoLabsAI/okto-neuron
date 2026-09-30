@@ -24,6 +24,126 @@ from okto_neuron.server.state import init_state
 from okto_neuron.vault import Vault
 
 
+# --- real-home guard --------------------------------------------------------
+# A pytest run once wrote writer-lease lock files into the developer's LIVE
+# vaults (~/.marginalia/vaults) because tests resolved the real home and opened
+# the real vault registry. Every test now runs with HOME pointing at a scratch
+# directory, the Neuron path variables unset, and a hard assertion that nothing
+# resolves under the real home. Tests may still monkeypatch.setenv their own
+# HOME / variables afterward: the per-test fixture runs first, theirs wins.
+
+# Read by src/okto_neuron/vault_registry.py:152/442, config/_app_config.py:157,
+# onboarding.py:326, core/schema/loader.py:159 (via _compat.getenv, which falls
+# back to the MARGINALIA_* spelling built by _compat.legacy_env_name, _compat.py:98)
+# and llm/_chatgpt.py:121/201 (CHATGPT_TOKEN_DIR, read straight from os.environ).
+_NEURON_PATH_VARS = (
+    "OKTO_NEURON_CONFIG",
+    "OKTO_NEURON_VAULT",
+    "OKTO_NEURON_ENV_FILE",
+    "OKTO_NEURON_PACK_PATH",
+    "CHATGPT_TOKEN_DIR",
+    "MARGINALIA_CONFIG",
+    "MARGINALIA_VAULT",
+    "MARGINALIA_ENV_FILE",
+    "MARGINALIA_PACK_PATH",
+)
+_APP_HOME_DIRNAMES = (".marginalia", ".okto-neuron")
+
+
+def _real_home() -> Path:
+    import os
+    import pwd
+
+    return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    import os
+
+    resolved = Path(os.path.realpath(path))
+    return resolved == root or root in resolved.parents
+
+
+def assert_home_is_isolated() -> None:
+    """Fail loudly if ``Path.home()`` or the app homes resolve into the real home."""
+    real = _real_home()
+    home = Path.home()
+    problems = []
+    if _is_under(home, real):
+        problems.append(f"Path.home() = {home} is the real user home {real} (or under it)")
+    for dirname in _APP_HOME_DIRNAMES:
+        if _is_under(home / dirname, real):
+            problems.append(f"{home / dirname} resolves under the real home {real}")
+    if problems:
+        message = "REAL-HOME GUARD: refusing to run tests against live data: " + "; ".join(problems)
+        raise pytest.UsageError(message)
+
+
+_REAL_APP_DIRS: tuple[str, ...] = ()
+_WRITE_FLAGS = 0
+
+
+def _write_guard_audit(event: str, args: tuple) -> None:
+    """Audit hook: refuse file creation/writes under the real ~/.marginalia|~/.okto-neuron.
+
+    Covers Python-level open()/os.open()/os.mkdir(). Native writers (sqlite, ladybug)
+    bypass audit events; HOME isolation above is the primary defence.
+    """
+    if not _REAL_APP_DIRS:
+        return
+    if event == "open":
+        path, _mode, flags = args
+        if not flags & _WRITE_FLAGS:
+            return
+    elif event == "os.mkdir":
+        path = args[0]
+    else:
+        return
+    if isinstance(path, bytes):
+        path = path.decode(errors="replace")
+    if not isinstance(path, str):
+        return
+    import os
+
+    resolved = os.path.realpath(path)
+    for root in _REAL_APP_DIRS:
+        if resolved == root or resolved.startswith(root + os.sep):
+            raise PermissionError(f"REAL-HOME GUARD: test attempted to write {resolved}")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    import os
+    import sys
+
+    global _REAL_APP_DIRS, _WRITE_FLAGS
+    _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+    real = _real_home()
+    _REAL_APP_DIRS = tuple(str(real / d) for d in _APP_HOME_DIRNAMES)
+    sys.addaudithook(_write_guard_audit)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _session_isolated_home(tmp_path_factory: pytest.TempPathFactory):
+    """Session-wide scratch HOME, then assert it is not the real one."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("HOME", str(tmp_path_factory.mktemp("session_home")))
+        for name in _NEURON_PATH_VARS:
+            mp.delenv(name, raising=False)
+        assert_home_is_isolated()
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home_and_neuron_env(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-test scratch HOME and no path variables; re-assert before the test body."""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    for name in _NEURON_PATH_VARS:
+        monkeypatch.delenv(name, raising=False)
+    assert_home_is_isolated()
+
+
 @pytest.fixture(autouse=True)
 def _review_queue_layout_gate_is_not_under_test(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
