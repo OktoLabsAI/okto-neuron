@@ -381,3 +381,69 @@ def test_real_grafx_4096_dim_light_read_modify_write(tmp_path: Path) -> None:
         assert s.get_node("big").embedding is None
     finally:
         s.close()
+
+
+def test_production_path_vault_keeps_graph_and_index_vectors(tmp_path: Path) -> None:
+    """End to end through the real ``Vault`` (IndexedStore over grafx, stub embedder):
+    a light read written back keeps the vector in the graph AND in the vector index,
+    an explicit clear drops both, and the index state survives a close and reopen."""
+    pytest.importorskip("okto_grafx")
+    from okto_neuron.query import search_claims
+    from okto_neuron.vault import Vault
+
+    root = tmp_path / "vault"
+    vault = Vault.init(root, backend="grafx", embedding_provider="stub")
+    try:
+        assert isinstance(vault.store, IndexedStore)
+        embedder = vault.embedder
+        vector = list(embedder.embed("alpha probe"))
+        vault.store.add_node(
+            Node(id="probe", type="Concept", title="alpha probe", facets={"v": 1}, embedding=vector)
+        )
+
+        def indexed_ids() -> set[str]:
+            return {node_id for node_id, _ in vault.store.index.scan_vectors()}
+
+        def top_hits() -> list[str]:
+            hits = search_claims(
+                "alpha probe", k=5, store=vault.store, embedder=embedder, index=vault.store.index
+            )
+            return [node.id for node, _score in hits]
+
+        assert "probe" in indexed_ids() and "probe" in top_hits()
+
+        light = vault.store.get_nodes(["probe"])[0]
+        assert light.embedding is None
+        vault.store.add_node(light.model_copy(update={"facets": {"v": 2}}))
+
+        kept = vault.store.get_node("probe", include_embedding=True)
+        assert kept.facets == {"v": 2}
+        assert kept.embedding == pytest.approx(vector, abs=1e-3)
+        assert "probe" in indexed_ids(), "index record lost its vector on a light upsert"
+        assert "probe" in top_hits()
+    finally:
+        vault.close()
+
+    reopened = Vault.open(root)
+    try:
+        assert "probe" in {i for i, _ in reopened.store.index.scan_vectors()}, "index lost it on reopen"
+        assert reopened.store.get_node("probe").embedding == pytest.approx(vector, abs=1e-3)
+        light = reopened.store.get_nodes(["probe"])[0]
+        reopened.store.add_node(light, clear_embedding=True)
+        assert reopened.store.get_node("probe").embedding is None
+        assert "probe" not in {i for i, _ in reopened.store.index.scan_vectors()}
+        hits = search_claims(
+            "alpha probe", k=5, store=reopened.store, embedder=reopened.embedder,
+            index=reopened.store.index,
+        )
+        # still findable lexically, but no longer through the vector leg
+        assert all(n.embedding is None for n, _ in hits if n.id == "probe")
+    finally:
+        reopened.close()
+
+    again = Vault.open(root)
+    try:
+        assert "probe" not in {i for i, _ in again.store.index.scan_vectors()}
+        assert again.store.get_node("probe").embedding is None
+    finally:
+        again.close()
