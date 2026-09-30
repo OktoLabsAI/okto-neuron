@@ -9,17 +9,33 @@ through Vault.store during the M1 extraction.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+import threading
+import uuid
+from typing import Any, Callable, Iterable, Optional
 
 from okto_neuron.core.schema import Edge, Node
 from okto_neuron.store.index.protocol import IndexStore
 from okto_neuron.store.protocol import BackendHealth, DriftReport, GraphStore, RecoveryStatus
 
 
+#: Backend-specific bulk/destructive writers reachable through ``__getattr__`` (not part of
+#: ``GraphStore``). Each one is wrapped so it bumps ``write_seq`` like ``add_node`` does.
+_BACKEND_MUTATORS = frozenset({"add_nodes", "add_edges", "wipe"})
+
+
 class IndexedStore:
     def __init__(self, store: GraphStore, index: IndexStore) -> None:
         self._store = store
         self._index = index
+        # Change detection for derived projections (see server/_projection.py): a uuid
+        # minted per store object plus a counter bumped once per completed mutation. A
+        # projection built at (generation, token, seq) is current exactly while all three
+        # still match. The counter moves AFTER the write (in a finally, so a write that
+        # raised midway also counts): a reader that saw seq N before scanning can never
+        # have missed a write that finished before its scan started.
+        self._instance_token = uuid.uuid4().hex
+        self._write_seq = 0
+        self._seq_lock = threading.Lock()
         # Optional capability protocols (e.g. integrity.EdgeAdjacencyReader) are
         # matched by @runtime_checkable isinstance() checks, which use
         # inspect.getattr_static and therefore never reach __getattr__ below
@@ -33,6 +49,20 @@ class IndexedStore:
             self.list_edge_adjacency = list_edge_adjacency
 
     @property
+    def instance_token(self) -> str:
+        """Identity of this store object (a fresh one after every reopen or swap)."""
+        return self._instance_token
+
+    @property
+    def write_seq(self) -> int:
+        """Number of mutations completed through this facade since it was created."""
+        return self._write_seq
+
+    def _bump_write_seq(self) -> None:
+        with self._seq_lock:
+            self._write_seq += 1
+
+    @property
     def graph(self) -> GraphStore:
         """The raw graph store (for reindex, heal and tests)."""
         return self._store
@@ -42,17 +72,23 @@ class IndexedStore:
         return self._index
 
     def add_node(self, node: Node, clear_embedding: bool = False) -> None:
-        if clear_embedding:
-            self._store.add_node(node, clear_embedding=True)
-            # The index keeps a record's vector when the node has none, so an
-            # explicit clear drops the record first.
-            self._index.delete(node.id)
-        else:
-            self._store.add_node(node)
-        self._index.upsert(node)
+        try:
+            if clear_embedding:
+                self._store.add_node(node, clear_embedding=True)
+                # The index keeps a record's vector when the node has none, so an
+                # explicit clear drops the record first.
+                self._index.delete(node.id)
+            else:
+                self._store.add_node(node)
+            self._index.upsert(node)
+        finally:
+            self._bump_write_seq()
 
     def add_edge(self, edge: Edge) -> None:
-        self._store.add_edge(edge)
+        try:
+            self._store.add_edge(edge)
+        finally:
+            self._bump_write_seq()
 
     def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
         return self._store.get_node(node_id, include_embedding=include_embedding)
@@ -102,4 +138,16 @@ class IndexedStore:
 
     def __getattr__(self, name: str) -> Any:
         # Only reached for attributes the wrapper does not define itself.
-        return getattr(self._store, name)
+        attr = getattr(self._store, name)
+        if name in _BACKEND_MUTATORS and callable(attr):
+            return self._counted(attr)
+        return attr
+
+    def _counted(self, method: Callable[..., Any]) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return method(*args, **kwargs)
+            finally:
+                self._bump_write_seq()
+
+        return call

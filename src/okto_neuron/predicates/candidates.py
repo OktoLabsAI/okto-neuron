@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from itertools import combinations
-from typing import Iterable, Protocol
+from typing import Any, Iterable, Protocol
 
 from okto_neuron.core.schema import Edge, Node
 from okto_neuron.store.protocol import GraphStore
@@ -67,11 +67,62 @@ class PredicateCandidate:
 
 
 @dataclass(frozen=True)
-class _StoreSnapshot:
+class PredicateStats:
+    """Everything candidate generation needs from the graph, as plain counters.
+
+    Built by one set-based scan (:func:`build_predicate_stats`) and maintained per vault by
+    ``server/_projection.py``; :func:`generate_predicate_candidates` and
+    :func:`shared_argument_evidence` accept it through ``stats=`` so a caller that holds a
+    current projection never rescans the store.
+    """
+
     vocabulary: Counter[str]
     argument_pairs: dict[str, Counter[tuple[str, str]]]
     signatures: dict[str, Counter[tuple[str, str]]]
     samples: dict[str, tuple[PredicateSample, ...]]
+
+    def to_payload(self) -> dict[str, Any]:
+        """JSON-safe form (sidecar persistence)."""
+
+        def pairs(table: dict[str, Counter[tuple[str, str]]]) -> dict[str, list[list[Any]]]:
+            return {
+                predicate: [[a, b, count] for (a, b), count in sorted(counter.items())]
+                for predicate, counter in sorted(table.items())
+            }
+
+        return {
+            "vocabulary": dict(sorted(self.vocabulary.items())),
+            "argument_pairs": pairs(self.argument_pairs),
+            "signatures": pairs(self.signatures),
+            "samples": {
+                predicate: [[s.claim_id, s.title, s.source_excerpt] for s in items]
+                for predicate, items in sorted(self.samples.items())
+            },
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "PredicateStats":
+        """Inverse of :meth:`to_payload`; raises ``ValueError``/``TypeError``/``KeyError`` on a
+        malformed payload (the caller treats that as a corrupt sidecar)."""
+
+        def pairs(raw: dict[str, list[list[Any]]]) -> dict[str, Counter[tuple[str, str]]]:
+            return {
+                str(predicate): Counter({(str(a), str(b)): int(n) for a, b, n in rows})
+                for predicate, rows in raw.items()
+            }
+
+        return cls(
+            vocabulary=Counter({str(k): int(v) for k, v in payload["vocabulary"].items()}),
+            argument_pairs=pairs(payload["argument_pairs"]),
+            signatures=pairs(payload["signatures"]),
+            samples={
+                str(predicate): tuple(PredicateSample(str(c), str(t), str(e)) for c, t, e in rows)
+                for predicate, rows in payload["samples"].items()
+            },
+        )
+
+
+_StoreSnapshot = PredicateStats  # pre-projection name, kept for importers
 
 
 def collect_predicate_vocabulary(store: GraphStore) -> Counter[str]:
@@ -85,11 +136,21 @@ def collect_predicate_vocabulary(store: GraphStore) -> Counter[str]:
 
 
 def shared_argument_evidence(
-    store: GraphStore,
+    store: GraphStore | None,
     predicate_a: str,
     predicate_b: str,
+    *,
+    stats: PredicateStats | None = None,
 ) -> SharedArgumentEvidence:
-    """Count same-order and swapped-order shared S/O pairs for two predicates."""
+    """Count same-order and swapped-order shared S/O pairs for two predicates.
+
+    With ``stats`` the answer comes from the maintained projection and ``store`` is unused.
+    """
+    if stats is not None:
+        return _shared_argument_evidence_from_counts(
+            predicate_a, predicate_b, stats.argument_pairs
+        )
+    assert store is not None, "shared_argument_evidence needs a store or stats"
     edge_rows, claim_rows = _predicate_rows(store)
     return _shared_argument_evidence_from_counts(
         predicate_a,
@@ -99,17 +160,23 @@ def shared_argument_evidence(
 
 
 def generate_predicate_candidates(
-    store: GraphStore,
+    store: GraphStore | None,
     embedder: EmbeddingProvider,
     *,
+    stats: PredicateStats | None = None,
     alias_index: PredicateAliasIndex | None = None,
     judged_pairs: Iterable[tuple[str, str]] | None = None,
     cluster_threshold: float = 0.80,
     min_support: int = 2,
     max_pairs: int = 30,
 ) -> list[PredicateCandidate]:
-    """Return ranked predicate-pair candidates for one bounded judge run."""
-    snapshot = _scan_store(store)
+    """Return ranked predicate-pair candidates for one bounded judge run.
+
+    ``stats`` is the maintained per-vault projection; without it the store is scanned.
+    """
+    if stats is None:
+        assert store is not None, "generate_predicate_candidates needs a store or stats"
+    snapshot = stats if stats is not None else _scan_store(store)
     vocabulary = snapshot.vocabulary
     if len(vocabulary) < 2 or max_pairs <= 0:
         return []
@@ -209,7 +276,12 @@ def _argument_pairs(
     return argument_pairs
 
 
-def _scan_store(store: GraphStore) -> _StoreSnapshot:
+def build_predicate_stats(store: GraphStore) -> PredicateStats:
+    """One set-based scan of ``store`` (no vectors are read) into :class:`PredicateStats`."""
+    return _scan_store(store)
+
+
+def _scan_store(store: GraphStore) -> PredicateStats:
     """Full snapshot for candidate generation, set-based: the two row scans plus
     ONE ``get_nodes`` over every endpoint, Claim argument and sample Block id."""
     edge_rows, claim_rows = _predicate_rows(store)
@@ -250,7 +322,7 @@ def _scan_store(store: GraphStore) -> _StoreSnapshot:
     for predicate, claim, facets in sample_rows:
         samples.setdefault(predicate, []).append(_claim_sample(nodes, claim, facets))
 
-    return _StoreSnapshot(
+    return PredicateStats(
         vocabulary=_vocabulary(edge_rows, claim_rows),
         argument_pairs=_argument_pairs(edge_rows, claim_rows),
         signatures=signatures,

@@ -536,6 +536,16 @@ explicit: <code>add_node(node, clear_embedding=True)</code>. A new node with no 
 graph generation digest does not change when a vector is preserved. No in-tree caller clears a vector
 today: the copy paths (reembed, rebuild, heal, snapshot load) write into fresh stores. A backend
 registered through the entry point must honour the same semantics and accept <code>clear_embedding</code>.</p>
+<p>Every store the daemon serves is an <code>IndexedStore</code>, which carries a change counter for derived
+projections: <code>instance_token</code> (a uuid minted per store object, so a reopen or swap is a new one) and
+<code>write_seq</code>, bumped once after each completed mutation (<code>add_node</code>, <code>add_edge</code>, and the backend bulk
+writers <code>add_nodes</code>, <code>add_edges</code>, <code>wipe</code> reached through delegation; a write that raised also counts,
+because it may have applied partially). A projection built at <code>(generation, instance_token, write_seq)</code>
+is current exactly while all three still match. <code>tests/store/test_write_seq.py</code> enumerates the
+<code>GraphStore</code> protocol and fails when a member is not classified as read-only or mutating. Predicate
+vocabulary, shared-argument pairs, argument signatures and samples are one <code>PredicateStats</code> value
+(<code>predicates.build_predicate_stats</code>), which candidate generation accepts through <code>stats=</code> instead of
+rescanning the graph.</p>
 <p>Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. <code>GrafxStore</code> therefore passes <code>buffer_budget_bytes</code> to
 <code>okto_grafx.connect</code>: <code>storage.buffer_budget</code> in the vault yaml (bytes or a string such as <code>256MiB</code>,

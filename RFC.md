@@ -346,6 +346,17 @@ graph generation digest does not change when a vector is preserved. No in-tree c
 today: the copy paths (reembed, rebuild, heal, snapshot load) write into fresh stores. A backend
 registered through the entry point must honour the same semantics and accept `clear_embedding`.
 
+Every store the daemon serves is an `IndexedStore`, which carries a change counter for derived
+projections: `instance_token` (a uuid minted per store object, so a reopen or swap is a new one) and
+`write_seq`, bumped once after each completed mutation (`add_node`, `add_edge`, and the backend bulk
+writers `add_nodes`, `add_edges`, `wipe` reached through delegation; a write that raised also counts,
+because it may have applied partially). A projection built at `(generation, instance_token, write_seq)`
+is current exactly while all three still match. `tests/store/test_write_seq.py` enumerates the
+`GraphStore` protocol and fails when a member is not classified as read-only or mutating. Predicate
+vocabulary, shared-argument pairs, argument signatures and samples are one `PredicateStats` value
+(`predicates.build_predicate_stats`), which candidate generation accepts through `stats=` instead of
+rescanning the graph.
+
 Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
 on a 179 MB production graph) exceeds it. `GrafxStore` therefore passes `buffer_budget_bytes` to
 `okto_grafx.connect`: `storage.buffer_budget` in the vault yaml (bytes or a string such as `256MiB`,
