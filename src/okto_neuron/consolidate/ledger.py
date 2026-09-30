@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
@@ -1837,11 +1838,52 @@ def _write_sidecar_file(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _remove_stale_sidecar_temps(path, keep=tmp)
     finally:
         try:
             tmp.unlink()
         except FileNotFoundError:
             pass
+
+
+_STALE_TEMP_SECONDS = 3600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but is not ours to signal
+    return True
+
+
+def _remove_stale_sidecar_temps(path: Path, *, keep: Path) -> None:
+    """Drop ``<index>.<pid>.<tid>.tmp`` files a killed writer left behind.
+
+    A temp is stale when its writer's pid is gone or it is over an hour old; the
+    writer's own live temp is never touched. Best effort: the index is a cache.
+    """
+    prefix = f"{path.name}."
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(".tmp")) or name == keep.name:
+            continue
+        parts = name[len(prefix) : -len(".tmp")].split(".")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            continue
+        temp = path.parent / name
+        try:
+            old = now - temp.stat().st_mtime > _STALE_TEMP_SECONDS
+            if old or not _pid_alive(int(parts[0])):
+                temp.unlink()
+        except OSError:
+            continue
 
 
 def edge_candidate_id(payload: dict[str, Any]) -> str:

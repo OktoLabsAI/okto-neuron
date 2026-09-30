@@ -313,3 +313,35 @@ def test_no_in_lock_section_scans_more_than_the_inline_tail_under_a_fast_appende
     assert calls > 0
     assert in_lock["from_zero"] == 0, "a whole-ledger rebuild ran under the ledger lock"
     assert in_lock["worst"] <= tail + 64 * 1024, in_lock
+
+
+def test_stale_sidecar_temps_are_removed_and_a_live_writers_temp_is_kept(tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+    import time
+
+    dead = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True
+    )
+    dead_pid = int(dead.stdout)
+    index = tmp_path / mod.LEDGER_INDEX_FILENAME
+    stale = [tmp_path / f"{index.name}.{dead_pid}.{tid}.tmp" for tid in (1, 2, 3)]
+    live = tmp_path / f"{index.name}.{os.getpid()}.999.tmp"
+    old_live = tmp_path / f"{index.name}.{os.getpid()}.998.tmp"
+    unrelated = tmp_path / f"{index.name}.notapid.x.tmp"
+    for temp in [*stale, live, old_live, unrelated]:
+        temp.write_bytes(b"x")
+    two_hours_ago = time.time() - 7200
+    os.utime(old_live, (two_hours_ago, two_hours_ago))
+
+    mod._write_sidecar_file(index, b"payload")
+
+    assert index.read_bytes() == b"payload"
+    assert [temp.exists() for temp in stale] == [False, False, False]
+    assert live.exists(), "a live writer's recent temp must be kept"
+    assert not old_live.exists(), "a temp over an hour old is stale even if its pid is alive"
+    assert unrelated.exists(), "names that are not <pid>.<tid> are left alone"
+    assert not list(
+        tmp_path.glob(f"{index.name}.{os.getpid()}.{__import__('threading').get_ident()}.tmp")
+    )
