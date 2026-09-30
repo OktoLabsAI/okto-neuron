@@ -50,7 +50,7 @@ from okto_neuron.server._vault_pool import (
     acquire_daemon_writer_lease,
 )
 from okto_neuron.server.http import build_rest_app
-from okto_neuron.server.lifecycle import GracefulShutdown
+from okto_neuron.server.lifecycle import GracefulShutdown, close_budget, last_stop_request
 from okto_neuron.server.state import (
     ServerState,
     VaultRuntime,
@@ -98,7 +98,7 @@ def _configured_executor_workers() -> tuple[int, int]:
 
 
 class _ShutdownSignalHandler:
-    """First signal starts one bounded drain; a repeat exits immediately."""
+    """First signal starts one bounded drain; a repeat (or ``stop --force``) exits immediately."""
 
     def __init__(
         self,
@@ -118,7 +118,8 @@ class _ShutdownSignalHandler:
         self.triggered = False
 
     def __call__(self, signum: int | None = None) -> None:
-        if self.triggered:
+        request = last_stop_request()
+        if self.triggered or (request is not None and request.force):
             self._orchestrator.request_force_shutdown()
             cancelled = kill_active_cli_processes() + cancel_active_litellm_calls()
             self._rest_server.force_exit = True
@@ -136,8 +137,17 @@ class _ShutdownSignalHandler:
             return
 
         self.triggered = True
-        self._orchestrator.request_shutdown(timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        _LOG.info("shutdown signal received; entering drain")
+        drain_timeout = (
+            request.drain_timeout
+            if request is not None and request.drain_timeout is not None
+            else SHUTDOWN_DRAIN_TIMEOUT
+        )
+        self._orchestrator.request_shutdown(timeout=drain_timeout)
+        _LOG.info(
+            "shutdown signal received; entering drain (drain_timeout=%.1fs, close_budget=%.1fs)",
+            drain_timeout,
+            close_budget(drain_timeout),
+        )
         self._state.mark_shutting_down()
         cancelled = kill_active_cli_processes() + cancel_active_litellm_calls()
         if cancelled:

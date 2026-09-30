@@ -615,29 +615,93 @@ def test_send_stop_legacy_migration_requires_exact_vault(
     assert sent == []
 
 
-def test_stop_server_legacy_escalates_to_sigkill(
+def test_stop_server_never_escalates_on_its_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """One request, then only polling: no second request is sent within --timeout (#22)."""
     target = lifecycle_module._LegacyTarget(pid=4242, start_token="birth-1")
-    requested: list[int] = []
-    running = True
+    requested: list[tuple[int, bool]] = []
+    started = time.monotonic()
 
-    def fake_request(vault, *, sig, expected=None):  # type: ignore[no-untyped-def]
-        nonlocal running
-        requested.append(sig)
-        if expected is not None:
-            running = False
+    def fake_request(vault, *, sig, expected=None, force=False, drain_timeout=None):  # type: ignore[no-untyped-def]
+        requested.append((sig, force))
         return target
 
     monkeypatch.setattr(lifecycle_module, "_request_stop_target", fake_request)
+    monkeypatch.setattr(lifecycle_module, "_STOP_EXIT_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(lifecycle_module, "_MIN_CLOSE_BUDGET_SECONDS", 0.0)
     monkeypatch.setattr(
         lifecycle_module,
         "_legacy_target_still_same",
-        lambda vault, current: running,
+        lambda vault, current: time.monotonic() - started < 0.4,
     )
 
-    assert stop_server(tmp_path, timeout=0.3, poll_interval=0.01) == 4242
-    assert requested == [signal.SIGTERM, signal.SIGKILL]
+    assert stop_server(tmp_path, timeout=2.0, poll_interval=0.01) == 4242
+    assert requested == [(signal.SIGTERM, False)]
+
+
+def test_stop_server_times_out_without_escalating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = lifecycle_module._PidRecord(
+        pid=99999, start_token="posix:fixture", owner_id="owner-fixture"
+    )
+    requested: list[tuple[int, bool, float | None]] = []
+
+    def fake_request(vault, *, sig, expected=None, force=False, drain_timeout=None):  # type: ignore[no-untyped-def]
+        requested.append((sig, force, drain_timeout))
+        return target
+
+    monkeypatch.setattr(lifecycle_module, "_request_stop_target", fake_request)
+    monkeypatch.setattr(lifecycle_module, "_STOP_EXIT_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(lifecycle_module, "_MIN_CLOSE_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(
+        lifecycle_module, "_active_pid_record", lambda vault, **kw: target
+    )
+
+    with pytest.raises(LifecycleError, match="did not exit"):
+        stop_server(tmp_path, timeout=0.3, poll_interval=0.01)
+    # The daemon was asked once, carrying --timeout as its drain budget.
+    assert requested == [(signal.SIGTERM, False, 0.3)]
+
+
+def test_stop_server_force_sends_the_force_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = lifecycle_module._PidRecord(
+        pid=99999, start_token="posix:fixture", owner_id="owner-fixture"
+    )
+    requested: list[tuple[int, bool]] = []
+
+    def fake_request(vault, *, sig, expected=None, force=False, drain_timeout=None):  # type: ignore[no-untyped-def]
+        requested.append((sig, force))
+        return target
+
+    def gone(vault, **kw):  # type: ignore[no-untyped-def]
+        raise lifecycle_module._OwnerGone("exited")
+
+    monkeypatch.setattr(lifecycle_module, "_request_stop_target", fake_request)
+    monkeypatch.setattr(lifecycle_module, "_active_pid_record", gone)
+
+    assert stop_server(tmp_path, timeout=1.0, poll_interval=0.01, force=True) == 99999
+    assert requested == [(signal.SIGTERM, True)]
+
+
+def test_stop_server_force_kills_a_legacy_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = lifecycle_module._LegacyTarget(pid=4242, start_token="birth-1")
+    sent: list[int] = []
+    monkeypatch.setattr(lifecycle_module, "_active_pid_record", lambda *a, **k: (_ for _ in ()).throw(
+        lifecycle_module._LegacyOwner(4242)))
+    monkeypatch.setattr(lifecycle_module, "_validate_legacy_target", lambda vault, pid: target)
+    monkeypatch.setattr(
+        lifecycle_module, "_signal_legacy_target", lambda vault, tgt, sig: sent.append(sig)
+    )
+    monkeypatch.setattr(lifecycle_module, "_legacy_target_still_same", lambda vault, cur: False)
+
+    assert stop_server(tmp_path, timeout=1.0, poll_interval=0.01, force=True) == 4242
+    assert sent == [signal.SIGKILL]
 
 
 def test_send_stop_refuses_locked_identity_mismatch(tmp_path: Path) -> None:
@@ -825,7 +889,7 @@ def test_stop_server_tolerates_transient_identity_check_failure(
     monkeypatch.setattr(
         lifecycle_module,
         "_request_stop_target",
-        lambda vault, *, sig, expected=None: target,
+        lambda vault, *, sig, expected=None, force=False, drain_timeout=None: target,
     )
 
     calls = {"n": 0}
@@ -845,81 +909,59 @@ def test_stop_server_tolerates_transient_identity_check_failure(
     assert calls["n"] >= 2
 
 
-def test_stop_server_does_not_swallow_a_proven_identity_mismatch(
+def test_stop_server_keeps_polling_through_an_identity_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A genuine (non-transient) identity mismatch must still abort the wait.
+    """``PID identity mismatch`` while the owner still holds the lock is not an error.
 
-    Only ``_IdentityUnverifiable`` (an inconclusive read while the owner is
-    still confirmed alive) is tolerated by the poll loop. A plain
-    ``LifecycleError`` -- e.g. the PID file now belongs to a provably
-    different process, or its record is corrupt -- must keep propagating so
-    ``stop_server`` fails loudly instead of waiting out the full timeout.
+    #22: a stop that had in fact succeeded printed the mismatch and exited 1.
+    The birth token reading differently mid-teardown must keep the poll going
+    until the owner is gone.
     """
     target = lifecycle_module._PidRecord(
         pid=99999, start_token="posix:fixture", owner_id="owner-fixture"
     )
-
     monkeypatch.setattr(
         lifecycle_module,
         "_request_stop_target",
-        lambda vault, *, sig, expected=None: target,
+        lambda vault, *, sig, expected=None, force=False, drain_timeout=None: target,
     )
-
-    def always_mismatched(vault, *, expected_owner_id=None, expected_start_token=None):  # type: ignore[no-untyped-def]
-        raise LifecycleError(
-            f"PID identity mismatch for {target.pid}; refusing to signal an "
-            "unrelated or unverifiable process"
-        )
-
-    monkeypatch.setattr(lifecycle_module, "_active_pid_record", always_mismatched)
-
-    with pytest.raises(LifecycleError, match="PID identity mismatch"):
-        stop_server(tmp_path, timeout=2.0, poll_interval=0.01)
-
-
-def test_stop_server_retries_escalation_after_transient_identity_check_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The same transient-read race can hit the escalation signal, not just the
-    poll check, and must not be dropped silently.
-
-    ``_active_pid_record`` runs inside ``_request_stop_target`` (via
-    ``_request_stop``) *before* the signal file is written, so a transient
-    ``_IdentityUnverifiable`` there means no second signal was actually
-    delivered. ``stop_server`` must retry escalation on a later iteration
-    rather than marking it done and letting the target wait out the deadline
-    without ever receiving the repeat signal.
-    """
-    target = lifecycle_module._LegacyTarget(pid=4242, start_token="birth-1")
-    requested: list[int] = []
     calls = {"n": 0}
 
-    def flaky_request(vault, *, sig, expected=None):  # type: ignore[no-untyped-def]
-        requested.append(sig)
-        if expected is not None:
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise lifecycle_module._IdentityUnverifiable(
-                    f"PID identity mismatch for {target.pid}; refusing to signal an "
-                    "unrelated or unverifiable process"
-                )
-        return target
+    def mismatch_then_gone(vault, *, expected_owner_id=None, expected_start_token=None):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise lifecycle_module._IdentityMismatch(
+                f"PID identity mismatch for {target.pid}; refusing to signal an "
+                "unrelated or unverifiable process"
+            )
+        raise lifecycle_module._OwnerGone("owner exited")
 
-    monkeypatch.setattr(lifecycle_module, "_request_stop_target", flaky_request)
+    monkeypatch.setattr(lifecycle_module, "_active_pid_record", mismatch_then_gone)
+
+    assert stop_server(tmp_path, timeout=2.0, poll_interval=0.01) == target.pid
+    assert calls["n"] == 4
+
+
+def test_stop_server_still_raises_on_a_corrupt_pid_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = lifecycle_module._PidRecord(
+        pid=99999, start_token="posix:fixture", owner_id="owner-fixture"
+    )
     monkeypatch.setattr(
         lifecycle_module,
-        "_legacy_target_still_same",
-        lambda vault, current: calls["n"] < 2,
+        "_request_stop_target",
+        lambda vault, *, sig, expected=None, force=False, drain_timeout=None: target,
     )
 
-    assert stop_server(tmp_path, timeout=0.5, poll_interval=0.01) == 4242
-    # Initial SIGTERM, then a posix legacy escalation always uses SIGKILL: the
-    # first escalation attempt raised _IdentityUnverifiable and was retried
-    # (not dropped) rather than being marked done without delivering a signal.
-    assert requested[0] == signal.SIGTERM
-    assert requested.count(signal.SIGKILL) >= 2
-    assert calls["n"] >= 2
+    def corrupt(vault, *, expected_owner_id=None, expected_start_token=None):  # type: ignore[no-untyped-def]
+        raise LifecycleError("daemon lock is held, but its identity record is missing or corrupt")
+
+    monkeypatch.setattr(lifecycle_module, "_active_pid_record", corrupt)
+
+    with pytest.raises(LifecycleError, match="missing or corrupt"):
+        stop_server(tmp_path, timeout=2.0, poll_interval=0.01)
 
 
 def test_send_stop_migrates_localized_versioned_birth_token(
@@ -985,6 +1027,7 @@ ready = Path(sys.argv[2])
 signals = {"count": 0}
 def handle(signum, frame):
     signals["count"] += 1
+    ready.with_suffix(".count").write_text(str(signals["count"]))
     if signals["count"] >= 2:
         raise SystemExit(0)
 signal.signal(signal.SIGTERM, handle)
@@ -1032,8 +1075,12 @@ def test_stop_server_signals_and_waits(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX-only signal semantics")
-def test_stop_server_escalates_with_repeat_signal(tmp_path: Path) -> None:
+def test_stop_server_repeat_requests_are_not_delivered_but_force_is(tmp_path: Path) -> None:
+    """The watcher delivers the first request and forced ones, never a repeat (#22)."""
+    import threading
+
     ready = tmp_path / "ready"
+    count_file = ready.with_suffix(".count")
     script_path = tmp_path / "child-repeat.py"
     script_path.write_text(_CHILD_REQUIRES_REPEAT_SCRIPT, encoding="utf-8")
     proc = subprocess.Popen(
@@ -1042,13 +1089,38 @@ def test_stop_server_escalates_with_repeat_signal(tmp_path: Path) -> None:
         stderr=subprocess.STDOUT,
     )
     try:
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and not ready.exists():
             time.sleep(0.05)
         assert ready.exists(), "child did not signal readiness"
 
-        assert stop_server(tmp_path, timeout=2.0, poll_interval=0.02) == proc.pid
-        assert proc.wait(timeout=2.0) == 0
+        graceful: dict[str, object] = {}
+
+        def run_graceful() -> None:
+            try:
+                graceful["pid"] = stop_server(tmp_path, timeout=30.0, poll_interval=0.02)
+            except BaseException as exc:  # noqa: BLE001
+                graceful["error"] = exc
+
+        waiter = threading.Thread(target=run_graceful)
+        waiter.start()
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not count_file.exists():
+            time.sleep(0.05)
+        assert count_file.read_text() == "1"
+
+        # Another graceful request (as a second `stop` would send) is not a
+        # second signal: the child still sees exactly one.
+        send_stop(tmp_path)
+        time.sleep(0.5)
+        assert count_file.read_text() == "1"
+        assert proc.poll() is None
+
+        # --force is delivered, and is the second signal the child needs.
+        assert stop_server(tmp_path, timeout=5.0, poll_interval=0.02, force=True) == proc.pid
+        assert proc.wait(timeout=5.0) == 0
+        waiter.join(timeout=5.0)
+        assert graceful.get("pid") == proc.pid
         assert not pid_file_path(tmp_path).exists()
     finally:
         if proc.poll() is None:

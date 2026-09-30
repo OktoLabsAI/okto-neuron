@@ -3138,8 +3138,20 @@ def dev(
     type=click.Path(path_type=Path),
     help="Legacy daemon lock root; new application daemons do not require it.",
 )
-@click.option("--timeout", default=30.0, type=float, help="Seconds to wait for shutdown.")
-def stop(vault: Path | None, timeout: float) -> None:
+@click.option(
+    "--timeout",
+    default=30.0,
+    type=float,
+    help="Drain budget in seconds. The daemon gets a further close budget "
+    "(max(5 s, 25%)) to close its stores; stop waits for both and never escalates.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Send the force request: skip the drain and exit now (stores are not closed).",
+)
+def stop(vault: Path | None, timeout: float, force: bool) -> None:
     """Stop the application daemon."""
     from okto_neuron.server.lifecycle import LifecycleError, read_pid, stop_server
 
@@ -3151,12 +3163,16 @@ def stop(vault: Path | None, timeout: float) -> None:
         resolved = _resolve_vault(vault) if vault is not None else _discover_stop_root()
     running_pid = read_pid(resolved)
     if running_pid is not None:
-        click.echo(
-            f"stopping okto-neuron server (pid={running_pid}); waiting up to {timeout:.1f}s "
-            "for drain, then escalating automatically"
-        )
+        if force:
+            click.echo(f"forcing okto-neuron server (pid={running_pid}) to exit")
+        else:
+            click.echo(
+                f"stopping okto-neuron server (pid={running_pid}); waiting up to "
+                f"{timeout:.1f}s for drain plus the store-close budget (no automatic "
+                "escalation; use --force to skip the drain)"
+            )
     try:
-        pid = stop_server(resolved, timeout=timeout)
+        pid = stop_server(resolved, timeout=timeout, force=force)
     except LifecycleError as exc:
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(1) from exc

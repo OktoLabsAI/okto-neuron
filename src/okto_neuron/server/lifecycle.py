@@ -492,6 +492,27 @@ def read_pid(vault: Path) -> int | None:
     return record.pid if record is not None else legacy_pid
 
 
+@dataclass(frozen=True)
+class StopRequest:
+    """What the last owner-bound stop request asked for (``stop --timeout/--force``)."""
+
+    force: bool = False
+    drain_timeout: float | None = None
+
+
+_LAST_STOP_REQUEST: StopRequest | None = None
+
+
+def last_stop_request() -> StopRequest | None:
+    """The stop request the watcher most recently turned into a signal, if any.
+
+    The signal handler reads this to size the drain budget for ``stop --timeout``
+    and to tell ``stop --force`` from the first, graceful request. A plain
+    SIGTERM/SIGINT (no request file) leaves it ``None``.
+    """
+    return _LAST_STOP_REQUEST
+
+
 class PidFile:
     """Context manager that owns ``<vault>/.marginalia/server.pid``.
 
@@ -605,6 +626,7 @@ class PidFile:
             return
         path = signal_file_path(self.vault)
         last_request_id: str | None = None
+        delivered_first = False
         while not self._watch_stop.wait(_SIGNAL_POLL_SECONDS):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -629,6 +651,25 @@ class PidFile:
             # ever sends a signal to a numeric PID, eliminating PID-reuse kills.
             if os.getpid() != record.pid or _process_start_token(record.pid) != record.start_token:
                 return
+            force = payload.get("force") is True
+            # Only the first request and explicit ``--force`` requests become
+            # signals. A repeat graceful request must never be read by the
+            # daemon as the operator's second signal (#22); a real second
+            # SIGTERM/Ctrl-C still forces through the signal handler.
+            if delivered_first and not force:
+                last_request_id = request_id
+                continue
+            drain_timeout: float | None
+            try:
+                raw_timeout = payload.get("drain_timeout")
+                drain_timeout = float(raw_timeout) if raw_timeout is not None else None
+            except (TypeError, ValueError):
+                drain_timeout = None
+            if drain_timeout is not None and not (0.0 <= drain_timeout < 86400.0):
+                drain_timeout = None
+            global _LAST_STOP_REQUEST
+            _LAST_STOP_REQUEST = StopRequest(force=force, drain_timeout=drain_timeout)
+            delivered_first = True
             last_request_id = request_id
             # ``raise_signal`` targets this process directly (and invokes the
             # Python handler on Windows, where ``os.kill(SIGTERM)`` would call
@@ -944,6 +985,17 @@ class _IdentityUnverifiable(LifecycleError):
     """
 
 
+class _IdentityMismatch(_IdentityUnverifiable):
+    """The owner's birth token read differently from the one captured at stop time.
+
+    While the lifecycle lock is still held by the recorded owner this is not a
+    different process (only the lock holder can write that record): it is the
+    same daemon whose process-table entry reads differently while it tears down.
+    Like :class:`_IdentityUnverifiable` it fails closed for callers deciding
+    whether to signal, and a caller that is only polling keeps polling.
+    """
+
+
 @dataclass(frozen=True)
 class _LegacyTarget:
     pid: int
@@ -1020,7 +1072,7 @@ def _active_pid_record(
                         "unrelated or unverifiable process"
                     )
                 if current_start != expected_start_token:
-                    raise LifecycleError(
+                    raise _IdentityMismatch(
                         f"PID identity mismatch for {record.pid}; refusing to signal an "
                         "unrelated or unverifiable process"
                     )
@@ -1258,7 +1310,14 @@ def _signal_legacy_target(vault: Path, target: _LegacyTarget, sig: int) -> None:
         raise _OwnerGone from exc
 
 
-def _write_signal_request(vault: Path, record: _PidRecord, sig: int) -> None:
+def _write_signal_request(
+    vault: Path,
+    record: _PidRecord,
+    sig: int,
+    *,
+    force: bool = False,
+    drain_timeout: float | None = None,
+) -> None:
     if sig not in {signal.SIGTERM, signal.SIGINT}:
         raise LifecycleError(f"unsupported daemon stop signal: {sig}")
     path = signal_file_path(vault)
@@ -1273,6 +1332,8 @@ def _write_signal_request(vault: Path, record: _PidRecord, sig: int) -> None:
                 "start_token": record.start_token,
                 "signal": int(sig),
                 "request_id": request_id,
+                "force": bool(force),
+                "drain_timeout": drain_timeout,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1313,6 +1374,8 @@ def _request_stop(
     expected_owner_id: str | None = None,
     expected_pid: int | None = None,
     expected_start_token: str | None = None,
+    force: bool = False,
+    drain_timeout: float | None = None,
 ) -> _PidRecord:
     record = _active_pid_record(
         vault,
@@ -1321,7 +1384,7 @@ def _request_stop(
     )
     if expected_pid is not None and record.pid != expected_pid:
         raise _OwnerChanged
-    _write_signal_request(vault, record, sig)
+    _write_signal_request(vault, record, sig, force=force, drain_timeout=drain_timeout)
     return record
 
 
@@ -1331,6 +1394,8 @@ def _request_stop_target(
     sig: int,
     expected: _PidRecord | _LegacyTarget | None = None,
     expected_pid: int | None = None,
+    force: bool = False,
+    drain_timeout: float | None = None,
 ) -> _PidRecord | _LegacyTarget:
     if isinstance(expected, _PidRecord):
         return _request_stop(
@@ -1339,18 +1404,31 @@ def _request_stop_target(
             expected_owner_id=expected.owner_id,
             expected_pid=expected.pid,
             expected_start_token=expected.start_token,
+            force=force,
+            drain_timeout=drain_timeout,
         )
     if isinstance(expected, _LegacyTarget):
-        _signal_legacy_target(vault, expected, sig)
+        _signal_legacy_target(vault, expected, _legacy_signal(sig, force))
         return expected
     try:
-        return _request_stop(vault, sig=sig, expected_pid=expected_pid)
+        return _request_stop(
+            vault,
+            sig=sig,
+            expected_pid=expected_pid,
+            force=force,
+            drain_timeout=drain_timeout,
+        )
     except _LegacyOwner as legacy:
         target = _validate_legacy_target(vault, legacy.pid)
         if expected_pid is not None and target.pid != expected_pid:
             raise _OwnerChanged
-        _signal_legacy_target(vault, target, sig)
+        _signal_legacy_target(vault, target, _legacy_signal(sig, force))
         return target
+
+
+def _legacy_signal(sig: int, force: bool) -> int:
+    """A pre-lock daemon has no force request: ``--force`` is SIGKILL for it."""
+    return signal.SIGKILL if force and os.name == "posix" else sig
 
 
 def send_stop(
@@ -1391,32 +1469,53 @@ def active_server_pid(vault: Path) -> int | None:
         return None
 
 
+def close_budget(drain_timeout: float) -> float:
+    """Seconds reserved after the drain budget for the store close (#22).
+
+    ``max(5 s, 25 %)`` of the drain budget: the drain may use all of
+    ``drain_timeout``, and the close then still has this long before the hard
+    deadline (``drain_timeout + close_budget``).
+    """
+    return max(_MIN_CLOSE_BUDGET_SECONDS, _CLOSE_BUDGET_FRACTION * max(0.0, drain_timeout))
+
+
+_MIN_CLOSE_BUDGET_SECONDS = 5.0
+_CLOSE_BUDGET_FRACTION = 0.25
+_STOP_EXIT_GRACE_SECONDS = 5.0
+
+
 def stop_server(
     vault: Path,
     *,
     sig: int = signal.SIGTERM,
     timeout: float = 30.0,
     poll_interval: float = 0.1,
+    force: bool = False,
 ) -> int:
-    """Signal the server and wait for the PID file to be removed.
+    """Ask the server to stop once and wait for it to exit.
 
-    A server that has not stopped after ten seconds receives the same signal a
-    second time. The runtime treats that repeat as an explicit force request;
-    this makes ``okto-neuron stop`` deterministic without requiring the operator
-    to discover the PID and send another signal manually.
+    Exactly ONE request is sent: ``stop`` never escalates on its own (#22). The
+    request carries ``timeout`` as the daemon's drain budget; the daemon then
+    has a further :func:`close_budget` to close its stores, so this waits up to
+    ``timeout`` plus that budget plus a small exit grace. Success is the owner
+    releasing its lifecycle lock (or the PID being gone). An identity read that
+    is unavailable or differs while the lock is still held is not an exit and
+    not an error: keep polling.
+
+    ``force=True`` sends the force request instead (the daemon skips the
+    drain; a legacy daemon gets SIGKILL).
 
     Returns the PID that was signalled. Raises :class:`LifecycleError` on
     timeout.
     """
     try:
-        target = _request_stop_target(vault, sig=sig)
+        target = _request_stop_target(vault, sig=sig, force=force, drain_timeout=timeout)
     except _OwnerGone as exc:
         raise LifecycleError(str(exc)) from exc
     pid = target.pid
     started = time.monotonic()
-    deadline = started + timeout
-    escalation_at = started + min(10.0, max(0.1, timeout / 2.0))
-    escalated = False
+    wait = timeout + close_budget(timeout) + _STOP_EXIT_GRACE_SECONDS
+    deadline = started + wait
     while time.monotonic() < deadline:
         if isinstance(target, _PidRecord):
             try:
@@ -1428,49 +1527,19 @@ def stop_server(
             except (_OwnerGone, _OwnerChanged):
                 return pid
             except _IdentityUnverifiable:
-                # ``_active_pid_record`` fails closed (refuses to vouch for the
-                # owner) whenever a single process-birth read is transiently
-                # unavailable, e.g. a ``ps`` call timing out under system load
-                # -- see test_expected_locked_owner_with_unavailable_identity_
-                # remains_fail_closed. That is correct when deciding whether to
-                # *signal* a process, but here we are only polling whether the
-                # target we already signalled is still there. An inconclusive
-                # read is not proof the owner exited, so keep waiting rather
-                # than aborting the whole stop attempt; only a confirmed
-                # _OwnerGone/_OwnerChanged above, or the deadline below, ends
-                # the wait. A genuine, provable identity mismatch (or a
-                # corrupt/missing record) still raises the base
-                # ``LifecycleError`` and is not caught here.
+                # Covers a transiently unreadable process-birth identity and a
+                # birth token that reads differently while the owner still
+                # holds the lock. Neither is proof the owner exited, and
+                # neither is an error: we only poll a target we already
+                # signalled. Only a confirmed exit above, or the deadline
+                # below, ends the wait. A corrupt or missing PID record still
+                # raises the base ``LifecycleError``.
                 pass
         elif not _legacy_target_still_same(vault, target):
             return pid
-        if not escalated and time.monotonic() >= escalation_at:
-            try:
-                escalation_signal = (
-                    signal.SIGKILL
-                    if isinstance(target, _LegacyTarget) and os.name == "posix"
-                    else sig
-                )
-                _request_stop_target(
-                    vault,
-                    sig=escalation_signal,
-                    expected=target,
-                )
-            except (_OwnerGone, _OwnerChanged):
-                return pid
-            except _IdentityUnverifiable:
-                # Same transient-read race as above, but here it happened
-                # while trying to deliver the escalation signal itself: no
-                # signal was written (the identity check runs before
-                # ``_write_signal_request``), so leave ``escalated`` False
-                # and retry escalation on a later iteration instead of
-                # silently dropping the second signal.
-                pass
-            else:
-                escalated = True
         time.sleep(poll_interval)
     path = pid_file_path(vault)
-    raise LifecycleError(f"server did not exit within {timeout:.1f}s (pid={pid}, pid_file={path})")
+    raise LifecycleError(f"server did not exit within {wait:.1f}s (pid={pid}, pid_file={path})")
 
 
 # ---------------------------------------------------------------------------
