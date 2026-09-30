@@ -2239,7 +2239,9 @@ class CandidateLedger:
         Both entry points are the ones a first reader uses, so this only moves
         the cold build earlier; it never changes what a read returns. ``cancelled``
         is checked between the two builds so a daemon that is stopping skips the
-        second one. The index is a cache: a failed pass is left to the readers.
+        second one. It ends by answering the UI's summary question once, so the run view's
+        reduced copy of the newest run is built here and not on the first poll. The index is
+        a cache: a failed pass is left to the readers.
         """
         if not self.path.exists():
             return
@@ -2252,6 +2254,10 @@ class CandidateLedger:
             if cancelled is not None and cancelled():
                 return
             self._offset_index()
+            if cancelled is not None and cancelled():
+                return
+            # The UI's first poll would otherwise parse the big plan rows on the event loop.
+            self.run_progress_summary(None, limit=12)
         except _BuildCancelled:
             return
         finally:
