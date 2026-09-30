@@ -257,6 +257,9 @@ read once before the loop.
 - `resolve.find_contradictions` and `resolve.resolve` take an optional
   `claims=` snapshot, and the two resolve loops in `Companion.remember` read
   the Claim list once per loop, not once per Claim candidate.
+- The server's `companion-triage` job (`server/_curation.py`) reads the Claim
+  list once and passes it as `claims=` to every `resolve()` call in its
+  candidate loop. That loop only reads the store, so the snapshot is exact.
 
 On a synthetic Grafx store (4,000 nodes, 13,000 edges, 2,500 Claims, local
 laptop), `collect_predicate_vocabulary` went from a 53.6 s median to 0.39 s,

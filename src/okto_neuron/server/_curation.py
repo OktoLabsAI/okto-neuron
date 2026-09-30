@@ -933,7 +933,11 @@ def _run_companion_triage_verdicts(
 
 def run_companion_triage(state: "ServerState", job: Any) -> dict:
     """Judge parked companion node candidates and auto-resolve clear cases."""
-    from okto_neuron.companion import Companion, ReviewItemNotFoundError
+    from okto_neuron.companion import (
+        Companion,
+        ReviewItemNotFoundError,
+        _claims_for_contradiction_scan,
+    )
     from okto_neuron.consolidate.review_queue import ReviewQueue
     from okto_neuron.curator import LLMCandidateCurator, _source_excerpt
     from okto_neuron.llm import sampler_overrides
@@ -966,9 +970,13 @@ def run_companion_triage(state: "ServerState", job: Any) -> dict:
     items: list[_TriageItem] = []
     errors: list[dict[str, str]] = []
     gate_threshold = consolidation.auto_commit_threshold
+    # This loop only reads the store (Claims are written later, by
+    # ``resolve_review``), so one Claim snapshot equals what each resolve() would
+    # have re-read per candidate. Runs on a job worker, like every store call here.
+    claim_snapshot = _claims_for_contradiction_scan(store, candidates)
     for candidate in candidates:
         try:
-            outcome = resolve(candidate, store, embedder=embedder)
+            outcome = resolve(candidate, store, embedder=embedder, claims=claim_snapshot)
             prompt = curator.build_prompt(
                 candidate,
                 outcome,

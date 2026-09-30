@@ -15389,6 +15389,9 @@ their Documents in two calls.</li>
 <li><code>resolve.find_contradictions</code> and <code>resolve.resolve</code> take an optional
 <code>claims=</code> snapshot, and the two resolve loops in <code>Companion.remember</code> read
 the Claim list once per loop, not once per Claim candidate.</li>
+<li>The server's <code>companion-triage</code> job (<code>server/_curation.py</code>) reads the Claim
+list once and passes it as <code>claims=</code> to every <code>resolve()</code> call in its
+candidate loop. That loop only reads the store, so the snapshot is exact.</li>
 </ul>
 <p>On a synthetic Grafx store (4,000 nodes, 13,000 edges, 2,500 Claims, local
 laptop), <code>collect_predicate_vocabulary</code> went from a 53.6 s median to 0.39 s,
