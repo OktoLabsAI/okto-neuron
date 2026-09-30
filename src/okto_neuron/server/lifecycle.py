@@ -58,6 +58,11 @@ PID_RELATIVE = Path(".marginalia") / "server.pid"
 SIGNAL_RELATIVE = Path(".marginalia") / "server.signal"
 """Instance-targeted stop request consumed by the PID-file owner."""
 
+SHUTDOWN_OUTCOME_CAPABILITY = "shutdown_outcome"
+"""Advertised in the PID record by a daemon that writes ``server.outcome`` on every clean
+stop. ``stop`` reads it from the record (still on disk after the daemon exited), so a
+0.3.1 daemon, which never writes the file, is told apart from a new one that crashed."""
+
 OUTCOME_RELATIVE = Path(".marginalia") / "server.outcome"
 """Final status a daemon leaves when its store close was skipped (read once by ``stop``)."""
 
@@ -116,17 +121,19 @@ def outcome_file_path(root: Path) -> Path:
 _OUTCOME_ROOT: Path | None = None
 
 
-def write_close_skipped_outcome(calls_in_flight: dict[str, int]) -> None:
-    """Record, just before a hard exit, that the store close was skipped.
+def write_shutdown_outcome(outcome: str, calls_in_flight: dict[str, int] | None = None) -> None:
+    """Record how this daemon's shutdown ended (``closed`` right after the store
+    close completed, ``close_skipped`` just before the hard exit).
 
     Best effort (the exit path must not raise): ``stop`` reads and removes the
-    file to report exit code 3 instead of plain success.
+    file and exits 0 only for ``closed``.
     """
     root = _OUTCOME_ROOT
     if root is None:
         return
+    calls_in_flight = calls_in_flight or {}
     payload = {
-        "outcome": "close_skipped",
+        "outcome": outcome,
         "pid": os.getpid(),
         "calls_in_flight": sum(calls_in_flight.values()),
         "vaults": sorted(name for name, count in calls_in_flight.items() if count),
@@ -141,11 +148,21 @@ def write_close_skipped_outcome(calls_in_flight: dict[str, int]) -> None:
         _LOG.warning("could not write the shutdown outcome file", exc_info=True)
 
 
+def write_close_skipped_outcome(calls_in_flight: dict[str, int]) -> None:
+    write_shutdown_outcome("close_skipped", calls_in_flight)
+
+
+def pid_record_capabilities(root: Path) -> frozenset[str]:
+    """Capabilities the daemon advertised in its PID record (empty for a legacy one)."""
+    record, _legacy = _read_pid_payload(pid_file_path(root))
+    return frozenset(record.capabilities) if record is not None else frozenset()
+
+
 def consume_stop_outcome(root: Path, pid: int) -> dict[str, Any] | None:
     """Read and remove the outcome file left by daemon ``pid``.
 
-    Returns the payload only when it is well-formed, says ``close_skipped`` and
-    belongs to ``pid``. A missing, corrupt or stale (other pid) file yields
+    Returns the payload only when it is well-formed, says ``closed`` or
+    ``close_skipped`` and belongs to ``pid``. A missing, corrupt or stale (other pid) file yields
     ``None``; any file found is removed so it cannot leak into a later stop.
     """
     path = outcome_file_path(root)
@@ -160,7 +177,7 @@ def consume_stop_outcome(root: Path, pid: int) -> dict[str, Any] | None:
         return None
     if (
         not isinstance(payload, dict)
-        or payload.get("outcome") != "close_skipped"
+        or payload.get("outcome") not in ("closed", "close_skipped")
         or payload.get("pid") != pid
         or not isinstance(payload.get("calls_in_flight"), int)
     ):
@@ -174,16 +191,20 @@ class _PidRecord:
     start_token: str
     owner_id: str
     version: int = PID_RECORD_VERSION
+    capabilities: tuple[str, ...] = ()
 
     def to_json(self) -> str:
+        payload: dict[str, Any] = {
+            "version": self.version,
+            "pid": self.pid,
+            "start_token": self.start_token,
+            "owner_id": self.owner_id,
+        }
+        if self.capabilities:
+            payload["capabilities"] = list(self.capabilities)
         return (
             json.dumps(
-                {
-                    "version": self.version,
-                    "pid": self.pid,
-                    "start_token": self.start_token,
-                    "owner_id": self.owner_id,
-                },
+                payload,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -208,12 +229,17 @@ def _parse_pid_record(raw: str) -> tuple[_PidRecord | None, int | None]:
             owner_id = str(payload.get("owner_id") or "")
         except (TypeError, ValueError):
             return None, None
+        raw_caps = payload.get("capabilities")
+        capabilities = (
+            tuple(str(item) for item in raw_caps) if isinstance(raw_caps, list) else ()
+        )
         if version == PID_RECORD_VERSION and pid > 0 and start_token and owner_id:
             return _PidRecord(
                 pid=pid,
                 start_token=start_token,
                 owner_id=owner_id,
                 version=version,
+                capabilities=capabilities,
             ), None
         return None, None
     try:
@@ -663,6 +689,9 @@ class PidFile:
                 pid=self._pid,
                 start_token=start_token,
                 owner_id=secrets.token_hex(16),
+                capabilities=(
+                    (SHUTDOWN_OUTCOME_CAPABILITY,) if self._pid == os.getpid() else ()
+                ),
             )
             _write_pid_fd(fd, record)
             _remove_path(signal_file_path(self.vault), what="stop-request file")
@@ -1147,6 +1176,7 @@ def _active_pid_record(
                     start_token=current_start,
                     owner_id=record.owner_id,
                     version=record.version,
+                    capabilities=record.capabilities,
                 )
             if current_start == record.start_token:
                 return record
@@ -1170,6 +1200,7 @@ def _active_pid_record(
                     start_token=current_start,
                     owner_id=record.owner_id,
                     version=record.version,
+                    capabilities=record.capabilities,
                 )
             raise LifecycleError(
                 f"PID identity mismatch for {record.pid}; refusing to signal an "

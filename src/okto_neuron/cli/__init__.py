@@ -3159,8 +3159,10 @@ def dev(
 def stop(vault: Path | None, timeout: float, force: bool) -> None:
     """Stop the application daemon."""
     from okto_neuron.server.lifecycle import (
+        SHUTDOWN_OUTCOME_CAPABILITY,
         LifecycleError,
         consume_stop_outcome,
+        pid_record_capabilities,
         read_pid,
         stop_server,
     )
@@ -3181,16 +3183,26 @@ def stop(vault: Path | None, timeout: float, force: bool) -> None:
                 f"{timeout:.1f}s for drain plus the store-close budget (no automatic "
                 "escalation; use --force to skip the drain)"
             )
+    # Read before the stop: the record is gone once the daemon exits. A daemon that
+    # does not advertise the capability (0.3.1) never writes an outcome file.
+    advertised_outcome = SHUTDOWN_OUTCOME_CAPABILITY in pid_record_capabilities(resolved)
     try:
         pid = stop_server(resolved, timeout=timeout, force=force)
     except LifecycleError as exc:
         click.echo(str(exc), err=True)
         raise click.exceptions.Exit(1) from exc
-    skipped = consume_stop_outcome(resolved, pid)
-    if skipped is not None:
+    outcome = consume_stop_outcome(resolved, pid)
+    if outcome is not None and outcome["outcome"] == "close_skipped":
         click.echo(
-            f"stopped, but the store close was skipped ({skipped['calls_in_flight']} grafx "
+            f"stopped, but the store close was skipped ({outcome['calls_in_flight']} grafx "
             "calls in flight); the next start recovers from the WAL",
+            err=True,
+        )
+        raise click.exceptions.Exit(3)
+    if outcome is None and advertised_outcome:
+        click.echo(
+            "stopped, but the daemon left no shutdown outcome (crash or forced exit); "
+            "the next start recovers from the WAL",
             err=True,
         )
         raise click.exceptions.Exit(3)

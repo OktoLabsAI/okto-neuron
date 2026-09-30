@@ -508,6 +508,9 @@ async def _graceful_shutdown(
             else:
                 summary["store_closed"] = True
                 summary["outcome"] = "closed"
+                from okto_neuron.server.lifecycle import write_shutdown_outcome
+
+                write_shutdown_outcome("closed")
         if raise_exit:
             orchestrator.request_force_shutdown()
             rest_server.force_exit = True

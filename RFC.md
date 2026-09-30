@@ -406,11 +406,16 @@ so the close goes ahead around it. If a grafx call is still running at the hard 
 plus close budget), the daemon does not close under it: it logs `store close skipped: N grafx
 calls in flight, relying on WAL recovery`, flushes telemetry and logs, and exits; the next open
 recovers from the WAL. The order is store close, then writer-lease release, then the pid file.
-Before that hard exit the daemon writes `.marginalia/server.outcome` (`outcome=close_skipped`, its pid, the
-calls in flight and the vault names) next to the pid file; `okto-neuron stop` reads and removes it, prints
-`stopped, but the store close was skipped (N grafx calls in flight); the next start recovers from the
-WAL` and exits 3. A stop that closed the stores exits 0; a file from another pid, or a corrupt one, is
-ignored and removed.
+The daemon leaves its verdict in `.marginalia/server.outcome` (`outcome=closed` right after the store
+close completed, `outcome=close_skipped` with the calls in flight and vault names just before the hard
+exit; both carry its pid, written atomically). `okto-neuron stop` reads and removes it and exits 0 only
+for `closed`. `close_skipped` prints `stopped, but the store close was skipped (N grafx calls in flight);
+the next start recovers from the WAL` and exits 3. When the daemon is gone and left no outcome (killed
+mid-stop, crashed, or `--force`), a daemon that advertises the `shutdown_outcome` capability in its pid
+record gets `stopped, but the daemon left no shutdown outcome (crash or forced exit); the next start
+recovers from the WAL` and exit 3. A 0.3.1 daemon never writes the file and does not advertise the
+capability (read from the pid record before the stop, since it is gone after), so `stop` keeps exit 0 for
+it. An outcome from another pid, a corrupt one, or an unknown value counts as no outcome.
 Every phase logs `shutdown.phase name=... duration_ms=... remaining_s=...` (each vault's close
 included) and a final `shutdown.summary` line. The ladybug and neo4j adapters do not count their
 native calls yet, so they need `store/_inflight.py` before the daemon's clean-close path can

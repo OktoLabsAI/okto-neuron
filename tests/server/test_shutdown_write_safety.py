@@ -44,10 +44,14 @@ import pytest
 pytest.importorskip("okto_grafx")
 
 from okto_neuron.server.lifecycle import (  # noqa: E402
+    SHUTDOWN_OUTCOME_CAPABILITY,
+    PidFile,
     consume_stop_outcome,
     outcome_file_path,
+    pid_record_capabilities,
     read_pid,
     write_close_skipped_outcome,
+    write_shutdown_outcome,
 )
 from okto_neuron.store.grafx import GrafxStore  # noqa: E402
 from okto_neuron.store.integrity import AuditStatus, audit_graph  # noqa: E402
@@ -84,6 +88,11 @@ _SERVE = textwrap.dedent(
     from okto_neuron.store.grafx import GrafxStore
 
     lifecycle._MIN_CLOSE_BUDGET_SECONDS = close_budget
+    import os
+    if os.environ.get("OKTO_TEST_LEGACY_DAEMON"):
+        # Behave like a 0.3.1 daemon: no advertised capability, no outcome file.
+        lifecycle.SHUTDOWN_OUTCOME_CAPABILITY = "x-legacy"
+        lifecycle.write_shutdown_outcome = lambda *a, **k: None
     never = threading.Event()
 
     def _execute_write(self, statement, params):
@@ -138,7 +147,7 @@ def _post_add(base: str, name: str, timeout: float = 30.0) -> str:
 
 
 class _Daemon:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, *, legacy: bool = False) -> None:
         self.tmp = tmp_path
         self.vault = tmp_path / "scratch-vault"
         Vault.init(self.vault, backend="grafx", embedding_provider="stub").close()
@@ -150,6 +159,8 @@ class _Daemon:
             if not k.startswith(("OKTO_NEURON_", "MARGINALIA_"))
         }
         self.env["HOME"] = str(home)
+        if legacy:
+            self.env["OKTO_TEST_LEGACY_DAEMON"] = "1"
         self.runtime_root = home / ".okto-neuron" / "runtime"
         self.rest_port, self.mcp_port = _free_port(), _free_port()
         self.base = f"http://127.0.0.1:{self.rest_port}"
@@ -264,6 +275,62 @@ def test_write_parked_before_commit_is_absent_and_committed_writes_survive(tmp_p
     assert nodes == nodes_total_before, "an uncommitted write left nodes behind"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal semantics")
+def test_daemon_killed_mid_stop_reports_no_outcome_exit_3(tmp_path: Path) -> None:
+    daemon = _Daemon(tmp_path)
+    daemon.start()
+    try:
+        _post_add(daemon.base, "before-kill")
+        daemon.park_flag.write_text("1")
+        threading.Thread(target=_try_post, args=(daemon, "parked"), daemon=True).start()
+        deadline = time.monotonic() + 60.0
+        while not daemon.parked_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert daemon.parked_marker.exists()
+        stop = subprocess.Popen(
+            [sys.executable, "-c", _cli(["stop", "--timeout", "30"])],
+            env=daemon.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        deadline = time.monotonic() + 30.0
+        while "shutdown." not in daemon.log() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert "shutdown." in daemon.log(), "daemon never started its shutdown"
+        daemon.proc.kill()  # after the stop request, before any outcome is written
+        output, _ = stop.communicate(timeout=120)
+    finally:
+        daemon.kill()
+    assert stop.returncode == 3, output
+    assert (
+        "stopped, but the daemon left no shutdown outcome (crash or forced exit); "
+        "the next start recovers from the WAL"
+    ) in output
+    assert not outcome_file_path(daemon.runtime_root).exists()
+
+
+def _try_post(daemon: _Daemon, name: str) -> None:
+    try:
+        _post_add(daemon.base, name, timeout=120.0)
+    except Exception:  # noqa: BLE001 - the daemon is killed under it
+        pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal semantics")
+def test_legacy_daemon_without_the_capability_keeps_exit_0(tmp_path: Path) -> None:
+    daemon = _Daemon(tmp_path, legacy=True)
+    daemon.start()
+    try:
+        _post_add(daemon.base, "legacy-doc")
+        assert SHUTDOWN_OUTCOME_CAPABILITY not in pid_record_capabilities(daemon.runtime_root)
+        stop = daemon.stop_cli(30)
+        code = daemon.proc.wait(timeout=60)
+    finally:
+        daemon.kill()
+    assert stop.returncode == 0, stop.stdout + stop.stderr
+    assert code == 0
+    assert "stopped okto-neuron server" in stop.stdout + stop.stderr
+    assert not outcome_file_path(daemon.runtime_root).exists()
+
+
 def test_stop_outcome_file_handling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from okto_neuron.server import lifecycle
 
@@ -288,8 +355,26 @@ def test_stop_outcome_file_handling(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert consume_stop_outcome(tmp_path, 42) is None  # corrupt
     assert not path.exists()
 
-    path.write_text(json.dumps({"outcome": "closed", "pid": 42, "calls_in_flight": 0}))
-    assert consume_stop_outcome(tmp_path, 42) is None  # wrong outcome
+    path.write_text(json.dumps({"outcome": "closed", "pid": 7, "calls_in_flight": 0}))
+    assert consume_stop_outcome(tmp_path, 42) is None  # a stale `closed` from another pid
+    assert not path.exists()
+
+    path.write_text(json.dumps({"outcome": "weird", "pid": 42, "calls_in_flight": 0}))
+    assert consume_stop_outcome(tmp_path, 42) is None  # unknown outcome
+    assert not path.exists()
+
+    monkeypatch.setattr(lifecycle, "_OUTCOME_ROOT", tmp_path)
+    monkeypatch.setattr(os, "getpid", lambda: 42)
+    write_shutdown_outcome("closed")
+    monkeypatch.undo()
+    closed = consume_stop_outcome(tmp_path, 42)
+    assert closed is not None and closed["outcome"] == "closed"
+
+
+def test_pid_record_advertises_the_outcome_capability(tmp_path: Path) -> None:
+    assert pid_record_capabilities(tmp_path) == frozenset()  # no record at all
+    with PidFile(tmp_path):
+        assert SHUTDOWN_OUTCOME_CAPABILITY in pid_record_capabilities(tmp_path)
 
 
 def _live_edges(daemon: _Daemon) -> int:
@@ -366,6 +451,7 @@ def test_stop_under_a_real_write_stream_loses_no_acked_write(tmp_path: Path) -> 
 
     assert stop.returncode == 0, stop_output
     assert code == 0, log
+    assert not outcome_file_path(daemon.runtime_root).exists(), "stop must consume the closed outcome"
     assert "stopped okto-neuron server" in stop_output
     assert "PID identity mismatch" not in stop_output + log
     assert "repeat shutdown signal" not in log

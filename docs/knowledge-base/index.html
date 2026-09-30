@@ -590,10 +590,14 @@ calls and waits for running ones. A thread parked in an LLM or network wait hold
 so the close goes ahead around it. If a grafx call is still running at the hard deadline (drain
 plus close budget), the daemon does not close under it: it logs <code>store close skipped: N grafx calls in flight, relying on WAL recovery</code>, flushes telemetry and logs, and exits; the next open
 recovers from the WAL. The order is store close, then writer-lease release, then the pid file.
-Before that hard exit the daemon writes <code>.marginalia/server.outcome</code> (<code>outcome=close_skipped</code>, its pid, the
-calls in flight and the vault names) next to the pid file; <code>okto-neuron stop</code> reads and removes it, prints
-<code>stopped, but the store close was skipped (N grafx calls in flight); the next start recovers from the WAL</code> and exits 3. A stop that closed the stores exits 0; a file from another pid, or a corrupt one, is
-ignored and removed.
+The daemon leaves its verdict in <code>.marginalia/server.outcome</code> (<code>outcome=closed</code> right after the store
+close completed, <code>outcome=close_skipped</code> with the calls in flight and vault names just before the hard
+exit; both carry its pid, written atomically). <code>okto-neuron stop</code> reads and removes it and exits 0 only
+for <code>closed</code>. <code>close_skipped</code> prints <code>stopped, but the store close was skipped (N grafx calls in flight); the next start recovers from the WAL</code> and exits 3. When the daemon is gone and left no outcome (killed
+mid-stop, crashed, or <code>--force</code>), a daemon that advertises the <code>shutdown_outcome</code> capability in its pid
+record gets <code>stopped, but the daemon left no shutdown outcome (crash or forced exit); the next start recovers from the WAL</code> and exit 3. A 0.3.1 daemon never writes the file and does not advertise the
+capability (read from the pid record before the stop, since it is gone after), so <code>stop</code> keeps exit 0 for
+it. An outcome from another pid, a corrupt one, or an unknown value counts as no outcome.
 Every phase logs <code>shutdown.phase name=... duration_ms=... remaining_s=...</code> (each vault's close
 included) and a final <code>shutdown.summary</code> line. The ladybug and neo4j adapters do not count their
 native calls yet, so they need <code>store/_inflight.py</code> before the daemon's clean-close path can

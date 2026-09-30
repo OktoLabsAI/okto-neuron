@@ -193,15 +193,23 @@ server did not exit within 42.5s (pid=41234, pid_file=/Users/you/.marginalia/run
 
 `LifecycleError` from the initial signal attempt (for example, the owner is already gone) exits 1 the same way.
 
-### Exit code 3: stopped without closing the store
+### Exit code 3: stopped without a confirmed store close
 
-If the daemon reaches its hard deadline with grafx calls still running, it does not close the store under them. Before exiting it writes `.marginalia/server.outcome` next to the PID file; `stop` reads and removes that file and prints to stderr:
+The daemon writes its verdict to `.marginalia/server.outcome` next to the PID file: `closed` right after the stores were closed, or `close_skipped` just before the hard exit when grafx calls were still running at the deadline. `stop` reads and removes that file and exits 0 only for `closed`.
+
+`close_skipped` prints this to stderr and exits 3:
 
 ```text
 stopped, but the store close was skipped (1 grafx calls in flight); the next start recovers from the WAL
 ```
 
-then exits 3. No data is lost (the next open recovers from the WAL), but this is not a clean stop. A stop that closed the stores exits 0. An outcome file left by a different PID, or a corrupt one, is ignored and removed.
+If the daemon is gone and left no outcome (it was killed mid-stop, crashed, or you used `--force`), `stop` prints this to stderr and exits 3:
+
+```text
+stopped, but the daemon left no shutdown outcome (crash or forced exit); the next start recovers from the WAL
+```
+
+No data is lost in either case (the next open recovers from the WAL), but neither is a clean stop. A daemon from 0.3.1 never writes the file, so `stop` only expects one from a daemon whose PID record advertises the `shutdown_outcome` capability; for a 0.3.1 daemon a stop that completes still exits 0. An outcome file left by a different PID, a corrupt one, or an unknown value is ignored and removed.
 
 ## okto-neuron status
 
