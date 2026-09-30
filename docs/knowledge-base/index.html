@@ -491,7 +491,11 @@ call goes to one of two bounded pools in <code>server/_store_io.py</code>, sized
 </tr>
 </tbody>
 </table>
-<p><code>single_flight</code> collapses concurrent identical full scans (upkeep predicates, graph stats,
+<p>Large responses (review queue, graph and node reads, ledger, predicate snapshot, queue and
+authority lists, drift and quality reports) are JSON-encoded on the worker, in pieces so the
+GIL is released between elements (a single <code>json.dumps</code> of a multi-megabyte payload would hold
+it for the whole call), and returned as pre-encoded bytes identical to <code>JSONResponse</code>.
+Single-flight caches those bytes. <code>single_flight</code> collapses concurrent identical full scans (upkeep predicates, graph stats,
 integrity summary, ledger runs/summary) into one execution. Long jobs never occupy a store
 worker, so they cannot starve UI reads; the JobExecutor is also where a separate worker
 process will plug in. On shutdown both pools finish calls already executing (bounded by the

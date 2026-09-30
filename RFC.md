@@ -298,7 +298,11 @@ call goes to one of two bounded pools in `server/_store_io.py`, sized in `okto-n
 | StoreExecutor | `[server] store_workers` (4) | `store_io`, `single_flight` | short store, sidecar and YAML I/O for requests and background loops, recall's query embedding |
 | JobExecutor | `[server] job_workers` (2) | `job_io` | curation job runners, ingest and remember extraction, answer synthesis, re-embed, provider/model test probes |
 
-`single_flight` collapses concurrent identical full scans (upkeep predicates, graph stats,
+Large responses (review queue, graph and node reads, ledger, predicate snapshot, queue and
+authority lists, drift and quality reports) are JSON-encoded on the worker, in pieces so the
+GIL is released between elements (a single `json.dumps` of a multi-megabyte payload would hold
+it for the whole call), and returned as pre-encoded bytes identical to `JSONResponse`.
+Single-flight caches those bytes. `single_flight` collapses concurrent identical full scans (upkeep predicates, graph stats,
 integrity summary, ledger runs/summary) into one execution. Long jobs never occupy a store
 worker, so they cannot starve UI reads; the JobExecutor is also where a separate worker
 process will plug in. On shutdown both pools finish calls already executing (bounded by the

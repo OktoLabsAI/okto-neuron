@@ -44,11 +44,15 @@ import asyncio
 import concurrent.futures
 import contextvars
 import functools
+import json
 import logging
 import threading
 import time
 import weakref
-from typing import Any, Awaitable, Callable, Hashable, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Hashable, TypeVar
+
+if TYPE_CHECKING:
+    from starlette.responses import Response
 
 _LOG = logging.getLogger("okto_neuron.server.store_io")
 
@@ -312,6 +316,61 @@ def single_flight(
     return get_store_executor().single_flight(key, fn, *args, **kwargs)
 
 
+_CHUNK_ITEMS = 32
+"""Containers larger than this are encoded element by element."""
+
+
+def _encode(obj: Any) -> str:
+    return json.dumps(
+        obj, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
+    )
+
+
+def _encode_chunked(obj: Any) -> str:
+    """Same text as :func:`_encode`, built piece by piece for big containers.
+
+    ``json.dumps`` runs in C without releasing the GIL, so encoding a
+    multi-megabyte payload in ONE call stalls the event loop for the whole
+    encode even on a worker thread. Encoding a big list or dict element by
+    element goes through Python bytecode between elements, which lets the loop
+    thread take the GIL back every few milliseconds.
+    """
+    if isinstance(obj, list) and len(obj) > _CHUNK_ITEMS:
+        return "[" + ",".join(_encode_chunked(item) for item in obj) + "]"
+    if (
+        isinstance(obj, dict)
+        and len(obj) > 1
+        and all(type(key) is str for key in obj)
+        and any(isinstance(v, (list, dict)) and len(v) > _CHUNK_ITEMS for v in obj.values())
+    ):
+        return "{" + ",".join(f"{_encode(k)}:{_encode_chunked(v)}" for k, v in obj.items()) + "}"
+    return _encode(obj)
+
+
+def encode_json(obj: Any) -> bytes:
+    """The bytes ``starlette.responses.JSONResponse(obj)`` would render."""
+    return _encode_chunked(obj).encode("utf-8")
+
+
+def encode_op(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> bytes:
+    """Run a store op and JSON-encode its result, all on the calling worker."""
+    return encode_json(fn(*args, **kwargs))
+
+
+def json_bytes_response(
+    content: bytes, status_code: int = 200, headers: dict[str, str] | None = None
+) -> "Response":
+    """A response carrying pre-encoded JSON (identical headers to JSONResponse)."""
+    from starlette.responses import Response
+
+    return Response(
+        content=content,
+        status_code=status_code,
+        headers=headers,
+        media_type="application/json",
+    )
+
+
 def _exit_context(resource: Any) -> None:
     resource.__exit__(None, None, None)
 
@@ -354,6 +413,9 @@ __all__ = [
     "StoreExecutor",
     "acquire_off_loop",
     "call_soon_on_loop",
+    "encode_json",
+    "encode_op",
+    "json_bytes_response",
     "configure_executors",
     "get_job_executor",
     "get_store_executor",

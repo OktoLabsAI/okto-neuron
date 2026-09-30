@@ -72,7 +72,15 @@ from okto_neuron.server import _curation, _jobs, _scheduler
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
-from okto_neuron.server._store_io import acquire_off_loop, job_io, single_flight, store_io
+from okto_neuron.server._store_io import (
+    acquire_off_loop,
+    encode_json,
+    encode_op,
+    job_io,
+    json_bytes_response,
+    single_flight,
+    store_io,
+)
 from okto_neuron.server._vault_pool import VaultPoolError
 from okto_neuron.server.lifecycle import request_id as bind_request_id
 from okto_neuron.server.state import (
@@ -2429,7 +2437,7 @@ async def detect_drift(request: Request) -> JSONResponse:
     # state.py is explicit: "Read handlers MUST NOT acquire it").
     try:
         body = await store_io(
-            _detect_drift_payload, state, root, dry_run, payload.get("mode", "on-query")
+            encode_op, _detect_drift_payload, state, root, dry_run, payload.get("mode", "on-query")
         )
     except _ApiError as exc:
         return exc.response()
@@ -2438,7 +2446,7 @@ async def detect_drift(request: Request) -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         _LOG.exception("unexpected drift failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
-    return JSONResponse(body)
+    return json_bytes_response(body)
 
 
 def _detect_drift_payload(
@@ -2715,7 +2723,7 @@ async def review_queue(request: Request) -> JSONResponse:
     if state.shutting_down:
         return _draining_response()
     try:
-        items = await store_io(_review_queue_payload, state)
+        body = await store_io(encode_op, _review_queue_body, state)
     except VaultClosedError as exc:
         return _err(503, "vault_closed", str(exc))
     except OktoNeuronError as exc:
@@ -2724,7 +2732,11 @@ async def review_queue(request: Request) -> JSONResponse:
         _LOG.exception("unexpected review_queue failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
 
-    return JSONResponse({"status": "ok", "items": items})
+    return json_bytes_response(body)
+
+
+def _review_queue_body(state: ServerState | VaultRuntime) -> dict[str, Any]:
+    return {"status": "ok", "items": _review_queue_payload(state)}
 
 
 def _review_queue_payload(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
@@ -2941,13 +2953,15 @@ def _store(state: ServerState) -> Any:
 async def _graph_read(what: str, op: Callable[..., Any], *args: Any) -> Any:
     """Run one KG-browser store op off the loop; map its failures to a response.
 
-    Returns the op's payload, or a ``JSONResponse`` for a failure. A typed
-    store/backend failure (e.g. GraphBackendError from a driver limit) carries
-    a real cause; it is reported instead of the bare catch-all's "internal
-    server error", which hid Grafx's 1024-element query cap.
+    Returns the finished response: the op's payload JSON-encoded ON the worker
+    (a big payload encoded on the loop stalls /health, REST and MCP), or an
+    error response. A typed store/backend failure (e.g. GraphBackendError from
+    a driver limit) carries a real cause; it is reported instead of the bare
+    catch-all's "internal server error", which hid Grafx's 1024-element query
+    cap.
     """
     try:
-        return await store_io(op, *args)
+        return json_bytes_response(await store_io(encode_op, op, *args))
     except _ApiError as exc:
         return exc.response()
     except VaultClosedError as exc:
@@ -2961,9 +2975,10 @@ async def _graph_read(what: str, op: Callable[..., Any], *args: Any) -> Any:
 
 async def _graph_read_shared(what: str, key: Any, op: Callable[..., Any], *args: Any) -> Any:
     """:func:`_graph_read` for an expensive full scan: concurrent identical
-    requests share ONE execution (single-flight) and its result or failure."""
+    requests share ONE execution (single-flight); the cached value is the
+    encoded response body, not the object."""
     try:
-        return await single_flight(key, op, *args)
+        return json_bytes_response(await single_flight(key, encode_op, op, *args))
     except VaultClosedError as exc:
         return _err(503, "vault_closed", str(exc))
     except OktoNeuronError as exc:
@@ -3056,7 +3071,7 @@ async def api_nodes_list(request: Request) -> JSONResponse:
         offset,
         include_structural,
     )
-    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+    return body
 
 
 def _nodes_list_payload(
@@ -3122,7 +3137,7 @@ async def api_node_detail(request: Request) -> JSONResponse:
         return _draining_response()
     node_id = request.path_params["id"]
     body = await _graph_read("node-detail", _node_detail_payload, state, node_id)
-    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+    return body
 
 
 def _node_detail_payload(state: ServerState | VaultRuntime, node_id: str) -> dict[str, Any]:
@@ -3169,7 +3184,7 @@ async def api_node_types(request: Request) -> JSONResponse:
         return _draining_response()
     include_structural = _include_structural(request)
     body = await _graph_read("node-types", _node_types_payload, state, include_structural)
-    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+    return body
 
 
 def _node_types_payload(
@@ -3297,7 +3312,7 @@ async def api_graph(request: Request) -> JSONResponse:
         min_degree,
         include_structural,
     )
-    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+    return body
 
 
 def _graph_payload(
@@ -3414,7 +3429,7 @@ async def api_node_neighbors(request: Request) -> JSONResponse:
         limit,
         include_structural,
     )
-    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+    return body
 
 
 def _neighbors_payload(
@@ -3523,7 +3538,7 @@ async def api_graph_stats(request: Request) -> JSONResponse:
         state,
         include_structural,
     )
-    return body if isinstance(body, JSONResponse) else JSONResponse(body)
+    return body
 
 
 def _graph_stats_payload(
@@ -3884,17 +3899,16 @@ async def api_semantic_governance(request: Request) -> JSONResponse:
         )
     try:
         async with state.config_lock:
-            payload = await store_io(_semantic_governance_payload, state)
+            body = await store_io(
+                encode_op, lambda: {"status": "ok", **_semantic_governance_payload(state)}
+            )
     except (PredicateRegistryError, ValueError):
         _LOG.exception("semantic governance side-store validation failed")
         return _internal_error()
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected semantic governance read failure")
         return _internal_error()
-    return JSONResponse(
-        {"status": "ok", **payload},
-        headers={"Cache-Control": "no-store"},
-    )
+    return json_bytes_response(body, headers={"Cache-Control": "no-store"})
 
 
 async def api_semantic_quality(request: Request) -> JSONResponse:
@@ -4020,8 +4034,8 @@ async def api_semantic_quality(request: Request) -> JSONResponse:
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected semantic-quality evaluation failure")
         return _internal_error()
-    return JSONResponse(
-        {"status": "ok", "semantic_quality": report},
+    return json_bytes_response(
+        await store_io(encode_json, {"status": "ok", "semantic_quality": report}),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -5605,7 +5619,8 @@ async def api_ingest_queue_item(request: Request) -> JSONResponse:
     detail = await iq.item_detail_async(state, item_id)
     if detail is None:
         return _err(404, "not_found", f"ingest queue item not found: {item_id}")
-    return JSONResponse(detail)
+    # Up to ~80 events of up to 12 KB text each: encode off the loop.
+    return json_bytes_response(await store_io(encode_json, detail))
 
 
 async def api_ingest_queue_retry(request: Request) -> JSONResponse:
@@ -5685,16 +5700,18 @@ async def api_ledger_runs(request: Request) -> JSONResponse:
         limit = max(1, min(int(raw_limit), 500))
     except ValueError:
         return _err(400, "bad_request", "limit must be an integer")
-    runs = await single_flight(
+    body = await single_flight(
         ("ledger_runs", str(state.vault_path), limit), _ledger_runs, state.vault_path, limit
     )
-    return JSONResponse({"status": "ok", "runs": runs})
+    return json_bytes_response(body)
 
 
-def _ledger_runs(vault_path: Path, limit: int) -> list[dict[str, Any]]:
+def _ledger_runs(vault_path: Path, limit: int) -> bytes:
+    """Store op: the encoded response body (a whole-ledger read)."""
     from okto_neuron.consolidate.ledger import CandidateLedger
 
-    return CandidateLedger(Path(vault_path) / ".marginalia").run_summaries(limit=limit)
+    runs = CandidateLedger(Path(vault_path) / ".marginalia").run_summaries(limit=limit)
+    return encode_json({"status": "ok", "runs": runs})
 
 
 async def api_ledger_run_detail(request: Request) -> JSONResponse:
@@ -5705,16 +5722,18 @@ async def api_ledger_run_detail(request: Request) -> JSONResponse:
     run_id = request.path_params.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         return _err(400, "bad_request", "missing run id")
-    detail = await store_io(_ledger_run_detail, state.vault_path, run_id)
-    if detail is None:
+    body = await store_io(_ledger_run_detail, state.vault_path, run_id)
+    if body is None:
         return _err(404, "not_found", f"ledger run not found: {run_id}")
-    return JSONResponse({"status": "ok", **detail})
+    return json_bytes_response(body)
 
 
-def _ledger_run_detail(vault_path: Path, run_id: str) -> dict[str, Any] | None:
+def _ledger_run_detail(vault_path: Path, run_id: str) -> bytes | None:
+    """Store op: the encoded response body, or ``None`` for an unknown run."""
     from okto_neuron.consolidate.ledger import CandidateLedger
 
-    return CandidateLedger(Path(vault_path) / ".marginalia").run_detail(run_id)
+    detail = CandidateLedger(Path(vault_path) / ".marginalia").run_detail(run_id)
+    return None if detail is None else encode_json({"status": "ok", **detail})
 
 
 async def api_ledger_summary(request: Request) -> JSONResponse:
@@ -5730,24 +5749,26 @@ async def api_ledger_summary(request: Request) -> JSONResponse:
         return _err(400, "bad_request", "limit must be an integer")
     raw_run_id = request.query_params.get("run_id")
     run_id = str(raw_run_id) if raw_run_id else None
-    summary = await single_flight(
+    body = await single_flight(
         ("ledger_summary", str(state.vault_path), run_id, limit),
         _ledger_summary,
         state.vault_path,
         run_id,
         limit,
     )
-    if summary is None:
-        return JSONResponse({"status": "ok", "run": None})
-    return JSONResponse({"status": "ok", **summary})
+    return json_bytes_response(body)
 
 
-def _ledger_summary(vault_path: Path, run_id: str | None, limit: int) -> dict[str, Any] | None:
+def _ledger_summary(vault_path: Path, run_id: str | None, limit: int) -> bytes:
+    """Store op: the encoded response body (a whole-ledger read)."""
     from okto_neuron.consolidate.ledger import CandidateLedger
 
-    return CandidateLedger(Path(vault_path) / ".marginalia").run_progress_summary(
+    summary = CandidateLedger(Path(vault_path) / ".marginalia").run_progress_summary(
         run_id, limit=limit
     )
+    if summary is None:
+        return encode_json({"status": "ok", "run": None})
+    return encode_json({"status": "ok", **summary})
 
 
 async def api_ingest_cancel(request: Request) -> JSONResponse:
@@ -6696,15 +6717,16 @@ async def api_reconcile_queue(request: Request) -> JSONResponse:
         return gate
     state = get_state()
     try:
-        rows = await store_io(_reconcile_queue_rows, state)
+        body = await store_io(encode_op, _reconcile_queue_body, state)
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected reconcile-queue failure")
         return _internal_error()
-    return JSONResponse({"status": "ok", "entries": rows})
+    return json_bytes_response(body)
 
 
-def _reconcile_queue_rows(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
-    return [_curation.queued_cluster_row(qc) for qc in _curation.reconcile_queue(state).list()]
+def _reconcile_queue_body(state: ServerState | VaultRuntime) -> dict[str, Any]:
+    rows = [_curation.queued_cluster_row(qc) for qc in _curation.reconcile_queue(state).list()]
+    return {"status": "ok", "entries": rows}
 
 
 async def api_reconcile_review_confirm(request: Request) -> JSONResponse:
@@ -6874,7 +6896,7 @@ async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
 
     state = get_state()
     try:
-        grouped, vocabulary_size = await single_flight(
+        records_json, counts, vocabulary_size = await single_flight(
             ("predicate_snapshot", str(state.vault_path)),
             _predicate_snapshot,
             state,
@@ -6885,23 +6907,25 @@ async def api_predicate_upkeep_snapshot(request: Request) -> JSONResponse:
 
     last_propose = _jobs.latest_of_kind(state, "predicate-propose")
     last_apply = _jobs.latest_of_kind(state, "predicate-apply")
-    return JSONResponse(
+    # The big part (the records) arrives pre-encoded from the worker; only the
+    # small job/worker fields are encoded here, then spliced in key order.
+    head = encode_json({"status": "ok", "vocabulary_size": vocabulary_size})[:-1]
+    tail = encode_json(
         {
-            "status": "ok",
-            "vocabulary_size": vocabulary_size,
-            "records": grouped,
-            "counts": {status: len(rows) for status, rows in grouped.items()},
+            "counts": counts,
             "last_propose": last_propose.to_public() if last_propose else None,
             "last_apply": last_apply.to_public() if last_apply else None,
             "worker_active": state.curation_worker_active,
         }
-    )
+    )[1:]
+    return json_bytes_response(head + b',"records":' + records_json + b"," + tail)
 
 
 def _predicate_snapshot(
     state: ServerState | VaultRuntime,
-) -> tuple[dict[str, list[dict[str, Any]]], int]:
-    """Store op: alias records grouped by status + vocabulary size (60 s cache)."""
+) -> tuple[bytes, dict[str, int], int]:
+    """Store op: alias records grouped by status, encoded, + counts + vocabulary
+    size (60 s cache)."""
     records = _curation.predicate_alias_index(state).records()
     vocabulary_size = _predicate_vocabulary_size(state)
     grouped: dict[str, list[dict[str, Any]]] = {
@@ -6912,7 +6936,8 @@ def _predicate_snapshot(
     }
     for record in records:
         grouped.setdefault(record.status, []).append(_curation.predicate_record_row(record))
-    return grouped, vocabulary_size
+    counts = {status: len(rows) for status, rows in grouped.items()}
+    return encode_json(grouped), counts, vocabulary_size
 
 
 def _set_predicate_record_status(
@@ -6999,15 +7024,16 @@ async def api_authority_list(request: Request) -> JSONResponse:
         return gate
     state = get_state()
     try:
-        rows = await store_io(_authority_rows, state)
+        body = await store_io(encode_op, _authority_body, state)
     except Exception:  # noqa: BLE001
         _LOG.exception("unexpected authority-list failure")
         return _internal_error()
-    return JSONResponse({"status": "ok", "records": rows})
+    return json_bytes_response(body)
 
 
-def _authority_rows(state: ServerState | VaultRuntime) -> list[dict[str, Any]]:
-    return [_curation.authority_record_row(r) for r in _curation.authority_index(state).records()]
+def _authority_body(state: ServerState | VaultRuntime) -> dict[str, Any]:
+    rows = [_curation.authority_record_row(r) for r in _curation.authority_index(state).records()]
+    return {"status": "ok", "records": rows}
 
 
 def _authority_unmerge(state: ServerState | VaultRuntime, cluster_id: str) -> bool:

@@ -374,3 +374,164 @@ async def test_concurrent_predicate_polls_share_one_scan_and_health_stays_fast(
     assert len(scans) == 1, f"expected one shared scan, saw {len(scans)}"
     assert len(health_latencies) >= 5
     assert max(health_latencies) < 0.1, f"/health max {max(health_latencies) * 1000:.0f} ms"
+
+
+# ---------------------------------------------------------------------------
+# Big payloads: serialising a large response is loop work too
+# ---------------------------------------------------------------------------
+
+_BIG_ITEMS = 12000
+
+_ROWS_CACHE: list[dict[str, Any]] = []
+
+
+def _big_rows(count: int = _BIG_ITEMS) -> list[dict[str, Any]]:
+    """Built once: rebuilding ~200k objects per request would measure the garbage
+    collector, not serialisation."""
+    if count != _BIG_ITEMS:
+        return _make_rows(count)
+    if not _ROWS_CACHE:
+        _ROWS_CACHE.extend(_make_rows(count))
+    return _ROWS_CACHE
+
+
+def _make_rows(count: int) -> list[dict[str, Any]]:
+    excerpt = "excerpt text " * 40  # ~500 characters
+    return [
+        {
+            "id": f"node:{index}",
+            "type": "Claim",
+            "title": f"synthetic title {index}",
+            "excerpt": excerpt,
+            "facets": {f"k{n}": f"value-{index}-{n}" for n in range(40)},
+            "edges": [{"type": "rel", "dst": f"node:{index + n}"} for n in range(10)],
+        }
+        for index in range(count)
+    ]
+
+
+_REVIEW_ITEMS: list[Any] = []
+
+
+class _BigReviewCompanion:
+    @staticmethod
+    def review_queue_all() -> list[Any]:
+        from types import SimpleNamespace
+
+        if not _REVIEW_ITEMS:
+            _REVIEW_ITEMS.extend(
+                SimpleNamespace(
+                    kind="node",
+                    model_dump=lambda mode="json", row=row: row,
+                    block_id=None,
+                    source_path="/synthetic/source.md",
+                    byte_start=0,
+                    byte_end=10,
+                    content_hash="h",
+                )
+                for row in _big_rows()
+            )
+        return list(_REVIEW_ITEMS)
+
+
+def _patch_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(http_mod, "_companion", lambda state: _BigReviewCompanion())
+
+
+def _patch_graph_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = {"status": "ok", "nodes": _big_rows(), "total": _BIG_ITEMS}
+    for name in ("_nodes_list_payload", "_graph_payload", "_neighbors_payload"):
+        monkeypatch.setattr(http_mod, name, lambda *args, _b=body, **kwargs: _b)
+    monkeypatch.setattr(
+        http_mod,
+        "_graph_stats_payload",
+        lambda *args, _b={"status": "ok", "node_types": _big_rows(), "edge_types": []}: _b,
+    )
+
+
+def _patch_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    monkeypatch.setattr(
+        CandidateLedger, "run_summaries", lambda self, limit=50: _big_rows(), raising=True
+    )
+    monkeypatch.setattr(
+        CandidateLedger,
+        "run_progress_summary",
+        lambda self, run_id=None, limit=12: {"runs": _big_rows()},
+        raising=True,
+    )
+    monkeypatch.setattr(
+        CandidateLedger, "run_detail", lambda self, run_id: {"rows": _big_rows()}, raising=True
+    )
+
+
+def _patch_predicates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    rows = [SimpleNamespace(status="queued", row=row) for row in _big_rows()]
+    monkeypatch.setattr(
+        http_mod._curation,
+        "predicate_alias_index",
+        lambda state, **kwargs: SimpleNamespace(records=lambda: rows),
+    )
+    monkeypatch.setattr(
+        http_mod._curation, "predicate_record_row", lambda record: dict(record.row)
+    )
+    monkeypatch.setattr(http_mod, "_predicate_vocabulary_size", lambda state: 1)
+
+
+_BIG_CASES: dict[str, tuple[Callable[[pytest.MonkeyPatch], None], str]] = {
+    "review_queue": (_patch_review, "/api/v1/review-queue"),
+    "nodes_list": (_patch_graph_ops, "/api/v1/nodes"),
+    "graph": (_patch_graph_ops, "/api/v1/graph"),
+    "neighbors": (_patch_graph_ops, "/api/v1/nodes/anything/neighbors"),
+    "graph_stats": (_patch_graph_ops, "/api/v1/graph/stats"),
+    "ledger_runs": (_patch_ledger, "/api/v1/ledger/runs"),
+    "ledger_summary": (_patch_ledger, "/api/v1/ledger/summary"),
+    "ledger_detail": (_patch_ledger, "/api/v1/ledger/runs/any-run"),
+    "predicate_snapshot": (_patch_predicates, "/api/v1/upkeep/predicates"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", sorted(_BIG_CASES))
+async def test_big_payload_is_never_serialised_on_the_loop(
+    guarded, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """Structural, no timing: every ``json.dumps`` the request makes is recorded
+    with whether it ran on the event-loop thread; the multi-megabyte encode must
+    happen on a worker. (Serialising a big payload on the loop stalls /health,
+    REST and MCP for the whole encode.)"""
+    import json
+
+    patch, url = _BIG_CASES[case]
+    patch(monkeypatch)
+    state, _vault_path = guarded
+
+    real_dumps = json.dumps
+    calls: list[tuple[bool, int]] = []
+
+    def _recording_dumps(*args: Any, **kwargs: Any) -> str:
+        text = real_dumps(*args, **kwargs)
+        on_loop = asyncio._get_running_loop() is not None
+        calls.append((on_loop, len(text)))
+        return text
+
+    app = http_mod.build_rest_app(state)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 50125))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        monkeypatch.setattr(json, "dumps", _recording_dumps)
+        response = await client.get(url, timeout=300)
+        monkeypatch.setattr(json, "dumps", real_dumps)
+
+    assert response.status_code == 200, response.text[:300]
+    assert len(response.content) > 1_000_000, "payload too small to be the large-payload path"
+    on_loop_chars = sum(size for on_loop, size in calls if on_loop)
+    worker_chars = sum(size for on_loop, size in calls if not on_loop)
+    assert on_loop_chars < 10_000, (
+        f"{case}: {on_loop_chars} characters of JSON were serialised on the event loop "
+        f"(largest single call {max((n for on_loop, n in calls if on_loop), default=0)}); "
+        "encode the response inside store_io"
+    )
+    assert worker_chars > 1_000_000, "the large encode did not run on a worker at all"
