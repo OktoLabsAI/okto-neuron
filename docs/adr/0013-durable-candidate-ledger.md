@@ -190,7 +190,7 @@ ledger. A plan lifecycle that is not the clean plan, receipts, one terminal row 
 sets an anomaly flag; the reader then re-derives its verdict with the whole-ledger
 validation, so the errors raised for a damaged ledger are the ones it always raised.
 
-Known limits. Callers that need the index itself (plan validation, resume, receipts, index checkpoint) still run the in-lock sync. They run inside the semantic writer lease where no concurrent appender exists, and the startup prewarm makes their cold case rare. If an end-to-end ingest shows a stall there, this is reopened.
+Known limits. Callers that need the index itself (plan validation, resume, receipts, index checkpoint) still run the in-lock sync. They run inside the semantic writer lease where no concurrent appender exists, and the startup prewarm makes their cold case rare. If an end-to-end ingest shows a stall there, this is reopened. The prewarm covers only the vaults that are open when the daemon starts; a vault opened later pays its cold build on its first read.
 
 ### Agentic workflow shape
 
