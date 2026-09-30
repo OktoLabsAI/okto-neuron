@@ -81,6 +81,10 @@ _LEDGER_INDEX_BUILD_LOCKS: dict[str, threading.Lock] = {}
 _STREAM_CHUNK_BYTES = 1 << 20
 
 
+class _SnapshotChanged(Exception):
+    """The pinned ledger prefix was truncated while being read."""
+
+
 def _stream_lines(chunks: Iterable[AnyStr]) -> Iterator[AnyStr]:
     """Yield the lines of a chunked ``bytes`` or ``str`` stream without holding it.
 
@@ -911,6 +915,20 @@ class _LedgerOffsetIndex:
     completeness_reason: str
 
 
+def _last_line_end(handle: Any, size: int) -> int:
+    """Byte offset just past the last newline at or below ``size`` (0 if none)."""
+    position = size
+    while position > 0:
+        start = max(0, position - 65536)
+        handle.seek(start)
+        block = handle.read(position - start)
+        found = block.rfind(b"\n")
+        if found >= 0:
+            return start + found + 1
+        position = start
+    return 0
+
+
 def _ledger_file_signature(path: Path) -> tuple[int, int, int, int]:
     stat = path.stat()
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
@@ -955,41 +973,62 @@ def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetInde
         completeness_status="complete",
         completeness_reason="empty_ledger",
     )
-    with _exclusive_lock(directory / ".candidate-ledger.lock"):
-        with path.open("rb") as handle:
+
+    def ingest(offset: int, raw: bytes) -> None:
+        nonlocal malformed, unrecognized_versions
+        if not raw.strip():
+            return
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            malformed += 1
+            return
+        if not isinstance(record, dict):
+            malformed += 1
+            return
+        version = record.get("ledger_version")
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version not in _ACCEPTED_LEDGER_VERSIONS
+        ):
+            unrecognized_versions += 1
+        kind = str(record.get("kind") or "")
+        if not kind:
+            return
+        location = (offset, len(raw))
+        offsets_by_kind.setdefault(kind, []).append(location)
+        run_id = str(record.get("run_id") or "")
+        if run_id:
+            offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
+        if kind == "candidate":
+            _index_candidate_identity(index, record)
+
+    # Snapshot under the lock, stream the bulk without it, then take the lock only
+    # to fold in what was appended meanwhile. The file is append-only, so bytes
+    # below the snapshot never change under the open handle.
+    lock = directory / ".candidate-ledger.lock"
+    with _exclusive_lock(lock):
+        handle = path.open("rb")
+        cut = _last_line_end(handle, os.fstat(handle.fileno()).st_size)
+    try:
+        handle.seek(0)
+        while handle.tell() < cut:
+            offset = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                break
+            ingest(offset, raw)
+        with _exclusive_lock(lock):
             while True:
                 offset = handle.tell()
                 raw = handle.readline()
                 if not raw:
                     break
-                if not raw.strip():
-                    continue
-                try:
-                    record = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
-                    malformed += 1
-                    continue
-                if not isinstance(record, dict):
-                    malformed += 1
-                    continue
-                version = record.get("ledger_version")
-                if (
-                    not isinstance(version, int)
-                    or isinstance(version, bool)
-                    or version not in _ACCEPTED_LEDGER_VERSIONS
-                ):
-                    unrecognized_versions += 1
-                kind = str(record.get("kind") or "")
-                if not kind:
-                    continue
-                location = (offset, len(raw))
-                offsets_by_kind.setdefault(kind, []).append(location)
-                run_id = str(record.get("run_id") or "")
-                if run_id:
-                    offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
-                if kind == "candidate":
-                    _index_candidate_identity(index, record)
+                ingest(offset, raw)
             index.signature = _ledger_file_signature(path)
+    finally:
+        handle.close()
     reasons: list[str] = []
     if malformed:
         reasons.append("malformed_ledger_lines")
@@ -1082,6 +1121,7 @@ _SIDECAR_ANCHOR_BYTES = 4096
 # what the next open re-reads from the ledger tail.
 _SIDECAR_CHECKPOINT_BYTES = 4 * 1024 * 1024
 _SIDECAR_CACHE_SIZE = 8
+_SIDECAR_INLINE_TAIL = 8 * 1024 * 1024  # catch up under the lock only up to this much
 _SIDECARS_GUARD = threading.Lock()
 _SIDECARS: OrderedDict[str, "_Sidecar"] = OrderedDict()
 _PLAN_ROW_KINDS = frozenset({"commit_plan", "operation_receipt", "commit_record", "plan_abandoned"})
@@ -1406,10 +1446,13 @@ class _Sidecar:
         del self.open_plans[plan_id]
         self.closed[plan_id] = "c" if kind == "commit_record" else "a"
 
-    def catch_up(self, handle: Any, read_row: _RowReader) -> None:
-        """Index every complete line past ``size``; an unterminated tail stays uncovered."""
+    def catch_up(self, handle: Any, read_row: _RowReader, limit: int | None = None) -> None:
+        """Index every complete line past ``size`` (stopping at ``limit`` if given).
+
+        An unterminated tail stays uncovered.
+        """
         handle.seek(self.size)
-        while True:
+        while limit is None or self.size < limit:
             raw = handle.readline()
             if not raw or not raw.endswith(b"\n"):
                 return
@@ -1652,6 +1695,9 @@ class _RunView:
     def order(self) -> list[str]:
         return self.state.run_order()
 
+    def close(self) -> None:
+        self._handle.close()
+
     def records(self, run_id: str) -> list[dict[str, Any]]:
         """The run's rows in ledger order: only its byte span is read."""
         assert self.state.runs is not None
@@ -1726,6 +1772,44 @@ class CandidateLedger:
         self._persist_sidecar(state)
         return state
 
+    def _prepare_sidecar(self) -> None:
+        """Bring the in-process index near the ledger's size without a long lock hold.
+
+        A state that is current, or a few MiB behind, is left for the in-lock
+        :meth:`_sync_sidecar` to finish. Anything else (no usable state, or far
+        behind) is scanned from a snapshot with no lock held and then published;
+        the caller's in-lock sync only folds in the rows appended meanwhile.
+        """
+        path = self.path
+        key = str(path.resolve())
+        lock = Path(self.dir) / ".candidate-ledger.lock"
+        with _exclusive_lock(lock):
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                return
+            cached = _sidecar_cache_get(key)
+            candidate = cached if cached is not None else self._load_sidecar_file()
+            with path.open("rb") as probe:
+                usable = candidate is not None and candidate.matches(probe, size)
+            if usable and candidate is not None and size - candidate.size <= _SIDECAR_INLINE_TAIL:
+                return
+            work = candidate if usable and cached is None else None
+            handle = path.open("rb")
+            cut = _last_line_end(handle, size)
+        reader = _RowReader(path)
+        try:
+            work = work or _Sidecar()
+            work.catch_up(handle, reader, limit=cut)
+        except BaseException:
+            return  # the in-lock sync rebuilds if this snapshot pass could not finish
+        finally:
+            reader.close()
+            handle.close()
+        with _exclusive_lock(lock):
+            if _sidecar_cache_get(key) is cached:
+                _sidecar_cache_put(key, work)
+
     @contextmanager
     def _run_view(self):
         """Yield an offset-based :class:`_RunView` under the ledger lock.
@@ -1735,13 +1819,29 @@ class CandidateLedger:
         ``utf-8`` rejects (their historic behavior is defined by that reader),
         or ends in an unterminated row the index does not cover.
         """
+        self._prepare_sidecar()
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
             state = self._sync_sidecar()
             if state is None or state.exotic or state.uncovered:
-                yield None
-                return
-            with self.path.open("rb") as handle:
-                yield _RunView(state, handle)
+                view = None
+            else:
+                assert state.runs is not None
+                # A copy and an open handle: the spans are read after the lock is
+                # released, and bytes below them never change (append-only).
+                view = _RunView(
+                    _Sidecar(
+                        records=state.records,
+                        runs={run_id: dict(entry) for run_id, entry in state.runs.items()},
+                    ),
+                    self.path.open("rb"),
+                )
+        if view is None:
+            yield None
+            return
+        try:
+            yield view
+        finally:
+            view.close()
 
     def _load_sidecar_file(self) -> _Sidecar | None:
         try:
@@ -1768,6 +1868,7 @@ class CandidateLedger:
         """Persist the index now (it is otherwise checkpointed every few MiB)."""
         if not self.path.exists():
             return
+        self._prepare_sidecar()
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
             state = self._sync_sidecar()
             if state is not None:
@@ -1840,20 +1941,23 @@ class CandidateLedger:
                 if _ledger_file_signature(self.path) != index.signature:
                     _invalidate_ledger_offset_index(self.path)
                     continue
-                records: list[dict[str, Any]] = []
-                with self.path.open("rb") as handle:
-                    for offset, length in locations:
-                        handle.seek(offset)
-                        try:
-                            record = json.loads(handle.read(length).decode("utf-8"))
-                        except (UnicodeDecodeError, ValueError):
-                            continue
-                        if not isinstance(record, dict) or record.get("kind") not in kinds:
-                            continue
-                        if run_ids is not None and str(record.get("run_id") or "") not in run_ids:
-                            continue
-                        records.append(record)
-                return records
+                handle = self.path.open("rb")
+            # The indexed rows lie below the verified size and never change
+            # (append-only), so they are read without holding the ledger lock.
+            records: list[dict[str, Any]] = []
+            with handle:
+                for offset, length in locations:
+                    handle.seek(offset)
+                    try:
+                        record = json.loads(handle.read(length).decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    if not isinstance(record, dict) or record.get("kind") not in kinds:
+                        continue
+                    if run_ids is not None and str(record.get("run_id") or "") not in run_ids:
+                        continue
+                    records.append(record)
+            return records
         raise RuntimeError("candidate ledger changed continuously while reading its index")
 
     def _require_complete_index(self, *, purpose: str) -> _LedgerOffsetIndex | None:
@@ -2363,6 +2467,25 @@ class CandidateLedger:
         fh.seek(0, os.SEEK_END)
         return True
 
+    @contextmanager
+    def _snapshot(self):
+        """Pin the ledger as it is now, then let appends continue.
+
+        The lock is held only to open the file and read its size. The ledger is
+        append-only (the one in-place change is truncating a crash-torn tail, which
+        this detects as a short read), so bytes below the snapshot size never change
+        under the open handle, and nothing in this module replaces the ledger file
+        (``os.replace`` is used for the index sidecar only). The caller reads
+        ``[0, snapshot)`` without the lock.
+        """
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            handle = self.path.open("rb")
+            snapshot = os.fstat(handle.fileno()).st_size
+        try:
+            yield handle, snapshot
+        finally:
+            handle.close()
+
     def scan(
         self,
         *,
@@ -2387,6 +2510,16 @@ class CandidateLedger:
         """
         if max_malformed_samples < 0:
             raise ValueError("max_malformed_samples must be >= 0")
+        for _attempt in range(3):
+            try:
+                return self._scan_once(max_malformed_samples, kinds)
+            except _SnapshotChanged:
+                continue  # a torn tail was repaired under the snapshot; take a new one
+        raise RuntimeError("candidate ledger kept changing under scan")
+
+    def _scan_once(
+        self, max_malformed_samples: int, kinds: frozenset[str] | None
+    ) -> LedgerScanResult:
         if not self.path.exists():
             return LedgerScanResult(
                 path=self.path,
@@ -2413,7 +2546,10 @@ class CandidateLedger:
 
         def hashed_chunks(handle: Any) -> Iterator[bytes]:
             nonlocal file_size, last_byte
-            for chunk in _read_chunks(handle, _STREAM_CHUNK_BYTES):
+            while file_size < snapshot:
+                chunk = handle.read(min(_STREAM_CHUNK_BYTES, snapshot - file_size))
+                if not chunk:
+                    break
                 digest.update(chunk)
                 file_size += len(chunk)
                 last_byte = chunk[-1:]
@@ -2429,60 +2565,59 @@ class CandidateLedger:
         final_nonempty_line_number: int | None = None
 
         line_number = 0
-        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
-            with self.path.open("rb") as handle:
-                for line_number, raw_line in enumerate(
-                    _stream_lines(hashed_chunks(handle)), start=1
-                ):
-                    if not raw_line.strip():
-                        continue
-                    nonempty_lines += 1
-                    final_nonempty_line_number = line_number
-                    reason: str | None = None
+        with self._snapshot() as (handle, snapshot):
+            for line_number, raw_line in enumerate(_stream_lines(hashed_chunks(handle)), start=1):
+                if not raw_line.strip():
+                    continue
+                nonempty_lines += 1
+                final_nonempty_line_number = line_number
+                reason: str | None = None
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    reason = "invalid_utf8"
+
+                record: Any = None
+                if reason is None:
                     try:
-                        line = raw_line.decode("utf-8")
-                    except UnicodeDecodeError:
-                        line = raw_line.decode("utf-8", errors="replace")
-                        reason = "invalid_utf8"
-
-                    record: Any = None
-                    if reason is None:
-                        try:
-                            record = json.loads(line)
-                        except ValueError:
-                            reason = "invalid_json"
-                        else:
-                            if not isinstance(record, dict):
-                                reason = "record_not_object"
-
-                    if reason is not None:
-                        malformed_line_count += 1
-                        malformed_line_numbers.add(line_number)
-                        if len(malformed) < max_malformed_samples:
-                            sample = json.dumps(line.strip(), ensure_ascii=True)[1:-1]
-                            sample_truncated = len(sample) > _MALFORMED_SAMPLE_CHARS
-                            if sample_truncated:
-                                sample = sample[: _MALFORMED_SAMPLE_CHARS - 3] + "..."
-                            malformed.append(
-                                MalformedLedgerLine(
-                                    line_number=line_number,
-                                    reason=reason,
-                                    sample=sample,
-                                    sample_truncated=sample_truncated,
-                                )
-                            )
-                        continue
-
-                    if kinds is None or record.get("kind") in kinds:
-                        parsed_records.append(record)
-                    version = record.get("ledger_version")
-                    if isinstance(version, int) and not isinstance(version, bool):
-                        ledger_versions.add(version)
-                        if version not in _ACCEPTED_LEDGER_VERSIONS:
-                            unrecognized_version_record_count += 1
+                        record = json.loads(line)
+                    except ValueError:
+                        reason = "invalid_json"
                     else:
-                        unrecognized_version_record_count += 1
+                        if not isinstance(record, dict):
+                            reason = "record_not_object"
 
+                if reason is not None:
+                    malformed_line_count += 1
+                    malformed_line_numbers.add(line_number)
+                    if len(malformed) < max_malformed_samples:
+                        sample = json.dumps(line.strip(), ensure_ascii=True)[1:-1]
+                        sample_truncated = len(sample) > _MALFORMED_SAMPLE_CHARS
+                        if sample_truncated:
+                            sample = sample[: _MALFORMED_SAMPLE_CHARS - 3] + "..."
+                        malformed.append(
+                            MalformedLedgerLine(
+                                line_number=line_number,
+                                reason=reason,
+                                sample=sample,
+                                sample_truncated=sample_truncated,
+                            )
+                        )
+                    continue
+
+                if kinds is None or record.get("kind") in kinds:
+                    parsed_records.append(record)
+                version = record.get("ledger_version")
+                if isinstance(version, int) and not isinstance(version, bool):
+                    ledger_versions.add(version)
+                    if version not in _ACCEPTED_LEDGER_VERSIONS:
+                        unrecognized_version_record_count += 1
+                else:
+                    unrecognized_version_record_count += 1
+
+        if file_size != snapshot:
+            raise _SnapshotChanged
         unterminated_final_line = bool(file_size) and last_byte not in (b"\n", b"\r")
 
         trailing_partial = bool(
@@ -2739,6 +2874,7 @@ class CandidateLedger:
         )
         # Runs holding a current-format sealed plan come from the index sidecar, so
         # the (large) commit_plan rows are not read back just to be inspected.
+        self._prepare_sidecar()
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
             state = self._sync_sidecar()
             if state is None:
@@ -2829,6 +2965,7 @@ class CandidateLedger:
             ) from exc
         if not self.path.exists():
             return ()
+        self._prepare_sidecar()
         loaded: list[tuple[str, dict[str, Any], int, list[tuple[int, dict[str, Any]]]]] | None
         loaded = []
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
@@ -2889,12 +3026,14 @@ class CandidateLedger:
 
         order: list[str] = []
         plans: dict[str, dict[str, Any]] = {}
-        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+        with self._snapshot() as (_pinned, snapshot):
             reader = _RowReader(self.path)
             try:
                 with self.path.open("rb") as handle:
                     offset = 0
                     for raw in iter(handle.readline, b""):
+                        if offset >= snapshot:
+                            break
                         position, offset = offset, offset + len(raw)
                         try:
                             record = json.loads(raw.decode("utf-8"))
@@ -2967,6 +3106,7 @@ class CandidateLedger:
         """The receipt rows of an open plan straight from the index, else ``None``."""
         if not self.path.exists():
             return None
+        self._prepare_sidecar()
         with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
             state = self._sync_sidecar()
             if state is None or state.anomaly or state.completeness_reason():
