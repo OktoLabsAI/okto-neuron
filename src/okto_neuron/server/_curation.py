@@ -94,7 +94,13 @@ async def _swap_under_runtime_fence(
             reopened.close()
             raise
         if validate_reopened is not None:
-            await asyncio.to_thread(validate_reopened, reopened)
+            # Store executor, NOT the job executor: this coroutine is awaited by a
+            # job runner that is itself parked on a job worker (the swap is
+            # marshaled onto the loop), so a job-pool hop here could deadlock
+            # once every job worker is such a parked runner.
+            from okto_neuron.server._store_io import store_io
+
+            await store_io(validate_reopened, reopened)
         safe_to_unfence = True
     except Exception:
         # The graph swap helper rolls its filesystem rename back where possible.
@@ -884,6 +890,10 @@ def _run_companion_triage_verdicts(
                 )
 
     if max_concurrent > 1 and len(batches) > 1:
+        # Exempt from the StoreExecutor/JobExecutor rule (issue #13): an
+        # LLM-internal fan-out of concurrent model calls, created and joined
+        # inside one job runner that already occupies a job worker. It never
+        # touches the store and never runs on the event loop.
         with ThreadPoolExecutor(max_workers=min(max_concurrent, len(batches))) as pool:
             futures = {
                 id(batch): pool.submit(

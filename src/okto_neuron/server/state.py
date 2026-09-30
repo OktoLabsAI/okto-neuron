@@ -862,9 +862,9 @@ def reset_state_for_tests() -> None:
         # A store-executor call abandoned by a cancelled request (or a worker
         # task torn down with its test loop) may still be inside the graph;
         # never close a vault underneath it.
-        from okto_neuron.server._store_io import wait_store_idle
+        from okto_neuron.server._store_io import wait_executors_idle
 
-        wait_store_idle(timeout=30.0)
+        wait_executors_idle(timeout=30.0)
         try:
             _STATE.close()
         except Exception:  # noqa: BLE001

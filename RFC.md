@@ -290,13 +290,25 @@ leases the matching Ladybug handle for the operation. This is request routing, n
 query fanout. No `MultiVault`, authority-overlay, or catalog-federation API has shipped.
 
 REST, MCP and `/health` share one asyncio event loop, so no handler may do store, sidecar or
-YAML I/O on it. Every such call goes through one bounded store executor
-(`server/_store_io.py`, `store_io`; `[server] store_workers` in `okto-neuron.toml`, default 4),
-which also collapses concurrent identical full scans (upkeep predicates, graph stats, integrity
-summary, ledger runs/summary) into one execution with `single_flight`. LLM extraction and
-answer synthesis, query embedding and re-embed stay on the default executor so a slow model
-call never holds a store worker. `tests/server/test_event_loop_guard.py` fails any route or MCP
-tool that blocks the loop for more than 50 ms against a deliberately slow store.
+YAML I/O on it, and nothing in `okto_neuron.server` uses the default executor. Every blocking
+call goes to one of two bounded pools in `server/_store_io.py`, sized in `okto-neuron.toml`:
+
+| Pool | Key (default) | Entry point | Work |
+|---|---|---|---|
+| StoreExecutor | `[server] store_workers` (4) | `store_io`, `single_flight` | short store, sidecar and YAML I/O for requests and background loops, recall's query embedding |
+| JobExecutor | `[server] job_workers` (2) | `job_io` | curation job runners, ingest and remember extraction, answer synthesis, re-embed, provider/model test probes |
+
+`single_flight` collapses concurrent identical full scans (upkeep predicates, graph stats,
+integrity summary, ledger runs/summary) into one execution. Long jobs never occupy a store
+worker, so they cannot starve UI reads; the JobExecutor is also where a separate worker
+process will plug in. On shutdown both pools finish calls already executing (bounded by the
+drain deadline) before vault handles close, then cancel anything still queued. Two deliberate
+exceptions remain: the graph swap at the end of rebuild/heal/reembed jobs runs on the loop as
+one no-await block (reads see a short latency blip, never a half-swapped graph), and the
+companion-triage LLM fan-out uses its own thread pool inside a job runner.
+`tests/server/test_event_loop_guard.py` fails any route or MCP tool that blocks the loop for
+more than 50 ms against a deliberately slow store, and `test_no_default_executor.py` fails on
+any new default-executor offload.
 
 Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and

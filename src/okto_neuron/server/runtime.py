@@ -35,12 +35,14 @@ from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._store_io import (
+    DEFAULT_JOB_WORKERS,
     DEFAULT_STORE_WORKERS,
     acquire_off_loop,
-    configure_store_executor,
-    shutdown_store_executor,
+    configure_executors,
+    job_io,
+    shutdown_executors,
     store_io,
-    wait_store_idle,
+    wait_executors_idle_async,
 )
 from okto_neuron.server._vault_pool import VaultLease, VaultPoolError
 from okto_neuron.server.http import build_rest_app
@@ -68,24 +70,27 @@ DEFAULT_HOST = "127.0.0.1"
 _LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
-def _configured_store_workers() -> int:
-    """``[server] store_workers`` from ``okto-neuron.toml`` (default 4).
+def _configured_executor_workers() -> tuple[int, int]:
+    """``[server] store_workers`` / ``job_workers`` from ``okto-neuron.toml``
+    (defaults 4 and 2).
 
     A broken or unreadable app config never stops ``serve``; it falls back to the
-    default and says so, because the same file is re-read (and reported) by the
+    defaults and says so, because the same file is re-read (and reported) by the
     commands that actually depend on it.
     """
     from okto_neuron.config import OktoNeuronConfig
 
     try:
-        return int(OktoNeuronConfig.load().server.store_workers)
+        server = OktoNeuronConfig.load().server
+        return int(server.store_workers), int(server.job_workers)
     except Exception as exc:  # noqa: BLE001 - startup must not die on this knob
         _LOG.warning(
-            "could not read [server] store_workers (%s); using %d",
+            "could not read [server] store_workers/job_workers (%s); using %d/%d",
             exc,
             DEFAULT_STORE_WORKERS,
+            DEFAULT_JOB_WORKERS,
         )
-        return DEFAULT_STORE_WORKERS
+        return DEFAULT_STORE_WORKERS, DEFAULT_JOB_WORKERS
 
 
 class _ShutdownSignalHandler:
@@ -351,11 +356,12 @@ async def _graceful_shutdown(
                 tasks=owned_tasks,
                 force_process_exit=force_process_exit,
             )
-        # A store call whose request was cancelled keeps running on its worker;
-        # let it finish (bounded by the deadline) before any handle closes.
-        await asyncio.to_thread(wait_store_idle, remaining)
+        # A pool call whose awaiting task was cancelled keeps running on its
+        # worker; let it finish (bounded by the deadline) before any handle
+        # closes. Both pools then cancel whatever is still queued.
+        await wait_executors_idle_async(remaining)
         remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        await asyncio.wait_for(asyncio.to_thread(state.close), timeout=max(remaining, 0.001))
+        await asyncio.wait_for(store_io(state.close), timeout=max(remaining, 0.001))
     except asyncio.TimeoutError:
         _force_shutdown(
             reason="writer lock or vault close",
@@ -1352,7 +1358,7 @@ def _build_mcp_server(state: ServerState):
             raise RuntimeError(f"{sanitised.code}: {sanitised}") from exc
 
     @mcp.tool()
-    def ask(
+    async def ask(
         question: str,
         k: int = 20,
         hops: int = 1,
@@ -1453,6 +1459,49 @@ def _build_mcp_server(state: ServerState):
         An out-of-range knob (e.g. ``coverage_threshold=1.5``) fails the call
         with a readable ``invalid retrieval policy: ...`` error.
         """
+        # Retrieval + LLM answer synthesis (seconds to minutes): job executor.
+        return await job_io(
+            functools.partial(
+                _ask_impl,
+                question=question,
+                k=k,
+                hops=hops,
+                vault=vault,
+                enable_subgraph=enable_subgraph,
+                source_block_policy=source_block_policy,
+                seed_k=seed_k,
+                max_degree_per_seed=max_degree_per_seed,
+                neighbour_budget_tokens=neighbour_budget_tokens,
+                source_block_budget_tokens=source_block_budget_tokens,
+                coverage_threshold=coverage_threshold,
+                min_claim_confidence=min_claim_confidence,
+                max_nodes=max_nodes,
+                max_relationships=max_relationships,
+                max_claims=max_claims,
+                relationship_types=relationship_types,
+                include_sources=include_sources,
+            )
+        )
+
+    def _ask_impl(
+        question: str,
+        k: int = 20,
+        hops: int = 1,
+        vault: str | None = None,
+        enable_subgraph: bool | None = None,
+        source_block_policy: Literal["never", "on_coverage_miss", "always", "blend"] | None = None,
+        seed_k: int | None = None,
+        max_degree_per_seed: int | None = None,
+        neighbour_budget_tokens: int | None = None,
+        source_block_budget_tokens: int | None = None,
+        coverage_threshold: float | None = None,
+        min_claim_confidence: float | None = None,
+        max_nodes: int | None = None,
+        max_relationships: int | None = None,
+        max_claims: int | None = None,
+        relationship_types: list[str] | None = None,
+        include_sources: bool = False,
+    ) -> dict[str, object]:
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
         _ignored: list[str] = []
@@ -1690,7 +1739,7 @@ def _build_mcp_server(state: ServerState):
                     )
                     # Off-load the blocking extraction so the event loop stays
                     # responsive while this vault's lock serializes writes.
-                    result = await asyncio.to_thread(
+                    result = await job_io(
                         functools.partial(
                             companion_for(selected_vault).remember,
                             ingest_source,
@@ -1940,10 +1989,11 @@ async def _run_async(
     # ``init_state`` already adopted the startup fallback vault into the pool (the
     # pool owns ALL handles, so shutdown closes it once via ``pool.close_all()``).
 
-    # Issue #13: one bounded executor owns every store/vault-file/config read a
-    # handler needs, so no request ever blocks the loop that serves /health,
-    # REST and MCP. Shut down in the ``finally`` below after the vaults close.
-    configure_store_executor(_configured_store_workers())
+    # Issue #13: two bounded executors own every blocking call the server makes
+    # (store/vault-file/config I/O, and long jobs/model work), so no request ever
+    # blocks the loop that serves /health, REST and MCP. Shut down in the
+    # ``finally`` below after the vaults close.
+    configure_executors(*_configured_executor_workers())
 
     # Pin the configured LLM providers' lazy imports (litellm, boto3) into this
     # process NOW, while the launch-time environment is intact — see the helper's
@@ -2114,7 +2164,7 @@ async def _run_async(
                         loop.remove_signal_handler(sig)
             uvicorn_error_logger.removeFilter(mcp_lifecycle_filter)
             reset_state_for_tests()
-            shutdown_store_executor()
+            shutdown_executors()
 
     if cancellation is not None:  # pragma: no cover - defensive
         raise cancellation

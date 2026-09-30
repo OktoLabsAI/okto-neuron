@@ -69,6 +69,10 @@ class ServerSettings(BaseModel):
     """Threads in the daemon's bounded store executor. Every graph read, vault
     sidecar/JSON read and YAML load a request handler needs runs there instead
     of on the event loop that also serves ``/health``, REST and MCP."""
+    job_workers: int = Field(default=2, ge=1, le=64)
+    """Threads in the daemon's bounded job executor: curation job runners,
+    ingest/remember extraction, answer synthesis and re-embed. Kept apart from
+    the store executor so long jobs never starve UI reads."""
 
 
 class OktoNeuronConfig(BaseModel):

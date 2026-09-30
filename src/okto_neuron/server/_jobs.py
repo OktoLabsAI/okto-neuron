@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from okto_neuron.server import _integrity as graph_integrity
-from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, store_io
+from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
 if TYPE_CHECKING:
     from okto_neuron.server.state import ServerState
@@ -474,9 +474,9 @@ async def _drain(state: "ServerState") -> None:
                                     state,
                                     vault,
                                 )
-                            result = await asyncio.to_thread(_run)
+                            result = await job_io(_run)
                     else:
-                        result = await asyncio.to_thread(_run)
+                        result = await job_io(_run)
                 job.result = result if isinstance(result, dict) else {"result": result}
                 job.status = "done"
                 job.progress = "done"

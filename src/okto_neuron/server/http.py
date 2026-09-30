@@ -72,7 +72,7 @@ from okto_neuron.server import _curation, _jobs, _scheduler
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
-from okto_neuron.server._store_io import acquire_off_loop, single_flight, store_io
+from okto_neuron.server._store_io import acquire_off_loop, job_io, single_flight, store_io
 from okto_neuron.server._vault_pool import VaultPoolError
 from okto_neuron.server.lifecycle import request_id as bind_request_id
 from okto_neuron.server.state import (
@@ -1932,9 +1932,8 @@ async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
             await store_io(pool.release_path, runtime.vault_path, require_fenced=True)
             released = True
 
-            # Embedding-bound (minutes): stays on the default executor so it
-            # never occupies a store worker for the whole re-embed.
-            await asyncio.to_thread(_kg_reembed, runtime.vault_path)
+            # Embedding-bound (minutes): job executor, never a store worker.
+            await job_io(_kg_reembed, runtime.vault_path)
             await _open_and_install_fenced(runtime)
             released = False
         _set_runtime_open_warning(runtime, None)
@@ -2362,11 +2361,8 @@ async def query(request: Request) -> JSONResponse:
         return k_cap_err
 
     try:
-        # Off-load the blocking query (embedding + vector search) so the event
-        # loop stays responsive during a slow retrieval. Deliberately NOT a store
-        # op: the query embedding (and a cold model load) must not occupy one of
-        # the few store workers that serve graph reads.
-        hits, metrics = await asyncio.to_thread(_query_with_recall_cost, state.vault, text, k=k)
+        # Store read: vector search plus one short query embedding.
+        hits, metrics = await store_io(_query_with_recall_cost, state.vault, text, k=k)
     except QueryError as exc:
         return _err(500, "query_failed", str(exc))
     except VaultClosedError as exc:
@@ -2560,9 +2556,7 @@ async def remember(request: Request) -> JSONResponse:
             await store_io(graph_integrity.require_write_allowed, state, state.vault)
             # Off-load the blocking LLM extraction so the event loop stays
             # responsive; writer_lock still serializes the write.
-            result = await asyncio.to_thread(
-                _companion(state).remember, source, sensitivity=sensitivity
-            )
+            result = await job_io(_companion(state).remember, source, sensitivity=sensitivity)
             # ADR 0009 P4: signal in-process ingest activity for the continuous
             # curation scheduler's debounce.
             now = time.time()
@@ -2636,11 +2630,8 @@ async def recall(request: Request) -> JSONResponse:
         return k_cap_err
 
     try:
-        # Off-load the blocking query (embedding + vector search) so the event
-        # loop stays responsive during a slow retrieval. Deliberately NOT a store
-        # op: the query embedding (and a cold model load) must not occupy one of
-        # the few store workers that serve graph reads.
-        hits, metrics = await asyncio.to_thread(_query_with_recall_cost, state.vault, text, k=k)
+        # Store read: vector search plus one short query embedding.
+        hits, metrics = await store_io(_query_with_recall_cost, state.vault, text, k=k)
     except QueryError as exc:
         return _err(500, "query_failed", str(exc))
     except VaultClosedError as exc:
@@ -2688,7 +2679,7 @@ async def ask(request: Request) -> JSONResponse:
     try:
         # Off-load the blocking LLM answer synthesis so the event loop stays
         # responsive while retrieval + generation runs.
-        answer = await asyncio.to_thread(
+        answer = await job_io(
             _companion(state).ask,
             question,
             k=k,
@@ -5220,7 +5211,7 @@ async def api_ingest(request: Request) -> JSONResponse:
             filename = target.name
             # Off-load the blocking LLM extraction so the event loop stays
             # responsive; writer_lock still serializes the write.
-            result = await asyncio.to_thread(_companion(state).remember, target)
+            result = await job_io(_companion(state).remember, target)
         except IntegrityFenceError as exc:
             return _integrity_fenced_response(exc)
         except IngestError as exc:
@@ -5788,11 +5779,8 @@ async def api_recall(request: Request) -> JSONResponse:
         return k_cap_err
 
     try:
-        # Off-load the blocking query (embedding + vector search) so the event
-        # loop stays responsive during a slow retrieval. Deliberately NOT a store
-        # op: the query embedding (and a cold model load) must not occupy one of
-        # the few store workers that serve graph reads.
-        hits, metrics = await asyncio.to_thread(_query_with_recall_cost, state.vault, text, k=k)
+        # Store read: vector search plus one short query embedding.
+        hits, metrics = await store_io(_query_with_recall_cost, state.vault, text, k=k)
     except QueryError as exc:
         return _err(500, "query_failed", str(exc))
     except VaultClosedError as exc:
@@ -5836,7 +5824,7 @@ async def api_ask(request: Request) -> JSONResponse:
     try:
         # Off-load the blocking LLM answer synthesis so the event loop stays
         # responsive while retrieval + generation runs.
-        answer = await asyncio.to_thread(
+        answer = await job_io(
             _companion(state).ask,
             question,
             k=k,
@@ -5932,7 +5920,7 @@ async def api_llm_test(request: Request) -> JSONResponse:
                 {"ok": False, "models": [], "error": "claude CLI not found on PATH"}
             )
         try:
-            proc = await asyncio.to_thread(
+            proc = await job_io(
                 _subprocess.run,
                 [binary, "--version"],
                 capture_output=True,
@@ -5959,7 +5947,7 @@ async def api_llm_test(request: Request) -> JSONResponse:
     if provider in ("pi_cli", "pi"):
         from okto_neuron.onboarding import _discover_pi_cli_models
 
-        result = await asyncio.to_thread(_discover_pi_cli_models, timeout=10.0)
+        result = await job_io(_discover_pi_cli_models, timeout=10.0)
         if not result.models and result.error:
             return JSONResponse({"ok": False, "models": [], "error": result.error})
         return JSONResponse({"ok": True, "models": result.models, "error": None})
@@ -5967,7 +5955,7 @@ async def api_llm_test(request: Request) -> JSONResponse:
     if provider in ("codex_cli", "codex"):
         from okto_neuron.onboarding import _discover_codex_cli_models
 
-        result = await asyncio.to_thread(_discover_codex_cli_models)
+        result = await job_io(_discover_codex_cli_models)
         if not result.models and result.error:
             return JSONResponse({"ok": False, "models": [], "error": result.error})
         return JSONResponse({"ok": True, "models": result.models, "error": None})
@@ -6043,7 +6031,7 @@ async def api_llm_test(request: Request) -> JSONResponse:
         None,
     )
     if discovery_preset is not None:
-        result = await asyncio.to_thread(
+        result = await job_io(
             discover_models,
             discovery_preset,
             api_base=effective_api_base,
@@ -6297,7 +6285,7 @@ async def api_llm_test_completion(request: Request) -> JSONResponse:
     started = time.monotonic()
     try:
         reply, parameter_plan = await asyncio.wait_for(
-            asyncio.to_thread(_run_completion), timeout=_TEST_COMPLETION_TIMEOUT_S
+            job_io(_run_completion), timeout=_TEST_COMPLETION_TIMEOUT_S
         )
     except asyncio.TimeoutError:
         return JSONResponse(
@@ -6486,7 +6474,7 @@ async def api_embedding_models(request: Request) -> JSONResponse:
     from okto_neuron.providers import litellm_proxy_models
 
     try:
-        catalog = await asyncio.to_thread(
+        catalog = await job_io(
             litellm_proxy_models,
             api_base=api_base,
             api_key_env=api_key_env,
@@ -6577,7 +6565,7 @@ async def api_embedding_test(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "models": [], "error": str(exc)})
 
     try:
-        vectors = await asyncio.to_thread(
+        vectors = await job_io(
             embed_many,
             get_provider(config),
             [

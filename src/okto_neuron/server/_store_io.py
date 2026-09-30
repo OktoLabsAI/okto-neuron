@@ -1,16 +1,32 @@
-"""Bounded off-loop executor for store, vault-file and config I/O (issue #13).
+"""The server's two bounded off-loop executors (issue #13).
 
 The REST and MCP servers run on ONE asyncio event loop in one thread. Any
 synchronous graph read, sidecar/JSON read, YAML load or pool-lock wait inside an
-async handler freezes ``/health``, REST and MCP together. Every such call goes
-through :func:`store_io`, which runs it on the daemon's single
-:class:`StoreExecutor` instead of the loop.
+async handler freezes ``/health``, REST and MCP together. Nothing in
+``okto_neuron.server`` offloads to the default executor; every blocking call
+goes to one of two named pools:
 
-Design:
+* :class:`StoreExecutor` (``[server] store_workers`` in ``okto-neuron.toml``,
+  default 4) via :func:`store_io` / :func:`single_flight`: short store,
+  vault-file and config I/O a request or background loop needs (recall's one
+  query embedding included).
+* :class:`JobExecutor` (``[server] job_workers``, default 2) via
+  :func:`job_io`: long-running and model-bound work — curation job runners,
+  ingest/remember extraction, answer synthesis, re-embed, and the provider /
+  model / CLI probes behind the config page's Test buttons. It is separate so
+  a burst of jobs can never starve UI reads, and it is the seam a future worker
+  process replaces.
 
-* One bounded ``ThreadPoolExecutor`` per daemon (``[server] store_workers`` in
-  ``okto-neuron.toml``, default 4). LLM, extraction and embedding offloads keep
-  using their own executors so a slow model call cannot starve graph reads.
+Both pools:
+
+* run work in a copy of the caller's ``contextvars`` context, so the
+  request-bound :class:`~okto_neuron.server.state.VaultRuntime` and the request
+  id travel with it exactly as they do through ``asyncio.to_thread``;
+* count executing calls so shutdown can wait for them (bounded) before vault
+  handles close, then cancel anything still queued.
+
+Further:
+
 * Work runs in a copy of the caller's ``contextvars`` context, so the
   request-bound :class:`~okto_neuron.server.state.VaultRuntime` and the request
   id travel with it exactly as they do through ``asyncio.to_thread``.
@@ -30,26 +46,30 @@ import contextvars
 import functools
 import logging
 import threading
+import time
 import weakref
 from typing import Any, Awaitable, Callable, Hashable, TypeVar
 
 _LOG = logging.getLogger("okto_neuron.server.store_io")
 
 DEFAULT_STORE_WORKERS = 4
+DEFAULT_JOB_WORKERS = 2
 
 _T = TypeVar("_T")
 
 
-class StoreExecutor:
-    """A bounded thread pool dedicated to store and vault-file work."""
+class BoundedExecutor:
+    """A named, bounded thread pool with in-flight accounting."""
 
-    def __init__(self, max_workers: int = DEFAULT_STORE_WORKERS) -> None:
+    kind = "bounded"
+
+    def __init__(self, max_workers: int) -> None:
         if max_workers < 1:
-            raise ValueError("store executor needs at least one worker")
+            raise ValueError(f"{self.kind} executor needs at least one worker")
         self.max_workers = max_workers
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
-            thread_name_prefix="okto-neuron-store",
+            thread_name_prefix=f"okto-neuron-{self.kind}",
         )
         # Per-loop in-flight table: a future belongs to the loop that created it,
         # and tests (Starlette TestClient) run requests on short-lived loops.
@@ -67,8 +87,13 @@ class StoreExecutor:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def busy(self) -> int:
+        """Calls executing right now."""
+        return self._busy
+
     async def run(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
-        """Run ``fn(*args, **kwargs)`` on a store worker and await its result."""
+        """Run ``fn(*args, **kwargs)`` on a worker and await its result."""
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         call = functools.partial(context.run, self._tracked, loop, fn, args, kwargs)
@@ -129,6 +154,24 @@ class StoreExecutor:
         self._pool.shutdown(wait=wait, cancel_futures=True)
 
 
+class StoreExecutor(BoundedExecutor):
+    """Short store, vault-file and config I/O (default 4 workers)."""
+
+    kind = "store"
+
+    def __init__(self, max_workers: int = DEFAULT_STORE_WORKERS) -> None:
+        super().__init__(max_workers)
+
+
+class JobExecutor(BoundedExecutor):
+    """Long-running jobs, extraction and model work (default 2 workers)."""
+
+    kind = "job"
+
+    def __init__(self, max_workers: int = DEFAULT_JOB_WORKERS) -> None:
+        super().__init__(max_workers)
+
+
 _dispatch = threading.local()
 
 
@@ -151,7 +194,7 @@ def call_soon_on_loop(fn: Callable[..., Any], /, *args: Any) -> bool:
 
     Returns ``True`` when the call was handed to the loop (the caller must not
     run it itself), ``False`` when the caller is already on an event loop thread
-    or was not dispatched by :func:`store_io` (the caller runs it directly, as
+    or was not dispatched by :func:`store_io` / :func:`job_io` (the caller runs it directly, as
     before).
     """
     try:
@@ -167,51 +210,88 @@ def call_soon_on_loop(fn: Callable[..., Any], /, *args: Any) -> bool:
     return True
 
 
-_EXECUTOR: StoreExecutor | None = None
+_EXECUTORS: dict[str, BoundedExecutor] = {}
 _EXECUTOR_LOCK = threading.Lock()
+_FACTORIES: dict[str, Callable[[int], BoundedExecutor]] = {
+    "store": StoreExecutor,
+    "job": JobExecutor,
+}
+_DEFAULTS = {"store": DEFAULT_STORE_WORKERS, "job": DEFAULT_JOB_WORKERS}
 
 
-def configure_store_executor(max_workers: int = DEFAULT_STORE_WORKERS) -> StoreExecutor:
-    """Install the daemon's executor, replacing (and shutting down) any previous one."""
-    global _EXECUTOR
+def configure_executors(
+    store_workers: int = DEFAULT_STORE_WORKERS, job_workers: int = DEFAULT_JOB_WORKERS
+) -> None:
+    """Install the daemon's two pools, shutting down any previous ones."""
     with _EXECUTOR_LOCK:
-        previous = _EXECUTOR
-        _EXECUTOR = StoreExecutor(max_workers)
-    if previous is not None:
-        previous.shutdown(wait=False)
-    _LOG.info("store executor started with %d worker(s)", max_workers)
-    return _EXECUTOR
+        previous = list(_EXECUTORS.values())
+        _EXECUTORS["store"] = StoreExecutor(store_workers)
+        _EXECUTORS["job"] = JobExecutor(job_workers)
+    for executor in previous:
+        executor.shutdown(wait=False)
+    _LOG.info(
+        "executors started: store=%d worker(s), job=%d worker(s)", store_workers, job_workers
+    )
+
+
+def _get(kind: str) -> BoundedExecutor:
+    # In-process test apps never run ``okto-neuron serve``; they get default
+    # pools on first use so handlers behave the same as in the daemon.
+    with _EXECUTOR_LOCK:
+        executor = _EXECUTORS.get(kind)
+        if executor is None or executor.closed:
+            executor = _FACTORIES[kind](_DEFAULTS[kind])
+            _EXECUTORS[kind] = executor
+        return executor
 
 
 def get_store_executor() -> StoreExecutor:
-    """Return the daemon's executor, lazily creating a default one.
+    return _get("store")  # type: ignore[return-value]
 
-    In-process test apps never run ``okto-neuron serve``; they get a default
-    executor on first use so handlers behave the same as in the daemon.
-    """
-    global _EXECUTOR
+
+def get_job_executor() -> JobExecutor:
+    return _get("job")  # type: ignore[return-value]
+
+
+def shutdown_executors(*, wait: bool = False) -> None:
+    """Shut both pools down (server stop): queued calls are cancelled; calls
+    already executing finish on their own thread. Safe to call twice."""
     with _EXECUTOR_LOCK:
-        if _EXECUTOR is None or _EXECUTOR.closed:
-            _EXECUTOR = StoreExecutor(DEFAULT_STORE_WORKERS)
-        return _EXECUTOR
-
-
-def shutdown_store_executor(*, wait: bool = False) -> None:
-    """Shut the daemon's executor down (server stop). Safe to call twice."""
-    global _EXECUTOR
-    with _EXECUTOR_LOCK:
-        executor, _EXECUTOR = _EXECUTOR, None
-    if executor is not None:
+        executors = list(_EXECUTORS.values())
+        _EXECUTORS.clear()
+    for executor in executors:
         executor.shutdown(wait=wait)
 
 
-def wait_store_idle(timeout: float | None = None) -> bool:
-    """Wait for in-flight store calls to finish before closing vault handles.
-
-    Returns True when no call is executing (also when no executor exists)."""
+def _executing() -> int:
     with _EXECUTOR_LOCK:
-        executor = _EXECUTOR
-    return True if executor is None else executor.wait_idle(timeout)
+        executors = list(_EXECUTORS.values())
+    return sum(executor.busy for executor in executors)
+
+
+def wait_executors_idle(timeout: float | None = None) -> bool:
+    """Block until no call executes on either pool (or ``timeout``).
+
+    Used before vault handles close so a native store call never runs against
+    a closed database. Returns True when idle."""
+    with _EXECUTOR_LOCK:
+        executors = list(_EXECUTORS.values())
+    deadline = None if timeout is None else time.monotonic() + timeout
+    for executor in executors:
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if not executor.wait_idle(remaining):
+            return False
+    return True
+
+
+async def wait_executors_idle_async(timeout: float) -> bool:
+    """:func:`wait_executors_idle` for the event loop, without borrowing a thread."""
+    deadline = time.monotonic() + timeout
+    while _executing():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.02)
+    return True
 
 
 def store_io(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Awaitable[_T]:
@@ -219,11 +299,16 @@ def store_io(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Awaitable[_
     return get_store_executor().run(fn, *args, **kwargs)
 
 
+def job_io(fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> Awaitable[_T]:
+    """Await long-running ``fn(*args, **kwargs)`` on the job executor."""
+    return get_job_executor().run(fn, *args, **kwargs)
+
+
 def single_flight(
     key: Hashable, fn: Callable[..., _T], /, *args: Any, **kwargs: Any
 ) -> Awaitable[_T]:
     """Collapse concurrent identical store calls into one execution (see
-    :meth:`StoreExecutor.single_flight`)."""
+    :meth:`BoundedExecutor.single_flight`)."""
     return get_store_executor().single_flight(key, fn, *args, **kwargs)
 
 
@@ -262,14 +347,20 @@ async def acquire_off_loop(
 
 
 __all__ = [
+    "DEFAULT_JOB_WORKERS",
     "DEFAULT_STORE_WORKERS",
-    "acquire_off_loop",
+    "BoundedExecutor",
+    "JobExecutor",
     "StoreExecutor",
+    "acquire_off_loop",
     "call_soon_on_loop",
-    "configure_store_executor",
+    "configure_executors",
+    "get_job_executor",
     "get_store_executor",
-    "shutdown_store_executor",
+    "job_io",
+    "shutdown_executors",
     "single_flight",
     "store_io",
-    "wait_store_idle",
+    "wait_executors_idle",
+    "wait_executors_idle_async",
 ]
