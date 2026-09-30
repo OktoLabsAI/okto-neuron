@@ -46,6 +46,7 @@ import contextvars
 import functools
 import json
 import logging
+import os
 import threading
 import time
 import weakref
@@ -86,6 +87,10 @@ class BoundedExecutor:
         # reach zero or a native store call can run against a closed database.
         self._busy = 0
         self._idle = threading.Condition()
+        # Submitted-but-not-finished calls, so shutdown can cancel the ones
+        # still queued (a running call cannot be interrupted).
+        self._pending: set[concurrent.futures.Future[Any]] = set()
+        self._pending_lock = threading.Lock()
 
     @property
     def closed(self) -> bool:
@@ -101,7 +106,26 @@ class BoundedExecutor:
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         call = functools.partial(context.run, self._tracked, loop, fn, args, kwargs)
-        return await loop.run_in_executor(self._pool, call)
+        future = self._pool.submit(call)
+        with self._pending_lock:
+            self._pending.add(future)
+        future.add_done_callback(self._forget_pending)
+        return await asyncio.wrap_future(future, loop=loop)
+
+    def _forget_pending(self, future: concurrent.futures.Future[Any]) -> None:
+        with self._pending_lock:
+            self._pending.discard(future)
+
+    def cancel_queued(self) -> int:
+        """Cancel calls that have not started; running calls are left alone.
+
+        Returns how many were cancelled. A cancelled call's awaiting task gets
+        ``CancelledError``; nothing here can (or tries to) stop a call already
+        executing on a worker.
+        """
+        with self._pending_lock:
+            pending = tuple(self._pending)
+        return sum(1 for future in pending if future.cancel())
 
     def _tracked(
         self,
@@ -260,11 +284,49 @@ def get_job_executor() -> JobExecutor:
 def shutdown_executors(*, wait: bool = False) -> None:
     """Shut both pools down (server stop): queued calls are cancelled; calls
     already executing finish on their own thread. Safe to call twice."""
+    global _ABANDONED_WORKERS
     with _EXECUTOR_LOCK:
         executors = list(_EXECUTORS.values())
         _EXECUTORS.clear()
     for executor in executors:
+        if not wait:
+            _ABANDONED_WORKERS += executor.busy
         executor.shutdown(wait=wait)
+
+
+_ABANDONED_WORKERS = 0
+
+
+def abandoned_workers() -> int:
+    """Worker threads still executing a call when the pools were shut down."""
+    return _ABANDONED_WORKERS
+
+
+def exit_if_workers_abandoned(exit_code: int = 0) -> None:
+    """Exit now when a worker is stuck, so it cannot hold the interpreter open.
+
+    ``concurrent.futures`` joins every worker at interpreter exit; a thread
+    parked in an LLM or network wait would hang a stop that already closed the
+    stores. Call this last, after the stores are closed and the PID file is
+    released.
+    """
+    stuck = _ABANDONED_WORKERS
+    if not stuck:
+        return
+    _LOG.warning("exiting with %d stuck worker thread(s) abandoned", stuck)
+    logging.shutdown()
+    os._exit(exit_code)
+
+
+def cancel_queued_work() -> int:
+    """Cancel every not-yet-started call on both pools (drain budget exhausted).
+
+    Unlike :func:`shutdown_executors` this keeps the pools registered, so
+    :func:`wait_executors_idle` still sees the calls that are executing.
+    """
+    with _EXECUTOR_LOCK:
+        executors = list(_EXECUTORS.values())
+    return sum(executor.cancel_queued() for executor in executors)
 
 
 def _executing() -> int:
@@ -412,7 +474,10 @@ __all__ = [
     "JobExecutor",
     "StoreExecutor",
     "acquire_off_loop",
+    "abandoned_workers",
     "call_soon_on_loop",
+    "cancel_queued_work",
+    "exit_if_workers_abandoned",
     "encode_json",
     "encode_op",
     "json_bytes_response",

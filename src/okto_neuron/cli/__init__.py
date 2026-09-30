@@ -3049,6 +3049,11 @@ def serve(
                         "vault": str(resolved) if resolved is not None else None,
                     },
                 )
+        from okto_neuron.server._store_io import exit_if_workers_abandoned
+
+        # The stores are closed and the PID file released; a worker still parked
+        # in an LLM/network wait must not keep the process alive.
+        exit_if_workers_abandoned()
     except StaleLockError as exc:
         # Idempotent start: surface the running server and exit 1.
         logger.error(

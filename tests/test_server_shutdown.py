@@ -423,6 +423,69 @@ async def test_runtime_one_deadline_bounds_owned_worker_wait(monkeypatch) -> Non
     forced: list[int] = []
     started = time.monotonic()
     try:
+        await runtime._graceful_shutdown(
+            state=state,  # type: ignore[arg-type]
+            orchestrator=GracefulShutdown(),
+            rest_server=FakeServer(),  # type: ignore[arg-type]
+            mcp_server=FakeServer(),  # type: ignore[arg-type]
+            transport_tasks=transports,
+            force_process_exit=forced.append,
+        )
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+
+    # The drain budget (0.05 s) expired on the stuck worker, which was cancelled;
+    # the reserved close budget then let the store close run. No hard exit.
+    assert time.monotonic() - started < 2.0
+    assert state.shutting_down is True
+    assert state.close_calls == 1
+    assert forced == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_skips_close_under_an_in_flight_grafx_call(monkeypatch, caplog) -> None:
+    """A grafx call still running at the hard deadline is never closed under."""
+    import logging
+
+    from okto_neuron.server import lifecycle, runtime
+    from okto_neuron.server.lifecycle import GracefulShutdown
+
+    monkeypatch.setattr(runtime, "SHUTDOWN_DRAIN_TIMEOUT", 0.05)
+    monkeypatch.setattr(lifecycle, "_MIN_CLOSE_BUDGET_SECONDS", 0.2)
+
+    class FakeServer:
+        should_exit = False
+        force_exit = False
+
+    class FakePool:
+        def calls_in_flight(self) -> dict[str, int]:
+            return {"scratch": 2}
+
+    class FakeState:
+        scheduler_task = None
+        folder_watch_task = None
+        ingest_worker_task = None
+        curation_worker_task = None
+        writer_lock = asyncio.Lock()
+        shutting_down = False
+        vault_pool = FakePool()
+        close_calls = 0
+
+        def mark_shutting_down(self) -> None:
+            self.shutting_down = True
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    state = FakeState()
+    forced: list[int] = []
+    transports = (
+        asyncio.create_task(asyncio.sleep(0)),
+        asyncio.create_task(asyncio.sleep(0)),
+    )
+    with caplog.at_level(logging.INFO):
         with pytest.raises(runtime._ShutdownDeadlineExpired):
             await runtime._graceful_shutdown(
                 state=state,  # type: ignore[arg-type]
@@ -432,15 +495,13 @@ async def test_runtime_one_deadline_bounds_owned_worker_wait(monkeypatch) -> Non
                 transport_tasks=transports,
                 force_process_exit=forced.append,
             )
-    finally:
-        worker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker
 
-    assert time.monotonic() - started < 0.5
-    assert state.shutting_down is True
     assert state.close_calls == 0
     assert forced == [1]
+    assert (
+        "store close skipped: 2 grafx calls in flight, relying on WAL recovery" in caplog.text
+    )
+    assert "outcome=close_skipped" in caplog.text
 
 
 @pytest.mark.asyncio

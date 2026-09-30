@@ -1625,7 +1625,14 @@ class GracefulShutdown:
         self._shutdown_event = threading.Event()
         self._force_event = threading.Event()
         self._deadline: float | None = None
+        self._drain_timeout: float | None = None
         self._closed = False
+
+    @property
+    def drain_timeout(self) -> float | None:
+        """The first shutdown request's drain budget in seconds, if set."""
+        with self._lock:
+            return self._drain_timeout
 
     @property
     def shutdown_event(self) -> threading.Event:
@@ -1662,6 +1669,7 @@ class GracefulShutdown:
             with self._lock:
                 if self._deadline is None:
                     self._deadline = candidate
+                    self._drain_timeout = max(0.0, timeout)
         self._shutdown_event.set()
 
     def request_force_shutdown(self) -> None:

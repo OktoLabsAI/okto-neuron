@@ -436,6 +436,20 @@ class VaultPool:
             handle_lease.release()
         return True
 
+    def calls_in_flight(self) -> dict[str, int]:
+        """Grafx calls executing per open vault (``{}`` for other backends).
+
+        Reads without taking the pool lock (it can be held across a slow open);
+        a dict snapshot is atomic under the GIL. Shutdown uses this to tell a
+        thread parked in a non-store wait (count 0) from one inside a grafx
+        statement or transaction (count > 0).
+        """
+        counts: dict[str, int] = {}
+        for path, vault in tuple(self._vaults.items()):
+            value = getattr(getattr(vault, "store", None), "calls_in_flight", 0)
+            counts[path.name] = counts.get(path.name, 0) + int(value)
+        return counts
+
     def close_all(self) -> None:
         """Close every pooled handle once. Idempotent; used after task drain."""
         with self._lock:

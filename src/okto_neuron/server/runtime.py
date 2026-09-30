@@ -21,6 +21,8 @@ import logging
 import os
 import re
 import signal
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional
 
@@ -38,6 +40,7 @@ from okto_neuron.server._store_io import (
     DEFAULT_JOB_WORKERS,
     DEFAULT_STORE_WORKERS,
     acquire_off_loop,
+    cancel_queued_work,
     configure_executors,
     job_io,
     shutdown_executors,
@@ -50,7 +53,13 @@ from okto_neuron.server._vault_pool import (
     acquire_daemon_writer_lease,
 )
 from okto_neuron.server.http import build_rest_app
-from okto_neuron.server.lifecycle import GracefulShutdown, close_budget, last_stop_request
+from okto_neuron.server.lifecycle import (
+    GracefulShutdown,
+    close_budget,
+    last_stop_request,
+    set_shutdown_hard_deadline,
+    shutdown_phase,
+)
 from okto_neuron.server.state import (
     ServerState,
     VaultRuntime,
@@ -207,27 +216,6 @@ def _hard_exit(exit_code: int) -> None:
     os._exit(exit_code)
 
 
-def _force_shutdown(
-    *,
-    reason: str,
-    orchestrator: GracefulShutdown,
-    rest_server: uvicorn.Server,
-    mcp_server: uvicorn.Server,
-    tasks: set[asyncio.Task],
-    force_process_exit: Callable[[int], None],
-) -> None:
-    """Escalate a missed absolute deadline; production callback never returns."""
-    orchestrator.request_force_shutdown()
-    rest_server.force_exit = True
-    mcp_server.force_exit = True
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    _LOG.error("graceful shutdown deadline exhausted during %s; forcing exit", reason)
-    force_process_exit(1)
-    raise _ShutdownDeadlineExpired(reason)
-
-
 async def _wait_for_tasks(
     tasks: set[asyncio.Task], orchestrator: GracefulShutdown
 ) -> set[asyncio.Task]:
@@ -281,6 +269,13 @@ def _runtime_writer_locks(state: ServerState) -> tuple[asyncio.Lock, ...]:
     return tuple(unique)
 
 
+def _grafx_calls_in_flight(state: ServerState) -> dict[str, int]:
+    """Grafx calls executing per vault right now (empty for other backends)."""
+    pool = getattr(state, "vault_pool", None)
+    counter = getattr(pool, "calls_in_flight", None)
+    return dict(counter()) if callable(counter) else {}
+
+
 async def _graceful_shutdown(
     *,
     state: ServerState,
@@ -290,104 +285,230 @@ async def _graceful_shutdown(
     transport_tasks: tuple[asyncio.Task, asyncio.Task],
     force_process_exit: Callable[[int], None] = _hard_exit,
 ) -> None:
-    """Stop every owned activity and close the vault under one absolute deadline."""
+    """Stop every owned activity and close the stores within two budgets.
+
+    The drain budget (``stop --timeout``, default 30 s) covers transports,
+    workers and in-flight requests. When it runs out the work is cancelled, NOT
+    abandoned with the stores open: a further close budget
+    (``max(5 s, 25 %)``, see :func:`close_budget`) is reserved so the stores
+    still close. Only a grafx call that is still executing at the hard deadline
+    (drain + close budget) prevents the close: the process then exits without
+    closing and relies on WAL recovery; closing under a running statement is
+    never attempted.
+    """
+    started = time.monotonic()
     orchestrator.request_shutdown(timeout=SHUTDOWN_DRAIN_TIMEOUT)
-    state.mark_shutting_down()
-    rest_server.should_exit = True
-    mcp_server.should_exit = True
+    drain_timeout = orchestrator.drain_timeout
+    if drain_timeout is None:
+        drain_timeout = SHUTDOWN_DRAIN_TIMEOUT
+    deadline = orchestrator.deadline
+    drain_deadline = deadline if deadline is not None else started + drain_timeout
+    budget = close_budget(drain_timeout)
+    hard_deadline = drain_deadline + budget
+    set_shutdown_hard_deadline(hard_deadline)
+    summary: dict[str, Any] = {"drain_expired": False, "store_closed": False, "outcome": "error"}
 
-    scheduler_task = state.scheduler_task
-    folder_watch_task = state.folder_watch_task
-    for task in (scheduler_task, folder_watch_task):
-        if task is not None and not task.done():
-            task.cancel()
+    def drain_left() -> float:
+        return max(0.0, drain_deadline - time.monotonic())
 
-    owned_tasks = set(transport_tasks) | _runtime_tasks(state)
-    for task in (scheduler_task, folder_watch_task):
-        if task is not None:
-            owned_tasks.add(task)
+    owned_tasks: set[asyncio.Task] = set(transport_tasks)
 
-    pending = await _wait_for_tasks(owned_tasks, orchestrator)
-    if pending:
-        _force_shutdown(
-            reason="transports or background workers",
-            orchestrator=orchestrator,
-            rest_server=rest_server,
-            mcp_server=mcp_server,
-            tasks=owned_tasks,
-            force_process_exit=force_process_exit,
-        )
-
-    if not await _wait_for_request_drain(orchestrator):
-        _force_shutdown(
-            reason="in-flight requests",
-            orchestrator=orchestrator,
-            rest_server=rest_server,
-            mcp_server=mcp_server,
-            tasks=owned_tasks,
-            force_process_exit=force_process_exit,
-        )
-
-    # A request already in flight when SIGTERM arrived may have submitted a
-    # worker or maintenance task after the first snapshot. Request drain closes
-    # that race; resnapshot ALL runtime-owned tasks before any handle can close.
-    late_runtime_tasks = _runtime_tasks(state) - owned_tasks
-    if late_runtime_tasks:
-        owned_tasks.update(late_runtime_tasks)
-        pending = await _wait_for_tasks(late_runtime_tasks, orchestrator)
-        if pending:
-            _force_shutdown(
-                reason="late per-vault workers",
-                orchestrator=orchestrator,
-                rest_server=rest_server,
-                mcp_server=mcp_server,
-                tasks=owned_tasks,
-                force_process_exit=force_process_exit,
+    def abandon_drain(reason: str) -> None:
+        """Drain budget spent: cancel what is left and go on to the store close."""
+        first = not summary["drain_expired"]
+        summary["drain_expired"] = True
+        orchestrator.request_force_shutdown()
+        rest_server.force_exit = True
+        mcp_server.force_exit = True
+        cancelled_tasks = 0
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+                cancelled_tasks += 1
+        stopped_calls = kill_active_cli_processes() + cancel_active_litellm_calls()
+        cancelled_queued = cancel_queued_work()
+        if first:
+            _LOG.warning(
+                "shutdown.drain_expired reason=%s cancelled_tasks=%d cancelled_queued_calls=%d "
+                "stopped_model_calls=%d; continuing to the store close (%.1fs left)",
+                reason,
+                cancelled_tasks,
+                cancelled_queued,
+                stopped_calls,
+                max(0.0, hard_deadline - time.monotonic()),
             )
+
+    summary_logged = False
+
+    def log_summary() -> None:
+        nonlocal summary_logged
+        if summary_logged:
+            return
+        summary_logged = True
+        _LOG.info(
+            "shutdown.summary total_ms=%d drain_timeout_s=%.1f close_budget_s=%.1f "
+            "drain_expired=%s store_closed=%s outcome=%s",
+            int((time.monotonic() - started) * 1000),
+            drain_timeout,
+            budget,
+            str(summary["drain_expired"]).lower(),
+            str(summary["store_closed"]).lower(),
+            summary["outcome"],
+        )
 
     acquired: list[asyncio.Lock] = []
     try:
-        for writer_lock in _runtime_writer_locks(state):
-            remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
-            if remaining <= 0:
-                _force_shutdown(
-                    reason="writer locks",
-                    orchestrator=orchestrator,
-                    rest_server=rest_server,
-                    mcp_server=mcp_server,
-                    tasks=owned_tasks,
-                    force_process_exit=force_process_exit,
-                )
-            await asyncio.wait_for(writer_lock.acquire(), timeout=remaining)
-            acquired.append(writer_lock)
-        remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        if remaining <= 0:
-            _force_shutdown(
-                reason="vault close",
-                orchestrator=orchestrator,
-                rest_server=rest_server,
-                mcp_server=mcp_server,
-                tasks=owned_tasks,
-                force_process_exit=force_process_exit,
-            )
+        with shutdown_phase("signal_quiesce"):
+            state.mark_shutting_down()
+            rest_server.should_exit = True
+            mcp_server.should_exit = True
+            scheduler_task = state.scheduler_task
+            folder_watch_task = state.folder_watch_task
+            for task in (scheduler_task, folder_watch_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            owned_tasks |= _runtime_tasks(state)
+            for task in (scheduler_task, folder_watch_task):
+                if task is not None:
+                    owned_tasks.add(task)
+
+        with shutdown_phase("transports_and_workers") as detail:
+            pending = await _wait_for_tasks(owned_tasks, orchestrator)
+            detail["pending"] = len(pending)
+            if pending:
+                abandon_drain("transports or background workers")
+                await asyncio.wait(pending, timeout=min(1.0, max(0.0, hard_deadline - time.monotonic())))
+
+        with shutdown_phase("request_drain") as detail:
+            drained = await _wait_for_request_drain(orchestrator)
+            detail["in_flight"] = orchestrator.in_flight
+            if not drained:
+                abandon_drain("in-flight requests")
+
+        # A request already in flight when SIGTERM arrived may have submitted a
+        # worker or maintenance task after the first snapshot. Request drain closes
+        # that race; resnapshot ALL runtime-owned tasks before any handle can close.
+        with shutdown_phase("late_workers") as detail:
+            late_runtime_tasks = _runtime_tasks(state) - owned_tasks
+            detail["late"] = len(late_runtime_tasks)
+            if late_runtime_tasks:
+                owned_tasks.update(late_runtime_tasks)
+                pending = await _wait_for_tasks(late_runtime_tasks, orchestrator)
+                if pending:
+                    abandon_drain("late per-vault workers")
+                    await asyncio.wait(
+                        pending, timeout=min(1.0, max(0.0, hard_deadline - time.monotonic()))
+                    )
+
+        with shutdown_phase("writer_locks") as detail:
+            skipped = 0
+            for writer_lock in _runtime_writer_locks(state):
+                try:
+                    await asyncio.wait_for(writer_lock.acquire(), timeout=drain_left())
+                except asyncio.TimeoutError:
+                    # A stuck holder. The close does not depend on this lock: it
+                    # is gated on the in-flight grafx count below.
+                    skipped += 1
+                    abandon_drain("writer locks")
+                else:
+                    acquired.append(writer_lock)
+            detail["held"] = len(acquired)
+            detail["skipped"] = skipped
+
         # A pool call whose awaiting task was cancelled keeps running on its
-        # worker; let it finish (bounded by the deadline) before any handle
-        # closes. Both pools then cancel whatever is still queued.
-        await wait_executors_idle_async(remaining)
-        remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        await asyncio.wait_for(store_io(state.close), timeout=max(remaining, 0.001))
-    except asyncio.TimeoutError:
-        _force_shutdown(
-            reason="writer lock or vault close",
-            orchestrator=orchestrator,
-            rest_server=rest_server,
-            mcp_server=mcp_server,
-            tasks=owned_tasks,
-            force_process_exit=force_process_exit,
-        )
+        # worker; give it the rest of the drain budget before handles close.
+        with shutdown_phase("wait_store_idle") as detail:
+            idle = await wait_executors_idle_async(drain_left())
+            detail["idle"] = idle
+            if not idle:
+                # Busy workers are in an LLM/network wait or a grafx call; the
+                # grafx count below tells which. Nothing queued may start now.
+                abandon_drain("busy executors")
+
+        # Close from a dedicated thread: the store executor may be wedged, and
+        # the close must not queue behind a stuck worker.
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+        outcome: dict[str, Any] = {}
+
+        def close_stores() -> None:
+            try:
+                state.close()
+                outcome["ok"] = True
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+
+        with shutdown_phase("grafx_quiesce") as detail:
+            while True:
+                inflight = _grafx_calls_in_flight(state)
+                if not any(inflight.values()) or time.monotonic() >= hard_deadline:
+                    break
+                await asyncio.sleep(0.02)
+            detail["grafx_calls_in_flight"] = sum(inflight.values())
+
+        blocked = sum(inflight.values())
+        if blocked:
+            summary["outcome"] = "close_skipped"
+            _LOG.error(
+                "store close skipped: %d grafx calls in flight, relying on WAL recovery", blocked
+            )
+            _LOG.error(
+                "shutdown.close_skipped per_vault=%s",
+                ",".join(f"{name}:{count}" for name, count in sorted(inflight.items()) if count),
+            )
+            raise_exit = True
+        else:
+            raise_exit = False
+            closer = threading.Thread(
+                target=close_stores, name="okto-neuron-shutdown-close", daemon=True
+            )
+            with shutdown_phase("store_close_total") as detail:
+                closer.start()
+                try:
+                    await asyncio.wait_for(
+                        finished.wait(), timeout=max(0.001, hard_deadline - time.monotonic())
+                    )
+                except asyncio.TimeoutError:
+                    detail["completed"] = False
+                else:
+                    detail["completed"] = "error" not in outcome
+            if not finished.is_set():
+                # The close thread is still running: a grafx call started after
+                # the quiesce check (close then waits for it) or the native close
+                # itself is stuck. Exit; the next open recovers from the WAL.
+                inflight = _grafx_calls_in_flight(state)
+                blocked = sum(inflight.values())
+                summary["outcome"] = "close_timeout"
+                if blocked:
+                    _LOG.error(
+                        "store close skipped: %d grafx calls in flight, relying on WAL recovery",
+                        blocked,
+                    )
+                else:
+                    _LOG.error(
+                        "store close did not finish before the hard deadline, "
+                        "relying on WAL recovery"
+                    )
+                raise_exit = True
+            elif "error" in outcome:
+                summary["outcome"] = "close_error"
+                raise outcome["error"]
+            else:
+                summary["store_closed"] = True
+                summary["outcome"] = "closed"
+        if raise_exit:
+            orchestrator.request_force_shutdown()
+            rest_server.force_exit = True
+            mcp_server.force_exit = True
+            log_summary()
+            force_process_exit(1)
+            raise _ShutdownDeadlineExpired(str(summary["outcome"]))
     finally:
         for writer_lock in reversed(acquired):
             writer_lock.release()
+        log_summary()
 
 
 def auth_token_path(vault_path: Path | None, rest_port: int) -> Path:

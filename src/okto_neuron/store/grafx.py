@@ -87,10 +87,12 @@ S5) — its `--extra grafx` invocation carries no `--extra ladybug`.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
+import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TypedDict, TypeVar
@@ -468,6 +470,15 @@ class GrafxStore:
             self.vault_path = given
             self.graph_path = given / _GRAPH_DIR_NAME
         self._closed = False
+        # In-flight grafx calls (#22): every statement/transaction this store
+        # issues runs under ``_grafx_call``, so shutdown can tell "a thread is
+        # parked in an LLM wait" (count 0, safe to close around) from "a thread
+        # is inside a grafx statement" (count > 0, closing underneath it is
+        # unproven). ``close`` waits for the count to reach zero and refuses
+        # new calls once it has started.
+        self._call_cond = threading.Condition()
+        self._calls_in_flight = 0
+        self._closing = False
         self._retry_policy = _resolve_retry_policy(config)
         budget, graph_size, source = _resolve_buffer_budget(
             config, self.vault_path, self.graph_path
@@ -688,10 +699,46 @@ class GrafxStore:
         """
         self._ensure_open()
 
+    @property
+    def calls_in_flight(self) -> int:
+        """Grafx statements/transactions executing right now (#22)."""
+        with self._call_cond:
+            return self._calls_in_flight
+
+    @contextlib.contextmanager
+    def _grafx_call(self) -> Iterator[None]:
+        """Count one grafx call; refuse new ones once close has begun."""
+        with self._call_cond:
+            if self._closing or self._closed:
+                raise GraphBackendError(
+                    "graph store is closed",
+                    backend="grafx",
+                    vault_path=self.vault_path,
+                )
+            self._calls_in_flight += 1
+        try:
+            yield
+        finally:
+            with self._call_cond:
+                self._calls_in_flight -= 1
+                if not self._calls_in_flight:
+                    self._call_cond.notify_all()
+
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        """Close the database once no grafx call is executing.
+
+        Blocks until every in-flight call has finished (new calls are refused
+        from the moment close starts), so the database is never closed under a
+        running statement. Shutdown polls :attr:`calls_in_flight` first and
+        skips the close, relying on WAL recovery, when a call is still running
+        at the hard deadline.
+        """
+        with self._call_cond:
+            if self._closed:
+                return
+            self._closing = True
+            self._call_cond.wait_for(lambda: self._calls_in_flight == 0)
+            self._closed = True
         if not self._db.closed:
             self._db.close()
 
@@ -763,15 +810,16 @@ class GrafxStore:
     # ------------------------------------------------------------------
 
     def _create_schema(self, dim: int) -> None:
-        txn = self._db.begin("write")
-        try:
-            for statement in _ddl_statements(dim):
-                txn.execute(statement)
-            txn.commit()
-        except Exception:
-            if txn.active:
-                txn.rollback()
-            raise
+        with self._grafx_call():
+            txn = self._db.begin("write")
+            try:
+                for statement in _ddl_statements(dim):
+                    txn.execute(statement)
+                txn.commit()
+            except Exception:
+                if txn.active:
+                    txn.rollback()
+                raise
 
     def _read_metadata_row(self) -> _IdentityRow | None:
         rows = self._query(
@@ -863,11 +911,12 @@ class GrafxStore:
         non-retryable. Writes are translated after retry gives up instead.
         """
         def read() -> list[dict[str, Any]]:
-            if params is None:
-                # list_edge_adjacency passes no parameters; _db.execute treats
-                # them as optional and so must this wrapper.
-                return self._db.execute(statement).dictionaries()
-            return self._db.execute(statement, params).dictionaries()
+            with self._grafx_call():
+                if params is None:
+                    # list_edge_adjacency passes no parameters; _db.execute
+                    # treats them as optional and so must this wrapper.
+                    return self._db.execute(statement).dictionaries()
+                return self._db.execute(statement, params).dictionaries()
 
         try:
             # Reads are idempotent, so a driver-flagged retryable failure is
@@ -889,14 +938,15 @@ class GrafxStore:
             ) from exc
 
     def _execute_write(self, statement: str, params: Mapping[str, object]) -> None:
-        txn = self._db.begin("write")
-        try:
-            txn.execute(statement, params)
-            txn.commit()
-        except Exception:
-            if txn.active:
-                txn.rollback()
-            raise
+        with self._grafx_call():
+            txn = self._db.begin("write")
+            try:
+                txn.execute(statement, params)
+                txn.commit()
+            except Exception:
+                if txn.active:
+                    txn.rollback()
+                raise
 
     def _run_with_retry(self, attempt: Callable[[], _T]) -> _T:
         """D-10's default policy via the shared `store/_retry.py` helper —
