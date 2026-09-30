@@ -40,7 +40,16 @@ _DRIVER = textwrap.dedent(
     from pathlib import Path
 
     mode, vault_path = sys.argv[1], Path(sys.argv[2])
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(name)s %(message)s")
+    # Buffered on purpose: the lines reach the file only if the exit path flushes
+    # the handlers (os._exit skips atexit), which is what the test proves.
+    import logging.handlers
+    file_handler = logging.FileHandler(sys.argv[5])
+    file_handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    buffered = logging.handlers.MemoryHandler(
+        capacity=10000, flushLevel=logging.CRITICAL + 1, target=file_handler
+    )
+    logging.getLogger().addHandler(buffered)
+    logging.getLogger().setLevel(logging.INFO)
 
     from okto_neuron.server import _store_io, lifecycle, runtime
     from okto_neuron.server.state import ServerState
@@ -110,17 +119,24 @@ def _make_vault(tmp_path: Path) -> Path:
 
 
 def _run_driver(tmp_path: Path, mode: str, vault: Path) -> subprocess.CompletedProcess[str]:
+    """Run the driver; the log file's text is attached as ``.log``."""
     home = tmp_path / "home"
     home.mkdir()
     env = {k: v for k, v in os.environ.items() if not k.startswith(("OKTO_NEURON_MLFLOW", "MARGINALIA_"))}
     env["HOME"] = str(home)
-    return subprocess.run(
-        [sys.executable, "-c", _DRIVER, mode, str(vault), str(CLOSE_BUDGET_S), str(DRAIN_S)],
+    log_file = tmp_path / "serve.log"
+    result = subprocess.run(
+        [
+            sys.executable, "-c", _DRIVER, mode, str(vault),
+            str(CLOSE_BUDGET_S), str(DRAIN_S), str(log_file),
+        ],
         capture_output=True,
         text=True,
         timeout=120,
         env=env,
     )
+    result.log = log_file.read_text(encoding="utf-8") if log_file.exists() else ""  # type: ignore[attr-defined]
+    return result
 
 
 def _assert_intact(vault: Path) -> None:
@@ -141,7 +157,7 @@ def _phase_lines(text: str) -> list[str]:
 def test_thread_parked_in_llm_wait_does_not_block_the_store_close(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     result = _run_driver(tmp_path, "llm", vault)
-    log = result.stderr
+    log = result.log  # type: ignore[attr-defined]
 
     assert result.returncode == 0, log
     assert "GRACEFUL_SHUTDOWN_RETURNED" in result.stdout
@@ -151,6 +167,9 @@ def test_thread_parked_in_llm_wait_does_not_block_the_store_close(tmp_path: Path
     assert "vault=scratch-vault" in vault_close and "status=ok" in vault_close
     assert "name=store_close_total" in log and "completed=True" in log
     assert "store_closed=true outcome=closed" in log
+    # The process left through os._exit (a stuck worker); the buffered log file
+    # still carries the final lines, so the exit path flushed the handlers.
+    assert "exiting with 1 stuck worker thread(s) abandoned" in log
     # order: per-vault close, then store_close, then the lease release
     assert log.index("name=vault_close") < log.index("name=store_close ")
     assert log.index("name=store_close ") < log.index("name=writer_lease_release")
@@ -161,7 +180,7 @@ def test_thread_parked_in_llm_wait_does_not_block_the_store_close(tmp_path: Path
 def test_thread_parked_inside_a_grafx_call_skips_the_close_and_recovers(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     result = _run_driver(tmp_path, "grafx", vault)
-    log = result.stderr
+    log = result.log  # type: ignore[attr-defined]
 
     assert result.returncode == 1, log
     assert "GRACEFUL_SHUTDOWN_RETURNED" not in result.stdout
@@ -169,5 +188,27 @@ def test_thread_parked_inside_a_grafx_call_skips_the_close_and_recovers(tmp_path
     assert "shutdown.close_skipped per_vault=scratch-vault:1" in log
     assert "name=vault_close " not in log
     assert "store_closed=false outcome=close_skipped" in log
+    assert "shutdown.summary" in log.splitlines()[-1]
     print("\n".join(_phase_lines(log)))
     _assert_intact(vault)
+
+
+def test_flush_before_exit_reports_dropped_telemetry_and_flushes_handlers(caplog) -> None:
+    import queue
+    import logging
+
+    from okto_neuron.llm import _telemetry
+    from okto_neuron.server.lifecycle import flush_before_exit
+
+    stuck: queue.Queue = queue.Queue()
+    stuck.put(object())
+    stuck.put(object())  # unfinished_tasks stays 2: nothing consumes it
+    previous = _telemetry._QUEUE
+    _telemetry._QUEUE = stuck
+    try:
+        with caplog.at_level(logging.WARNING, logger="okto_neuron.server.shutdown"):
+            result = flush_before_exit(0.1)
+    finally:
+        _telemetry._QUEUE = previous
+    assert result == {"telemetry_dropped": 2}
+    assert "shutdown.telemetry_dropped count=2" in caplog.text

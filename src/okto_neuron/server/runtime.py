@@ -212,8 +212,18 @@ class _ShutdownDeadlineExpired(RuntimeError):
 
 
 def _hard_exit(exit_code: int) -> None:
-    """Exit without waiting for Python's executor shutdown after a hard deadline."""
+    """Exit without waiting for Python's executor shutdown after a hard deadline.
+
+    ``os._exit`` skips ``atexit``, so flush telemetry and the log handlers first
+    (the final ``shutdown.summary`` line must reach the serve log).
+    """
+    from okto_neuron.server.lifecycle import flush_before_exit
+
+    flush_before_exit(_HARD_EXIT_FLUSH_SECONDS)
     os._exit(exit_code)
+
+
+_HARD_EXIT_FLUSH_SECONDS = 2.0
 
 
 async def _wait_for_tasks(

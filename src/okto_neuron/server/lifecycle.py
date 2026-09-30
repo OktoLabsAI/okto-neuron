@@ -1561,6 +1561,45 @@ def set_shutdown_hard_deadline(deadline: float | None) -> None:
     _SHUTDOWN_HARD_DEADLINE = deadline
 
 
+def flush_before_exit(timeout_s: float = 5.0) -> dict[str, int]:
+    """Flush what ``os._exit`` would drop: telemetry, logs, stdout/stderr.
+
+    ``os._exit`` skips ``atexit`` and thread joins, so the pending MLflow span
+    queue, buffered log handlers and stdio are flushed explicitly, in that
+    order, with telemetry bounded to ``timeout_s``. Spans still queued after
+    the bound are given up on and their count is logged, then logging is shut
+    down (flushing every handler) and stdio flushed. Returns
+    ``{"telemetry_dropped": n}``.
+    """
+    dropped = 0
+    try:
+        from okto_neuron.llm import _telemetry
+
+        pending = _telemetry._QUEUE
+        if pending is not None and not _telemetry.flush(timeout_s):
+            dropped = int(pending.unfinished_tasks)
+    except Exception:  # noqa: BLE001 - the exit path must not raise
+        _SHUTDOWN_LOG.warning("telemetry flush failed before exit", exc_info=True)
+    mlflow = sys.modules.get("mlflow")
+    flush_async = getattr(mlflow, "flush_trace_async_logging", None)
+    if callable(flush_async):
+        try:
+            flush_async()
+        except Exception:  # noqa: BLE001
+            _SHUTDOWN_LOG.warning("mlflow trace flush failed before exit", exc_info=True)
+    if dropped:
+        _SHUTDOWN_LOG.warning(
+            "shutdown.telemetry_dropped count=%d (export queue not drained in %.1fs)",
+            dropped,
+            timeout_s,
+        )
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    return {"telemetry_dropped": dropped}
+
+
 @contextlib.contextmanager
 def shutdown_phase(name: str, **fields: Any) -> Iterator[dict[str, Any]]:
     """Log one ``shutdown.phase`` line (name, duration_ms, remaining_s, status).

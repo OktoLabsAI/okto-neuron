@@ -87,12 +87,10 @@ S5) — its `--extra grafx` invocation carries no `--extra ladybug`.
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import logging
-import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TypedDict, TypeVar
@@ -104,6 +102,7 @@ from okto_neuron.config._vault import RetryConfig
 from okto_neuron.core.schema import Edge, Node, Provenance
 from okto_neuron.errors import EmbeddingDimMismatch, GraphBackendError, GraphWriteExhausted
 from okto_neuron.store import schema
+from okto_neuron.store._inflight import InflightGate
 from okto_neuron.store._retry import retry_with_backoff
 from okto_neuron.store.closed_set import require_same_edge_identity, require_writable_node_type
 from okto_neuron.store.integrity import EdgeAdjacencyObservation
@@ -471,14 +470,13 @@ class GrafxStore:
             self.graph_path = given / _GRAPH_DIR_NAME
         self._closed = False
         # In-flight grafx calls (#22): every statement/transaction this store
-        # issues runs under ``_grafx_call``, so shutdown can tell "a thread is
-        # parked in an LLM wait" (count 0, safe to close around) from "a thread
-        # is inside a grafx statement" (count > 0, closing underneath it is
-        # unproven). ``close`` waits for the count to reach zero and refuses
-        # new calls once it has started.
-        self._call_cond = threading.Condition()
-        self._calls_in_flight = 0
-        self._closing = False
+        # issues, and every ``health`` probe, runs under ``_gate.call``; ``close``
+        # goes through the gate so the database is never closed under one.
+        self._gate = InflightGate(
+            lambda: GraphBackendError(
+                "graph store is closed", backend="grafx", vault_path=self.vault_path
+            )
+        )
         self._retry_policy = _resolve_retry_policy(config)
         budget, graph_size, source = _resolve_buffer_budget(
             config, self.vault_path, self.graph_path
@@ -702,43 +700,20 @@ class GrafxStore:
     @property
     def calls_in_flight(self) -> int:
         """Grafx statements/transactions executing right now (#22)."""
-        with self._call_cond:
-            return self._calls_in_flight
-
-    @contextlib.contextmanager
-    def _grafx_call(self) -> Iterator[None]:
-        """Count one grafx call; refuse new ones once close has begun."""
-        with self._call_cond:
-            if self._closing or self._closed:
-                raise GraphBackendError(
-                    "graph store is closed",
-                    backend="grafx",
-                    vault_path=self.vault_path,
-                )
-            self._calls_in_flight += 1
-        try:
-            yield
-        finally:
-            with self._call_cond:
-                self._calls_in_flight -= 1
-                if not self._calls_in_flight:
-                    self._call_cond.notify_all()
+        return self._gate.count
 
     def close(self) -> None:
         """Close the database once no grafx call is executing.
 
         Blocks until every in-flight call has finished (new calls are refused
-        from the moment close starts), so the database is never closed under a
-        running statement. Shutdown polls :attr:`calls_in_flight` first and
-        skips the close, relying on WAL recovery, when a call is still running
-        at the hard deadline.
+        from the moment close starts). Shutdown polls :attr:`calls_in_flight`
+        first and skips the close, relying on WAL recovery, when a call is still
+        running at the hard deadline.
         """
-        with self._call_cond:
-            if self._closed:
-                return
-            self._closing = True
-            self._call_cond.wait_for(lambda: self._calls_in_flight == 0)
-            self._closed = True
+        self._gate.close(self._close_database)
+
+    def _close_database(self) -> None:
+        self._closed = True
         if not self._db.closed:
             self._db.close()
 
@@ -771,14 +746,17 @@ class GrafxStore:
         succeeds, so that is what this probe uses too.
         """
         try:
-            probe = grafx.connect(self.graph_path, descriptor_revalidation="strict")
-            try:
-                probe.execute(
-                    "MATCH (m:Node {id: $id}) RETURN m.id AS id",
-                    {"id": schema.SCHEMA_METADATA_NODE_ID},
-                )
-            finally:
-                probe.close()
+            # Its own connection, so it is allowed after close, but it is still
+            # counted: a close that starts while a probe runs waits for it.
+            with self._gate.call(allow_closed=True):
+                probe = grafx.connect(self.graph_path, descriptor_revalidation="strict")
+                try:
+                    probe.execute(
+                        "MATCH (m:Node {id: $id}) RETURN m.id AS id",
+                        {"id": schema.SCHEMA_METADATA_NODE_ID},
+                    )
+                finally:
+                    probe.close()
         except Exception as exc:  # noqa: BLE001 - health check reports, never raises
             return BackendHealth(healthy=False, detail=f"{type(exc).__name__}: {exc}")
         return BackendHealth(healthy=True, detail="ok")
@@ -810,7 +788,7 @@ class GrafxStore:
     # ------------------------------------------------------------------
 
     def _create_schema(self, dim: int) -> None:
-        with self._grafx_call():
+        with self._gate.call():
             txn = self._db.begin("write")
             try:
                 for statement in _ddl_statements(dim):
@@ -911,7 +889,7 @@ class GrafxStore:
         non-retryable. Writes are translated after retry gives up instead.
         """
         def read() -> list[dict[str, Any]]:
-            with self._grafx_call():
+            with self._gate.call():
                 if params is None:
                     # list_edge_adjacency passes no parameters; _db.execute
                     # treats them as optional and so must this wrapper.
@@ -938,7 +916,7 @@ class GrafxStore:
             ) from exc
 
     def _execute_write(self, statement: str, params: Mapping[str, object]) -> None:
-        with self._grafx_call():
+        with self._gate.call():
             txn = self._db.begin("write")
             try:
                 txn.execute(statement, params)

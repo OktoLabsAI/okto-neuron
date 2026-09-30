@@ -302,19 +302,28 @@ def abandoned_workers() -> int:
     return _ABANDONED_WORKERS
 
 
-def exit_if_workers_abandoned(exit_code: int = 0) -> None:
-    """Exit now when a worker is stuck, so it cannot hold the interpreter open.
+def exit_if_workers_abandoned(exit_code: int = 0, *, flush_timeout: float = 5.0) -> None:
+    """Hard-exit, after a flush, only when a stuck worker would hold the process.
 
     ``concurrent.futures`` joins every worker at interpreter exit; a thread
     parked in an LLM or network wait would hang a stop that already closed the
     stores. Call this last, after the stores are closed and the PID file is
-    released.
+    released. Returns normally when no abandoned non-daemon worker is alive.
     """
-    stuck = _ABANDONED_WORKERS
+    if not _ABANDONED_WORKERS:
+        return
+    current = threading.current_thread()
+    stuck = [
+        t
+        for t in threading.enumerate()
+        if t.is_alive() and not t.daemon and t is not current and t is not threading.main_thread()
+    ]
     if not stuck:
         return
-    _LOG.warning("exiting with %d stuck worker thread(s) abandoned", stuck)
-    logging.shutdown()
+    _LOG.warning("exiting with %d stuck worker thread(s) abandoned", len(stuck))
+    from okto_neuron.server.lifecycle import flush_before_exit
+
+    flush_before_exit(flush_timeout)
     os._exit(exit_code)
 
 
