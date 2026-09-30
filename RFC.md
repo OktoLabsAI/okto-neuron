@@ -328,6 +328,24 @@ jittered backoff from 10 ms to 200 ms, 2 s total) so `get_node`, `get_nodes` and
 surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
 exhausted budget reaches the caller as `GraphBackendError` with `retryable=True`.
 
+One process at a time writes a vault. The daemon takes a per-vault writer lease
+(`<vault>/.okto-neuron-writer.lock`, an OS file lock that dies with its holder, never deleted;
+one JSON line records pid, process start token, role, operation, endpoint and time) for every
+vault it serves and keeps it for the life of the process, idle eviction included. A CLI command
+that writes (`watch`, `pilot`, `init --wipe`, `kg init` on an existing vault, `kg rebuild`,
+`reembed`, `reindex`, `reconcile propose/apply/review confirm/review reject/heal`,
+`snapshot dump`, `onboard`) takes the lease or refuses with exit 5 while the daemon holds it,
+naming the daemon pid and the API call that does the same thing, or telling you to stop the
+daemon first; it never proxies. `init` on a new path, `vault create` and `snapshot load` take
+the lease themselves. Readers (`review list`, `quality *`, `snapshot verify`) take no lease. A
+live OS lock is always honoured: a record whose pid or start token does not check out is reported
+as an unverifiable holder, and a record left by a dead process never blocks (the lock is free, so
+the lease is reclaimed and `writer_lease.stale_reclaimed` is logged). Inside the daemon the lease
+is re-entrant, so its own jobs never contend with it. On a filesystem without working file locks
+(some NFS or SMB mounts) the lease degrades: `/api/v1/status` reports `writer_lease_degraded`
+for that vault and the daemon logs a startup warning naming it, because nothing then stops a
+second writer. Lock order is writer lease, then `.graph-handle.lock`, then engine locks.
+
 Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
 symlink/path safety, fences new leases, drains existing work, releases the owned handle, and

@@ -335,6 +335,28 @@ def _unlock_pid_fd(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+# Public names for the cross-process OS-lock primitives, shared with the
+# per-vault writer lease (``okto_neuron.store.writer_lease``). POSIX uses
+# ``flock(LOCK_EX | LOCK_NB)``; Windows locks one byte past the bounded record so
+# the record itself stays readable while the lock is held.
+LOCK_RECORD_LIMIT = _PID_FILE_LIMIT
+
+
+def try_lock_fd(fd: int) -> bool:
+    """Take the exclusive, non-blocking OS lock on ``fd``; False on contention."""
+    return _try_lock_pid_fd(fd)
+
+
+def unlock_fd(fd: int) -> None:
+    """Release the lock taken by :func:`try_lock_fd` (idempotent, never raises)."""
+    _unlock_pid_fd(fd)
+
+
+def process_start_token(pid: int) -> str | None:
+    """Birth fingerprint of ``pid`` (retrying transient reads); ``None`` when unknown."""
+    return _process_start_token_with_retry(pid)
+
+
 def _read_pid_fd(fd: int) -> str:
     os.lseek(fd, 0, os.SEEK_SET)
     return os.read(fd, _PID_FILE_LIMIT).decode("utf-8", errors="replace")

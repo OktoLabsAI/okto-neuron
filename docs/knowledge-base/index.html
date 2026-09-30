@@ -520,6 +520,23 @@ retryable error (<code>index_view_changed</code>), and <code>GrafxStore</code> r
 jittered backoff from 10 ms to 200 ms, 2 s total) so <code>get_node</code>, <code>get_nodes</code> and <code>list_*</code> never
 surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
 exhausted budget reaches the caller as <code>GraphBackendError</code> with <code>retryable=True</code>.</p>
+<p>One process at a time writes a vault. The daemon takes a per-vault writer lease
+(<code>&lt;vault&gt;/.okto-neuron-writer.lock</code>, an OS file lock that dies with its holder, never deleted;
+one JSON line records pid, process start token, role, operation, endpoint and time) for every
+vault it serves and keeps it for the life of the process, idle eviction included. A CLI command
+that writes (<code>watch</code>, <code>pilot</code>, <code>init --wipe</code>, <code>kg init</code> on an existing vault, <code>kg rebuild</code>,
+<code>reembed</code>, <code>reindex</code>, <code>reconcile propose/apply/review confirm/review reject/heal</code>,
+<code>snapshot dump</code>, <code>onboard</code>) takes the lease or refuses with exit 5 while the daemon holds it,
+naming the daemon pid and the API call that does the same thing, or telling you to stop the
+daemon first; it never proxies. <code>init</code> on a new path, <code>vault create</code> and <code>snapshot load</code> take
+the lease themselves. Readers (<code>review list</code>, <code>quality *</code>, <code>snapshot verify</code>) take no lease. A
+live OS lock is always honoured: a record whose pid or start token does not check out is reported
+as an unverifiable holder, and a record left by a dead process never blocks (the lock is free, so
+the lease is reclaimed and <code>writer_lease.stale_reclaimed</code> is logged). Inside the daemon the lease
+is re-entrant, so its own jobs never contend with it. On a filesystem without working file locks
+(some NFS or SMB mounts) the lease degrades: <code>/api/v1/status</code> reports <code>writer_lease_degraded</code>
+for that vault and the daemon logs a startup warning naming it, because nothing then stops a
+second writer. Lock order is writer lease, then <code>.graph-handle.lock</code>, then engine locks.</p>
 <p>Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
 symlink/path safety, fences new leases, drains existing work, releases the owned handle, and
