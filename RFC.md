@@ -346,6 +346,13 @@ is re-entrant, so its own jobs never contend with it. On a filesystem without wo
 for that vault and the daemon logs a startup warning naming it, because nothing then stops a
 second writer. Lock order is writer lease, then `.graph-handle.lock`, then engine locks.
 
+The daemon takes the lease before it registers a runtime, opens a startup vault or opens a pooled
+handle. If a CLI command holds it, the request gets a 409 `vault_busy` naming the holder's pid
+and operation, and vault discovery skips that vault (logged once) and retries on its next pass,
+so one busy vault never hides the others. The lease is released only at shutdown, after the
+stores are closed and before the pid file is removed, and on managed delete just before the
+directory is removed (re-acquired if the delete rolls back).
+
 Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
 symlink/path safety, fences new leases, drains existing work, releases the owned handle, and
