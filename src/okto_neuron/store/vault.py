@@ -30,6 +30,7 @@ from okto_neuron.store._bootstrap import (
     reset_bootstrap_cache_for_tests,
 )
 from okto_neuron.store.index import compute_graph_generation, reindex_all
+from okto_neuron.store.index.corpus import STAMP_PREFIX
 from okto_neuron.store.index.indexed import IndexedStore
 from okto_neuron.store.index.registry import resolve_index_backend
 from okto_neuron.store.ladybug import LadybugStore, VaultConnection
@@ -113,7 +114,13 @@ def _open_index(vault_path: Path, store: object, backend_name: str) -> object:
     index_cls = resolve_index_backend(backend_name)
     index = _construct_backend(index_cls, vault_path, None)
     expected = compute_graph_generation(store)
-    if index.generation() != expected:
+    stored = index.generation()
+    if stored != expected:
+        if stored and not stored.startswith(STAMP_PREFIX):
+            _LOG.info(
+                "index stamp format upgraded, rebuilding %d docs",
+                sum(1 for _ in store.list_nodes()),
+            )
         started = time.perf_counter()
         reindex_all(store, index)
         _LOG.info(

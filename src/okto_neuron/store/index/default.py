@@ -33,6 +33,7 @@ class DefaultIndexStore:
         self._corpus_store = JsonlCorpusStore(self.index_dir)
         self._records: dict[str, IndexRecord] = {}
         self._scorer: Optional[BM25Scorer] = None
+        self._corpus_store.discard_stale_tmp()
         self._stamp: Optional[str] = None
         if self._corpus_store.exists():
             self._records, meta = self._corpus_store.load()
