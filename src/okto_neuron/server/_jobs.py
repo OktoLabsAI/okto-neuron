@@ -90,6 +90,15 @@ _INTEGRITY_RECOVERY_KINDS = frozenset({"rebuild", "rollback"})
 # Retrying one implicitly after a process restart can repeat expensive model work
 # or operate on a retained partial generation. Recovery is therefore explicit.
 _NON_RESUMABLE_ON_RESTART_KINDS = frozenset({"rebuild", "rollback", "heal", "reembed"})
+# Scheduler sweeps (equal to ``_scheduler.SWEEP_KINDS``; defined here because the
+# scheduler imports this module lazily and a test pins the two sets together).
+# They are read-only and the scheduler regenerates them, so a persisted queued or
+# running one is not resumed at boot: resuming contends for the GIL with the
+# startup vault opens (measured 113 s opens vs 9-13 s without the resumed sweep).
+_SWEEP_KINDS_NOT_RESUMED = frozenset({"reconcile-propose", "predicate-propose", "detect-drift"})
+_SWEEP_NOT_RESUMED_REASON = (
+    "interrupted by process restart; not auto-resumed (scheduler regenerates sweeps)"
+)
 
 
 def register_runner(
@@ -291,6 +300,7 @@ def rehydrate_jobs(state: "ServerState") -> None:
     known = {f.name for f in fields(CurationJob)}
     restored: list[CurationJob] = []
     changed = False
+    swept: list[CurationJob] = []
     for entry in data.get("jobs", []) if isinstance(data, dict) else []:
         if not isinstance(entry, dict):
             continue
@@ -301,7 +311,14 @@ def rehydrate_jobs(state: "ServerState") -> None:
             job = CurationJob(**kwargs)
         except TypeError:
             continue
-        if job.status == "running":
+        if job.status in ("running", "queued") and job.kind in _SWEEP_KINDS_NOT_RESUMED:
+            changed = True
+            job.status = "error"
+            job.progress = "error"
+            job.error = _SWEEP_NOT_RESUMED_REASON
+            job.finished_at = time.time()
+            swept.append(job)
+        elif job.status == "running":
             changed = True
             if job.kind in _NON_RESUMABLE_ON_RESTART_KINDS:
                 recovery_note: str | None = None
@@ -328,6 +345,44 @@ def rehydrate_jobs(state: "ServerState") -> None:
     state.curation_jobs = restored
     if changed:
         persist(state)
+    if swept:
+        _fail_linked_sweep_outcomes(state, swept)
+        _LOG.info(
+            "%d sweep jobs not resumed after restart for %s",
+            len(swept),
+            Path(state.vault_path).name,
+        )
+
+
+def _fail_linked_sweep_outcomes(state: "ServerState", swept: list[CurationJob]) -> None:
+    """Mark the ingest items waiting on a swept D8 job's outcome as failed.
+
+    The ingest queue is rehydrated before the jobs, so the items are in memory;
+    the sidecar is written once at the end (``persist_now=False`` per job)."""
+    from okto_neuron.server import _ingest_queue
+    from okto_neuron.server._curation import _publish_linked_reconcile_outcome
+
+    changed = False
+    for job in swept:
+        if job.kind != "reconcile-propose":
+            continue
+        outcome = {
+            "state": "failed",
+            "stage": "propose",
+            "job_id": job.id,
+            "trigger": str(job.params.get("trigger") or "manual"),
+            "error_category": "InterruptedByRestart",
+            "error": _SWEEP_NOT_RESUMED_REASON,
+        }
+        changed |= _publish_linked_reconcile_outcome(
+            state,
+            job.params.get("ingest_item_ids"),
+            outcome,
+            expected_job_id=job.id,
+            persist_now=False,
+        )
+    if changed:
+        _ingest_queue.persist(state)
 
 
 # ── enqueue / lookup / snapshot ──────────────────────────────────────────────--
