@@ -35,6 +35,7 @@ from okto_neuron.errors import EmbeddingDimMismatch, OptionalDependencyError
 from okto_neuron.llm._cli_provider import kill_active_cli_processes
 from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
+from okto_neuron.server import _gc_tuning
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._prewarm import start_ledger_prewarm
 from okto_neuron.server._store_io import (
@@ -2341,6 +2342,12 @@ async def _run_async(
     )
     if ready_event is not None:
         ready_event.set()
+    # #38: the startup vault is open (_open_startup_vault), runtimes are discovered
+    # (_resume_durable_runtime_work) and no request has been served yet. Freeze the long-lived heap ONCE here, then raise the
+    # collector thresholds; the pause watch is installed regardless. Before the prewarm
+    # so no background thread is allocating while the freeze runs.
+    _gc_tuning.install_gc_watch()
+    _gc_tuning.apply_gc_tuning()
     # After readiness: warm the ledger indexes of the vaults that opened (#14).
     start_ledger_prewarm(state)
 

@@ -81,6 +81,13 @@ class ServerSettings(BaseModel):
     projection_max_age_s: float = Field(default=600.0, ge=1.0, le=86400.0)
     """A projection older than this counts as stale even if no write went through this
     process (covers writes from another process, which cannot move the in-process counter)."""
+    gc_tuning: object = True
+    """``false`` turns off the one-time ``gc.freeze()`` + threshold change at startup
+    (``OKTO_NEURON_GC_TUNING`` overrides). Untyped on purpose: an invalid value is
+    warned about and ignored by ``server._gc_tuning`` instead of failing the whole file."""
+    gc_thresholds: object = None
+    """Three positive integers ``[gen0, gen1, gen2]`` (default ``[50000, 20, 100]``;
+    ``OKTO_NEURON_GC_THRESHOLDS=a,b,c`` overrides). Validated like ``gc_tuning``."""
 
 
 class OktoNeuronConfig(BaseModel):

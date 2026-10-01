@@ -68,7 +68,7 @@ from okto_neuron.semantic_quality import (
     evaluate_ledger_scan as evaluate_semantic_ledger_scan,
 )
 from okto_neuron.semantic_quality import evaluate_store as evaluate_semantic_quality
-from okto_neuron.server import _curation, _jobs, _projection, _scheduler
+from okto_neuron.server import _curation, _gc_tuning, _jobs, _projection, _scheduler
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
@@ -1225,6 +1225,7 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
         "vault_warning": state.vault_open_error,
         "uptime_s": state.uptime_seconds(),
         "pid": state.pid,
+        "gc": _gc_tuning.snapshot(),
         "recovered_from_corruption": recovered,
         "recovery_mode": recovery_mode,
         "seconds_since_last_ingest": seconds_since_last_ingest,

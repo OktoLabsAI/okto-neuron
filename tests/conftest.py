@@ -220,6 +220,24 @@ _PRISTINE_LOGGER_STATE: dict[str, Any] = {
 
 
 @pytest.fixture(autouse=True)
+def _restore_gc_state():
+    """Undo what ``apply_gc_tuning`` / ``install_gc_watch`` leave process-wide (#38).
+
+    ``runtime._run_async`` freezes the heap, raises the thresholds and installs a
+    ``gc.callbacks`` hook; none of that is covered by the logger restore below.
+    """
+    import gc
+
+    from okto_neuron.server import _gc_tuning
+
+    thresholds = gc.get_threshold()
+    yield
+    _gc_tuning.reset_for_tests()
+    gc.set_threshold(*thresholds)
+    gc.unfreeze()
+
+
+@pytest.fixture(autouse=True)
 def _restore_logger_state():
     """Undo logging changes a test (or ``configure_logging``) leaves behind.
 
