@@ -238,6 +238,24 @@ def _restore_gc_state():
 
 
 @pytest.fixture(autouse=True)
+def _reset_model_call_force_cancel():
+    """Clear the model-call force-cancel flags before and after every test.
+
+    ``runtime._run_async``'s shutdown calls ``cancel_active_litellm_calls`` /
+    ``kill_active_cli_processes``, which raise process-wide flags that nothing
+    clears (production exits afterwards). Left set, a later test's model call
+    raises ``LLMCallCancelled``.
+    """
+    from okto_neuron.llm import _cli_provider, _litellm_process
+
+    _litellm_process._reset_force_cancel_for_tests()
+    _cli_provider._reset_for_tests()
+    yield
+    _litellm_process._reset_force_cancel_for_tests()
+    _cli_provider._reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _restore_logger_state():
     """Undo logging changes a test (or ``configure_logging``) leaves behind.
 

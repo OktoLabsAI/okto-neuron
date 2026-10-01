@@ -183,18 +183,6 @@ def test_freeze_runs_at_most_once_per_process(
     assert freeze_spy == ["freeze", "freeze"]
 
 
-@pytest.fixture
-def _undo_shutdown_cancel_flags():
-    """``_run_async``'s shutdown sets the process-wide force-cancel flags of the LLM
-    helpers (right for a dying daemon); clear them so later tests can call a model."""
-    yield
-    from okto_neuron.llm import _cli_provider, _litellm_process
-
-    _litellm_process._FORCE_CANCEL.clear()
-    _cli_provider._FORCE_CANCEL_ALL.clear()
-
-
-@pytest.mark.usefixtures("_undo_shutdown_cancel_flags")
 def test_serve_startup_freezes_after_the_startup_vault_opens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, freeze_spy: list[str]
 ) -> None:
