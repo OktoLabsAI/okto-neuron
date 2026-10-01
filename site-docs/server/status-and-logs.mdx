@@ -94,7 +94,9 @@ The payload has exactly these keys.
 The server's `/api/v1/status` response carries more fields than the CLI forwards, among them
 `recovered_from_corruption`, `folder_watch_running`, `integrity` and `gc` (collector thresholds,
 frozen-object count, collections per generation, and pause counters: `max_pause_ms`,
-`total_pause_ms`, `slow_pauses` over 50 ms, `last_slow_pause_at`). If you need those, read the
+`total_pause_ms`, `slow_pauses` over 50 ms, `last_slow_pause_at`, plus `switch_interval_s`, the
+current GIL switch interval in seconds, and `switch_interval_tuned`, whether `serve` changed
+it). If you need those, read the
 endpoint directly.
 
 ## Degraded reasons

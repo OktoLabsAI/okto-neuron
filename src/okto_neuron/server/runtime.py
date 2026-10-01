@@ -2348,6 +2348,9 @@ async def _run_async(
     # so no background thread is allocating while the freeze runs.
     _gc_tuning.install_gc_watch()
     _gc_tuning.apply_gc_tuning()
+    # Same point: shorter GIL switch interval so the event loop is not starved by a
+    # CPU-bound audit thread (what remains once the collector pauses are gone).
+    _gc_tuning.apply_switch_interval()
     # After readiness: warm the ledger indexes of the vaults that opened (#14).
     start_ledger_prewarm(state)
 

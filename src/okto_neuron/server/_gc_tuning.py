@@ -29,12 +29,21 @@ falls back to the next source, then to the default; startup never fails here):
 * ``OKTO_NEURON_GC_TUNING=off`` / ``gc_tuning = false``: no freeze, no threshold change.
 * ``OKTO_NEURON_GC_THRESHOLDS=50000,20,100`` / ``gc_thresholds = [50000, 20, 100]``.
 * ``OKTO_NEURON_GC_WATCH=off``: do not install the pause hook.
+
+GIL switch interval (also #38, same startup point): with the collector tamed, the
+remaining ``/health`` stalls during a back-to-back audit were pure-bytecode GIL sharing
+between the audit thread and the event loop (default interval 5 ms). :func:`apply_switch_interval`
+sets ``sys.setswitchinterval(0.001)`` ONCE per process (job-window ``/health`` p99
+121.7-124.4 ms -> 38.8 ms in the scratch audit). Knobs: ``OKTO_NEURON_SWITCH_INTERVAL=<seconds>|off``
+/ ``[server] switch_interval``; ``off`` leaves the interpreter default; an invalid value
+(non-numeric, <= 0, > 1.0 s) warns and falls back to the next source, then 0.001.
 """
 
 from __future__ import annotations
 
 import gc
 import logging
+import sys
 import threading
 import time
 from typing import Any
@@ -49,6 +58,9 @@ LOG_INTERVAL_S = 5.0
 _FLUSH_POLL_S = 1.0
 _OFF = {"off", "false", "0", "no"}
 _ON = {"on", "true", "1", "yes"}
+DEFAULT_SWITCH_INTERVAL_S = 0.001
+MAX_SWITCH_INTERVAL_S = 1.0
+_SWITCH_OFF = "off"
 
 _clock = time.perf_counter
 _mono = time.monotonic
@@ -68,7 +80,8 @@ _pending_thread = ""
 # --- state touched outside the collector --------------------------------------------
 _last_log = float("-inf")
 _applied = False
-_stop = threading.Event()
+_switch_applied = False
+_stop =threading.Event()
 _thread: threading.Thread | None = None
 
 
@@ -101,6 +114,26 @@ def _parse_thresholds(raw: object) -> tuple[int, int, int] | None:
     return values[0], values[1], values[2]
 
 
+def _parse_switch_interval(raw: object) -> float | str | None:
+    """Seconds in (0, 1.0], or ``"off"``; anything else is invalid (``None``)."""
+    if isinstance(raw, bool):
+        return _SWITCH_OFF if raw is False else None
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("off", "false", "no"):
+            return _SWITCH_OFF
+        try:
+            raw = float(text)
+        except ValueError:
+            return None
+    if not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    if not 0 < value <= MAX_SWITCH_INTERVAL_S:  # also rejects nan
+        return None
+    return value
+
+
 def _pick(parse: Any, default: Any, *candidates: tuple[str, object]) -> Any:
     """First candidate that parses; an invalid one warns and falls through."""
     for label, value in candidates:
@@ -130,6 +163,51 @@ def _resolve(server: Any) -> tuple[bool, tuple[int, int, int]]:
     return enabled, thresholds
 
 
+def _load_server_settings() -> Any:
+    """The ``[server]`` settings, or ``None`` (defaults) when the config cannot be read."""
+    try:
+        from okto_neuron.config import OktoNeuronConfig
+
+        return OktoNeuronConfig.load().server
+    except Exception as exc:  # noqa: BLE001 - startup must not die on these knobs
+        _LOG.warning("could not read [server] runtime settings (%s); using the defaults", exc)
+        return None
+
+
+def apply_switch_interval(server: Any = None) -> dict[str, Any]:
+    """Shorten the GIL switch interval once per process; return what happened (INFO logged).
+
+    ``off`` leaves the interpreter default untouched and logs nothing.
+    """
+    global _switch_applied
+    if server is None:
+        server = _load_server_settings()
+    chosen = _pick(
+        _parse_switch_interval,
+        DEFAULT_SWITCH_INTERVAL_S,
+        ("OKTO_NEURON_SWITCH_INTERVAL", _compat.getenv("OKTO_NEURON_SWITCH_INTERVAL")),
+        ("[server] switch_interval", getattr(server, "switch_interval", None)),
+    )
+    previous = sys.getswitchinterval()
+    report: dict[str, Any] = {
+        "enabled": chosen != _SWITCH_OFF,
+        "switch_interval_s": previous,
+        "previous_switch_interval_s": previous,
+        "skipped": None,
+    }
+    if chosen == _SWITCH_OFF:
+        report["skipped"] = "disabled"
+    elif _switch_applied:
+        report["skipped"] = "already_applied"
+        _LOG.info("switch interval already applied in this process; not setting it again")
+    else:
+        sys.setswitchinterval(chosen)
+        _switch_applied = True
+        report["switch_interval_s"] = sys.getswitchinterval()
+        _LOG.info("switch interval set to %s (was %s)", report["switch_interval_s"], previous)
+    return report
+
+
 def apply_gc_tuning(server: Any = None) -> dict[str, Any]:
     """Freeze once and set the thresholds; return what happened (also logged at INFO).
 
@@ -138,12 +216,7 @@ def apply_gc_tuning(server: Any = None) -> dict[str, Any]:
     """
     global _applied
     if server is None:
-        try:
-            from okto_neuron.config import OktoNeuronConfig
-
-            server = OktoNeuronConfig.load().server
-        except Exception as exc:  # noqa: BLE001 - startup must not die on this knob
-            _LOG.warning("could not read [server] gc settings (%s); using the defaults", exc)
+        server = _load_server_settings()
     enabled, thresholds = _resolve(server)
     previous = gc.get_threshold()
     report: dict[str, Any] = {
@@ -262,6 +335,8 @@ def snapshot() -> dict[str, Any]:
         "slow_pauses": _slow,
         "slow_pause_threshold_ms": SLOW_PAUSE_MS,
         "last_slow_pause_at": _last_slow_at or None,
+        "switch_interval_s": sys.getswitchinterval(),
+        "switch_interval_tuned": _switch_applied,
     }
 
 
@@ -269,6 +344,7 @@ def reset_for_tests() -> None:
     """Remove the hook, stop its thread, zero the counters, forget that tuning ran."""
     global _installed, _t0, _total_us, _max_us, _slow, _last_slow_at, _pending
     global _pending_worst_us, _pending_gen, _pending_thread, _last_log, _applied, _thread
+    global _switch_applied
     _stop.set()
     if _on_gc in gc.callbacks:
         gc.callbacks.remove(_on_gc)
@@ -282,3 +358,4 @@ def reset_for_tests() -> None:
     _pending_thread = ""
     _last_log = float("-inf")
     _applied = False
+    _switch_applied = False

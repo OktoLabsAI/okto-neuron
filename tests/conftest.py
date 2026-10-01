@@ -227,13 +227,16 @@ def _restore_gc_state():
     ``gc.callbacks`` hook; none of that is covered by the logger restore below.
     """
     import gc
+    import sys
 
     from okto_neuron.server import _gc_tuning
 
     thresholds = gc.get_threshold()
+    switch_interval = sys.getswitchinterval()
     yield
     _gc_tuning.reset_for_tests()
     gc.set_threshold(*thresholds)
+    sys.setswitchinterval(switch_interval)
     gc.unfreeze()
 
 
