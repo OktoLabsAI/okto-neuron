@@ -6,7 +6,9 @@ import ipaddress
 import os
 import re
 import socket
+import threading
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Self
 from urllib.parse import urlparse
@@ -48,6 +50,72 @@ def _config_file_for(path: Path | str) -> Path:
     return vault_config_path(candidate)
 
 
+def _safe_load(stream: Any) -> Any:
+    """``yaml.safe_load`` for every config read in this module (one seam to swap/spy)."""
+
+    return yaml.safe_load(stream)
+
+
+# ── process-wide read caches ────────────────────────────────────────────────
+# ``GET /api/v1/status`` and the scheduler tick re-read every vault's yaml on each
+# call (#14). Entries are keyed by the file's stat tuple, so any rewrite misses.
+# ``st_ctime_ns`` is part of the tuple because mtime+size can repeat across two
+# writes inside one filesystem timestamp tick (``os.utime`` can even restore
+# mtime), whereas ctime cannot be set from userspace. Only successful reads are
+# stored; a parse/validation/version error re-raises on every call. Writers in
+# this process also invalidate explicitly (a same-tick, same-size rewrite on a
+# coarse-granularity filesystem could still share a ctime).
+_CONFIG_CACHE_MAX = 64
+_CONFIG_CACHE_LOCK = threading.Lock()
+_LOAD_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, bool]] = OrderedDict()
+_VERSION_CACHE: OrderedDict[tuple[Any, ...], int | None] = OrderedDict()
+
+
+def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+def _cache_get(cache: OrderedDict[tuple[Any, ...], Any], key: tuple[Any, ...]) -> Any:
+    with _CONFIG_CACHE_LOCK:
+        if key not in cache:
+            return _MISSING
+        cache.move_to_end(key)
+        return cache[key]
+
+
+def _cache_put(cache: OrderedDict[tuple[Any, ...], Any], key: tuple[Any, ...], value: Any) -> None:
+    with _CONFIG_CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > _CONFIG_CACHE_MAX:
+            cache.popitem(last=False)
+
+
+_MISSING: Any = object()
+
+
+def clear_config_cache() -> None:
+    """Drop every cached vault config and yaml version (tests, defaults writes)."""
+
+    with _CONFIG_CACHE_LOCK:
+        _LOAD_CACHE.clear()
+        _VERSION_CACHE.clear()
+
+
+def invalidate_config_cache(vault_path: Path | str) -> None:
+    """Drop the cached entries of one vault; call after writing its yaml."""
+
+    config_path = _config_file_for(vault_path)
+    with _CONFIG_CACHE_LOCK:
+        for cache in (_LOAD_CACHE, _VERSION_CACHE):
+            for key in [k for k in cache if k[1] == config_path]:
+                del cache[key]
+
+
 _YAML_VERSION_LINE = re.compile(r"^marginalia_yaml_version:[ \t]*[0-9]*[ \t]*(#.*)?$", re.MULTILINE)
 
 
@@ -60,13 +128,23 @@ def vault_yaml_version(vault_path: Path | str) -> int | None:
     """
 
     config_path = _config_file_for(vault_path)
+    stat_key = _stat_key(config_path)
+    key = ("version", config_path, stat_key)
+    if stat_key is not None:
+        cached = _cache_get(_VERSION_CACHE, key)
+        if cached is not _MISSING:
+            return cached
     if not config_path.is_file():
         return None
-    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    data = _safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        return None
-    found = data.get("marginalia_yaml_version", 1)
-    return found if isinstance(found, int) and not isinstance(found, bool) else None
+        result = None
+    else:
+        found = data.get("marginalia_yaml_version", 1)
+        result = found if isinstance(found, int) and not isinstance(found, bool) else None
+    if stat_key is not None:
+        _cache_put(_VERSION_CACHE, key, result)
+    return result
 
 
 def set_vault_yaml_version(vault_path: Path | str, version: int) -> None:
@@ -99,6 +177,7 @@ def set_vault_yaml_version(vault_path: Path | str, version: int) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+    invalidate_config_cache(config_path)
     if vault_yaml_version(vault_path) != version:
         raise ConfigParseError(
             config_path,
@@ -1794,7 +1873,7 @@ class VaultConfig(BaseModel):
         path = cls.application_defaults_path()
         try:
             with path.open("r", encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
+                data = _safe_load(handle) or {}
         except FileNotFoundError:
             return cls.default()
         except yaml.YAMLError as error:
@@ -1810,11 +1889,39 @@ class VaultConfig(BaseModel):
         *,
         application_defaults: Self | None = None,
     ) -> Self:
-        """Load a vault config, extending application defaults only when opted in."""
+        """Load a vault config, extending application defaults only when opted in.
+
+        Successful loads are cached process-wide, keyed by the stat tuple of the
+        vault yaml and of the application ``defaults.yaml`` it may inherit (a
+        missing defaults file is its own key). Every call returns a deep copy, so
+        a caller mutating its model never reaches the cache. An explicit
+        ``application_defaults`` argument bypasses the cache.
+        """
         config_path = _config_file_for(vault_path)
+        if application_defaults is not None:
+            return cls._load_uncached(config_path, application_defaults)[0]
+        vault_stat = _stat_key(config_path)
+        if vault_stat is None:
+            return cls._load_uncached(config_path, None)[0]
+        defaults_path = cls.application_defaults_path()
+        key = ("load", config_path, cls, vault_stat, str(defaults_path), _stat_key(defaults_path))
+        cached = _cache_get(_LOAD_CACHE, key)
+        if cached is not _MISSING:
+            model, missing_version = cached
+            if missing_version:
+                _warn_missing_version_once(config_path)
+            return model.model_copy(deep=True)
+        model, missing_version = cls._load_uncached(config_path, None)
+        _cache_put(_LOAD_CACHE, key, (model, missing_version))
+        return model.model_copy(deep=True)
+
+    @classmethod
+    def _load_uncached(
+        cls, config_path: Path, application_defaults: Self | None
+    ) -> tuple[Self, bool]:
         try:
             with config_path.open("r", encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
+                data = _safe_load(handle) or {}
         except FileNotFoundError as error:
             raise ConfigNotFound(config_path, cause=error) from error
         except yaml.YAMLError as error:
@@ -1827,8 +1934,9 @@ class VaultConfig(BaseModel):
             raise ConfigParseError(config_path, cause=error) from error
 
         if not isinstance(data, dict):
-            return cls._validate_data(data, config_path)
-        if "marginalia_yaml_version" not in data:
+            return cls._validate_data(data, config_path), False
+        missing_version = "marginalia_yaml_version" not in data
+        if missing_version:
             _warn_missing_version_once(config_path)
         if data.get("inherits_application_defaults") is True:
             baseline = application_defaults or cls.load_application_defaults()
@@ -1838,7 +1946,7 @@ class VaultConfig(BaseModel):
             baseline.model_dump(mode="json", exclude_none=True),
             data,
         )
-        return cls._validate_data(merged, config_path)
+        return cls._validate_data(merged, config_path), missing_version
 
     # ── writable surface (web-UI config-write) ──────────────────────────────
     WRITABLE_BLOCKS: ClassVar[tuple[str, ...]] = (
@@ -1878,7 +1986,7 @@ class VaultConfig(BaseModel):
         config_path = _config_file_for(vault_path)
         try:
             with config_path.open("r", encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
+                data = _safe_load(handle) or {}
         except FileNotFoundError:
             return {}
         except yaml.YAMLError as error:
@@ -1903,6 +2011,7 @@ class VaultConfig(BaseModel):
         compact["inherits_application_defaults"] = True
         config_path = _config_file_for(vault_path)
         config_path.write_text(yaml.safe_dump(compact, sort_keys=False), encoding="utf-8")
+        invalidate_config_cache(config_path)
         return cls.load(vault_path)
 
     @classmethod
@@ -1947,6 +2056,7 @@ class VaultConfig(BaseModel):
         os.chmod(path.parent, 0o700)
         path.write_text(yaml.safe_dump(persisted, sort_keys=False), encoding="utf-8")
         os.chmod(path, 0o600)
+        clear_config_cache()
         return validated, _changed_paths(before, validated)
 
     @classmethod
@@ -1991,6 +2101,7 @@ class VaultConfig(BaseModel):
 
         config_path = _config_file_for(vault_path)
         config_path.write_text(yaml.safe_dump(persisted, sort_keys=False), encoding="utf-8")
+        invalidate_config_cache(config_path)
 
         changed = _changed_paths(before, validated)
         return validated, changed

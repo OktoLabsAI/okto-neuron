@@ -42,7 +42,7 @@ from okto_neuron.cli._client import (
 )
 from okto_neuron.cli.models import app as models_app
 from okto_neuron.config._app_config import default_app_home
-from okto_neuron.config._vault import DEFAULT_NEW_VAULT_BACKEND
+from okto_neuron.config._vault import DEFAULT_NEW_VAULT_BACKEND, invalidate_config_cache
 from okto_neuron.detectors import DETECTOR_NAMES, run_detector
 from okto_neuron.errors import OktoNeuronError, OptionalDependencyError
 from okto_neuron.onboarding import (
@@ -1843,6 +1843,7 @@ def _remove_explicit_llm_config(vault_path: Path) -> list[str]:
         return []
     raw.pop("llm", None)
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    invalidate_config_cache(config_path)
     return ["llm"]
 
 

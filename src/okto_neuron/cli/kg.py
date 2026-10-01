@@ -25,6 +25,7 @@ import yaml
 
 from okto_neuron._compat import secret_env as _secret_env
 from okto_neuron._compat import vault_config_path
+from okto_neuron.config._vault import invalidate_config_cache
 from okto_neuron import __version__
 from okto_neuron.curation import orchestrate
 from okto_neuron.errors import (
@@ -218,6 +219,7 @@ def _write_kg_init_vault_config(
         raise VaultPathNotADirectory(vault_path, cause=exc) from exc
     config_path = vault_config_path(vault_path)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    invalidate_config_cache(config_path)
     os.chmod(config_path, 0o644)
 
 
@@ -3222,6 +3224,7 @@ def _write_snapshot_vault_config(
     }
     config_path = vault_config_path(vault_path)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    invalidate_config_cache(config_path)
     os.chmod(config_path, 0o644)
 
 

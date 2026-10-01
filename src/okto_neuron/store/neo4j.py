@@ -56,7 +56,7 @@ from neo4j.exceptions import ClientError, DriverError, Neo4jError, ServiceUnavai
 
 from okto_neuron._compat import secret_env as _secret_env
 from okto_neuron._compat import vault_config_path
-from okto_neuron.config._vault import RetryConfig
+from okto_neuron.config._vault import RetryConfig, invalidate_config_cache
 from okto_neuron.core.schema import Edge, Node, Provenance
 from okto_neuron.errors import (
     EmbeddingDimMismatch,
@@ -194,6 +194,7 @@ def _persist_legacy_vault_id(vault_path: Path, vault_id: str) -> None:
             yaml.safe_dump(raw, fh, sort_keys=False)
         os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, config_path)
+        invalidate_config_cache(config_path)
     except OSError:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
