@@ -241,3 +241,43 @@ def test_kill_9_inside_the_window_loses_no_state_transition(tmp_path: Path) -> N
     assert len(state.ingest_queue[0].events) <= 300, (
         "events in the window may be lost, never states"
     )
+
+
+def test_jobs_progress_ticks_coalesce_and_the_shutdown_flush_writes_the_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from okto_neuron.server import _jobs
+    from okto_neuron.server import runtime as rt
+
+    state = _state(tmp_path / "vault")
+    state.curation_jobs = []
+    job = _jobs.CurationJob(id="j1", kind="reconcile", status="running")
+    state.curation_jobs.append(job)
+    writes: list[int] = []
+    real = _jobs._persist_locked
+
+    def counting(s):  # type: ignore[no-untyped-def]
+        writes.append(1)
+        time.sleep(0.2)
+        real(s)
+
+    monkeypatch.setattr(_jobs, "_persist_locked", counting)
+    latencies: list[float] = []
+
+    def ticks() -> None:
+        for n in range(300):
+            start = time.perf_counter()
+            _jobs._set_progress(state, job, f"adjudicating {n}/300")
+            latencies.append(time.perf_counter() - start)
+
+    async def scenario() -> int:
+        monkeypatch.setattr(_jobs._coalescer(state), "interval", 0.1)
+        await job_io(ticks)
+        assert max(latencies) < 0.05, f"slowest progress tick {max(latencies) * 1000:.0f} ms"
+        assert len(writes) <= 3, "300 ticks coalesced into a few writes"
+        _jobs._set_progress(state, job, "last tick")
+        return rt._flush_sidecars(state)
+
+    assert asyncio.run(scenario()) >= 1
+    data = json.loads(_jobs.jobs_path(state).read_text(encoding="utf-8"))
+    assert data["jobs"][0]["progress"] == "last tick"

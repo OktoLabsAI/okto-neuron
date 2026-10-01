@@ -310,7 +310,9 @@ def _grafx_calls_in_flight(state: ServerState) -> dict[str, int]:
 
 
 def _flush_sidecars(state: Any) -> int:
-    """Final write of every coalesced sidecar (ingest queue); returns how many wrote."""
+    """Final write of every coalesced sidecar (ingest queue, curation jobs); returns how many wrote."""
+    from okto_neuron.server import _jobs
+
     written = 0
     runtimes = getattr(state, "runtimes", None)
     try:
@@ -320,10 +322,11 @@ def _flush_sidecars(state: Any) -> int:
     for target in targets:
         if getattr(target, "vault_path", None) is None:
             continue
-        try:
-            written += int(bool(iq.shutdown_flush(target)))
-        except Exception:  # noqa: BLE001 - a failed sidecar write must not block shutdown
-            _LOG.warning("final sidecar flush failed", exc_info=True)
+        for flush in (iq.shutdown_flush, _jobs.shutdown_flush):
+            try:
+                written += int(bool(flush(target)))
+            except Exception:  # noqa: BLE001 - a failed sidecar write must not block shutdown
+                _LOG.warning("final sidecar flush failed", exc_info=True)
     return written
 
 
