@@ -42,6 +42,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -344,17 +345,29 @@ def latest_of_kind(state: "ServerState", kind: str) -> CurationJob | None:
     return matches[-1] if matches else None
 
 
-def snapshot(state: "ServerState", *, kind: str | None = None) -> dict:
-    jobs = [j for j in state.curation_jobs if kind is None or j.kind == kind]
-    summary = {
-        "total": len(jobs),
-        "queued": sum(1 for j in jobs if j.status == "queued"),
-        "running": sum(1 for j in jobs if j.status == "running"),
-        "done": sum(1 for j in jobs if j.status == "done"),
-        "error": sum(1 for j in jobs if j.status == "error"),
+def summary(state: "ServerState", *, kind: str | None = None) -> dict:
+    """Job summary counts only: one pass, no ``to_public`` payloads (status hot path)."""
+    counts: Counter[str] = Counter()
+    for j in state.curation_jobs:
+        if kind is None or j.kind == kind:
+            counts[j.status] += 1
+    return {
+        "total": sum(counts.values()),
+        "queued": counts["queued"],
+        "running": counts["running"],
+        "done": counts["done"],
+        "error": counts["error"],
         "active": state.curation_worker_active,
     }
-    return {"status": "ok", "summary": summary, "jobs": [j.to_public() for j in jobs]}
+
+
+def snapshot(state: "ServerState", *, kind: str | None = None) -> dict:
+    jobs = [j for j in state.curation_jobs if kind is None or j.kind == kind]
+    return {
+        "status": "ok",
+        "summary": summary(state, kind=kind),
+        "jobs": [j.to_public() for j in jobs],
+    }
 
 
 # ── worker ─────────────────────────────────────────────────────────────────────

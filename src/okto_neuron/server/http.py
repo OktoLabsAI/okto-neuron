@@ -998,8 +998,7 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
 
 
-def _aggregate_ingest_summaries(runtimes: tuple[VaultRuntime, ...]) -> dict[str, object]:
-    summaries = [iq.snapshot(runtime)["summary"] for runtime in runtimes]
+def _aggregate_ingest_summaries(summaries: list[dict]) -> dict[str, object]:
     return {
         key: sum(int(summary.get(key) or 0) for summary in summaries)
         for key in ("total", "queued", "processing", "done", "error", "cancelled")
@@ -1160,10 +1159,12 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
     #    stops a CLI from writing this vault while the daemon serves it.
     for lease_vault, lease_reason in sorted(degraded_leases().items()):
         reasons.append(f"writer_lease_degraded: {lease_vault.name}: {lease_reason}")
+    # One summary-only pass per vault, reused for the aggregate and per-vault rows.
+    runtime_ingest = {runtime.vault_path: iq.summary(runtime) for runtime in runtimes}
     ingest_summary = (
-        _aggregate_ingest_summaries(runtimes)
+        _aggregate_ingest_summaries(list(runtime_ingest.values()))
         if application_scope
-        else iq.snapshot(state)["summary"]
+        else iq.summary(state)
     )
     queue_refusals = {
         runtime.vault_path: _queue_layout_refusal(runtime.vault_path) for runtime in runtimes
@@ -1179,8 +1180,8 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
             "backend": resolve_vault_backend(runtime.vault_path),
             "grafx_buffer_budget_bytes": _grafx_buffer_budget(state, runtime.vault_path),
             "draining": runtime.draining,
-            "ingest": iq.snapshot(runtime)["summary"],
-            "curation": _jobs.snapshot(runtime)["summary"],
+            "ingest": runtime_ingest[runtime.vault_path],
+            "curation": _jobs.summary(runtime),
             "maintenance": bool(runtime.maintenance_tasks),
             "integrity": integrity,
             # A v1 vault is refused (no open, no writes) until explicitly migrated.

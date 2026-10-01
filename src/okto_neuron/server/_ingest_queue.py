@@ -19,6 +19,7 @@ import re
 import tempfile
 import threading
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
@@ -772,26 +773,31 @@ def _note_ingest(state: "ServerState", at: float | None = None) -> float:
     return observed
 
 
-def snapshot(state: "ServerState") -> dict:
-    """Queue + summary counts for the UI poll."""
+def summary(state: "ServerState") -> dict:
+    """Queue summary counts only: one pass, no per-item payloads (status hot path)."""
     items = state.ingest_queue
-    summary = {
+    counts = Counter(i.status for i in items)
+    return {
         "total": len(items),
-        "queued": sum(1 for i in items if i.status == "queued"),
-        "processing": sum(1 for i in items if i.status == "processing"),
-        "done": sum(1 for i in items if i.status == "done"),
-        "error": sum(1 for i in items if i.status == "error"),
-        "cancelled": sum(1 for i in items if i.status == "cancelled"),
+        "queued": counts["queued"],
+        "processing": counts["processing"],
+        "done": counts["done"],
+        "error": counts["error"],
+        "cancelled": counts["cancelled"],
         "active": state.ingest_worker_active,
         "cancel_requested": bool(
             state.ingest_worker_active and getattr(state, "ingest_cancel_requested", False)
         ),
     }
+
+
+def snapshot(state: "ServerState") -> dict:
+    """Queue + summary counts for the UI poll."""
     return {
         "status": "ok",
         "vault": _vault_payload(state),
-        "summary": summary,
-        "items": [_item_payload(i, include_events=False) for i in items],
+        "summary": summary(state),
+        "items": [_item_payload(i, include_events=False) for i in state.ingest_queue],
     }
 
 
