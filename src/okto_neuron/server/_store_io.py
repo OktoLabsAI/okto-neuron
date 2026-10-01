@@ -446,20 +446,51 @@ def _exit_context(resource: Any) -> None:
     resource.__exit__(None, None, None)
 
 
-async def acquire_off_loop(
+class WouldBlock(Exception):
+    """A non-blocking call found another thread already doing the work it needs.
+
+    ``future`` completes when that work does (with its exception, if it failed).
+    Only raised while :data:`NONBLOCKING` is set, i.e. inside an
+    :func:`acquire_off_loop` worker; the caller awaits ``future`` on the event
+    loop and retries, so the waiter never occupies a worker thread.
+    """
+
+    def __init__(self, future: "concurrent.futures.Future[Any]") -> None:
+        self.future = future
+        super().__init__("another thread is already doing this work")
+
+
+NONBLOCKING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "okto_neuron_nonblocking", default=False
+)
+"""Set inside an :func:`acquire_off_loop` worker: a vault lease that would wait for
+another thread's open raises :class:`WouldBlock` instead of parking this worker."""
+
+
+def _run_nonblocking(fn: Callable[..., _T], /, *args: Any) -> _T:
+    # The worker runs in a copy of the caller's context, so this never leaks.
+    NONBLOCKING.set(True)
+    return fn(*args)
+
+
+async def _wait_unblocked(future: "concurrent.futures.Future[Any]") -> None:
+    """Await another thread's in-flight work on the loop, without a worker thread.
+
+    Shielded and never cancels ``future``: it is shared with every other waiter,
+    and a cancelled waiter must not abort the open for them.
+    """
+    inner = asyncio.wrap_future(future)
+    inner.add_done_callback(lambda done: done.cancelled() or done.exception())
+    await asyncio.shield(inner)
+
+
+async def _acquire_once(
     fn: Callable[..., _T],
     /,
     *args: Any,
-    release: Callable[[_T], Any] = _exit_context,
+    release: Callable[[_T], Any],
 ) -> _T:
-    """:func:`store_io` for a call that hands back an owned resource (a vault lease).
-
-    If the awaiting task is cancelled after the worker already acquired the
-    resource, it is released as soon as the worker returns instead of leaking
-    (a leaked lease would block vault deletion and maintenance forever).
-    ``release`` defaults to exiting the resource as a context manager.
-    """
-    future = asyncio.ensure_future(store_io(fn, *args))
+    future = asyncio.ensure_future(store_io(_run_nonblocking, fn, *args))
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:
@@ -476,7 +507,35 @@ async def acquire_off_loop(
         raise
 
 
+async def acquire_off_loop(
+    fn: Callable[..., _T],
+    /,
+    *args: Any,
+    release: Callable[[_T], Any] = _exit_context,
+) -> _T:
+    """:func:`store_io` for a call that hands back an owned resource (a vault lease).
+
+    If the awaiting task is cancelled after the worker already acquired the
+    resource, it is released as soon as the worker returns instead of leaking
+    (a leaked lease would block vault deletion and maintenance forever).
+    ``release`` defaults to exiting the resource as a context manager.
+
+    The worker runs with :data:`NONBLOCKING` set. When another thread is already
+    opening the vault, the lease raises :class:`WouldBlock` at once, this
+    coroutine waits for that open on the event loop (no worker is pinned by the
+    wait) and retries. A failed open raises its error here, as it does for the
+    thread that ran it.
+    """
+    while True:
+        try:
+            return await _acquire_once(fn, *args, release=release)
+        except WouldBlock as blocked:
+            await _wait_unblocked(blocked.future)
+
+
 __all__ = [
+    "NONBLOCKING",
+    "WouldBlock",
     "DEFAULT_JOB_WORKERS",
     "DEFAULT_STORE_WORKERS",
     "BoundedExecutor",
