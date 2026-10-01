@@ -183,6 +183,69 @@ def _no_inherited_legacy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+def _logger_state(logger: Any) -> dict[str, Any]:
+    return {
+        "propagate": logger.propagate,
+        "level": logger.level,
+        "disabled": logger.disabled,
+        "filters": list(logger.filters),
+        # pytest's own capture handlers are installed and removed by pytest per
+        # phase; they are never snapshotted or restored here.
+        "handlers": [
+            h for h in logger.handlers if not type(h).__module__.startswith("_pytest")
+        ],
+    }
+
+
+def _apply_logger_state(logger: Any, state: dict[str, Any]) -> None:
+    logger.propagate = state["propagate"]
+    logger.setLevel(state["level"])
+    logger.disabled = state["disabled"]
+    logger.filters[:] = state["filters"]
+    for handler in list(logger.handlers):
+        if not type(handler).__module__.startswith("_pytest") and handler not in state["handlers"]:
+            logger.removeHandler(handler)
+    for handler in state["handlers"]:
+        if handler not in logger.handlers:
+            logger.addHandler(handler)
+
+
+_PRISTINE_LOGGER_STATE: dict[str, Any] = {
+    "propagate": True,
+    "level": 0,
+    "disabled": False,
+    "filters": [],
+    "handlers": [],
+}
+
+
+@pytest.fixture(autouse=True)
+def _restore_logger_state():
+    """Undo logging changes a test (or ``configure_logging``) leaves behind.
+
+    ``configure_logging`` sets ``propagate=False`` and installs handlers on the
+    ``okto_neuron`` logger; left in place, a later test's ``caplog`` (a root
+    handler) sees nothing (#35). Snapshot the root logger, ``okto_neuron`` and
+    its existing children before each test and restore them afterwards; a child
+    logger first created during the test returns to the pristine state.
+    """
+    import logging
+
+    def tracked() -> dict[str, logging.Logger]:
+        found = {"": logging.getLogger(), "okto_neuron": logging.getLogger("okto_neuron")}
+        for name, obj in list(logging.root.manager.loggerDict.items()):
+            if name.startswith("okto_neuron") and isinstance(obj, logging.Logger):
+                found[name] = obj
+        return found
+
+    before = {name: _logger_state(lg) for name, lg in tracked().items()}
+    try:
+        yield
+    finally:
+        for name, lg in tracked().items():
+            _apply_logger_state(lg, before.get(name, _PRISTINE_LOGGER_STATE))
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Auto-skip the ADR 0010 Tier B real-judge band gate (``acceptance_judge``)
     unless it is explicitly selected with ``-m acceptance_judge``.
