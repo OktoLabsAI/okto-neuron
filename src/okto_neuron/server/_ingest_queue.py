@@ -445,7 +445,7 @@ def _persist_locked(state: "ServerState") -> None:
         return
 
 
-def _migrate_loaded_events(item: IngestItem) -> None:
+def _migrate_loaded_events(item: IngestItem) -> int:
     """Bring a sidecar written before the byte budget (#37) to the persisted form.
 
     Body-carrying events with a full payload get their preview computed; a finished
@@ -453,6 +453,7 @@ def _migrate_loaded_events(item: IngestItem) -> None:
     rewrites a small file.
     """
     events = item.events if isinstance(item.events, list) else []
+    migrated = 0
     for event in events:
         if not isinstance(event, dict) or event.get("kind") not in _BODY_EVENT_KINDS:
             continue
@@ -464,8 +465,10 @@ def _migrate_loaded_events(item: IngestItem) -> None:
         preview = _body_preview(payload)
         if preview is not None:
             event["body_preview"] = preview
+            migrated += 1
     if item.status in _TERMINAL:
         compact_terminal_events(item)
+    return migrated
 
 
 def rehydrate_queue(state: "ServerState") -> None:
@@ -488,6 +491,7 @@ def rehydrate_queue(state: "ServerState") -> None:
         return
     known = {f.name for f in fields(IngestItem)}
     restored: list[IngestItem] = []
+    migrated_bodies = 0
     for entry in data.get("items", []) if isinstance(data, dict) else []:
         if not isinstance(entry, dict):
             continue
@@ -505,9 +509,22 @@ def rehydrate_queue(state: "ServerState") -> None:
             item.stage_progress_done = 0
             item.stage_progress_total = 0
             item.outcome = {}
-        _migrate_loaded_events(item)
+        migrated_bodies += _migrate_loaded_events(item)
         restored.append(item)
     state.ingest_queue = restored
+    if migrated_bodies:
+        # One-time and permanent: the full bodies of a legacy sidecar are cut to
+        # previews here. Say so, with the sizes, so an operator can see it happen.
+        before = len(raw.encode("utf-8"))
+        persist(state)
+        _LOG.info(
+            "ingest history migrated to previews for %s: %d bytes -> %d bytes "
+            "(%d event bodies cut; full bodies remain only in any earlier backup)",
+            Path(state.vault_path).name,
+            before,
+            path.stat().st_size if path.exists() else 0,
+            migrated_bodies,
+        )
     # Seed the id counter past every persisted id so a restart (or vault
     # switch) never mints an id that collides with a rehydrated item.
     seq = int(getattr(state, "ingest_seq", 0) or 0)

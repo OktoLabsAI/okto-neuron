@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server._ingest_queue import IngestItem
@@ -146,7 +149,9 @@ def test_the_sidecar_is_a_small_fraction_of_the_live_bodies(tmp_path: Path) -> N
     assert size < 20 * (iq.MAX_PERSISTED_EVENT_BYTES_PER_ITEM * 2 + 4_000)
 
 
-def test_a_sidecar_written_before_the_budget_is_migrated_on_rehydrate(tmp_path: Path) -> None:
+def test_a_sidecar_written_before_the_budget_is_migrated_on_rehydrate(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     state = _state(tmp_path / "vault")
     legacy = IngestItem(id="1", name="a.md", path="/x/a.md", status="done")
     legacy.events = [
@@ -163,7 +168,10 @@ def test_a_sidecar_written_before_the_budget_is_migrated_on_rehydrate(tmp_path: 
 
     path.write_text(json.dumps({"version": 1, "items": [asdict(legacy), asdict(live)]}, indent=2))
     before = path.stat().st_size
-    iq.rehydrate_queue(state)
+    with caplog.at_level(logging.INFO, logger="okto_neuron.server.ingest_queue"):
+        iq.rehydrate_queue(state)
+    infos = [r.getMessage() for r in caplog.records if "migrated to previews" in r.getMessage()]
+    assert len(infos) == 1 and f"{before} bytes ->" in infos[0] and "vault" in infos[0]
     done, queued = state.ingest_queue
     assert all(e["payload"].get("truncated") is True for e in done.events)
     assert (
