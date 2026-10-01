@@ -1013,7 +1013,14 @@ async def api_status(request: Request) -> JSONResponse:
     state = get_state()
     if state.shutting_down:
         return _draining_response()
-    payload = await store_io(_status_payload, state)
+    # Concurrent pollers share one execution (the payload walks every vault's
+    # sidecars). Nothing is cached after it completes: the next call recomputes,
+    # and the last_degraded_reasons transition log runs once per execution. The
+    # key carries the scope so a vault-scoped call never shares an application
+    # result or another vault's. JSONResponse renders the dict immediately and
+    # nobody mutates it, so sharing the same object across waiters is safe.
+    scope = "application" if isinstance(state, ServerState) else str(state.vault_path)
+    payload = await single_flight(("status_payload", scope), _status_payload, state)
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
