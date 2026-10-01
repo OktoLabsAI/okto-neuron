@@ -180,3 +180,73 @@ def test_a_sidecar_written_before_the_budget_is_migrated_on_rehydrate(
     assert "body_preview" in queued.events[0], "an unfinished item keeps its full body in memory"
     iq.persist(state)
     assert path.stat().st_size < before / 3
+
+
+def _done_item(i: int, events: int = 6) -> IngestItem:
+    item = IngestItem(id=str(i), name=f"{i}.md", path=f"/x/{i}.md", status="done")
+    for n in range(events):
+        item.events.append(iq._event("llm_request", f"r{n}", _big_request(5_000)))
+    return item
+
+
+def test_the_text_cache_matches_the_uncached_payload_and_skips_finished_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path / "vault")
+    state.ingest_queue = [_done_item(i) for i in range(20)]
+    state.ingest_queue.append(
+        IngestItem(id="live", name="l.md", path="/x/l.md", status="processing")
+    )
+    expected = json.loads(json.dumps(iq._persist_payload(list(state.ingest_queue))))
+    first = _persisted(state)
+    assert first == expected
+
+    calls: list[str] = []
+    real = iq._persisted_item_dict
+    monkeypatch.setattr(
+        iq, "_persisted_item_dict", lambda item: (calls.append(item.id), real(item))[1]
+    )
+    again = _persisted(state)
+    assert again == expected
+    assert calls == ["live"], f"only the unfinished item may be re-serialized, got {calls}"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda item, state: setattr(item, "error", "boom"),
+        lambda item, state: item.outcome.update({"receipt": "checked"}),
+        lambda item, state: setattr(item, "extracted_nodes", 7),
+        lambda item, state: iq.record_event(state, item, "stage", "later", {}, persist_now=False),
+        lambda item, state: item.events.pop(0),
+        lambda item, state: setattr(item, "status", "error"),
+    ],
+    ids=["error", "outcome", "counter", "new event", "event trimmed", "status"],
+)
+def test_any_mutation_of_a_finished_item_invalidates_its_cached_text(
+    tmp_path: Path, mutate
+) -> None:
+    state = _state(tmp_path / "vault")
+    item = _done_item(1)
+    other = _done_item(2)
+    state.ingest_queue = [item, other]
+    _persisted(state)  # fills the cache
+    mutate(item, state)
+    data = _persisted(state)
+    fresh = json.loads(json.dumps(iq._persisted_item_dict(item)))
+    assert data["items"][0] == fresh, "the sidecar must reflect the mutation"
+    assert data["items"][1]["id"] == "2"
+
+
+def test_retention_is_applied_to_the_live_list_by_identity(tmp_path: Path) -> None:
+    state = _state(tmp_path / "vault")
+    state.ingest_queue = [_done_item(i, events=1) for i in range(iq.RETENTION_CAP + 20)]
+    newest = state.ingest_queue[-1]
+    iq.persist(state)
+    assert len(state.ingest_queue) == iq.RETENTION_CAP
+    assert state.ingest_queue[-1] is newest
+    assert [i.id for i in state.ingest_queue][0] == "20", "the oldest terminal items went first"
+    late = IngestItem(id="late", name="l.md", path="/x/l.md", status="queued")
+    state.ingest_queue.append(late)
+    iq.persist(state)
+    assert late in state.ingest_queue
