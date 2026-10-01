@@ -2985,6 +2985,7 @@ def serve(
             "to run `okto-neuron serve`",
             cause=exc,
         ) from exc
+    from okto_neuron.server._preload import preload_server_modules
     from okto_neuron.server.lifecycle import (
         LifecycleError,
         PidFile,
@@ -3081,6 +3082,9 @@ def serve(
             telemetry_warning,
             extra={"component": "server", "event": "telemetry.unavailable"},
         )
+    # Single-threaded import phase (#40): must run before PidFile starts its
+    # stop-signal watcher thread and before the executors exist.
+    preload_server_modules()
     try:
         with PidFile(lock_root) as pid_file:
             logger.info(

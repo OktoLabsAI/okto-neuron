@@ -37,6 +37,7 @@ from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _gc_tuning
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._preload import preload_server_modules
 from okto_neuron.server._prewarm import start_ledger_prewarm
 from okto_neuron.server._store_io import (
     DEFAULT_JOB_WORKERS,
@@ -2466,6 +2467,8 @@ def run(
     mcp_port: int = DEFAULT_MCP_PORT,
 ) -> None:
     """Synchronous entry point used by the ``okto-neuron serve`` CLI command."""
+    # Idempotent backstop for embedders: the CLI already ran it before any thread.
+    preload_server_modules()
     try:
         asyncio.run(
             _run_async(
