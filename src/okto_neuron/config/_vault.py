@@ -51,9 +51,14 @@ def _config_file_for(path: Path | str) -> Path:
 
 
 def _safe_load(stream: Any) -> Any:
-    """``yaml.safe_load`` for every config read in this module (one seam to swap/spy)."""
+    """``yaml.safe_load`` for every config read in this module (one seam to swap/spy).
 
-    return yaml.safe_load(stream)
+    Uses libyaml's ``CSafeLoader`` when PyYAML was built with it (several times
+    faster than the pure-Python ``SafeLoader``, same safe constructors and the same
+    ``YAMLError`` family); falls back to ``SafeLoader`` otherwise.
+    """
+
+    return yaml.load(stream, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
 
 
 # ── process-wide read caches ────────────────────────────────────────────────
