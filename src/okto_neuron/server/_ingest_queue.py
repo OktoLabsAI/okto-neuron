@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from okto_neuron.companion import LLMUnavailableError, RememberCancelled
 from okto_neuron.server._integrity import IntegrityFenceError, require_write_allowed
+from okto_neuron.server._persist_coalesce import PersistCoalescer
 from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
 if TYPE_CHECKING:
@@ -56,11 +57,9 @@ PERSIST_EVERY_BLOCKS = 10
 # total instead (Companion._emit_substage), so they never write the blocks
 # counters.
 _BLOCK_POPULATION_STAGES = frozenset({"parsing", "extracting", "embedding"})
-# LLM request/response artifacts are useful in the live inspector but extremely
-# chatty during relation curation. Keep every retained event in memory for the
-# UI, but persist the sidecar in batches so a large ingest does not perform
-# thousands of avoidable history-file writes.
-PERSIST_EVERY_CHATTY_EVENTS = 25
+# Events are chatty (LLM request/response artifacts above all). Every retained event is
+# kept in memory for the UI; the sidecar is written by a coalesced flush (see
+# ``request_persist``), not once per event.
 MAX_EVENTS_PER_ITEM = 80
 MAX_EVENT_TEXT_CHARS = 12_000
 MAX_EVENT_LIST_ITEMS = 80
@@ -90,7 +89,6 @@ _STRUCTURAL_EVENT_KINDS = frozenset({"extraction_result"})
 
 # Terminal statuses, factored out so retention and rehydrate agree.
 _TERMINAL = frozenset({"done", "error", "cancelled"})
-_CHATTY_EVENT_KINDS = frozenset({"llm_request", "llm_response"})
 
 
 @dataclass
@@ -411,11 +409,44 @@ def persist(state: "ServerState") -> None:
     serialized and snapshot INSIDE the lock, so whichever write lands last
     carries the newest queue even when store-executor threads persist
     concurrently (issue #13)."""
+    _coalescer(state).flushed()  # this write covers everything marked dirty so far
     with _PERSIST_LOCK:
         _persist_locked(state)
 
 
 _PERSIST_LOCK = threading.Lock()
+_COALESCER_LOCK = threading.Lock()
+
+
+def _coalescer(state: "ServerState") -> PersistCoalescer:
+    """The queue's coalescer (one per state/runtime), created on first use."""
+    coalescer = getattr(state, "_ingest_persist_coalescer", None)
+    if coalescer is None:
+        with _COALESCER_LOCK:
+            coalescer = getattr(state, "_ingest_persist_coalescer", None)
+            if coalescer is None:
+                coalescer = PersistCoalescer(lambda: persist(state), name="ingest-queue")
+                try:
+                    state._ingest_persist_coalescer = coalescer  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+    return coalescer
+
+
+def request_persist(state: "ServerState") -> None:
+    """Mark the queue dirty; ONE background flush writes it within a couple of seconds.
+
+    For progress and event chatter only. A crash may lose up to the flush interval of
+    progress EVENTS, never a state transition: enqueue, an item's start and terminal
+    status, cancel, retry, delete and receipts still call :func:`persist` directly.
+    Cheap and safe from any thread, including under the companion's event lock.
+    """
+    _coalescer(state).mark_dirty()
+
+
+def shutdown_flush(state: "ServerState") -> bool:
+    """Stop the background flush and write once more if anything is pending."""
+    return _coalescer(state).close()
 
 
 def _persist_locked(state: "ServerState") -> None:
@@ -1356,10 +1387,10 @@ def _make_on_progress(state: "ServerState", item: IngestItem) -> Callable[[str, 
     """Build a throttled ``on_progress`` for one item's drain.
 
     Updates the live ``IngestItem`` telemetry on every call (so a status poll
-    always sees fresh stage/block counts) but only triggers an atomic persist on
-    a stage change or every ``PERSIST_EVERY_BLOCKS`` blocks — terminal status is
-    persisted unconditionally by the caller. Runs inside the ``to_thread`` worker;
-    ``persist`` snapshots the list and only writes a file, so it is safe there."""
+    always sees fresh stage/block counts) but only marks the queue dirty on a
+    stage change or every ``PERSIST_EVERY_BLOCKS`` blocks; the coalesced flush writes
+    it (see :func:`request_persist`). Terminal status is persisted unconditionally by
+    the caller. Runs inside the ``to_thread`` worker; marking is cheap and thread-safe."""
     last_stage = item.stage
     last_persist_blocks = 0
 
@@ -1392,7 +1423,7 @@ def _make_on_progress(state: "ServerState", item: IngestItem) -> Callable[[str, 
             last_stage = stage
             if counts_blocks:
                 last_persist_blocks = blocks_done
-            persist(state)
+            request_persist(state)
 
     return on_progress
 
@@ -1408,10 +1439,7 @@ def _declared_total(raw: object) -> int | None:
 
 
 def _make_on_event(state: "ServerState", item: IngestItem) -> Callable[[dict], None]:
-    chatty_since_persist = 0
-
     def on_event(event: dict) -> None:
-        nonlocal chatty_since_persist
         kind = str(event.get("kind") or "event")
         summary = str(event.get("summary") or kind)
         payload = event.get("payload")
@@ -1456,22 +1484,17 @@ def _make_on_event(state: "ServerState", item: IngestItem) -> Callable[[dict], N
                     max(int(done or 0), 0),
                     _declared_total(total),
                 )
-        persist_now = True
-        if kind in _CHATTY_EVENT_KINDS:
-            chatty_since_persist += 1
-            persist_now = chatty_since_persist >= PERSIST_EVERY_CHATTY_EVENTS
-            if persist_now:
-                chatty_since_persist = 0
-        else:
-            chatty_since_persist = 0
+        # Runs under the companion's event lock: append in memory and mark dirty only;
+        # the sidecar write happens in the coalesced flush, off this thread's lock.
         record_event(
             state,
             item,
             kind,
             summary,
             payload if isinstance(payload, dict) else {"value": payload},
-            persist_now=persist_now,
+            persist_now=False,
         )
+        request_persist(state)
 
     return on_event
 

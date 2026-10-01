@@ -309,6 +309,24 @@ def _grafx_calls_in_flight(state: ServerState) -> dict[str, int]:
     return dict(counter()) if callable(counter) else {}
 
 
+def _flush_sidecars(state: Any) -> int:
+    """Final write of every coalesced sidecar (ingest queue); returns how many wrote."""
+    written = 0
+    runtimes = getattr(state, "runtimes", None)
+    try:
+        targets = [*(runtimes() if callable(runtimes) else ()), state]
+    except Exception:  # noqa: BLE001 - shutdown must not fail on a discovery error
+        targets = [state]
+    for target in targets:
+        if getattr(target, "vault_path", None) is None:
+            continue
+        try:
+            written += int(bool(iq.shutdown_flush(target)))
+        except Exception:  # noqa: BLE001 - a failed sidecar write must not block shutdown
+            _LOG.warning("final sidecar flush failed", exc_info=True)
+    return written
+
+
 async def _graceful_shutdown(
     *,
     state: ServerState,
@@ -410,7 +428,9 @@ async def _graceful_shutdown(
             detail["pending"] = len(pending)
             if pending:
                 abandon_drain("transports or background workers")
-                await asyncio.wait(pending, timeout=min(1.0, max(0.0, hard_deadline - time.monotonic())))
+                await asyncio.wait(
+                    pending, timeout=min(1.0, max(0.0, hard_deadline - time.monotonic()))
+                )
 
         with shutdown_phase("request_drain") as detail:
             drained = await _wait_for_request_drain(orchestrator)
@@ -457,6 +477,11 @@ async def _graceful_shutdown(
                 # Busy workers are in an LLM/network wait or a grafx call; the
                 # grafx count below tells which. Nothing queued may start now.
                 abandon_drain("busy executors")
+
+        # Coalesced sidecar writes (#37): stop the background flushers and write once
+        # more what is still pending, so a clean stop loses no progress event.
+        with shutdown_phase("flush_sidecars") as detail:
+            detail["flushed"] = _flush_sidecars(state)
 
         # Close from a dedicated thread: the store executor may be wedged, and
         # the close must not queue behind a stuck worker.
@@ -728,12 +753,16 @@ def _open_startup_vault(
         acquire_daemon_writer_lease(resolved)
     except VaultPoolError as exc:
         _LOG.warning("startup fallback vault is busy; starting the application without it: %s", exc)
-        return None, None, {
-            "code": exc.code,
-            "path": str(resolved),
-            "detail": str(exc),
-            "remedy": "Stop the process holding the vault, then select it again.",
-        }
+        return (
+            None,
+            None,
+            {
+                "code": exc.code,
+                "path": str(resolved),
+                "detail": str(exc),
+                "remedy": "Stop the process holding the vault, then select it again.",
+            },
+        )
     try:
         return Vault.open(resolved), resolved, None
     except EmbeddingDimMismatch as exc:
@@ -890,15 +919,12 @@ def _pool_error(exc: VaultPoolError, *, selector: str | None) -> VaultResolution
     branch on, so it is preserved; only the human text is sanitised, and the full
     original is logged for the operator.
     """
-    _LOG.warning(
-        "vault pool error %s for selector %r: %s", exc.code, selector, exc, exc_info=True
-    )
+    _LOG.warning("vault pool error %s for selector %r: %s", exc.code, selector, exc, exc_info=True)
     return VaultResolutionError(
         exc.code,
         # No ``exc.code`` in the text: the MCP layer already renders it as
         # ``f"{exc.code}: {exc}"``.
-        f"{_safe_selector_label(selector)} is not available; "
-        "see the server log for details",
+        f"{_safe_selector_label(selector)} is not available; see the server log for details",
     )
 
 
@@ -1018,8 +1044,7 @@ def _resolve_vault_path_selector_unguarded(
             # already knows which one it asked about.
             raise VaultResolutionError(
                 "unknown_vault",
-                "no vault at the requested path; create one first (init_vault) "
-                "or check the path",
+                "no vault at the requested path; create one first (init_vault) or check the path",
             )
         return target
 
@@ -1107,7 +1132,6 @@ def _validate_name_only_override(override: str) -> str:
             "instead",
         )
     return candidate
-
 
 
 def _canonical_vault_name(name: str) -> str:
@@ -2326,7 +2350,9 @@ async def _run_async(
         asyncio.create_task(rest_server.serve(), name="okto-neuron-rest"),
         asyncio.create_task(mcp_server.serve(), name="okto-neuron-mcp"),
     )
-    shutdown_waiter = asyncio.create_task(shutdown_wakeup.wait(), name="okto-neuron-shutdown-wakeup")
+    shutdown_waiter = asyncio.create_task(
+        shutdown_wakeup.wait(), name="okto-neuron-shutdown-wakeup"
+    )
     cancellation: asyncio.CancelledError | None = None
     try:
         # A signal wakes this wait immediately. A transport ending first is also
