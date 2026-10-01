@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,14 +154,22 @@ class JsonlCorpusStore:
         engine: str = DEFAULT_ENGINE,
         format_version: int = FORMAT_VERSION,
     ) -> dict[str, Any]:
-        """Rewrite corpus.jsonl and meta.json in full and return the new meta."""
+        """Rewrite corpus.jsonl and meta.json in full and return the new meta.
+
+        Order matters: the stamp in meta.json is trusted on open without being
+        recomputed, so it must never claim records that are not on disk. The
+        corpus is replaced first, the stamp second, each through a temp file and
+        ``os.replace``. A crash between the two leaves the new records under the
+        previous stamp, which no longer matches the graph and forces a rebuild.
+        """
         self.index_dir.mkdir(parents=True, exist_ok=True)
         ordered = sorted(records.values(), key=lambda record: record.id)
 
-        with self.corpus_path.open("w", encoding="utf-8") as handle:
-            for record in ordered:
-                handle.write(json.dumps(_record_to_row(record), separators=(",", ":"), ensure_ascii=False))
-                handle.write("\n")
+        lines = (
+            json.dumps(_record_to_row(record), separators=(",", ":"), ensure_ascii=False) + "\n"
+            for record in ordered
+        )
+        self._replace_atomically(self.corpus_path, lines)
 
         scorer = BM25Scorer(ordered)
         embedded_count = sum(1 for record in ordered if record.embedding is not None)
@@ -173,5 +182,14 @@ class JsonlCorpusStore:
             "embedded_count": embedded_count,
             "built_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._replace_atomically(self.meta_path, [json.dumps(meta, indent=2, sort_keys=True) + "\n"])
         return meta
+
+    @staticmethod
+    def _replace_atomically(path: Path, chunks: Iterable[str]) -> None:
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.writelines(chunks)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
