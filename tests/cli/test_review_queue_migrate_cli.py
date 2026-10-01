@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
-
 import hashlib
 import json
 import os
@@ -28,6 +26,8 @@ from okto_neuron.store.ladybug import VaultConnection
 from okto_neuron.store.writer_lease import release_all
 from tests.perf._synthetic_vault import build_synthetic_vault, scaled
 
+
+REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
 
 _HOLDER = textwrap.dedent(
     """

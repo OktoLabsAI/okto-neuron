@@ -9,14 +9,12 @@ and check the real gate.
 from __future__ import annotations
 
 import ast
-import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 from starlette.testclient import TestClient
 
 from okto_neuron.config._vault import vault_yaml_version

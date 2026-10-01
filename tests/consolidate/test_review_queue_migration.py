@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
-
 import hashlib
 import importlib.util
 import json
 import os
 import random
-import shutil
 import struct
 import subprocess
 import sys
@@ -29,7 +26,6 @@ from okto_neuron.consolidate.review_queue import (
     load_legacy_entries,
 )
 from okto_neuron.consolidate.review_queue_migration import (
-    ReviewQueueMigrationError,
     migrate,
     rollback,
 )
@@ -38,6 +34,8 @@ from okto_neuron.consolidate.review_queue_sqlite import (
     SqliteQueueStore,
 )
 from okto_neuron.store import InMemoryStore
+
+REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
 
 _HELPERS_PATH = Path(__file__).with_name("test_review_queue.py")
 _spec = importlib.util.spec_from_file_location("_rq_helpers", _HELPERS_PATH)

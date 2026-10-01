@@ -12,9 +12,8 @@ from starlette.testclient import TestClient
 from okto_neuron.consolidate import NodeCandidate
 from okto_neuron.consolidate.review_queue import ReviewQueue
 from okto_neuron.server import http as http_mod
-from okto_neuron.server._vault_pool import VaultPoolError
 from okto_neuron.server.http import build_rest_app
-from okto_neuron.server.state import ServerState, init_state, reset_state_for_tests
+from okto_neuron.server.state import init_state, reset_state_for_tests
 from okto_neuron.vault import Vault
 
 REAL_QUEUE_GATE = True

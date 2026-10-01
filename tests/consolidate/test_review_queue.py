@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
-
 import json
 import sqlite3
 
@@ -39,6 +37,9 @@ from okto_neuron.consolidate.review_queue_sqlite import (
 )
 from okto_neuron.predicates.admission import PredicateAdmissionDecision
 from okto_neuron.store import InMemoryStore
+
+
+REAL_QUEUE_GATE = True  # these tests exercise the version-1 layout gate itself
 
 
 def _cand(title: str = "c", content: str = "x", type_: str = "Concept") -> NodeCandidate:
