@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import socket
 import threading
@@ -16,6 +17,7 @@ from okto_neuron.consolidate import ledger as ledger_mod
 from okto_neuron.consolidate.ledger import LEDGER_FILENAME, CandidateLedger
 from okto_neuron.server import runtime
 from okto_neuron.vault import Vault
+from tests.consolidate.test_ledger_run_view_cache import _Loads
 from tests.support._ledger_synth import build_synthetic_ledger
 
 REAL_QUEUE_GATE = True  # keep the real v1 layout refusal (see conftest)
@@ -28,13 +30,13 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _vault_with_cold_ledger(path: Path) -> tuple[Path, str]:
+def _vault_with_cold_ledger(path: Path, **synth: int) -> tuple[Path, str]:
     vault = Vault.init(path, packs=["core"])
     root = Path(vault.path).resolve(strict=False)
     vault.close()
     marg = root / ".marginalia"
     marg.mkdir(exist_ok=True)
-    build_synthetic_ledger(marg, target_bytes=_BIG)
+    build_synthetic_ledger(marg, target_bytes=_BIG, **synth)
     ledger_mod._sidecar_cache_drop()
     with ledger_mod._LEDGER_INDEXES_GUARD:
         ledger_mod._LEDGER_INDEXES.clear()
@@ -183,3 +185,61 @@ def test_shutdown_during_a_warm_finishes_within_budget_and_ends_the_task(
     total_ms = int(summary[0].split("total_ms=")[1].split()[0])
     # drain 2s + close budget 5s: the graceful path never waits on the warm beyond it.
     assert total_ms < 7_000, summary[0]
+
+
+@pytest.mark.parametrize(
+    ("warm", "expect_big_parse"), [(True, False), (False, True)], ids=["warmed", "warm-disabled"]
+)
+def test_first_ui_summary_after_the_startup_warm_parses_nothing_big(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, warm: bool, expect_big_parse: bool
+) -> None:
+    """GET /api/v1/ledger/summary right after the warm: zero big json parses.
+
+    The ``warm-disabled`` case is the negative control: with the warm a no-op the
+    same request must cold-parse the multi-MB plan rows, so the assertion has teeth.
+    """
+    _isolate(monkeypatch, tmp_path)
+    # plan rows of ~1.2 MB (> the counter's threshold), inside a ~10 MB ledger
+    root, _ = _vault_with_cold_ledger(tmp_path / "v", plan_ops=6, op_chars=200_000)
+    if not warm:
+        monkeypatch.setattr(CandidateLedger, "prewarm", lambda self, cancelled=None: None)
+    loads = _Loads(monkeypatch)
+    body: list[dict] = []
+
+    def summary(port: int) -> dict:
+        url = f"http://127.0.0.1:{port}/api/v1/ledger/summary?limit=12"
+        with urllib.request.urlopen(url, timeout=120) as response:
+            return json.loads(response.read())
+
+    async def scenario() -> None:
+        ready = asyncio.Event()
+        rest_port = _free_port()
+        task = asyncio.create_task(
+            runtime._run_async(root, rest_port=rest_port, mcp_port=_free_port(), ready_event=ready)
+        )
+        await asyncio.wait_for(ready.wait(), 120)
+        try:
+            deadline = time.monotonic() + 30
+            while not (
+                warmers := [
+                    t for t in asyncio.all_tasks() if t.get_name() == "okto-neuron-ledger-prewarm"
+                ]
+            ):
+                assert time.monotonic() < deadline, "no warm task was started"
+                await asyncio.sleep(0.05)
+            await asyncio.wait_for(asyncio.gather(*warmers), 120)
+            while True:
+                try:
+                    await asyncio.to_thread(_health, rest_port)
+                    break
+                except OSError:
+                    assert time.monotonic() < deadline
+                    await asyncio.sleep(0.2)
+            loads.reset()  # the warm itself may parse; only the UI request is measured
+            body.append(await asyncio.to_thread(summary, rest_port))
+        finally:
+            await _stop(task)
+
+    asyncio.run(scenario())
+    assert body[0]["status"] == "ok" and body[0]["run"] is not None
+    assert (loads.big > 0) is expect_big_parse, loads.sizes
