@@ -33,10 +33,11 @@ falls back to the next source, then to the default; startup never fails here):
 GIL switch interval (also #38, same startup point): with the collector tamed, the
 remaining ``/health`` stalls during a back-to-back audit were pure-bytecode GIL sharing
 between the audit thread and the event loop (default interval 5 ms). :func:`apply_switch_interval`
-sets ``sys.setswitchinterval(0.001)`` ONCE per process (job-window ``/health`` p99
-121.7-124.4 ms -> 38.8 ms in the scratch audit). Knobs: ``OKTO_NEURON_SWITCH_INTERVAL=<seconds>|off``
+sets ``sys.setswitchinterval(0.0002)`` ONCE per process (job-window ``/health`` p99
+121.7-124.4 ms -> 38.8 ms in the scratch audit at 0.001; job-active MCP connect p99
+474 ms at 0.001 -> 124 ms at 0.0002, n=61 each, #40). Knobs: ``OKTO_NEURON_SWITCH_INTERVAL=<seconds>|off``
 / ``[server] switch_interval``; ``off`` leaves the interpreter default; an invalid value
-(non-numeric, <= 0, > 1.0 s) warns and falls back to the next source, then 0.001.
+(non-numeric, <= 0, > 1.0 s) warns and falls back to the next source, then 0.0002.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ LOG_INTERVAL_S = 5.0
 _FLUSH_POLL_S = 1.0
 _OFF = {"off", "false", "0", "no"}
 _ON = {"on", "true", "1", "yes"}
-DEFAULT_SWITCH_INTERVAL_S = 0.001
+DEFAULT_SWITCH_INTERVAL_S = 0.0002
 MAX_SWITCH_INTERVAL_S = 1.0
 _SWITCH_OFF = "off"
 
@@ -203,7 +204,8 @@ def apply_switch_interval(server: Any = None) -> dict[str, Any]:
     else:
         sys.setswitchinterval(chosen)
         _switch_applied = True
-        report["switch_interval_s"] = sys.getswitchinterval()
+        # CPython keeps whole microseconds: 0.0002 reads back as 0.00019999999999999998.
+        report["switch_interval_s"] = round(sys.getswitchinterval(), 9)
         _LOG.info("switch interval set to %s (was %s)", report["switch_interval_s"], previous)
     return report
 
@@ -335,7 +337,7 @@ def snapshot() -> dict[str, Any]:
         "slow_pauses": _slow,
         "slow_pause_threshold_ms": SLOW_PAUSE_MS,
         "last_slow_pause_at": _last_slow_at or None,
-        "switch_interval_s": sys.getswitchinterval(),
+        "switch_interval_s": round(sys.getswitchinterval(), 9),
         "switch_interval_tuned": _switch_applied,
     }
 

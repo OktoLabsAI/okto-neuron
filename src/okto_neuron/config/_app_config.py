@@ -89,7 +89,7 @@ class ServerSettings(BaseModel):
     """Three positive integers ``[gen0, gen1, gen2]`` (default ``[50000, 20, 100]``;
     ``OKTO_NEURON_GC_THRESHOLDS=a,b,c`` overrides). Validated like ``gc_tuning``."""
     switch_interval: object = None
-    """GIL switch interval in seconds (default ``0.001``, interpreter default is 0.005);
+    """GIL switch interval in seconds (default ``0.0002``, interpreter default is 0.005);
     ``false``/``"off"`` leaves the interpreter default (``OKTO_NEURON_SWITCH_INTERVAL``
     overrides). Validated like ``gc_tuning``: invalid or > 1.0 warns and uses the default."""
 

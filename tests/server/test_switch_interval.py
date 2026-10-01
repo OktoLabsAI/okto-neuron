@@ -46,11 +46,11 @@ def _logs(caplog: pytest.LogCaptureFixture, level: int) -> list[logging.LogRecor
 def test_applied_sets_the_default_and_logs_old_and_new(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO, logger=LOGGER):
         report = gct.apply_switch_interval(_NO_CONFIG)
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
     assert report["enabled"] is True and report["skipped"] is None
     assert report["previous_switch_interval_s"] == 0.005
     (info,) = _logs(caplog, logging.INFO)
-    assert info.getMessage() == "switch interval set to 0.001 (was 0.005)"
+    assert info.getMessage() == "switch interval set to 0.0002 (was 0.005)"
     assert gct.snapshot()["switch_interval_tuned"] is True
 
 
@@ -82,7 +82,7 @@ def test_invalid_env_warns_and_uses_the_default(
     monkeypatch.setenv("OKTO_NEURON_SWITCH_INTERVAL", str(bad))
     with caplog.at_level(logging.INFO, logger=LOGGER):
         gct.apply_switch_interval(_NO_CONFIG)
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
     assert len(_logs(caplog, logging.WARNING)) == 1
 
 
@@ -92,7 +92,7 @@ def test_invalid_config_warns_and_uses_the_default(
 ) -> None:
     with caplog.at_level(logging.INFO, logger=LOGGER):
         gct.apply_switch_interval(SimpleNamespace(switch_interval=bad))
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
     assert len(_logs(caplog, logging.WARNING)) == 1
 
 
@@ -114,7 +114,7 @@ def test_env_beats_config_beats_default(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.delenv("OKTO_NEURON_SWITCH_INTERVAL")
     gct.reset_for_tests()
     gct.apply_switch_interval(_NO_CONFIG)
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
 
 
 def test_invalid_env_falls_through_to_valid_config(
@@ -133,7 +133,7 @@ def test_app_config_accepts_a_garbage_key_without_failing_the_file() -> None:
     )
     assert config.server.store_workers == 3
     gct.apply_switch_interval(config.server)
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
     assert ServerSettings().switch_interval is None
 
 
@@ -146,7 +146,7 @@ def test_unreadable_app_config_never_crashes_apply(
     monkeypatch.setattr(OktoNeuronConfig, "load", classmethod(boom))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         gct.apply_switch_interval()
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
     assert len(_logs(caplog, logging.WARNING)) == 1
 
 
@@ -159,7 +159,7 @@ def test_applies_at_most_once_per_process(caplog: pytest.LogCaptureFixture) -> N
     assert any("already applied" in r.getMessage() for r in caplog.records)
     gct.reset_for_tests()  # re-arms the flag
     gct.apply_switch_interval(_NO_CONFIG)
-    assert sys.getswitchinterval() == 0.001
+    assert sys.getswitchinterval() == pytest.approx(0.0002)
 
 
 class _StubVault:
@@ -180,7 +180,7 @@ def test_status_payload_carries_the_switch_interval(tmp_path: Path) -> None:
     finally:
         reset_state_for_tests()
     for summary in (payload["gc"], body["gc"]):
-        assert summary["switch_interval_s"] == 0.001 and type(summary["switch_interval_s"]) is float
+        assert summary["switch_interval_s"] == 0.0002 and type(summary["switch_interval_s"]) is float
         assert summary["switch_interval_tuned"] is True
         assert "thresholds" in summary  # existing fields stay
     json.dumps(body["gc"])
@@ -228,7 +228,7 @@ def test_serve_startup_applies_after_the_opens_and_the_freeze(
         )
         await asyncio.wait_for(ready.wait(), 120)
         try:
-            assert sys.getswitchinterval() == 0.001
+            assert sys.getswitchinterval() == pytest.approx(0.0002)
             assert gct.snapshot()["switch_interval_tuned"] is True
         finally:
             signal.raise_signal(signal.SIGTERM)
