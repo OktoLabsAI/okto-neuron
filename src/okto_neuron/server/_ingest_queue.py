@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -26,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from okto_neuron.companion import LLMUnavailableError, RememberCancelled
 from okto_neuron.server._integrity import IntegrityFenceError, require_write_allowed
+from okto_neuron.server._persist_coalesce import PersistCoalescer
 from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
 if TYPE_CHECKING:
@@ -55,18 +57,38 @@ PERSIST_EVERY_BLOCKS = 10
 # total instead (Companion._emit_substage), so they never write the blocks
 # counters.
 _BLOCK_POPULATION_STAGES = frozenset({"parsing", "extracting", "embedding"})
-# LLM request/response artifacts are useful in the live inspector but extremely
-# chatty during relation curation. Keep every retained event in memory for the
-# UI, but persist the sidecar in batches so a large ingest does not perform
-# thousands of avoidable history-file writes.
-PERSIST_EVERY_CHATTY_EVENTS = 25
+# Events are chatty (LLM request/response artifacts above all). Every retained event is
+# kept in memory for the UI; the sidecar is written by a coalesced flush (see
+# ``request_persist``), not once per event.
 MAX_EVENTS_PER_ITEM = 80
 MAX_EVENT_TEXT_CHARS = 12_000
 MAX_EVENT_LIST_ITEMS = 80
+# Persisted byte budget (#37). Body-carrying events (LLM request/response, chunk text,
+# dedup/gate candidate lists) were ~88% of a 60 MB history file and the whole file is
+# rewritten on every persist. The live inspector still gets the full body while the item
+# is in flight; the sidecar, and a finished item, keep only a preview plus the original
+# length and a sha256 of the full body.
+EVENT_PREVIEW_CHARS = 2_048
+MAX_PERSISTED_EVENT_BYTES_PER_ITEM = 64 * 1024
+_KEEP_FIRST_EVENTS = 1
+_KEEP_LAST_EVENTS = 5
+_BODY_EVENT_KINDS = frozenset(
+    {
+        "llm_request",
+        "llm_response",
+        "chunks",
+        "gate",
+        "dedup_judge_batch",
+        "dedup_store_exact",
+        "dedup_store_judge",
+    }
+)
+# Events other code reads structurally after the fact (retained extraction counts, the
+# quality-check script): the byte cap drops these last.
+_STRUCTURAL_EVENT_KINDS = frozenset({"extraction_result"})
 
 # Terminal statuses, factored out so retention and rehydrate agree.
 _TERMINAL = frozenset({"done", "error", "cancelled"})
-_CHATTY_EVENT_KINDS = frozenset({"llm_request", "llm_response"})
 
 
 @dataclass
@@ -205,27 +227,166 @@ def history_path(state: "ServerState") -> Path:
     return Path(vault_path) / ".marginalia" / HISTORY_FILENAME
 
 
+def _apply_retention(items: list[IngestItem]) -> tuple[list[IngestItem], list[IngestItem]]:
+    """``(kept, dropped)``: every queued/processing item, plus the newest ``RETENTION_CAP``
+    terminal ones, in the original interleaved order."""
+    terminal_positions = [k for k, i in enumerate(items) if i.status in _TERMINAL]
+    drop: set[int] = set()
+    if len(terminal_positions) > RETENTION_CAP:
+        drop = set(terminal_positions[:-RETENTION_CAP])
+    kept = [i for k, i in enumerate(items) if k not in drop]
+    return kept, [i for k, i in enumerate(items) if k in drop]
+
+
 def _persist_payload(items: list[IngestItem]) -> dict:
     """Serializable queue snapshot with retention applied.
 
     Keeps every queued/processing item; caps the most recent ``RETENTION_CAP``
     terminal (done/error) items, dropping the oldest while preserving the
     original interleaved ordering."""
-    terminal_positions = [k for k, i in enumerate(items) if i.status in _TERMINAL]
-    drop: set[int] = set()
-    if len(terminal_positions) > RETENTION_CAP:
-        drop = set(terminal_positions[:-RETENTION_CAP])
-    kept = [i for k, i in enumerate(items) if k not in drop]
-    return {"version": HISTORY_VERSION, "items": [asdict(i) for i in kept]}
+    kept, _dropped = _apply_retention(items)
+    dicts = []
+    for item in kept:
+        if item.status in _TERMINAL:
+            compact_terminal_events(item)  # the full bodies leave memory with the item
+        dicts.append(_persisted_item_dict(item))
+    return {"version": HISTORY_VERSION, "items": dicts}
+
+
+def _item_fingerprint(item: IngestItem) -> tuple:
+    """Changes whenever anything the sidecar would write for a finished item changes.
+
+    The non-event fields are small, so they are compared by value; the events by their
+    count and the identity of the first and last (a record, a trim or a compaction all
+    replace or move one of them)."""
+    fixed = {f.name: getattr(item, f.name) for f in fields(item) if f.name != "events"}
+    events = item.events
+    return (
+        json.dumps(fixed, sort_keys=True, separators=(",", ":"), default=str),
+        len(events),
+        id(events[0]) if events else 0,
+        id(events[-1]) if events else 0,
+    )
+
+
+def _persist_text(items: list[IngestItem]) -> str:
+    """The sidecar text. A finished item's serialization is cached on the item and reused
+    until its fingerprint changes, so a persist costs the active items plus the
+    comparison, not the whole history. The items stay ``indent=2`` text: measured on a
+    restored 60 MB history, compact JSON saves 11% of the file and no persist time."""
+    kept, _dropped = _apply_retention(items)
+    parts: list[str] = []
+    for item in kept:
+        if item.status in _TERMINAL:
+            cached = getattr(item, "_persist_cache", None)
+            fingerprint = _item_fingerprint(item)
+            if cached is None or cached[0] != fingerprint:
+                compact_terminal_events(item)
+                fingerprint = _item_fingerprint(item)
+                cached = (fingerprint, json.dumps(_persisted_item_dict(item), indent=2))
+                item._persist_cache = cached  # type: ignore[attr-defined]
+            parts.append(cached[1])
+        else:
+            parts.append(json.dumps(_persisted_item_dict(item), indent=2))
+    return f'{{"version": {HISTORY_VERSION}, "items": [\n' + ",\n".join(parts) + "\n]}"
+
+
+def _trim_in_memory(state: "ServerState") -> None:
+    """Drop retained-over-the-cap terminal items from the live list as well, by identity
+    (a plain slice assignment could lose a concurrent append)."""
+    _kept, dropped = _apply_retention(list(state.ingest_queue))
+    for item in dropped:
+        try:
+            state.ingest_queue.remove(item)
+        except ValueError:
+            pass
+
+
+def _body_preview(payload: object) -> dict | None:
+    """``{truncated, original_bytes, sha256, preview}`` for a payload above the budget."""
+    text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
+    if len(text) <= EVENT_PREVIEW_CHARS:
+        return None
+    body = text.encode("utf-8")
+    return {
+        "truncated": True,
+        "original_bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "preview": text[:EVENT_PREVIEW_CHARS],
+    }
+
+
+def _persisted_event(event: dict) -> dict:
+    """The event as written to the sidecar: a preview in place of an over-budget body."""
+    preview = event.get("body_preview")
+    if preview is None:
+        return event
+    return {k: (preview if k == "payload" else v) for k, v in event.items() if k != "body_preview"}
+
+
+def _event_bytes(event: dict) -> int:
+    return len(json.dumps(event, separators=(",", ":"), ensure_ascii=False, default=str))
+
+
+def _cap_event_bytes(events: list[dict]) -> list[dict]:
+    """At most ``MAX_PERSISTED_EVENT_BYTES_PER_ITEM`` of events, oldest dropped first.
+
+    The first event and the last five always stay; structural events
+    (``extraction_result``) go only after every other kind.
+    """
+    sizes = [_event_bytes(e) for e in events]
+    total = sum(sizes)
+    if total <= MAX_PERSISTED_EVENT_BYTES_PER_ITEM:
+        return events
+    droppable = range(_KEEP_FIRST_EVENTS, max(_KEEP_FIRST_EVENTS, len(events) - _KEEP_LAST_EVENTS))
+    order = [i for i in droppable if events[i].get("kind") not in _STRUCTURAL_EVENT_KINDS]
+    order += [i for i in droppable if events[i].get("kind") in _STRUCTURAL_EVENT_KINDS]
+    dropped: set[int] = set()
+    for index in order:
+        if total <= MAX_PERSISTED_EVENT_BYTES_PER_ITEM:
+            break
+        dropped.add(index)
+        total -= sizes[index]
+    return [e for i, e in enumerate(events) if i not in dropped]
+
+
+def _persisted_events(events: list[dict]) -> list[dict]:
+    return _cap_event_bytes([_persisted_event(e) for e in list(events)])
+
+
+def compact_terminal_events(item: IngestItem) -> None:
+    """Cut a finished item's events to the persisted form, in memory too."""
+    if any("body_preview" in e for e in item.events) or _needs_cap(item.events):
+        item.events[:] = _persisted_events(item.events)
+
+
+def _needs_cap(events: list[dict]) -> bool:
+    return len(events) > _KEEP_FIRST_EVENTS + _KEEP_LAST_EVENTS and (
+        sum(_event_bytes(e) for e in events) > MAX_PERSISTED_EVENT_BYTES_PER_ITEM
+    )
+
+
+def _persisted_item_dict(item: IngestItem) -> dict:
+    """``asdict`` without deep-copying the (large) live events."""
+    data = {
+        f.name: copy.deepcopy(getattr(item, f.name)) for f in fields(item) if f.name != "events"
+    }
+    data["events"] = _persisted_events(item.events)
+    return data
 
 
 def _event(kind: str, summary: str, payload: dict | None = None) -> dict:
-    return {
+    event = {
         "ts": time.time(),
         "kind": kind,
         "summary": summary,
         "payload": _sanitize_event_value(payload or {}),
     }
+    if kind in _BODY_EVENT_KINDS:
+        preview = _body_preview(event["payload"])
+        if preview is not None:
+            event["body_preview"] = preview
+    return event
 
 
 def record_event(
@@ -304,18 +465,52 @@ def persist(state: "ServerState") -> None:
     serialized and snapshot INSIDE the lock, so whichever write lands last
     carries the newest queue even when store-executor threads persist
     concurrently (issue #13)."""
+    _coalescer(state).flushed()  # this write covers everything marked dirty so far
     with _PERSIST_LOCK:
         _persist_locked(state)
 
 
 _PERSIST_LOCK = threading.Lock()
+_COALESCER_LOCK = threading.Lock()
+
+
+def _coalescer(state: "ServerState") -> PersistCoalescer:
+    """The queue's coalescer (one per state/runtime), created on first use."""
+    coalescer = getattr(state, "_ingest_persist_coalescer", None)
+    if coalescer is None:
+        with _COALESCER_LOCK:
+            coalescer = getattr(state, "_ingest_persist_coalescer", None)
+            if coalescer is None:
+                coalescer = PersistCoalescer(lambda: persist(state), name="ingest-queue")
+                try:
+                    state._ingest_persist_coalescer = coalescer  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+    return coalescer
+
+
+def request_persist(state: "ServerState") -> None:
+    """Mark the queue dirty; ONE background flush writes it within a couple of seconds.
+
+    For progress and event chatter only. A crash may lose up to the flush interval of
+    progress EVENTS, never a state transition: enqueue, an item's start and terminal
+    status, cancel, retry, delete and receipts still call :func:`persist` directly.
+    Cheap and safe from any thread, including under the companion's event lock.
+    """
+    _coalescer(state).mark_dirty()
+
+
+def shutdown_flush(state: "ServerState") -> bool:
+    """Stop the background flush and write once more if anything is pending."""
+    return _coalescer(state).close()
 
 
 def _persist_locked(state: "ServerState") -> None:
     path = history_path(state)
     # Snapshot the list first: the drain worker runs ``remember`` off the event
     # loop and may append/mutate concurrently, so iterate a stable copy.
-    payload = _persist_payload(list(state.ingest_queue))
+    _trim_in_memory(state)
+    text = _persist_text(list(state.ingest_queue))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Unique temp per writer: a throttled on_progress persist runs in the
@@ -326,7 +521,7 @@ def _persist_locked(state: "ServerState") -> None:
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, indent=2))
+                fh.write(text)
             os.replace(tmp_name, path)
         except OSError:
             try:
@@ -336,6 +531,32 @@ def _persist_locked(state: "ServerState") -> None:
             return
     except OSError:
         return
+
+
+def _migrate_loaded_events(item: IngestItem) -> int:
+    """Bring a sidecar written before the byte budget (#37) to the persisted form.
+
+    Body-carrying events with a full payload get their preview computed; a finished
+    item is then cut to previews and the per-item budget at once, so the next persist
+    rewrites a small file.
+    """
+    events = item.events if isinstance(item.events, list) else []
+    migrated = 0
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") not in _BODY_EVENT_KINDS:
+            continue
+        payload = event.get("payload")
+        if "body_preview" in event or (
+            isinstance(payload, dict) and payload.get("truncated") is True
+        ):
+            continue
+        preview = _body_preview(payload)
+        if preview is not None:
+            event["body_preview"] = preview
+            migrated += 1
+    if item.status in _TERMINAL:
+        compact_terminal_events(item)
+    return migrated
 
 
 def rehydrate_queue(state: "ServerState") -> None:
@@ -358,6 +579,7 @@ def rehydrate_queue(state: "ServerState") -> None:
         return
     known = {f.name for f in fields(IngestItem)}
     restored: list[IngestItem] = []
+    migrated_bodies = 0
     for entry in data.get("items", []) if isinstance(data, dict) else []:
         if not isinstance(entry, dict):
             continue
@@ -375,8 +597,22 @@ def rehydrate_queue(state: "ServerState") -> None:
             item.stage_progress_done = 0
             item.stage_progress_total = 0
             item.outcome = {}
+        migrated_bodies += _migrate_loaded_events(item)
         restored.append(item)
     state.ingest_queue = restored
+    if migrated_bodies:
+        # One-time and permanent: the full bodies of a legacy sidecar are cut to
+        # previews here. Say so, with the sizes, so an operator can see it happen.
+        before = len(raw.encode("utf-8"))
+        persist(state)
+        _LOG.info(
+            "ingest history migrated to previews for %s: %d bytes -> %d bytes "
+            "(%d event bodies cut; full bodies remain only in any earlier backup)",
+            Path(state.vault_path).name,
+            before,
+            path.stat().st_size if path.exists() else 0,
+            migrated_bodies,
+        )
     # Seed the id counter past every persisted id so a restart (or vault
     # switch) never mints an id that collides with a rehydrated item.
     seq = int(getattr(state, "ingest_seq", 0) or 0)
@@ -1208,10 +1444,10 @@ def _make_on_progress(state: "ServerState", item: IngestItem) -> Callable[[str, 
     """Build a throttled ``on_progress`` for one item's drain.
 
     Updates the live ``IngestItem`` telemetry on every call (so a status poll
-    always sees fresh stage/block counts) but only triggers an atomic persist on
-    a stage change or every ``PERSIST_EVERY_BLOCKS`` blocks — terminal status is
-    persisted unconditionally by the caller. Runs inside the ``to_thread`` worker;
-    ``persist`` snapshots the list and only writes a file, so it is safe there."""
+    always sees fresh stage/block counts) but only marks the queue dirty on a
+    stage change or every ``PERSIST_EVERY_BLOCKS`` blocks; the coalesced flush writes
+    it (see :func:`request_persist`). Terminal status is persisted unconditionally by
+    the caller. Runs inside the ``to_thread`` worker; marking is cheap and thread-safe."""
     last_stage = item.stage
     last_persist_blocks = 0
 
@@ -1239,14 +1475,12 @@ def _make_on_progress(state: "ServerState", item: IngestItem) -> Callable[[str, 
         counts_blocks = stage in _BLOCK_POPULATION_STAGES
         if counts_blocks:
             _record_progress(state, item, "blocks", blocks_done, blocks_total)
-        enough_blocks = (
-            counts_blocks and blocks_done - last_persist_blocks >= PERSIST_EVERY_BLOCKS
-        )
+        enough_blocks = counts_blocks and blocks_done - last_persist_blocks >= PERSIST_EVERY_BLOCKS
         if stage_changed or enough_blocks:
             last_stage = stage
             if counts_blocks:
                 last_persist_blocks = blocks_done
-            persist(state)
+            request_persist(state)
 
     return on_progress
 
@@ -1262,10 +1496,7 @@ def _declared_total(raw: object) -> int | None:
 
 
 def _make_on_event(state: "ServerState", item: IngestItem) -> Callable[[dict], None]:
-    chatty_since_persist = 0
-
     def on_event(event: dict) -> None:
-        nonlocal chatty_since_persist
         kind = str(event.get("kind") or "event")
         summary = str(event.get("summary") or kind)
         payload = event.get("payload")
@@ -1310,22 +1541,17 @@ def _make_on_event(state: "ServerState", item: IngestItem) -> Callable[[dict], N
                     max(int(done or 0), 0),
                     _declared_total(total),
                 )
-        persist_now = True
-        if kind in _CHATTY_EVENT_KINDS:
-            chatty_since_persist += 1
-            persist_now = chatty_since_persist >= PERSIST_EVERY_CHATTY_EVENTS
-            if persist_now:
-                chatty_since_persist = 0
-        else:
-            chatty_since_persist = 0
+        # Runs under the companion's event lock: append in memory and mark dirty only;
+        # the sidecar write happens in the coalesced flush, off this thread's lock.
         record_event(
             state,
             item,
             kind,
             summary,
             payload if isinstance(payload, dict) else {"value": payload},
-            persist_now=persist_now,
+            persist_now=False,
         )
+        request_persist(state)
 
     return on_event
 

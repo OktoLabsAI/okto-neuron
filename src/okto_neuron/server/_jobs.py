@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._persist_coalesce import PersistCoalescer
 from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
 if TYPE_CHECKING:
@@ -213,8 +214,41 @@ def persist(state: "ServerState") -> None:
     a thread and may mutate concurrently. Writers are serialized and each one
     snapshots INSIDE the lock, so the last write to land always carries the
     newest queue even when store-executor threads persist concurrently."""
+    _coalescer(state).flushed()  # this write covers everything marked dirty so far
     with _PERSIST_LOCK:
         _persist_locked(state)
+
+
+_COALESCER_LOCK = threading.Lock()
+
+
+def _coalescer(state: "ServerState") -> PersistCoalescer:
+    """The job list's coalescer (one per state/runtime), created on first use."""
+    coalescer = getattr(state, "_jobs_persist_coalescer", None)
+    if coalescer is None:
+        with _COALESCER_LOCK:
+            coalescer = getattr(state, "_jobs_persist_coalescer", None)
+            if coalescer is None:
+                coalescer = PersistCoalescer(lambda: persist(state), name="curation-jobs")
+                try:
+                    state._jobs_persist_coalescer = coalescer  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+    return coalescer
+
+
+def request_persist(state: "ServerState") -> None:
+    """Mark the job list dirty; ONE background flush writes it within a couple of seconds.
+
+    For runner progress ticks only. Submit, every worker status transition and the linked
+    terminal outcome still call :func:`persist` directly, so a crash loses at most the
+    flush interval of progress text, never a state transition."""
+    _coalescer(state).mark_dirty()
+
+
+def shutdown_flush(state: "ServerState") -> bool:
+    """Stop the background flush and write once more if anything is pending."""
+    return _coalescer(state).close()
 
 
 def _persist_locked(state: "ServerState") -> None:
@@ -389,11 +423,11 @@ def ensure_worker(state: "ServerState") -> None:
 
 def _set_progress(state: "ServerState", job: CurationJob, stage: str) -> None:
     """Progress callback handed to runners. Mutates the live job (so a poll sees
-    it immediately) and persists. Runs in the to_thread worker; persist only
-    writes a file, so it is safe there."""
+    it immediately) and marks the list dirty; the coalesced flush writes it. Runs in
+    the to_thread worker; marking is cheap and thread-safe."""
     job.progress = stage
     job.last_progress_at = time.time()
-    persist(state)
+    request_persist(state)
 
 
 class JobStalledError(RuntimeError):
