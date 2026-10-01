@@ -743,6 +743,8 @@ export interface IngestEvent {
   ts: number
   kind: string
   summary: string
+  // Full body while the item is in flight; for a finished item (or after a restart) a body
+  // above the persist budget is { truncated, original_bytes, sha256, preview } (lib/ingest-events).
   payload: Record<string, unknown>
 }
 

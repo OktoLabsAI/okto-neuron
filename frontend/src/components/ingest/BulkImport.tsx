@@ -23,6 +23,7 @@ import {
 import type { IngestEvent, IngestQueueItem, IngestQueueResponse, UploadFile } from '@/types'
 import { useApp } from '@/store/app'
 import { Spinner, ErrorBox, Badge } from '@/components/ui'
+import { eventPayloadView } from '@/lib/ingest-events'
 import { CurationProgress } from './CurationProgress'
 import { IngestOutcomeBadge, IngestOutcomeSummary } from './IngestOutcomeSummary'
 
@@ -147,6 +148,7 @@ function EventInspector({
 
 function EventCard({ event }: { event: IngestEvent }) {
   const time = new Date(event.ts * 1000).toLocaleTimeString()
+  const view = eventPayloadView(event.payload)
   return (
     <details className="rounded-lg border border-surface-800 bg-surface-950/50" open={event.kind === 'llm_request' || event.kind === 'llm_response'}>
       <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs">
@@ -156,8 +158,11 @@ function EventCard({ event }: { event: IngestEvent }) {
         <span className="min-w-0 flex-1 truncate text-surface-200">{event.summary}</span>
         <span className="shrink-0 font-mono text-[10px] text-surface-600">{time}</span>
       </summary>
+      {view.note && (
+        <div className="border-t border-surface-800 px-3 py-1.5 text-[11px] text-amber-300">{view.note}</div>
+      )}
       <pre className="max-h-72 overflow-auto border-t border-surface-800 px-3 py-3 text-[11px] leading-relaxed text-surface-300">
-        {JSON.stringify(event.payload, null, 2)}
+        {view.text}
       </pre>
     </details>
   )
