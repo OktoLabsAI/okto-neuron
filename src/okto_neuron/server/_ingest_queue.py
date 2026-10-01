@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -63,6 +64,29 @@ PERSIST_EVERY_CHATTY_EVENTS = 25
 MAX_EVENTS_PER_ITEM = 80
 MAX_EVENT_TEXT_CHARS = 12_000
 MAX_EVENT_LIST_ITEMS = 80
+# Persisted byte budget (#37). Body-carrying events (LLM request/response, chunk text,
+# dedup/gate candidate lists) were ~88% of a 60 MB history file and the whole file is
+# rewritten on every persist. The live inspector still gets the full body while the item
+# is in flight; the sidecar, and a finished item, keep only a preview plus the original
+# length and a sha256 of the full body.
+EVENT_PREVIEW_CHARS = 2_048
+MAX_PERSISTED_EVENT_BYTES_PER_ITEM = 64 * 1024
+_KEEP_FIRST_EVENTS = 1
+_KEEP_LAST_EVENTS = 5
+_BODY_EVENT_KINDS = frozenset(
+    {
+        "llm_request",
+        "llm_response",
+        "chunks",
+        "gate",
+        "dedup_judge_batch",
+        "dedup_store_exact",
+        "dedup_store_judge",
+    }
+)
+# Events other code reads structurally after the fact (retained extraction counts, the
+# quality-check script): the byte cap drops these last.
+_STRUCTURAL_EVENT_KINDS = frozenset({"extraction_result"})
 
 # Terminal statuses, factored out so retention and rehydrate agree.
 _TERMINAL = frozenset({"done", "error", "cancelled"})
@@ -216,16 +240,99 @@ def _persist_payload(items: list[IngestItem]) -> dict:
     if len(terminal_positions) > RETENTION_CAP:
         drop = set(terminal_positions[:-RETENTION_CAP])
     kept = [i for k, i in enumerate(items) if k not in drop]
-    return {"version": HISTORY_VERSION, "items": [asdict(i) for i in kept]}
+    dicts = []
+    for item in kept:
+        if item.status in _TERMINAL:
+            compact_terminal_events(item)  # the full bodies leave memory with the item
+        dicts.append(_persisted_item_dict(item))
+    return {"version": HISTORY_VERSION, "items": dicts}
+
+
+def _body_preview(payload: object) -> dict | None:
+    """``{truncated, original_bytes, sha256, preview}`` for a payload above the budget."""
+    text = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
+    if len(text) <= EVENT_PREVIEW_CHARS:
+        return None
+    body = text.encode("utf-8")
+    return {
+        "truncated": True,
+        "original_bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "preview": text[:EVENT_PREVIEW_CHARS],
+    }
+
+
+def _persisted_event(event: dict) -> dict:
+    """The event as written to the sidecar: a preview in place of an over-budget body."""
+    preview = event.get("body_preview")
+    if preview is None:
+        return event
+    return {k: (preview if k == "payload" else v) for k, v in event.items() if k != "body_preview"}
+
+
+def _event_bytes(event: dict) -> int:
+    return len(json.dumps(event, separators=(",", ":"), ensure_ascii=False, default=str))
+
+
+def _cap_event_bytes(events: list[dict]) -> list[dict]:
+    """At most ``MAX_PERSISTED_EVENT_BYTES_PER_ITEM`` of events, oldest dropped first.
+
+    The first event and the last five always stay; structural events
+    (``extraction_result``) go only after every other kind.
+    """
+    sizes = [_event_bytes(e) for e in events]
+    total = sum(sizes)
+    if total <= MAX_PERSISTED_EVENT_BYTES_PER_ITEM:
+        return events
+    droppable = range(_KEEP_FIRST_EVENTS, max(_KEEP_FIRST_EVENTS, len(events) - _KEEP_LAST_EVENTS))
+    order = [i for i in droppable if events[i].get("kind") not in _STRUCTURAL_EVENT_KINDS]
+    order += [i for i in droppable if events[i].get("kind") in _STRUCTURAL_EVENT_KINDS]
+    dropped: set[int] = set()
+    for index in order:
+        if total <= MAX_PERSISTED_EVENT_BYTES_PER_ITEM:
+            break
+        dropped.add(index)
+        total -= sizes[index]
+    return [e for i, e in enumerate(events) if i not in dropped]
+
+
+def _persisted_events(events: list[dict]) -> list[dict]:
+    return _cap_event_bytes([_persisted_event(e) for e in list(events)])
+
+
+def compact_terminal_events(item: IngestItem) -> None:
+    """Cut a finished item's events to the persisted form, in memory too."""
+    if any("body_preview" in e for e in item.events) or _needs_cap(item.events):
+        item.events[:] = _persisted_events(item.events)
+
+
+def _needs_cap(events: list[dict]) -> bool:
+    return len(events) > _KEEP_FIRST_EVENTS + _KEEP_LAST_EVENTS and (
+        sum(_event_bytes(e) for e in events) > MAX_PERSISTED_EVENT_BYTES_PER_ITEM
+    )
+
+
+def _persisted_item_dict(item: IngestItem) -> dict:
+    """``asdict`` without deep-copying the (large) live events."""
+    data = {
+        f.name: copy.deepcopy(getattr(item, f.name)) for f in fields(item) if f.name != "events"
+    }
+    data["events"] = _persisted_events(item.events)
+    return data
 
 
 def _event(kind: str, summary: str, payload: dict | None = None) -> dict:
-    return {
+    event = {
         "ts": time.time(),
         "kind": kind,
         "summary": summary,
         "payload": _sanitize_event_value(payload or {}),
     }
+    if kind in _BODY_EVENT_KINDS:
+        preview = _body_preview(event["payload"])
+        if preview is not None:
+            event["body_preview"] = preview
+    return event
 
 
 def record_event(
@@ -338,6 +445,29 @@ def _persist_locked(state: "ServerState") -> None:
         return
 
 
+def _migrate_loaded_events(item: IngestItem) -> None:
+    """Bring a sidecar written before the byte budget (#37) to the persisted form.
+
+    Body-carrying events with a full payload get their preview computed; a finished
+    item is then cut to previews and the per-item budget at once, so the next persist
+    rewrites a small file.
+    """
+    events = item.events if isinstance(item.events, list) else []
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") not in _BODY_EVENT_KINDS:
+            continue
+        payload = event.get("payload")
+        if "body_preview" in event or (
+            isinstance(payload, dict) and payload.get("truncated") is True
+        ):
+            continue
+        preview = _body_preview(payload)
+        if preview is not None:
+            event["body_preview"] = preview
+    if item.status in _TERMINAL:
+        compact_terminal_events(item)
+
+
 def rehydrate_queue(state: "ServerState") -> None:
     """Restore ``state.ingest_queue`` from the sidecar on server startup.
 
@@ -375,6 +505,7 @@ def rehydrate_queue(state: "ServerState") -> None:
             item.stage_progress_done = 0
             item.stage_progress_total = 0
             item.outcome = {}
+        _migrate_loaded_events(item)
         restored.append(item)
     state.ingest_queue = restored
     # Seed the id counter past every persisted id so a restart (or vault
@@ -1239,9 +1370,7 @@ def _make_on_progress(state: "ServerState", item: IngestItem) -> Callable[[str, 
         counts_blocks = stage in _BLOCK_POPULATION_STAGES
         if counts_blocks:
             _record_progress(state, item, "blocks", blocks_done, blocks_total)
-        enough_blocks = (
-            counts_blocks and blocks_done - last_persist_blocks >= PERSIST_EVERY_BLOCKS
-        )
+        enough_blocks = counts_blocks and blocks_done - last_persist_blocks >= PERSIST_EVERY_BLOCKS
         if stage_changed or enough_blocks:
             last_stage = stage
             if counts_blocks:
