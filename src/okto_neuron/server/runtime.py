@@ -24,7 +24,7 @@ import signal
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 import uvicorn
 from pydantic import ValidationError
@@ -1554,6 +1554,31 @@ def _build_mcp_server(state: ServerState):
     def _release_pair(pair: tuple[VaultRuntime, VaultLease[Vault]]) -> None:
         pair[1].release()
 
+    async def _run_leased(
+        io: Callable[..., Awaitable[Any]],
+        lease: VaultLease[Vault],
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run ``fn`` on ``io`` holding an already-taken ``lease``.
+
+        The lease is released when the dispatched call settles, not when this
+        await is cancelled: a cancelled caller must not hand the handle back to
+        eviction while its worker is still reading it, and a call cancelled
+        while still queued (it never runs) must not leak the lease.
+        """
+        task = asyncio.ensure_future(io(fn, *args, **kwargs))
+
+        def _settled(done: asyncio.Future[Any]) -> None:
+            lease.release()
+            if not done.cancelled():
+                done.exception()  # consume it: nobody awaits a cancelled caller's task
+
+        task.add_done_callback(_settled)
+        return await asyncio.shield(task)
+
     def _lease(
         vault_override: str | None = None,
         override_ignored: list[str] | None = None,
@@ -1682,14 +1707,24 @@ def _build_mcp_server(state: ServerState):
         An out-of-range knob (e.g. ``coverage_threshold=1.5``) fails the call
         with a readable ``invalid retrieval policy: ...`` error.
         """
-        # Retrieval + LLM answer synthesis (seconds to minutes): job executor.
-        return await job_io(
+        if state.shutting_down:
+            raise RuntimeError("shutting_down: server is shutting down")
+        # Resolving reads the registry and leasing may open the vault: take the
+        # lease off-loop first, so a call waiting on another vault's open never
+        # occupies a job worker. The answer itself is seconds to minutes: job executor.
+        ignored: list[str] = []
+        runtime, lease = await acquire_off_loop(_lease, vault, ignored, release=_release_pair)
+        return await _run_leased(
+            job_io,
+            lease,
             functools.partial(
                 _ask_impl,
+                runtime=runtime,
+                lease=lease,
+                ignored=ignored,
                 question=question,
                 k=k,
                 hops=hops,
-                vault=vault,
                 enable_subgraph=enable_subgraph,
                 source_block_policy=source_block_policy,
                 seed_k=seed_k,
@@ -1707,10 +1742,12 @@ def _build_mcp_server(state: ServerState):
         )
 
     def _ask_impl(
+        runtime: VaultRuntime,
+        lease: VaultLease[Vault],
+        ignored: list[str],
         question: str,
         k: int = 20,
         hops: int = 1,
-        vault: str | None = None,
         enable_subgraph: bool | None = None,
         source_block_policy: Literal["never", "on_coverage_miss", "always", "blend"] | None = None,
         seed_k: int | None = None,
@@ -1727,8 +1764,6 @@ def _build_mcp_server(state: ServerState):
     ) -> dict[str, object]:
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
-        _ignored: list[str] = []
-        _runtime, lease = _lease(vault, _ignored)
         with lease as selected_vault:
             # Default to the vault's configured retrieval mode (block) — the grounded
             # eval showed block-dump answers (0.792) beat the subgraph path (0.6) while
@@ -1796,11 +1831,11 @@ def _build_mcp_server(state: ServerState):
         retrieval.setdefault("hops", effective_hops if enable_subgraph_effective else None)
         # Which vault actually answered. Injected HERE, in the MCP layer, so the
         # companion's trace (and its REST consumers / regression pins) is untouched.
-        retrieval["vault"] = _serving_vault_name(_runtime)
-        if _ignored:
+        retrieval["vault"] = _serving_vault_name(runtime)
+        if ignored:
             # The connection's ?vault= won; say so instead of letting the caller
             # believe their argument routed the call.
-            retrieval["vault_override_ignored"] = _ignored[0]
+            retrieval["vault_override_ignored"] = ignored[0]
         return {
             # "ok" only for a clean answer; "degraded" otherwise, with the
             # reason in retrieval.synthesis_status (same rule as REST /ask).
@@ -1863,33 +1898,42 @@ def _build_mcp_server(state: ServerState):
         Before choosing, check the project directory for a ``.okto-neuron-vault``
         file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
         """
-        # Pure graph read (no LLM): the whole call is one store op (issue #13).
-        return await store_io(
+        if state.shutting_down:
+            raise RuntimeError("shutting_down: server is shutting down")
+        # Pure graph read (no LLM): the whole call is one store op (issue #13),
+        # after a lease taken off-loop so waiting on an open never holds a worker.
+        ignored: list[str] = []
+        runtime, lease = await acquire_off_loop(_lease, vault, ignored, release=_release_pair)
+        return await _run_leased(
+            store_io,
+            lease,
             _explore_impl,
+            runtime,
+            lease,
+            ignored,
             topic,
             node_id,
             hops,
             k,
-            vault,
             relationship_types,
             min_claim_confidence,
             max_degree_per_seed,
         )
 
     def _explore_impl(
+        runtime: VaultRuntime,
+        lease: VaultLease[Vault],
+        ignored: list[str],
         topic: str,
         node_id: str | None,
         hops: int,
         k: int,
-        vault: str | None,
         relationship_types: list[str] | None,
         min_claim_confidence: float | None,
         max_degree_per_seed: int | None,
     ) -> dict[str, object]:
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
-        _ignored: list[str] = []
-        _runtime, lease = _lease(vault, _ignored)
         with lease as selected_vault:
             result = companion_for(selected_vault).explore(
                 topic,
@@ -1903,9 +1947,9 @@ def _build_mcp_server(state: ServerState):
                 max_degree_per_seed=max_degree_per_seed,
             )
         retrieval = dict(result.get("retrieval") or {})
-        retrieval["vault"] = _serving_vault_name(_runtime)
-        if _ignored:
-            retrieval["vault_override_ignored"] = _ignored[0]
+        retrieval["vault"] = _serving_vault_name(runtime)
+        if ignored:
+            retrieval["vault_override_ignored"] = ignored[0]
         result["retrieval"] = retrieval
         return result
 
