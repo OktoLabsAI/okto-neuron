@@ -8,17 +8,21 @@ inspectable and replayable enough for future tooling.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import io
 import json
+import logging
 import os
 import threading
+import time
 import uuid
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, AnyStr, Callable, Iterable, Iterator, Literal
 
 try:  # POSIX
     import fcntl
@@ -31,6 +35,10 @@ except ImportError:  # pragma: no cover - exercised on POSIX
     msvcrt = None  # type: ignore[assignment]
 
 LEDGER_FILENAME = "candidate-ledger.jsonl"
+_LOG = logging.getLogger(__name__)
+# A crash-torn tail is copied under the lock so scan() can report it exactly; a tail
+# bigger than this (one absurd row) is reported but not read.
+_SCAN_TAIL_CAP = 16 * 1024 * 1024
 FRESH_REBUILD_MATERIALIZATION_SCOPE = "fresh_rebuild.v1"
 # v2 (ADR 0015 D3.1): candidate rows no longer inline embedding vectors —
 # they store ``embedding_dim`` instead. Vectors live only in the graph store.
@@ -76,6 +84,52 @@ _LEDGER_INDEXES_GUARD = threading.Lock()
 _LEDGER_INDEX_CACHE_SIZE = 8
 _LEDGER_INDEXES: OrderedDict[str, "_LedgerOffsetIndex"] = OrderedDict()
 _LEDGER_INDEX_BUILD_LOCKS: dict[str, threading.Lock] = {}
+
+
+_STREAM_CHUNK_BYTES = 1 << 20
+
+
+def _stream_lines(chunks: Iterable[AnyStr]) -> Iterator[AnyStr]:
+    """Yield the lines of a chunked ``bytes`` or ``str`` stream without holding it.
+
+    The result equals ``"".join(chunks).splitlines()`` for any chunking (``bytes``
+    break on ``\\n``/``\\r``/``\\r\\n`` only; ``str`` on the wider set). A terminator
+    that could still be extended by the next chunk (a trailing ``\\r`` that may pair
+    with a leading ``\\n``) and an unterminated tail are held back, so peak memory
+    is one chunk plus the longest line.
+    """
+
+    pending: list[AnyStr] = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+        cr: AnyStr = b"\r" if isinstance(chunk, bytes) else "\r"  # type: ignore[assignment]
+        pieces = chunk.splitlines(keepends=True)
+        if pending:
+            if pending[-1].endswith(cr):
+                pieces = (chunk[:0].join(pending) + chunk).splitlines(keepends=True)
+                pending = []
+            elif len(pieces) == 1 and pieces[0].splitlines()[0] == pieces[0]:
+                pending.append(chunk)  # still inside one long line; do not re-join
+                continue
+            else:
+                pieces[0] = chunk[:0].join(pending) + pieces[0]
+                pending = []
+        last = pieces[-1]
+        if last.splitlines()[0] == last or last.endswith(cr):
+            pending.append(pieces.pop())
+        for piece in pieces:
+            yield piece.splitlines()[0]
+    if pending:
+        yield from pending[0][:0].join(pending).splitlines()
+
+
+def _read_chunks(handle: Any, size: int) -> Iterator[Any]:
+    while True:
+        chunk = handle.read(size)
+        if not chunk:
+            return
+        yield chunk
 
 
 def _now() -> str:
@@ -853,9 +907,15 @@ class LedgerScanResult:
 
 @dataclass
 class _LedgerOffsetIndex:
-    """Validated, memory-bounded routing metadata for one immutable file size."""
+    """Validated, memory-bounded routing metadata for the ledger prefix ``[0, cut)``.
 
-    signature: tuple[int, int, int, int]
+    ``signature`` is ``(device, inode, cut, anchor)`` where ``anchor`` is the last
+    ``_INDEX_ANCHOR_BYTES`` bytes below ``cut``. The index stays valid while the
+    same file still holds those bytes, however much has been appended beyond
+    ``cut``; rows beyond it are folded in by a short tail merge.
+    """
+
+    signature: tuple[int, int, int, bytes]
     offsets_by_kind: dict[str, list[tuple[int, int]]]
     offsets_by_run_kind: dict[tuple[str, str], list[tuple[int, int]]]
     node_identity_by_id: dict[str, tuple[str, str]]
@@ -863,11 +923,85 @@ class _LedgerOffsetIndex:
     latest_candidate_run: dict[str, str]
     completeness_status: LedgerCompleteness
     completeness_reason: str
+    malformed: int = 0
+    unrecognized_versions: int = 0
 
 
-def _ledger_file_signature(path: Path) -> tuple[int, int, int, int]:
-    stat = path.stat()
-    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+@dataclass
+class _Snapshot:
+    """A pinned ledger prefix: ``[0, cut)`` is read from ``handle``; ``tail`` is ``[cut, size)``."""
+
+    handle: Any
+    size: int
+    cut: int
+    tail: bytes
+    tail_skipped: bool = False  # the torn tail exceeded _SCAN_TAIL_CAP and was not copied
+
+
+class _PrefixReader(io.RawIOBase):
+    """A read-only raw stream over ``handle[0:cut]`` followed by ``tail``."""
+
+    def __init__(self, snapshot: _Snapshot) -> None:
+        self._handle = snapshot.handle
+        self._handle.seek(0)
+        self._left = snapshot.cut
+        self._tail = memoryview(snapshot.tail)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if self._left > 0:
+            chunk = self._handle.read(min(len(buffer), self._left))
+            if chunk:
+                buffer[: len(chunk)] = chunk
+                self._left -= len(chunk)
+                return len(chunk)
+            self._left = 0
+        count = min(len(buffer), len(self._tail))
+        buffer[:count] = self._tail[:count]
+        self._tail = self._tail[count:]
+        return count
+
+
+def _last_line_end(handle: Any, size: int) -> int:
+    """Byte offset just past the last newline at or below ``size`` (0 if none)."""
+    position = size
+    while position > 0:
+        start = max(0, position - 65536)
+        handle.seek(start)
+        block = handle.read(position - start)
+        found = block.rfind(b"\n")
+        if found >= 0:
+            return start + found + 1
+        position = start
+    return 0
+
+
+_INDEX_ANCHOR_BYTES = 4096
+
+
+def _read_anchor(fd: int, cut: int) -> bytes:
+    """The last bytes below ``cut``, read unbuffered so they are never a stale copy."""
+    start = max(0, cut - _INDEX_ANCHOR_BYTES)
+    return os.pread(fd, cut - start, start)
+
+
+def _prefix_signature(handle: Any, cut: int) -> tuple[int, int, int, bytes]:
+    stat = os.fstat(handle.fileno())
+    return (stat.st_dev, stat.st_ino, cut, _read_anchor(handle.fileno(), cut))
+
+
+def _prefix_holds(signature: tuple[int, int, int, bytes], handle: Any) -> bool:
+    """True when the open file still starts with the prefix ``signature`` describes."""
+    dev, ino, cut, anchor = signature
+    stat = os.fstat(handle.fileno())
+    return (
+        stat.st_dev == dev
+        and stat.st_ino == ino
+        and stat.st_size >= cut
+        and _read_anchor(handle.fileno(), cut) == anchor
+    )
 
 
 def _index_candidate_identity(
@@ -894,66 +1028,128 @@ def _index_candidate_identity(
         index.ambiguous_node_ids.add(candidate_id)
 
 
+def _ingest_index_row(index: _LedgerOffsetIndex, offset: int, raw: bytes) -> None:
+    if not raw.strip():
+        return
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        index.malformed += 1
+        return
+    if not isinstance(record, dict):
+        index.malformed += 1
+        return
+    version = record.get("ledger_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in _ACCEPTED_LEDGER_VERSIONS
+    ):
+        index.unrecognized_versions += 1
+    kind = str(record.get("kind") or "")
+    if not kind:
+        return
+    location = (offset, len(raw))
+    index.offsets_by_kind.setdefault(kind, []).append(location)
+    run_id = str(record.get("run_id") or "")
+    if run_id:
+        index.offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
+    if kind == "candidate":
+        _index_candidate_identity(index, record)
+
+
+def _refresh_index_completeness(index: _LedgerOffsetIndex) -> None:
+    reasons: list[str] = []
+    if index.malformed:
+        reasons.append("malformed_ledger_lines")
+    if index.unrecognized_versions:
+        reasons.append("unrecognized_ledger_versions")
+    if reasons:
+        index.completeness_status = "incomplete"
+        index.completeness_reason = "+".join(reasons)
+    else:
+        index.completeness_status = "complete"
+        index.completeness_reason = (
+            "all_nonempty_lines_parsed" if any(index.offsets_by_kind.values()) else "empty_ledger"
+        )
+
+
+def _merge_index_tail(index: _LedgerOffsetIndex, path: Path) -> None:
+    """Fold every row from ``index``'s cut to the end of the file into ``index``.
+
+    The ledger lock must be held (the tail then cannot change underneath). A fresh
+    handle is used on purpose: a handle opened earlier may hold read-ahead bytes
+    from above the cut (a crash-torn tail that an append can since have replaced).
+    """
+    cut = index.signature[2]
+    with path.open("rb") as handle:
+        handle.seek(cut)
+        while True:
+            offset = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                break
+            _ingest_index_row(index, offset, raw)
+        index.signature = _prefix_signature(handle, handle.tell())
+    _refresh_index_completeness(index)
+
+
+_CANCEL_CHECK_BYTES = 4 * 1024 * 1024  # how often a cancellable build looks at its flag
+
+
+class _BuildCancelled(Exception):
+    """A background index build was asked to stop; its partial state is discarded."""
+
+
+_BUILD_CANCEL = threading.local()  # set only by CandidateLedger.prewarm, per thread
+
+
+def _raise_if_cancelled() -> None:
+    cancelled = getattr(_BUILD_CANCEL, "fn", None)
+    if cancelled is not None and cancelled():
+        raise _BuildCancelled
+
+
 def _build_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex:
-    offsets_by_kind: dict[str, list[tuple[int, int]]] = {}
-    offsets_by_run_kind: dict[tuple[str, str], list[tuple[int, int]]] = {}
-    malformed = 0
-    unrecognized_versions = 0
     index = _LedgerOffsetIndex(
-        signature=(0, 0, 0, 0),
-        offsets_by_kind=offsets_by_kind,
-        offsets_by_run_kind=offsets_by_run_kind,
+        signature=(0, 0, 0, b""),
+        offsets_by_kind={},
+        offsets_by_run_kind={},
         node_identity_by_id={},
         ambiguous_node_ids=set(),
         latest_candidate_run={},
         completeness_status="complete",
         completeness_reason="empty_ledger",
     )
-    with _exclusive_lock(directory / ".candidate-ledger.lock"):
-        with path.open("rb") as handle:
-            while True:
-                offset = handle.tell()
-                raw = handle.readline()
-                if not raw:
-                    break
-                if not raw.strip():
-                    continue
-                try:
-                    record = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
-                    malformed += 1
-                    continue
-                if not isinstance(record, dict):
-                    malformed += 1
-                    continue
-                version = record.get("ledger_version")
-                if (
-                    not isinstance(version, int)
-                    or isinstance(version, bool)
-                    or version not in _ACCEPTED_LEDGER_VERSIONS
-                ):
-                    unrecognized_versions += 1
-                kind = str(record.get("kind") or "")
-                if not kind:
-                    continue
-                location = (offset, len(raw))
-                offsets_by_kind.setdefault(kind, []).append(location)
-                run_id = str(record.get("run_id") or "")
-                if run_id:
-                    offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
-                if kind == "candidate":
-                    _index_candidate_identity(index, record)
-            index.signature = _ledger_file_signature(path)
-    reasons: list[str] = []
-    if malformed:
-        reasons.append("malformed_ledger_lines")
-    if unrecognized_versions:
-        reasons.append("unrecognized_ledger_versions")
-    if reasons:
-        index.completeness_status = "incomplete"
-        index.completeness_reason = "+".join(reasons)
-    elif any(offsets_by_kind.values()):
-        index.completeness_reason = "all_nonempty_lines_parsed"
+
+    # Snapshot under the lock, stream the bulk without it, then take the lock only
+    # to fold in what was appended meanwhile. The file is append-only, so bytes
+    # below the snapshot never change under the open handle.
+    lock = directory / ".candidate-ledger.lock"
+    with _exclusive_lock(lock):
+        handle = path.open("rb")
+        cut = _last_line_end(handle, os.fstat(handle.fileno()).st_size)
+    try:
+        handle.seek(0)
+        next_check = _CANCEL_CHECK_BYTES
+        while handle.tell() < cut:
+            offset = handle.tell()
+            if offset >= next_check:
+                next_check = offset + _CANCEL_CHECK_BYTES
+                _raise_if_cancelled()
+            raw = handle.readline()
+            if not raw:
+                break
+            _ingest_index_row(index, offset, raw)
+        # The index so far covers exactly [0, cut): its signature says so even while
+        # appends keep landing; the tail merge below advances it.
+        index.signature = _prefix_signature(handle, cut)
+    except BaseException:
+        handle.close()
+        raise
+    handle.close()
+    with _exclusive_lock(lock):
+        _merge_index_tail(index, path)
     return index
 
 
@@ -962,58 +1158,732 @@ def _invalidate_ledger_offset_index(path: Path) -> None:
         _LEDGER_INDEXES.pop(str(path.resolve()), None)
 
 
-def _get_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex:
+def _pin_ledger_offset_index(
+    directory: Path, path: Path
+) -> tuple[_LedgerOffsetIndex, int, Any] | None:
+    """Return ``(index, cut, handle)``: the offset index and an open handle on the ledger.
+
+    Every indexed row below ``cut`` lies in an immutable prefix of the ledger that
+    ``handle`` reads without any lock. The index is brought up to date with the
+    file by a short tail merge under the ledger lock (or rebuilt when the file no
+    longer starts with the prefix it was built from), so an append landing while a
+    reader works can only add rows beyond ``cut``; it never invalidates the
+    snapshot. ``None`` when the ledger does not exist. The caller closes ``handle``.
+    """
     key = str(path.resolve())
-    signature = _ledger_file_signature(path)
-    with _LEDGER_INDEXES_GUARD:
-        cached = _LEDGER_INDEXES.get(key)
-        if cached is not None and cached.signature == signature:
-            _LEDGER_INDEXES.move_to_end(key)
-            return cached
-        build_lock = _LEDGER_INDEX_BUILD_LOCKS.setdefault(key, threading.Lock())
-    with build_lock:
-        signature = _ledger_file_signature(path)
+    lock = directory / ".candidate-ledger.lock"
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return None
+    try:
         with _LEDGER_INDEXES_GUARD:
             cached = _LEDGER_INDEXES.get(key)
-            if cached is not None and cached.signature == signature:
+            build_lock = _LEDGER_INDEX_BUILD_LOCKS.setdefault(key, threading.Lock())
+        if cached is not None:
+            signature = cached.signature  # one atomic read: cut and anchor agree
+            if (
+                _prefix_holds(signature, handle)
+                and os.fstat(handle.fileno()).st_size == signature[2]
+            ):
+                with _LEDGER_INDEXES_GUARD:
+                    if _LEDGER_INDEXES.get(key) is cached:
+                        _LEDGER_INDEXES.move_to_end(key)
+                return cached, signature[2], handle
+        with build_lock:
+            with _LEDGER_INDEXES_GUARD:
+                cached = _LEDGER_INDEXES.get(key)
+            if cached is not None:
+                with _exclusive_lock(lock):
+                    size = os.fstat(handle.fileno()).st_size
+                    if (
+                        _prefix_holds(cached.signature, handle)
+                        and size - cached.signature[2] <= _SIDECAR_INLINE_TAIL
+                    ):
+                        try:
+                            # Ledger lock held: no append (hence no in-place extension
+                            # of this index) can run concurrently.
+                            _merge_index_tail(cached, path)
+                        except BaseException:
+                            _invalidate_ledger_offset_index(path)  # half-merged: never reuse
+                            raise
+                        with _LEDGER_INDEXES_GUARD:
+                            _LEDGER_INDEXES.move_to_end(key)
+                        return cached, cached.signature[2], handle
+            built = _build_ledger_offset_index(directory, path)
+            cut = built.signature[2]  # the snapshot this reader holds
+            with _LEDGER_INDEXES_GUARD:
+                _LEDGER_INDEXES[key] = built
                 _LEDGER_INDEXES.move_to_end(key)
-                return cached
-        built = _build_ledger_offset_index(directory, path)
-        with _LEDGER_INDEXES_GUARD:
-            _LEDGER_INDEXES[key] = built
-            _LEDGER_INDEXES.move_to_end(key)
-            while len(_LEDGER_INDEXES) > _LEDGER_INDEX_CACHE_SIZE:
-                _LEDGER_INDEXES.popitem(last=False)
-        return built
+                while len(_LEDGER_INDEXES) > _LEDGER_INDEX_CACHE_SIZE:
+                    _LEDGER_INDEXES.popitem(last=False)
+            return built, cut, handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def _get_ledger_offset_index(directory: Path, path: Path) -> _LedgerOffsetIndex | None:
+    pinned = _pin_ledger_offset_index(directory, path)
+    if pinned is None:
+        return None
+    index, _cut, handle = pinned
+    handle.close()
+    return index
 
 
 def _extend_ledger_offset_index(
     path: Path,
     *,
-    previous_signature: tuple[int, int, int, int] | None,
-    current_signature: tuple[int, int, int, int],
     offset: int,
-    length: int,
+    encoded: bytes,
     record: dict[str, Any],
 ) -> None:
+    """Fold a row this process just appended (ledger lock held) into a cached index.
+
+    Only an index that ends exactly where the row starts is extended; one that lags
+    (another process appended) is left alone: readers catch it up from the file.
+    """
     key = str(path.resolve())
     with _LEDGER_INDEXES_GUARD:
         index = _LEDGER_INDEXES.get(key)
         if index is None:
             return
-        if previous_signature is None or index.signature != previous_signature:
-            _LEDGER_INDEXES.pop(key, None)
+        dev, ino, cut, anchor = index.signature
+        if cut != offset:
             return
         kind = str(record.get("kind") or "")
-        location = (offset, length)
+        location = (offset, len(encoded))
         index.offsets_by_kind.setdefault(kind, []).append(location)
         run_id = str(record.get("run_id") or "")
         if run_id:
             index.offsets_by_run_kind.setdefault((run_id, kind), []).append(location)
         if kind == "candidate":
             _index_candidate_identity(index, record)
-        index.signature = current_signature
+        index.signature = (
+            dev,
+            ino,
+            cut + len(encoded),
+            (anchor + encoded)[-_INDEX_ANCHOR_BYTES:],
+        )
         _LEDGER_INDEXES.move_to_end(key)
+
+
+# ---------------------------------------------------------------------------
+# Ledger index sidecar (issue #14b)
+#
+# ``candidate-ledger.jsonl.index`` is a rebuildable cache next to the ledger: the
+# per-run byte spans and sort keys the run APIs need, plus the open-plan set
+# (plans with a sealed ``commit_plan`` and no terminal row). It is NEVER a source
+# of truth: every fact in it is derivable from the ledger by one streaming scan,
+# deleting it is always safe, and any doubt (missing, corrupt, other version,
+# shorter ledger, tail bytes that no longer match) rebuilds it from the ledger.
+# The ledger format is untouched.
+# ---------------------------------------------------------------------------
+
+LEDGER_INDEX_FILENAME = LEDGER_FILENAME + ".index"
+_SIDECAR_VERSION = 1
+_SIDECAR_ANCHOR_BYTES = 4096
+# Persist at least this often (bytes of ledger covered since the last write).
+# Appends update the in-memory state under the ledger lock; a crash loses only
+# what the next open re-reads from the ledger tail.
+_SIDECAR_CHECKPOINT_BYTES = 4 * 1024 * 1024
+_SIDECAR_CACHE_SIZE = 8
+_SIDECAR_INLINE_TAIL = 8 * 1024 * 1024  # catch up under the lock only up to this much
+_SIDECARS_GUARD = threading.Lock()
+_SNAPSHOT_FAILURES: OrderedDict[str, tuple[tuple[int, str], str]] = OrderedDict()
+_SNAPSHOT_FAILURES_GUARD = threading.Lock()
+_SNAPSHOT_FAILURES_MAX = 64
+
+
+def _snapshot_signature(handle: Any, cut: int) -> tuple[int, str]:
+    """``(cut, sha256 of the last anchor-sized block below cut)``: names a ledger prefix."""
+    start = max(0, cut - _SIDECAR_ANCHOR_BYTES)
+    handle.seek(start)
+    return cut, hashlib.sha256(handle.read(cut - start)).hexdigest()
+
+
+def _snapshot_failure_record(key: str, signature: tuple[int, str], reason: str) -> None:
+    with _SNAPSHOT_FAILURES_GUARD:
+        _SNAPSHOT_FAILURES[key] = (signature, reason)
+        _SNAPSHOT_FAILURES.move_to_end(key)
+        while len(_SNAPSHOT_FAILURES) > _SNAPSHOT_FAILURES_MAX:
+            _SNAPSHOT_FAILURES.popitem(last=False)
+
+
+def _snapshot_failure_reason(key: str, signature: tuple[int, str]) -> str | None:
+    """The remembered reason if this exact prefix already failed, else ``None``."""
+    with _SNAPSHOT_FAILURES_GUARD:
+        entry = _SNAPSHOT_FAILURES.get(key)
+    return entry[1] if entry is not None and entry[0] == signature else None
+
+
+def _snapshot_failure_current(key: str) -> str | None:
+    with _SNAPSHOT_FAILURES_GUARD:
+        entry = _SNAPSHOT_FAILURES.get(key)
+    return entry[1] if entry is not None else None
+
+
+def _snapshot_failure_clear(key: str) -> None:
+    with _SNAPSHOT_FAILURES_GUARD:
+        _SNAPSHOT_FAILURES.pop(key, None)
+
+
+_SIDECARS: OrderedDict[str, "_Sidecar"] = OrderedDict()
+_PLAN_ROW_KINDS = frozenset({"commit_plan", "operation_receipt", "commit_record", "plan_abandoned"})
+_RECEIPT_STATUSES = frozenset({"applied", "already_present", "dead_lettered", "failed", "aborted"})
+
+
+def _accepted_version(record: dict[str, Any]) -> bool:
+    version = record.get("ledger_version")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version in _ACCEPTED_LEDGER_VERSIONS
+    )
+
+
+def _is_current_plan_row(record: dict[str, Any]) -> bool:
+    operations = record.get("operations")
+    return (
+        isinstance(operations, list)
+        and all(isinstance(operation, dict) for operation in operations)
+        and all(
+            isinstance(operation.get("operation_id"), str) and bool(operation.get("operation_id"))
+            for operation in operations
+        )
+    )
+
+
+def _validate_plan_group(
+    plan_id: str,
+    plan: dict[str, Any],
+    plan_position: int,
+    receipt_rows: list[tuple[int, dict[str, Any]]],
+    commit: tuple[int, dict[str, Any]] | None,
+    abandoned: tuple[int, dict[str, Any]] | None,
+) -> CommitPlanSnapshot | None:
+    """Validate one sealed plan with its receipts and terminal row.
+
+    ``None`` means a completed historical (pre-operation-id) plan, which stays
+    readable but is never executable. Positions are ledger byte offsets: only
+    their order matters. Raises the ``ValueError`` the whole-ledger validation
+    has always raised for the same damage.
+    """
+
+    run_id = str(plan.get("run_id") or "")
+    operations = plan.get("operations")
+    context = plan.get("context") or {}
+    plan_hash = str(plan.get("plan_hash") or "")
+    if not _is_current_plan_row(plan):
+        if commit is not None:
+            # Completed historical plans remain readable. An open legacy
+            # plan cannot be reinterpreted as an executable current plan.
+            return None
+        raise ValueError(f"legacy unreceipted commit plan: {plan_id}")
+    assert isinstance(operations, list)
+    if not run_id or not isinstance(context, dict) or not plan_hash:
+        raise ValueError(f"invalid commit plan structure: {plan_id}")
+    for operation in operations:
+        assert isinstance(operation, dict)
+        _validate_plan_operation(operation, operation_id_required=True)
+    operation_ids = [str(operation["operation_id"]) for operation in operations]
+    if len(operation_ids) != len(set(operation_ids)):
+        raise ValueError(f"invalid commit plan operation ids: {plan_id}")
+    _validate_plan_operation_set(operations)
+    expected_hash = _canonical_plan_hash(run_id, plan_id, operations, context)
+    if plan_hash != expected_hash:
+        raise ValueError(f"commit plan digest mismatch: {plan_id}")
+    snapshot = CommitPlanSnapshot(
+        run_id=run_id,
+        plan_id=plan_id,
+        plan_hash=plan_hash,
+        operations=tuple(dict(operation) for operation in operations),
+        context=dict(context),
+    )
+    expected = {
+        str(operation.get("operation_id") or ""): str(operation.get("operation") or "")
+        for operation in operations
+        if isinstance(operation, dict)
+    }
+    plan_receipts: dict[str, tuple[int, dict[str, Any]]] = {}
+    for receipt_position, receipt in receipt_rows:
+        operation_id = str(receipt.get("operation_id") or "")
+        if operation_id not in expected:
+            raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
+        if str(receipt.get("operation") or "") != expected[operation_id]:
+            raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
+        if str(receipt.get("run_id") or "") != run_id:
+            raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
+        if str(receipt.get("plan_hash") or "") != plan_hash:
+            raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
+        if receipt.get("status") not in _RECEIPT_STATUSES:
+            raise ValueError(f"invalid operation receipt status: {plan_id}/{operation_id}")
+        if not isinstance(receipt.get("result"), dict):
+            raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
+        if operation_id in plan_receipts:
+            raise ValueError(f"duplicate operation receipt: {plan_id}/{operation_id}")
+        plan_receipts[operation_id] = (receipt_position, receipt)
+
+    if commit is not None:
+        commit_position, commit_row = commit
+        if str(commit_row.get("plan_hash") or "") != plan_hash:
+            raise ValueError(f"commit receipt hash mismatch: {plan_id}")
+        if set(plan_receipts) != set(expected):
+            raise ValueError(f"commit receipt closes an incomplete plan: {plan_id}")
+        if any(position >= commit_position for position, _ in plan_receipts.values()):
+            raise ValueError(f"commit receipt precedes an operation receipt: {plan_id}")
+        if any(
+            receipt.get("status") in {"failed", "aborted"} for _, receipt in plan_receipts.values()
+        ):
+            raise ValueError(f"commit receipt closes a failed plan: {plan_id}")
+        result = commit_row.get("result")
+        if (
+            not isinstance(result, dict)
+            or result.get("operation_receipts_complete") is not True
+            or result.get("operation_receipts") != len(expected)
+        ):
+            raise ValueError(f"commit receipt lacks closure evidence: {plan_id}")
+    if abandoned is not None:
+        abandoned_position, abandoned_row = abandoned
+        if str(abandoned_row.get("run_id") or "") != run_id:
+            raise ValueError(f"abandoned plan run mismatch: {plan_id}")
+        if str(abandoned_row.get("plan_hash") or "") != plan_hash:
+            raise ValueError(f"abandoned plan hash mismatch: {plan_id}")
+        if abandoned_position <= plan_position:
+            raise ValueError(f"abandoned plan record precedes its plan: {plan_id}")
+        if plan_receipts:
+            raise ValueError(f"abandoned plan has operation receipts: {plan_id}")
+        if not str(abandoned_row.get("reason") or "").strip():
+            raise ValueError(f"abandoned plan lacks a reason: {plan_id}")
+        if not isinstance(abandoned_row.get("evidence"), dict):
+            raise ValueError(f"abandoned plan evidence is invalid: {plan_id}")
+    return snapshot
+
+
+class _RowReader:
+    """Read single ledger rows by ``(offset, length)``; opens the file on first use."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: Any = None
+
+    def __call__(self, offset: int, length: int) -> dict[str, Any]:
+        if self._handle is None:
+            self._handle = self._path.open("rb")
+        self._handle.seek(offset)
+        raw = self._handle.read(length)
+        try:
+            row = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"unreadable ledger row at byte {offset}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"unreadable ledger row at byte {offset}")
+        return row
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+
+@dataclass
+class _Sidecar:
+    """In-memory form of the index sidecar (see the block comment above)."""
+
+    size: int = 0  # ledger bytes covered: always ends on a newline
+    tail: bytes = b""  # last <= _SIDECAR_ANCHOR_BYTES covered bytes
+    records: int = 0  # parseable object rows
+    malformed: int = 0  # non-blank rows that are not JSON objects
+    unrecognized: int = 0  # object rows with a missing or unknown ledger_version
+    exotic: int = 0  # rows the whole-file reader splits or decodes differently
+    anomaly: bool = False  # plan bookkeeping needs the whole-ledger validation
+    runs: dict[str, dict[str, Any]] | None = None
+    plan_runs: set[str] | None = None
+    open_plans: dict[str, dict[str, Any]] | None = None
+    closed: dict[str, str] | None = None  # plan id -> "c" (committed) | "a" (abandoned)
+    next_order: int = 0
+    persisted_size: int = -1  # ledger bytes covered by the sidecar file on disk
+    uncovered: int = 0  # ledger bytes past ``size`` (an unterminated tail), set by sync
+    loaded_anchor: tuple[int, str] | None = None  # from disk; verified once, then dropped
+
+    def __post_init__(self) -> None:
+        self.runs = {} if self.runs is None else self.runs
+        self.plan_runs = set() if self.plan_runs is None else self.plan_runs
+        self.open_plans = {} if self.open_plans is None else self.open_plans
+        self.closed = {} if self.closed is None else self.closed
+
+    # -- derived ----------------------------------------------------------
+    def anchor(self) -> tuple[int, str]:
+        return len(self.tail), hashlib.sha256(self.tail).hexdigest()
+
+    def completeness_reason(self) -> str:
+        reasons = []
+        if self.malformed:
+            reasons.append("malformed_ledger_lines")
+        if self.unrecognized:
+            reasons.append("unrecognized_ledger_versions")
+        return "+".join(reasons)
+
+    def run_order(self) -> list[str]:
+        """Run ids newest first, exactly as ``run_summaries`` orders its rows."""
+        assert self.runs is not None
+        return [
+            run_id
+            for run_id, _ in sorted(
+                self.runs.items(),
+                key=lambda item: str(item[1]["started_at"] or item[1]["completed_at"] or ""),
+                reverse=True,
+            )
+        ]
+
+    # -- maintenance ------------------------------------------------------
+    def advance(self, raw: bytes) -> None:
+        self.size += len(raw)
+        self.tail = (self.tail + raw)[-_SIDECAR_ANCHOR_BYTES:]
+
+    def ingest_raw(self, raw: bytes, read_row: _RowReader) -> None:
+        """Account for one newline-terminated ledger line read from disk."""
+        offset = self.size
+        self.advance(raw)
+        if not raw.strip():
+            return
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self.malformed += 1
+            self.exotic += 1
+            return
+        if len(text.rstrip("\n").splitlines()) > 1:
+            self.exotic += 1  # str.splitlines() would split this row
+        try:
+            record = json.loads(text)
+        except ValueError:
+            self.malformed += 1
+            return
+        if not isinstance(record, dict):
+            self.malformed += 1
+            return
+        self.apply(offset, len(raw), record, read_row)
+
+    def apply(self, offset: int, length: int, record: dict[str, Any], read_row: _RowReader) -> None:
+        """Fold one parsed object row (at ``offset``) into the index."""
+        assert self.runs is not None and self.plan_runs is not None
+        self.records += 1
+        if not _accepted_version(record):
+            self.unrecognized += 1
+        kind = record.get("kind")
+        run_id = str(record.get("run_id") or "")
+        if run_id:
+            entry = self.runs.get(run_id)
+            if entry is None:
+                entry = self.runs[run_id] = {
+                    "first": offset,
+                    "end": offset,
+                    "state": "unknown",
+                    "started_at": None,
+                    "completed_at": None,
+                }
+            entry["end"] = offset + length
+            if kind == "ingest_run":
+                state = str(record.get("state") or entry["state"])
+                entry["state"] = state
+                if state == "started":
+                    entry["started_at"] = record.get("ts")
+                elif state:
+                    entry["completed_at"] = record.get("ts")
+        if kind == "commit_plan" and run_id and _accepted_version(record):
+            if _is_current_plan_row(record):
+                self.plan_runs.add(run_id)
+        if kind in _PLAN_ROW_KINDS and not self.anomaly:
+            try:
+                self._track_plan(str(kind), record, offset, length, read_row)
+            except ValueError:
+                self.anomaly = True
+
+    def _track_plan(
+        self,
+        kind: str,
+        record: dict[str, Any],
+        offset: int,
+        length: int,
+        read_row: _RowReader,
+    ) -> None:
+        """Keep the open-plan set; raise ``ValueError`` on anything unusual.
+
+        Only the clean lifecycle (plan, its receipts, one terminal row) is handled
+        incrementally. Every other ordering flags ``anomaly`` and the validating
+        reader re-derives the exact verdict with the whole-ledger validation.
+        """
+        assert self.open_plans is not None and self.closed is not None
+        plan_id = str(record.get("plan_id") or "")
+        if not plan_id:
+            return
+        if kind == "commit_plan":
+            if plan_id in self.open_plans or plan_id in self.closed:
+                raise ValueError(f"duplicate commit plan id: {plan_id}")
+            self.open_plans[plan_id] = {
+                "run": str(record.get("run_id") or ""),
+                "order": self.next_order,
+                "o": offset,
+                "l": length,
+                "receipts": [],
+            }
+            self.next_order += 1
+            return
+        meta = self.open_plans.get(plan_id)
+        if meta is None:
+            raise ValueError(f"{kind} for a plan that is not open: {plan_id}")
+        if kind == "operation_receipt":
+            meta["receipts"].append([offset, length])
+            return
+        if str(record.get("run_id") or "") != meta["run"]:
+            raise ValueError(f"terminal row run mismatch: {plan_id}")
+        receipts = [(o, read_row(o, n)) for o, n in meta["receipts"]]
+        terminal = (offset, record)
+        _validate_plan_group(
+            plan_id,
+            read_row(meta["o"], meta["l"]),
+            meta["o"],
+            receipts,
+            terminal if kind == "commit_record" else None,
+            terminal if kind == "plan_abandoned" else None,
+        )
+        del self.open_plans[plan_id]
+        self.closed[plan_id] = "c" if kind == "commit_record" else "a"
+
+    def catch_up(self, handle: Any, read_row: _RowReader, limit: int | None = None) -> None:
+        """Index every complete line past ``size`` (stopping at ``limit`` if given).
+
+        An unterminated tail stays uncovered.
+        """
+        handle.seek(self.size)
+        next_check = self.size + _CANCEL_CHECK_BYTES
+        while limit is None or self.size < limit:
+            if self.size >= next_check:
+                next_check = self.size + _CANCEL_CHECK_BYTES
+                _raise_if_cancelled()
+            raw = handle.readline()
+            if not raw or not raw.endswith(b"\n"):
+                return
+            self.ingest_raw(raw, read_row)
+
+    # -- persistence ------------------------------------------------------
+    def to_bytes(self) -> bytes:
+        assert self.runs is not None and self.plan_runs is not None
+        assert self.open_plans is not None and self.closed is not None
+        anchor_len, anchor_sha = self.anchor()
+        body = json.dumps(
+            {
+                "size": self.size,
+                "anchor_len": anchor_len,
+                "anchor_sha256": anchor_sha,
+                "records": self.records,
+                "malformed": self.malformed,
+                "unrecognized": self.unrecognized,
+                "exotic": self.exotic,
+                "anomaly": self.anomaly,
+                "next_order": self.next_order,
+                "runs": self.runs,
+                "plan_runs": sorted(self.plan_runs),
+                "open_plans": self.open_plans,
+                "closed": self.closed,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        header = json.dumps(
+            {
+                "index_version": _SIDECAR_VERSION,
+                "ledger": LEDGER_FILENAME,
+                "body_sha256": hashlib.sha256(body).hexdigest(),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return header + b"\n" + body + b"\n"
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "_Sidecar | None":
+        """Parse a sidecar file; ``None`` for anything but a fully valid current one."""
+        try:
+            header_raw, body_raw, rest = data.split(b"\n")
+            if rest:
+                return None
+            header = json.loads(header_raw)
+            if (
+                header.get("index_version") != _SIDECAR_VERSION
+                or header.get("ledger") != LEDGER_FILENAME
+                or header.get("body_sha256") != hashlib.sha256(body_raw).hexdigest()
+            ):
+                return None
+            body = json.loads(body_raw)
+            state = cls(
+                size=_nonneg_int(body["size"]),
+                records=_nonneg_int(body["records"]),
+                malformed=_nonneg_int(body["malformed"]),
+                unrecognized=_nonneg_int(body["unrecognized"]),
+                exotic=_nonneg_int(body["exotic"]),
+                anomaly=_bool(body["anomaly"]),
+                next_order=_nonneg_int(body["next_order"]),
+                runs=_run_table(body["runs"]),
+                plan_runs={_text(v) for v in body["plan_runs"]},
+                open_plans=_open_plan_table(body["open_plans"]),
+                closed={_text(k): _text(v) for k, v in body["closed"].items()},
+            )
+            anchor_len = _nonneg_int(body["anchor_len"])
+            if anchor_len > min(state.size, _SIDECAR_ANCHOR_BYTES):
+                return None
+            state.loaded_anchor = (anchor_len, _text(body["anchor_sha256"]))
+            state.persisted_size = state.size
+            return state
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+
+    def matches(self, handle: Any, file_size: int) -> bool:
+        """True when the ledger still has the bytes this state was built from."""
+        if self.size > file_size:
+            return False
+        if self.size == 0:
+            return True
+        length, sha = self.loaded_anchor or self.anchor()
+        handle.seek(self.size - length)
+        tail = handle.read(length)
+        if len(tail) != length or hashlib.sha256(tail).hexdigest() != sha:
+            return False
+        self.tail = tail
+        self.loaded_anchor = None
+        return True
+
+
+def _nonneg_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("expected a non-negative integer")
+    return value
+
+
+def _bool(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("expected a boolean")
+    return value
+
+
+def _text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("expected text")
+    return value
+
+
+def _run_table(raw: Any) -> dict[str, dict[str, Any]]:
+    table: dict[str, dict[str, Any]] = {}
+    for run_id, entry in raw.items():
+        table[_text(run_id)] = {
+            "first": _nonneg_int(entry["first"]),
+            "end": _nonneg_int(entry["end"]),
+            "state": _text(entry["state"]),
+            "started_at": entry["started_at"],
+            "completed_at": entry["completed_at"],
+        }
+    return table
+
+
+def _open_plan_table(raw: Any) -> dict[str, dict[str, Any]]:
+    table: dict[str, dict[str, Any]] = {}
+    for plan_id, entry in raw.items():
+        table[_text(plan_id)] = {
+            "run": _text(entry["run"]),
+            "order": _nonneg_int(entry["order"]),
+            "o": _nonneg_int(entry["o"]),
+            "l": _nonneg_int(entry["l"]),
+            "receipts": [[_nonneg_int(o), _nonneg_int(n)] for o, n in entry["receipts"]],
+        }
+    return table
+
+
+def _sidecar_cache_get(key: str) -> _Sidecar | None:
+    with _SIDECARS_GUARD:
+        state = _SIDECARS.get(key)
+        if state is not None:
+            _SIDECARS.move_to_end(key)
+        return state
+
+
+def _sidecar_cache_put(key: str, state: _Sidecar) -> None:
+    with _SIDECARS_GUARD:
+        _SIDECARS[key] = state
+        _SIDECARS.move_to_end(key)
+        while len(_SIDECARS) > _SIDECAR_CACHE_SIZE:
+            _SIDECARS.popitem(last=False)
+
+
+def _sidecar_cache_drop(path: Path | None = None) -> None:
+    """Forget the in-process state (all paths, or one): the next use reloads from disk."""
+    with _SIDECARS_GUARD:
+        if path is None:
+            _SIDECARS.clear()
+        else:
+            _SIDECARS.pop(str(path.resolve()), None)
+    with _SNAPSHOT_FAILURES_GUARD:
+        if path is None:
+            _SNAPSHOT_FAILURES.clear()
+        else:
+            _SNAPSHOT_FAILURES.pop(str(path.resolve()), None)
+    _reduced_runs_drop(None if path is None else str(path.resolve()))
+
+
+def _write_sidecar_file(path: Path, payload: bytes) -> None:
+    """Atomic replace: temp file in the same directory, fsync, rename."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _remove_stale_sidecar_temps(path, keep=tmp)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+_STALE_TEMP_SECONDS = 3600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but is not ours to signal
+    return True
+
+
+def _remove_stale_sidecar_temps(path: Path, *, keep: Path) -> None:
+    """Drop ``<index>.<pid>.<tid>.tmp`` files a killed writer left behind.
+
+    A temp is stale when its writer's pid is gone or it is over an hour old; the
+    writer's own live temp is never touched. Best effort: the index is a cache.
+    """
+    prefix = f"{path.name}."
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(".tmp")) or name == keep.name:
+            continue
+        parts = name[len(prefix) : -len(".tmp")].split(".")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            continue
+        temp = path.parent / name
+        try:
+            old = now - temp.stat().st_mtime > _STALE_TEMP_SECONDS
+            if old or not _pid_alive(int(parts[0])):
+                temp.unlink()
+        except OSError:
+            continue
 
 
 def edge_candidate_id(payload: dict[str, Any]) -> str:
@@ -1072,6 +1942,114 @@ def extraction_unit_id(
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Rows the run summaries only COUNT by kind. _summarize_runs and _progress_from_records
+# never read their content, so a reduced copy (kind and run_id) is exactly equivalent and
+# spares re-parsing a commit plan of tens of MiB on every poll.
+_COUNTED_ONLY_KINDS = frozenset({"commit_plan", "commit_record"})
+_REDUCED_RUN_MAX_ENTRIES = 64
+_REDUCED_RUN_MAX_BYTES = 128 * 1024 * 1024  # raw bytes of the rows kept, across all runs
+_REDUCED_RUN_ENTRY_MAX_BYTES = 32 * 1024 * 1024  # a run above this is read but not cached
+_REDUCED_RUNS: OrderedDict[tuple[str, str], tuple[int, int, list[dict[str, Any]], int]] = (
+    OrderedDict()
+)
+_REDUCED_RUNS_GUARD = threading.Lock()
+
+
+def _reduced_runs_drop(path_key: str | None = None) -> None:
+    with _REDUCED_RUNS_GUARD:
+        if path_key is None:
+            _REDUCED_RUNS.clear()
+            return
+        for key in [k for k in _REDUCED_RUNS if k[0] == path_key]:
+            del _REDUCED_RUNS[key]
+
+
+class _RunView:
+    """Offset-based reads of one ledger run at a time, under the ledger lock."""
+
+    def __init__(self, state: _Sidecar, handle: Any, path_key: str = "") -> None:
+        self.state = state
+        self._handle = handle
+        self._path_key = path_key
+
+    def order(self) -> list[str]:
+        return self.state.run_order()
+
+    def close(self) -> None:
+        self._handle.close()
+
+    def records(self, run_id: str) -> list[dict[str, Any]]:
+        """The run's rows in ledger order: only its byte span is read."""
+        assert self.state.runs is not None
+        entry = self.state.runs.get(run_id)
+        if entry is None:
+            return []
+        self._handle.seek(entry["first"])
+        rows: list[dict[str, Any]] = []
+        while self._handle.tell() < entry["end"]:
+            raw = self._handle.readline()
+            if not raw:
+                break
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(record, dict) and str(record.get("run_id") or "") == run_id:
+                rows.append(record)
+        return rows
+
+    def reduced_records(self, run_id: str) -> list[dict[str, Any]]:
+        """The run's rows for the kind-counting summaries, without re-reading old bytes.
+
+        Counted-only rows (:data:`_COUNTED_ONLY_KINDS`) come back as ``{"kind", "run_id"}``.
+        The result is cached per run with the span it covers; the ledger is append-only,
+        so a run whose span has not grown costs nothing, and one that grew parses only the
+        bytes appended since. Callers must not mutate the returned list.
+        """
+        assert self.state.runs is not None
+        entry = self.state.runs.get(run_id)
+        if entry is None:
+            return []
+        first, end = entry["first"], entry["end"]
+        key = (self._path_key, run_id)
+        with _REDUCED_RUNS_GUARD:
+            cached = _REDUCED_RUNS.get(key) if self._path_key else None
+            if cached is not None:
+                _REDUCED_RUNS.move_to_end(key)
+        start, rows, kept = first, [], 0
+        if cached is not None and cached[0] == first and cached[1] <= end:
+            if cached[1] == end:
+                return cached[2]
+            start, rows, kept = cached[1], list(cached[2]), cached[3]
+        self._handle.seek(start)
+        while self._handle.tell() < end:
+            raw = self._handle.readline()
+            if not raw:
+                break
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict) or str(record.get("run_id") or "") != run_id:
+                continue
+            kind = str(record.get("kind") or "")
+            if kind in _COUNTED_ONLY_KINDS:
+                rows.append({"kind": kind, "run_id": run_id})
+            else:
+                rows.append(record)
+                kept += len(raw)
+        if self._path_key and kept <= _REDUCED_RUN_ENTRY_MAX_BYTES:
+            with _REDUCED_RUNS_GUARD:
+                _REDUCED_RUNS[key] = (first, end, rows, kept)
+                _REDUCED_RUNS.move_to_end(key)
+                while len(_REDUCED_RUNS) > _REDUCED_RUN_MAX_ENTRIES or (
+                    len(_REDUCED_RUNS) > 1
+                    and sum(entry[3] for entry in _REDUCED_RUNS.values()) > _REDUCED_RUN_MAX_BYTES
+                ):
+                    _REDUCED_RUNS.popitem(last=False)
+        return rows
+
+
 @dataclass(frozen=True)
 class CandidateLedger:
     """Append-only JSONL ledger rooted in a vault's ``.marginalia`` directory."""
@@ -1081,6 +2059,257 @@ class CandidateLedger:
     @property
     def path(self) -> Path:
         return Path(self.dir) / LEDGER_FILENAME
+
+    @property
+    def index_path(self) -> Path:
+        """The rebuildable index sidecar (never a source of truth; safe to delete)."""
+        return Path(self.dir) / LEDGER_INDEX_FILENAME
+
+    def _sync_sidecar(self) -> _Sidecar | None:
+        """Bring the index in step with the ledger file. The ledger lock must be held.
+
+        Order of trust: the in-process state, else the sidecar file; either is
+        used only if the ledger still holds the bytes it was built from (not
+        shorter, same tail). Otherwise it is rebuilt by one streaming scan. A
+        ledger longer than the state covers (another process appended, or a crash
+        fell between the ledger write and the index update) is caught up by
+        scanning just the new tail.
+        """
+        path = self.path
+        try:
+            file_size = path.stat().st_size
+        except FileNotFoundError:
+            _sidecar_cache_drop(path)
+            return None
+        key = str(path.resolve())
+        state = _sidecar_cache_get(key)
+        reader = _RowReader(path)
+        try:
+            with path.open("rb") as handle:
+                if state is None:
+                    state = self._load_sidecar_file()
+                if state is not None and not state.matches(handle, file_size):
+                    state = None
+                if state is None:
+                    state = _Sidecar()
+                state.catch_up(handle, reader)
+        except BaseException:
+            _sidecar_cache_drop(path)
+            raise
+        finally:
+            reader.close()
+        state.uncovered = file_size - state.size
+        _sidecar_cache_put(key, state)
+        self._persist_sidecar(state)
+        return state
+
+    def _prepare_sidecar(self) -> bool:
+        """Bring the in-process index near the ledger's size without a long lock hold.
+
+        A state that is current, or a few MiB behind, is left for the in-lock
+        :meth:`_sync_sidecar` to finish. Anything else (no usable state, or far
+        behind) is scanned from a snapshot with no lock held and then published;
+        the caller's in-lock sync only folds in the rows appended meanwhile.
+
+        Returns ``False`` when that snapshot pass failed, or already failed on this
+        exact ledger prefix (a failure is remembered per snapshot signature and not
+        retried until the file changes past it). A failed pass is discarded whole:
+        its half-applied state is never published.
+        """
+        path = self.path
+        key = str(path.resolve())
+        lock = Path(self.dir) / ".candidate-ledger.lock"
+        with _exclusive_lock(lock):
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                return True
+            cached = _sidecar_cache_get(key)
+            candidate = cached if cached is not None else self._load_sidecar_file()
+            with path.open("rb") as probe:
+                usable = candidate is not None and candidate.matches(probe, size)
+            if usable and candidate is not None and size - candidate.size <= _SIDECAR_INLINE_TAIL:
+                _snapshot_failure_clear(key)
+                return True
+            # A state loaded from the file is ours alone; the cached one is shared with
+            # appends made under this lock, so extend a copy (the sidecar is small) and
+            # publish it only if the cache entry is still the one it was forked from.
+            work = None
+            if usable and candidate is not None:
+                work = candidate if cached is None else copy.deepcopy(candidate)
+            handle = path.open("rb")
+            cut = _last_line_end(handle, size)
+            signature = _snapshot_signature(handle, cut)
+            if _snapshot_failure_reason(key, signature) is not None:
+                handle.close()
+                return False
+        reader = _RowReader(path)
+        try:
+            work = work or _Sidecar()
+            work.catch_up(handle, reader, limit=cut)
+        except _BuildCancelled:
+            return False  # asked to stop: nothing remembered, nothing published
+        except Exception as exc:  # noqa: BLE001 - remembered and logged; never published
+            reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+            _snapshot_failure_record(key, signature, reason)
+            _LOG.info(
+                "candidate ledger index: snapshot pass failed (%s); not retried until "
+                "the ledger changes past %d bytes",
+                reason,
+                cut,
+            )
+            return False
+        except BaseException:
+            return False  # cancelled mid-pass: nothing remembered, nothing published
+        finally:
+            reader.close()
+            handle.close()
+        _snapshot_failure_clear(key)
+        with _exclusive_lock(lock):
+            if _sidecar_cache_get(key) is cached:
+                _sidecar_cache_put(key, work)
+        return True
+
+    def index_degraded_reason(self) -> str | None:
+        """Why the index is being bypassed for this ledger, or ``None`` when it is not."""
+        return _snapshot_failure_current(str(self.path.resolve()))
+
+    @contextmanager
+    def _run_view(self):
+        """Yield an offset-based :class:`_RunView` under the ledger lock.
+
+        Yields ``None`` when the whole-file readers must answer instead: the
+        ledger is absent, holds rows that ``str.splitlines`` splits or
+        ``utf-8`` rejects (their historic behavior is defined by that reader),
+        or ends in an unterminated row the index does not cover.
+        """
+        if not self._prepare_sidecar():
+            # The lock-free pass failed: answer from the streaming readers rather than
+            # rebuilding the whole index under the ledger lock.
+            yield None
+            return
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            state = self._sync_sidecar()
+            if state is None or state.exotic or state.uncovered:
+                view = None
+            else:
+                assert state.runs is not None
+                # A copy and an open handle: the spans are read after the lock is
+                # released, and bytes below them never change (append-only).
+                view = _RunView(
+                    _Sidecar(
+                        records=state.records,
+                        runs={run_id: dict(entry) for run_id, entry in state.runs.items()},
+                    ),
+                    self.path.open("rb"),
+                    str(self.path.resolve()),
+                )
+        if view is None:
+            yield None
+            return
+        try:
+            yield view
+        finally:
+            view.close()
+
+    def _load_sidecar_file(self) -> _Sidecar | None:
+        try:
+            data = self.index_path.read_bytes()
+        except OSError:
+            return None
+        return _Sidecar.from_bytes(data)
+
+    def _persist_sidecar(self, state: _Sidecar, *, force: bool = False) -> None:
+        """Best-effort checkpoint of the in-memory index (a cache: failures are ignored)."""
+        if (
+            not force
+            and 0 <= state.persisted_size
+            and (state.size - state.persisted_size < _SIDECAR_CHECKPOINT_BYTES)
+        ):
+            return
+        try:
+            _write_sidecar_file(self.index_path, state.to_bytes())
+        except OSError:
+            return
+        state.persisted_size = state.size
+
+    def write_index_checkpoint(self) -> None:
+        """Persist the index now (it is otherwise checkpointed every few MiB)."""
+        if not self.path.exists():
+            return
+        self._prepare_sidecar()
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            state = self._sync_sidecar()
+            if state is not None:
+                self._persist_sidecar(state, force=True)
+
+    def _sidecar_after_append(
+        self,
+        record_offset: int,
+        encoded: bytes,
+        record: dict[str, Any],
+        *,
+        repaired_tail: bool,
+    ) -> None:
+        """Fold one just-appended row into the index, under the same ledger lock.
+
+        Never raises: the row is already durable, and the index is a cache that
+        the next reader repairs by catching up from the ledger.
+        """
+        try:
+            key = str(self.path.resolve())
+            state = _sidecar_cache_get(key)
+            if state is None:
+                if record_offset != 0 or repaired_tail:
+                    return  # an existing ledger is indexed lazily by its first reader
+                state = _Sidecar()
+            elif repaired_tail or state.size > record_offset:
+                _sidecar_cache_drop(self.path)  # rewritten below the cut: rebuild on next use
+                return
+            elif state.size < record_offset:
+                # Another process appended: the state is still valid for [0, size) and
+                # the next reader folds in the tail (the anchor check catches divergence).
+                return
+            reader = _RowReader(self.path)
+            try:
+                state.apply(record_offset, len(encoded), record, reader)
+            finally:
+                reader.close()
+            state.advance(encoded)
+            _sidecar_cache_put(key, state)
+            self._persist_sidecar(state)
+        except Exception:  # noqa: BLE001 - cache maintenance must not fail a durable append
+            _sidecar_cache_drop(self.path)
+
+    def prewarm(self, cancelled: Callable[[], bool] | None = None) -> None:
+        """Build the in-process sidecar state and the offset index ahead of the first reader.
+
+        Both entry points are the ones a first reader uses, so this only moves
+        the cold build earlier; it never changes what a read returns. ``cancelled``
+        is checked between the two builds so a daemon that is stopping skips the
+        second one. It ends by answering the UI's summary question once, so the run view's
+        reduced copy of the newest run is built here and not on the first poll. The index is
+        a cache: a failed pass is left to the readers.
+        """
+        if not self.path.exists():
+            return
+        # The streaming loops of both builds look at ``cancelled`` every few MiB and
+        # discard their partial state when it is set, so a stop never waits for a
+        # whole cold pass. Only this thread sees the flag; readers are unaffected.
+        _BUILD_CANCEL.fn = cancelled
+        try:
+            self._prepare_sidecar()
+            if cancelled is not None and cancelled():
+                return
+            self._offset_index()
+            if cancelled is not None and cancelled():
+                return
+            # The UI's first poll would otherwise parse the big plan rows on the event loop.
+            self.run_progress_summary(None, limit=12)
+        except _BuildCancelled:
+            return
+        finally:
+            _BUILD_CANCEL.fn = None
 
     def _offset_index(self) -> _LedgerOffsetIndex | None:
         if not self.path.exists():
@@ -1095,41 +2324,39 @@ class CandidateLedger:
     ) -> list[dict[str, Any]]:
         """Parse only indexed rows needed by one operational query."""
 
-        for _attempt in range(2):
-            index = self._offset_index()
-            if index is None:
-                return []
-            if run_ids is None:
-                locations = [
-                    location for kind in kinds for location in index.offsets_by_kind.get(kind, ())
-                ]
-            else:
-                locations = [
-                    location
-                    for run_id in run_ids
-                    for kind in kinds
-                    for location in index.offsets_by_run_kind.get((run_id, kind), ())
-                ]
-            locations.sort()
-            with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
-                if _ledger_file_signature(self.path) != index.signature:
-                    _invalidate_ledger_offset_index(self.path)
+        pinned = _pin_ledger_offset_index(Path(self.dir), self.path)
+        if pinned is None:
+            return []
+        index, cut, handle = pinned
+        # Every indexed row below ``cut`` lies in a prefix that never changes
+        # (append-only), so the rows are read without holding the ledger lock; rows
+        # appended after this snapshot are simply not part of it.
+        if run_ids is None:
+            locations = [
+                location for kind in kinds for location in index.offsets_by_kind.get(kind, ())
+            ]
+        else:
+            locations = [
+                location
+                for run_id in run_ids
+                for kind in kinds
+                for location in index.offsets_by_run_kind.get((run_id, kind), ())
+            ]
+        locations = sorted(loc for loc in locations if loc[0] + loc[1] <= cut)
+        records: list[dict[str, Any]] = []
+        with handle:
+            for offset, length in locations:
+                handle.seek(offset)
+                try:
+                    record = json.loads(handle.read(length).decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
                     continue
-                records: list[dict[str, Any]] = []
-                with self.path.open("rb") as handle:
-                    for offset, length in locations:
-                        handle.seek(offset)
-                        try:
-                            record = json.loads(handle.read(length).decode("utf-8"))
-                        except (UnicodeDecodeError, ValueError):
-                            continue
-                        if not isinstance(record, dict) or record.get("kind") not in kinds:
-                            continue
-                        if run_ids is not None and str(record.get("run_id") or "") not in run_ids:
-                            continue
-                        records.append(record)
-                return records
-        raise RuntimeError("candidate ledger changed continuously while reading its index")
+                if not isinstance(record, dict) or record.get("kind") not in kinds:
+                    continue
+                if run_ids is not None and str(record.get("run_id") or "") not in run_ids:
+                    continue
+                records.append(record)
+        return records
 
     def _require_complete_index(self, *, purpose: str) -> _LedgerOffsetIndex | None:
         index = self._offset_index()
@@ -1533,7 +2760,6 @@ class CandidateLedger:
             "plan_abandoned",
             "integrity_outcome",
         } or (kind == "ingest_run" and str(record.get("state") or "") != "started")
-        previous_signature = _ledger_file_signature(self.path) if self.path.exists() else None
         record_offset = 0
         with _exclusive_lock(self.dir / ".candidate-ledger.lock"):
             with self.path.open("a+b") as fh:
@@ -1547,18 +2773,16 @@ class CandidateLedger:
                 if durable or repaired_tail:
                     fh.flush()
                     os.fsync(fh.fileno())
-            current_signature = _ledger_file_signature(self.path)
             if repaired_tail:
                 _invalidate_ledger_offset_index(self.path)
             else:
                 _extend_ledger_offset_index(
                     self.path,
-                    previous_signature=previous_signature,
-                    current_signature=current_signature,
                     offset=record_offset,
-                    length=len(encoded),
+                    encoded=encoded,
                     record=record,
                 )
+            self._sidecar_after_append(record_offset, encoded, record, repaired_tail=repaired_tail)
         if durable or repaired_tail:
             _fsync_directory(self.dir)
 
@@ -1637,10 +2861,45 @@ class CandidateLedger:
         fh.seek(0, os.SEEK_END)
         return True
 
+    @contextmanager
+    def _snapshot(self):
+        """Pin the ledger as it is now, then let appends continue.
+
+        Under the lock, and only for as long as that takes: open the file, read its
+        size ``S``, find ``cut`` (just past the last newline at or below ``S``, read
+        backwards in small blocks) and copy the bytes ``[cut, S)``, a crash-torn
+        tail if there is one. The caller reads ``[0, cut)`` from the open handle
+        without the lock. Those bytes never change: ``append()`` only appends, and
+        the one in-place change (``_prepare_append_target`` truncating a torn tail)
+        removes only bytes above the last newline, so a later append can rewrite
+        ``[cut, S)`` but never anything below it. Nothing here replaces the ledger
+        file (``os.replace`` is used for the index sidecar only), so the open
+        handle cannot end up on a stale inode.
+        """
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            handle = self.path.open("rb")
+            size = os.fstat(handle.fileno()).st_size
+            cut = _last_line_end(handle, size)
+            handle.seek(cut)
+            skipped = size - cut > _SCAN_TAIL_CAP
+            tail = handle.read(size - cut) if 0 < size - cut and not skipped else b""
+        if skipped:
+            _LOG.warning(
+                "candidate ledger ends in a %d-byte unterminated tail (over the %d-byte read cap); "
+                "it is reported as a trailing partial record but not read",
+                size - cut,
+                _SCAN_TAIL_CAP,
+            )
+        try:
+            yield _Snapshot(handle, size, cut, tail, skipped)
+        finally:
+            handle.close()
+
     def scan(
         self,
         *,
         max_malformed_samples: int = _MALFORMED_SAMPLE_LIMIT,
+        kinds: frozenset[str] | None = None,
     ) -> LedgerScanResult:
         """Read all ledger bytes and report any evidence that could not be parsed.
 
@@ -1649,9 +2908,22 @@ class CandidateLedger:
         can still fail on invalid UTF-8. Semantic audits use this method so such
         rows and interrupted final appends cannot disappear without an explicit
         incomplete result.
+
+        The file is streamed one chunk at a time under the ledger lock, so the
+        view stays immutable while memory is bounded by one chunk, one row and
+        the retained ``parsed_records``. Every line is still parsed and counted
+        (completeness, hash, sizes are always whole-file); ``kinds`` only limits
+        which parsed rows are *retained* in ``parsed_records`` for callers that
+        read one record kind from a large ledger. With ``kinds`` set,
+        ``parsed_record_count`` counts the retained rows.
         """
         if max_malformed_samples < 0:
             raise ValueError("max_malformed_samples must be >= 0")
+        return self._scan_once(max_malformed_samples, kinds)
+
+    def _scan_once(
+        self, max_malformed_samples: int, kinds: frozenset[str] | None
+    ) -> LedgerScanResult:
         if not self.path.exists():
             return LedgerScanResult(
                 path=self.path,
@@ -1672,10 +2944,22 @@ class CandidateLedger:
                 completeness_reason="ledger_file_absent",
             )
 
-        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
-            data = self.path.read_bytes()
-        raw_lines = data.splitlines()
-        unterminated_final_line = bool(data) and not data.endswith((b"\n", b"\r"))
+        digest = hashlib.sha256()
+        file_size = 0
+        last_byte = b""
+
+        def hashed_chunks(snap: _Snapshot) -> Iterator[bytes]:
+            nonlocal file_size, last_byte
+            reader = _PrefixReader(snap)
+            while True:
+                chunk = reader.read(_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    return
+                digest.update(chunk)
+                file_size += len(chunk)
+                last_byte = chunk[-1:]
+                yield chunk
+
         parsed_records: list[dict[str, Any]] = []
         malformed: list[MalformedLedgerLine] = []
         malformed_line_count = 0
@@ -1685,59 +2969,77 @@ class CandidateLedger:
         unrecognized_version_record_count = 0
         final_nonempty_line_number: int | None = None
 
-        for line_number, raw_line in enumerate(raw_lines, start=1):
-            if not raw_line.strip():
-                continue
+        line_number = 0
+        with self._snapshot() as snap:
+            for line_number, raw_line in enumerate(_stream_lines(hashed_chunks(snap)), start=1):
+                if not raw_line.strip():
+                    continue
+                nonempty_lines += 1
+                final_nonempty_line_number = line_number
+                reason: str | None = None
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError:
+                    line = raw_line.decode("utf-8", errors="replace")
+                    reason = "invalid_utf8"
+
+                record: Any = None
+                if reason is None:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        reason = "invalid_json"
+                    else:
+                        if not isinstance(record, dict):
+                            reason = "record_not_object"
+
+                if reason is not None:
+                    malformed_line_count += 1
+                    malformed_line_numbers.add(line_number)
+                    if len(malformed) < max_malformed_samples:
+                        sample = json.dumps(line.strip(), ensure_ascii=True)[1:-1]
+                        sample_truncated = len(sample) > _MALFORMED_SAMPLE_CHARS
+                        if sample_truncated:
+                            sample = sample[: _MALFORMED_SAMPLE_CHARS - 3] + "..."
+                        malformed.append(
+                            MalformedLedgerLine(
+                                line_number=line_number,
+                                reason=reason,
+                                sample=sample,
+                                sample_truncated=sample_truncated,
+                            )
+                        )
+                    continue
+
+                if kinds is None or record.get("kind") in kinds:
+                    parsed_records.append(record)
+                version = record.get("ledger_version")
+                if isinstance(version, int) and not isinstance(version, bool):
+                    ledger_versions.add(version)
+                    if version not in _ACCEPTED_LEDGER_VERSIONS:
+                        unrecognized_version_record_count += 1
+                else:
+                    unrecognized_version_record_count += 1
+
+        tail_unread = snap.size - snap.cut if snap.tail_skipped else 0
+        if tail_unread:
+            # Over-cap torn tail: counted as one unread partial row; its bytes are
+            # neither parsed nor hashed, so there is no whole-file digest to offer.
+            line_number += 1
             nonempty_lines += 1
             final_nonempty_line_number = line_number
-            reason: str | None = None
-            try:
-                line = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                line = raw_line.decode("utf-8", errors="replace")
-                reason = "invalid_utf8"
-
-            record: Any = None
-            if reason is None:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    reason = "invalid_json"
-                else:
-                    if not isinstance(record, dict):
-                        reason = "record_not_object"
-
-            if reason is not None:
-                malformed_line_count += 1
-                malformed_line_numbers.add(line_number)
-                if len(malformed) < max_malformed_samples:
-                    sample = json.dumps(line.strip(), ensure_ascii=True)[1:-1]
-                    sample_truncated = len(sample) > _MALFORMED_SAMPLE_CHARS
-                    if sample_truncated:
-                        sample = sample[: _MALFORMED_SAMPLE_CHARS - 3] + "..."
-                    malformed.append(
-                        MalformedLedgerLine(
-                            line_number=line_number,
-                            reason=reason,
-                            sample=sample,
-                            sample_truncated=sample_truncated,
-                        )
-                    )
-                continue
-
-            parsed_records.append(record)
-            version = record.get("ledger_version")
-            if isinstance(version, int) and not isinstance(version, bool):
-                ledger_versions.add(version)
-                if version not in _ACCEPTED_LEDGER_VERSIONS:
-                    unrecognized_version_record_count += 1
-            else:
-                unrecognized_version_record_count += 1
+            malformed_line_count += 1
+            malformed_line_numbers.add(line_number)
+            if len(malformed) < max_malformed_samples:
+                malformed.append(MalformedLedgerLine(line_number, "tail_over_read_cap", "", False))
+            file_size += tail_unread
+            last_byte = b"\x00"
+        unterminated_final_line = bool(file_size) and last_byte not in (b"\n", b"\r")
 
         trailing_partial = bool(
             unterminated_final_line
             and final_nonempty_line_number is not None
-            and final_nonempty_line_number == len(raw_lines)
+            and final_nonempty_line_number == line_number
             and final_nonempty_line_number in malformed_line_numbers
         )
         incomplete_reasons: list[str] = []
@@ -1760,7 +3062,7 @@ class CandidateLedger:
         return LedgerScanResult(
             path=self.path,
             parsed_records=tuple(parsed_records),
-            total_lines=len(raw_lines),
+            total_lines=line_number,
             nonempty_lines=nonempty_lines,
             malformed_line_count=malformed_line_count,
             malformed_lines=tuple(malformed),
@@ -1770,26 +3072,53 @@ class CandidateLedger:
             trailing_partial=trailing_partial,
             trailing_partial_line_number=(final_nonempty_line_number if trailing_partial else None),
             ledger_versions=tuple(sorted(ledger_versions)),
-            file_size_bytes=len(data),
-            file_sha256=hashlib.sha256(data).hexdigest(),
+            file_size_bytes=file_size,
+            file_sha256=None if tail_unread else digest.hexdigest(),
             completeness_status=completeness_status,
             completeness_reason=completeness_reason,
         )
 
-    def records(self) -> list[dict[str, Any]]:
+    def iter_records(self) -> Iterator[dict[str, Any]]:
+        """Stream every parseable record in file order, one row in memory at a time.
+
+        Same filtering and errors as :meth:`records`: blank, non-JSON and
+        non-object rows are skipped, invalid UTF-8 raises ``UnicodeDecodeError``
+        (here when the reader reaches it, not before the first row). Prefer this
+        over :meth:`records` for any consumer that does not need the whole ledger
+        at once; the ledger can be far larger than memory.
+        """
+        if not self.path.exists():
+            return
+        # ``read_text().splitlines()`` semantics (universal newlines, then the
+        # ``str`` line boundaries), streamed instead of slurped.
+        # The pinned snapshot (see :meth:`_snapshot`): rows appended after it are
+        # not read, and a torn tail that is later repaired cannot change what is read.
+        with self._snapshot() as snap:
+            text = io.TextIOWrapper(io.BufferedReader(_PrefixReader(snap)), encoding="utf-8")
+            for line in _stream_lines(_read_chunks(text, _STREAM_CHUNK_BYTES)):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+
+    def ingest_run_records(self) -> list[dict[str, Any]]:
+        """Every ``ingest_run`` row in ledger order, read by offset.
+
+        Same rows as ``scan(kinds={"ingest_run"}).parsed_records`` (malformed lines
+        are skipped the same way) but the cost follows the number of runs, not the
+        size of the ledger.
+        """
         if not self.path.exists():
             return []
-        records: list[dict[str, Any]] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
-        return records
+        return self._indexed_records(kinds={"ingest_run"})
+
+    def records(self) -> list[dict[str, Any]]:
+        """Every parseable record as a list (the whole ledger: prefer :meth:`iter_records`)."""
+        return list(self.iter_records())
 
     def _open_runs(self) -> dict[str, dict[str, Any]]:
         """All runs whose LAST ``ingest_run`` record is state ``started``
@@ -1971,14 +3300,22 @@ class CandidateLedger:
         if index is None:
             return ()
         replay_records = self._indexed_records(
-            kinds={"ingest_run", "commit_plan", "commit_record", "plan_abandoned"}
+            kinds={"ingest_run", "commit_record", "plan_abandoned"}
         )
+        # Runs holding a current-format sealed plan come from the index sidecar, so
+        # the (large) commit_plan rows are not read back just to be inspected.
+        self._prepare_sidecar()
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            state = self._sync_sidecar()
+            if state is None:
+                return ()
+            assert state.plan_runs is not None
+            current_plan_runs = set(state.plan_runs)
 
         starts: dict[str, dict[str, Any]] = {}
         terminal: dict[str, tuple[int, dict[str, Any]]] = {}
         committed: set[str] = set()
         abandoned: set[str] = set()
-        current_plan_runs: set[str] = set()
         for position, record in enumerate(replay_records):
             if record.get("ledger_version") not in _ACCEPTED_LEDGER_VERSIONS:
                 continue
@@ -1991,18 +3328,6 @@ class CandidateLedger:
                     starts[run_id] = record
                 else:
                     terminal[run_id] = (position, record)
-            elif kind == "commit_plan":
-                operations = record.get("operations")
-                if (
-                    isinstance(operations, list)
-                    and all(isinstance(operation, dict) for operation in operations)
-                    and all(
-                        isinstance(operation.get("operation_id"), str)
-                        and bool(operation.get("operation_id"))
-                        for operation in operations
-                    )
-                ):
-                    current_plan_runs.add(run_id)
             elif kind == "commit_record":
                 result = record.get("result")
                 if (
@@ -2053,6 +3378,13 @@ class CandidateLedger:
         This is the apply-resume lane. A fsynced plan remains authoritative even
         if the earlier buffered ``started`` row was lost or a planned sidefile
         mutation changed the run-start policy fingerprint.
+
+        The open-plan set comes from the index sidecar, so the cost follows the
+        open plans, not the ledger. Every plan is validated once, when it is
+        closed (or when the index is rebuilt); open plans are validated here. If
+        the ledger has any plan bookkeeping anomaly the verdict is re-derived by
+        :meth:`_validate_plans_full`, which raises exactly what the whole-ledger
+        validation always raised.
         """
 
         try:
@@ -2061,176 +3393,166 @@ class CandidateLedger:
             raise ValueError(
                 "cannot resume apply from an invalid candidate ledger: " + str(exc)
             ) from exc
-        index = self._offset_index()
-        if index is not None and index.completeness_status != "complete":
-            raise ValueError(
-                f"cannot resume apply from an invalid candidate ledger: {index.completeness_reason}"
-            )
-        plan_records = self._indexed_records(
-            kinds={
-                "commit_plan",
-                "operation_receipt",
-                "commit_record",
-                "plan_abandoned",
-            }
+        if not self.path.exists():
+            return ()
+        self._prepare_sidecar()
+        loaded: list[tuple[str, dict[str, Any], int, list[tuple[int, dict[str, Any]]]]] | None
+        loaded = []
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            state = self._sync_sidecar()
+            if state is None:
+                return ()
+            reason = state.completeness_reason()
+            if reason:
+                raise ValueError(f"cannot resume apply from an invalid candidate ledger: {reason}")
+            assert state.open_plans is not None
+            if state.anomaly:
+                loaded = None
+            else:
+                reader = _RowReader(self.path)
+                try:
+                    for plan_id, meta in sorted(
+                        state.open_plans.items(), key=lambda item: item[1]["order"]
+                    ):
+                        loaded.append(
+                            (
+                                plan_id,
+                                reader(meta["o"], meta["l"]),
+                                meta["o"],
+                                [(o, reader(o, n)) for o, n in meta["receipts"]],
+                            )
+                        )
+                except ValueError:
+                    loaded = None
+                finally:
+                    reader.close()
+        if loaded is None:
+            snapshots = self._validate_plans_full()
+        else:
+            snapshots = []
+            for plan_id, plan_row, plan_position, receipt_rows in loaded:
+                snapshot = _validate_plan_group(
+                    plan_id, plan_row, plan_position, receipt_rows, None, None
+                )
+                assert snapshot is not None  # an open plan is never a closed legacy plan
+                snapshots.append(snapshot)
+        return tuple(
+            snapshot
+            for snapshot in snapshots
+            if document_id is None
+            or str(snapshot.context.get("document_id") or "") == str(document_id)
         )
 
-        plans: dict[str, dict[str, Any]] = {}
-        plan_positions: dict[str, int] = {}
+    def _validate_plans_full(self) -> list[CommitPlanSnapshot]:
+        """Validate every plan in the ledger; return the unreceipted ones in ledger order.
+
+        The exact-verdict lane for a ledger whose plan bookkeeping is not the clean
+        lifecycle. One streaming pass keeps only byte offsets (never the rows), then
+        each plan is validated from its own rows, so memory follows the number of
+        plans. Raises the first ``ValueError`` in the order the original
+        whole-ledger validation did: row-order framing errors first, then per-plan
+        errors in plan order.
+        """
+
         order: list[str] = []
-        operation_receipt_rows: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        commit_rows: dict[str, tuple[int, dict[str, Any]]] = {}
-        abandoned_rows: dict[str, tuple[int, dict[str, Any]]] = {}
-        for position, record in enumerate(plan_records):
-            plan_id = str(record.get("plan_id") or "")
-            if not plan_id:
-                continue
-            if record.get("kind") == "commit_plan":
-                if plan_id in plans:
-                    raise ValueError(f"duplicate commit plan id: {plan_id}")
-                order.append(plan_id)
-                plans[plan_id] = record
-                plan_positions[plan_id] = position
-            elif record.get("kind") == "operation_receipt":
-                if plan_id not in plans:
-                    raise ValueError(f"operation receipt precedes or lacks plan: {plan_id}")
-                operation_receipt_rows.setdefault(plan_id, []).append((position, record))
-            elif record.get("kind") == "commit_record":
-                if plan_id not in plans:
-                    raise ValueError(f"commit receipt precedes or lacks plan: {plan_id}")
-                if plan_id in commit_rows:
-                    raise ValueError(f"duplicate commit receipt: {plan_id}")
-                if str(record.get("run_id") or "") != str(plans[plan_id].get("run_id") or ""):
-                    raise ValueError(f"commit receipt run mismatch: {plan_id}")
-                commit_rows[plan_id] = (position, record)
-            elif record.get("kind") == "plan_abandoned":
-                if plan_id not in plans:
-                    raise ValueError(f"abandoned plan precedes or lacks plan: {plan_id}")
-                if plan_id in abandoned_rows or plan_id in commit_rows:
-                    raise ValueError(f"duplicate terminal plan record: {plan_id}")
-                abandoned_rows[plan_id] = (position, record)
+        plans: dict[str, dict[str, Any]] = {}
+        with self._snapshot() as snap:
+            reader = _RowReader(self.path)
+            try:
+                with self.path.open("rb") as handle:
+                    offset = 0
+                    for raw in iter(handle.readline, b""):
+                        if offset >= snap.cut:
+                            break
+                        position, offset = offset, offset + len(raw)
+                        try:
+                            record = json.loads(raw.decode("utf-8"))
+                        except (UnicodeDecodeError, ValueError):
+                            continue
+                        if not isinstance(record, dict):
+                            continue
+                        kind = record.get("kind")
+                        plan_id = str(record.get("plan_id") or "")
+                        if kind not in _PLAN_ROW_KINDS or not plan_id:
+                            continue
+                        span = (position, len(raw))
+                        if kind == "commit_plan":
+                            if plan_id in plans:
+                                raise ValueError(f"duplicate commit plan id: {plan_id}")
+                            order.append(plan_id)
+                            plans[plan_id] = {
+                                "run": str(record.get("run_id") or ""),
+                                "plan": span,
+                                "receipts": [],
+                                "commit": None,
+                                "abandoned": None,
+                            }
+                            continue
+                        meta = plans.get(plan_id)
+                        if kind == "operation_receipt":
+                            if meta is None:
+                                raise ValueError(
+                                    f"operation receipt precedes or lacks plan: {plan_id}"
+                                )
+                            meta["receipts"].append(span)
+                        elif kind == "commit_record":
+                            if meta is None:
+                                raise ValueError(
+                                    f"commit receipt precedes or lacks plan: {plan_id}"
+                                )
+                            if meta["commit"] is not None:
+                                raise ValueError(f"duplicate commit receipt: {plan_id}")
+                            if str(record.get("run_id") or "") != meta["run"]:
+                                raise ValueError(f"commit receipt run mismatch: {plan_id}")
+                            meta["commit"] = span
+                        else:
+                            if meta is None:
+                                raise ValueError(
+                                    f"abandoned plan precedes or lacks plan: {plan_id}"
+                                )
+                            if meta["abandoned"] is not None or meta["commit"] is not None:
+                                raise ValueError(f"duplicate terminal plan record: {plan_id}")
+                            meta["abandoned"] = span
+                snapshots: list[CommitPlanSnapshot] = []
+                for plan_id in order:
+                    meta = plans[plan_id]
+                    commit = meta["commit"]
+                    abandoned = meta["abandoned"]
+                    snapshot = _validate_plan_group(
+                        plan_id,
+                        reader(*meta["plan"]),
+                        meta["plan"][0],
+                        [(o, reader(o, n)) for o, n in meta["receipts"]],
+                        (commit[0], reader(*commit)) if commit is not None else None,
+                        (abandoned[0], reader(*abandoned)) if abandoned is not None else None,
+                    )
+                    if snapshot is not None and commit is None and abandoned is None:
+                        snapshots.append(snapshot)
+                return snapshots
+            finally:
+                reader.close()
 
-        validated: dict[str, CommitPlanSnapshot] = {}
-        receipts_by_plan: dict[str, dict[str, tuple[int, dict[str, Any]]]] = {}
-        for plan_id in order:
-            plan = plans[plan_id]
-            run_id = str(plan.get("run_id") or "")
-            operations = plan.get("operations")
-            context = plan.get("context") or {}
-            plan_hash = str(plan.get("plan_hash") or "")
-            current_format = (
-                isinstance(operations, list)
-                and all(isinstance(operation, dict) for operation in operations)
-                and all(
-                    isinstance(operation.get("operation_id"), str)
-                    and bool(operation.get("operation_id"))
-                    for operation in operations
-                )
-            )
-            if not current_format:
-                if plan_id in commit_rows:
-                    # Completed historical plans remain readable. An open legacy
-                    # plan cannot be reinterpreted as an executable current plan.
-                    continue
-                raise ValueError(f"legacy unreceipted commit plan: {plan_id}")
-            assert isinstance(operations, list)
-            if not run_id or not isinstance(context, dict) or not plan_hash:
-                raise ValueError(f"invalid commit plan structure: {plan_id}")
-            for operation in operations:
-                assert isinstance(operation, dict)
-                _validate_plan_operation(operation, operation_id_required=True)
-            operation_ids = [str(operation["operation_id"]) for operation in operations]
-            if len(operation_ids) != len(set(operation_ids)):
-                raise ValueError(f"invalid commit plan operation ids: {plan_id}")
-            _validate_plan_operation_set(operations)
-            expected_hash = _canonical_plan_hash(run_id, plan_id, operations, context)
-            if plan_hash != expected_hash:
-                raise ValueError(f"commit plan digest mismatch: {plan_id}")
-            snapshot = CommitPlanSnapshot(
-                run_id=run_id,
-                plan_id=plan_id,
-                plan_hash=plan_hash,
-                operations=tuple(dict(operation) for operation in operations),
-                context=dict(context),
-            )
-            validated[plan_id] = snapshot
-            expected = {
-                str(operation.get("operation_id") or ""): str(operation.get("operation") or "")
-                for operation in operations
-                if isinstance(operation, dict)
-            }
-            plan_receipts: dict[str, tuple[int, dict[str, Any]]] = {}
-            for receipt_position, receipt in operation_receipt_rows.get(plan_id, []):
-                operation_id = str(receipt.get("operation_id") or "")
-                if operation_id not in expected:
-                    raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
-                if str(receipt.get("operation") or "") != expected[operation_id]:
-                    raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
-                if str(receipt.get("run_id") or "") != run_id:
-                    raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
-                if str(receipt.get("plan_hash") or "") != plan_hash:
-                    raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
-                if receipt.get("status") not in {
-                    "applied",
-                    "already_present",
-                    "dead_lettered",
-                    "failed",
-                    "aborted",
-                }:
-                    raise ValueError(f"invalid operation receipt status: {plan_id}/{operation_id}")
-                if not isinstance(receipt.get("result"), dict):
-                    raise ValueError(f"invalid operation receipt: {plan_id}/{operation_id}")
-                if operation_id in plan_receipts:
-                    raise ValueError(f"duplicate operation receipt: {plan_id}/{operation_id}")
-                plan_receipts[operation_id] = (receipt_position, receipt)
-            receipts_by_plan[plan_id] = plan_receipts
-
-            if plan_id in commit_rows:
-                commit_position, commit = commit_rows[plan_id]
-                if str(commit.get("plan_hash") or "") != plan_hash:
-                    raise ValueError(f"commit receipt hash mismatch: {plan_id}")
-                if set(plan_receipts) != set(expected):
-                    raise ValueError(f"commit receipt closes an incomplete plan: {plan_id}")
-                if any(position >= commit_position for position, _ in plan_receipts.values()):
-                    raise ValueError(f"commit receipt precedes an operation receipt: {plan_id}")
-                if any(
-                    receipt.get("status") in {"failed", "aborted"}
-                    for _, receipt in plan_receipts.values()
-                ):
-                    raise ValueError(f"commit receipt closes a failed plan: {plan_id}")
-                result = commit.get("result")
-                if (
-                    not isinstance(result, dict)
-                    or result.get("operation_receipts_complete") is not True
-                    or result.get("operation_receipts") != len(expected)
-                ):
-                    raise ValueError(f"commit receipt lacks closure evidence: {plan_id}")
-            if plan_id in abandoned_rows:
-                abandoned_position, abandoned = abandoned_rows[plan_id]
-                if str(abandoned.get("run_id") or "") != run_id:
-                    raise ValueError(f"abandoned plan run mismatch: {plan_id}")
-                if str(abandoned.get("plan_hash") or "") != plan_hash:
-                    raise ValueError(f"abandoned plan hash mismatch: {plan_id}")
-                if abandoned_position <= plan_positions[plan_id]:
-                    raise ValueError(f"abandoned plan record precedes its plan: {plan_id}")
-                if plan_receipts:
-                    raise ValueError(f"abandoned plan has operation receipts: {plan_id}")
-                if not str(abandoned.get("reason") or "").strip():
-                    raise ValueError(f"abandoned plan lacks a reason: {plan_id}")
-                if not isinstance(abandoned.get("evidence"), dict):
-                    raise ValueError(f"abandoned plan evidence is invalid: {plan_id}")
-
-        snapshots: list[CommitPlanSnapshot] = []
-        for plan_id in order:
-            if plan_id in commit_rows or plan_id in abandoned_rows:
-                continue
-            snapshot = validated[plan_id]
-            if document_id is not None and str(snapshot.context.get("document_id") or "") != str(
-                document_id
-            ):
-                continue
-            snapshots.append(snapshot)
-        return tuple(snapshots)
+    def _open_plan_receipt_rows(self, plan: CommitPlanSnapshot) -> list[dict[str, Any]] | None:
+        """The receipt rows of an open plan straight from the index, else ``None``."""
+        if not self.path.exists():
+            return None
+        self._prepare_sidecar()
+        with _exclusive_lock(Path(self.dir) / ".candidate-ledger.lock"):
+            state = self._sync_sidecar()
+            if state is None or state.anomaly or state.completeness_reason():
+                return None
+            assert state.open_plans is not None
+            meta = state.open_plans.get(plan.plan_id)
+            if meta is None or meta["run"] != plan.run_id:
+                return None
+            reader = _RowReader(self.path)
+            try:
+                rows = [reader(o, n) for o, n in meta["receipts"]]
+            except ValueError:
+                return None
+            finally:
+                reader.close()
+        return [row for row in rows if str(row.get("run_id") or "") == plan.run_id]
 
     def operation_receipts(self, plan: CommitPlanSnapshot) -> dict[str, dict[str, Any]]:
         """Return validated, unique durable receipts for one sealed plan."""
@@ -2240,10 +3562,10 @@ class CandidateLedger:
             for operation in plan.operations
         }
         receipts: dict[str, dict[str, Any]] = {}
-        for record in self._indexed_records(
-            kinds={"operation_receipt"},
-            run_ids={plan.run_id},
-        ):
+        rows = self._open_plan_receipt_rows(plan)
+        if rows is None:
+            rows = self._indexed_records(kinds={"operation_receipt"}, run_ids={plan.run_id})
+        for record in rows:
             if str(record.get("plan_id") or "") != plan.plan_id:
                 continue
             if str(record.get("run_id") or "") != plan.run_id:
@@ -2370,100 +3692,46 @@ class CandidateLedger:
         return index.latest_candidate_run.get(candidate_id) if index is not None else None
 
     def run_summaries(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        runs: dict[str, dict[str, Any]] = {}
-        for record in self.records():
-            run_id = str(record.get("run_id") or "")
-            if not run_id:
-                continue
-            row = runs.setdefault(
-                run_id,
-                {
-                    "run_id": run_id,
-                    "state": "unknown",
-                    "started_at": None,
-                    "completed_at": None,
-                    "document_id": None,
-                    "source": None,
-                    "name": None,
-                    "blocks_total": 0,
-                    "model": None,
-                    "summary": {},
-                    "counts": {
-                        "candidates": 0,
-                        "comparisons": 0,
-                        "commit_plans": 0,
-                        "commit_records": 0,
-                    },
-                    "_candidate_ids": set(),
-                },
-            )
-            kind = record.get("kind")
-            if kind == "ingest_run":
-                state = str(record.get("state") or row["state"])
-                row["state"] = state
-                if state == "started":
-                    row["started_at"] = record.get("ts")
-                    row["document_id"] = record.get("document_id")
-                    row["source"] = record.get("source")
-                    row["name"] = os.path.basename(str(record.get("source") or "")) or None
-                    row["blocks_total"] = int(record.get("blocks_total") or 0)
-                    row["model"] = record.get("model")
-                elif state:
-                    row["completed_at"] = record.get("ts")
-                    row["summary"] = record.get("summary") or {}
-                    row["post_semantic_policy_fingerprint"] = record.get(
-                        "post_semantic_policy_fingerprint"
+        if not self.path.exists():
+            return []
+        with self._run_view() as view:
+            if view is not None:
+                ids = view.order()[:limit]
+                rows = {
+                    row["run_id"]: row
+                    for row in _summarize_runs(
+                        record for run_id in ids for record in view.reduced_records(run_id)
                     )
-            elif kind == "candidate":
-                if record.get("candidate_id"):
-                    row["_candidate_ids"].add(str(record.get("candidate_id")))
-            elif kind == "comparison":
-                row["counts"]["comparisons"] += 1
-            elif kind == "commit_plan":
-                row["counts"]["commit_plans"] += 1
-            elif kind == "commit_record":
-                row["counts"]["commit_records"] += 1
-            elif kind == "integrity_outcome":
-                integrity = record.get("integrity")
-                if isinstance(integrity, dict):
-                    summary = dict(row.get("summary") or {})
-                    outcome = dict(summary.get("outcome") or {})
-                    outcome["integrity"] = dict(integrity)
-                    if record.get("quality"):
-                        outcome["quality"] = str(record["quality"])
-                    summary["outcome"] = outcome
-                    row["summary"] = summary
-                    row["integrity"] = dict(integrity)
-        values = []
-        for row in runs.values():
-            row["counts"]["candidates"] = len(row.pop("_candidate_ids", set()))
-            values.append(row)
-        ordered = sorted(
-            values,
-            key=lambda item: str(item.get("started_at") or item.get("completed_at") or ""),
-            reverse=True,
-        )
-        return ordered[:limit]
+                }
+                return [rows[run_id] for run_id in ids]
+        return _sort_run_rows(_summarize_runs(self.iter_records()))[:limit]
 
     def run_detail(self, run_id: str) -> dict[str, Any] | None:
-        records = [record for record in self.records() if record.get("run_id") == run_id]
+        if not self.path.exists():
+            return None
+        with self._run_view() as view:
+            if view is not None:
+                records = (
+                    [r for r in view.records(run_id) if r.get("run_id") == run_id]
+                    if run_id in view.state.runs  # type: ignore[operator]
+                    else []
+                )
+                row = None
+                if records and run_id in view.order()[:500]:
+                    row = _summarize_runs(records)[0]
+                return _run_detail_payload(records, row)
+        records = [record for record in self.iter_records() if record.get("run_id") == run_id]
         if not records:
             return None
-        compact = [_without_heavy_values(record) for record in records]
-        candidates = [
-            _candidate_summary(record) for record in compact if record.get("kind") == "candidate"
-        ]
-        return {
-            "run": next(
-                (row for row in self.run_summaries(limit=500) if row["run_id"] == run_id), None
+        row = next(
+            (
+                r
+                for r in _sort_run_rows(_summarize_runs(self.iter_records()))[:500]
+                if r["run_id"] == run_id
             ),
-            "records": compact,
-            "candidates": candidates,
-            "comparisons": [r for r in compact if r.get("kind") == "comparison"],
-            "commit_plans": [r for r in compact if r.get("kind") == "commit_plan"],
-            "commit_records": [r for r in compact if r.get("kind") == "commit_record"],
-            "integrity_outcomes": [r for r in compact if r.get("kind") == "integrity_outcome"],
-        }
+            None,
+        )
+        return _run_detail_payload(records, row)
 
     def run_progress_summary(
         self,
@@ -2478,286 +3746,413 @@ class CandidateLedger:
         This summary exposes that pending layer without returning the heavy LLM
         request/response records that the detail endpoint keeps for audit.
         """
-        records = self.records()
-        if not records:
+        if not self.path.exists():
             return None
-
-        run: dict[str, Any] | None = None
+        with self._run_view() as view:
+            if view is not None:
+                if not view.state.records:
+                    return None
+                order = view.order()
+                if run_id:
+                    selected = run_id if run_id in order[:500] else None
+                else:
+                    selected = order[0] if order else None
+                if selected is None:
+                    return None
+                run_records = view.reduced_records(selected)
+                run = _summarize_runs(run_records)[0] if run_records else None
+                if not run_records:
+                    return None
+                return _progress_from_records(run, run_records, limit=limit)
+        if next(self.iter_records(), None) is None:
+            return None
+        rows = _sort_run_rows(_summarize_runs(self.iter_records()))
         if run_id:
-            run = next(
-                (row for row in self.run_summaries(limit=500) if row["run_id"] == run_id), None
-            )
+            run = next((row for row in rows[:500] if row["run_id"] == run_id), None)
         else:
-            run = next(iter(self.run_summaries(limit=1)), None)
+            run = next(iter(rows[:1]), None)
         if not run:
             return None
-
         selected_run_id = str(run.get("run_id") or "")
         run_records = [
-            record for record in records if str(record.get("run_id") or "") == selected_run_id
+            record
+            for record in self.iter_records()
+            if str(record.get("run_id") or "") == selected_run_id
         ]
         if not run_records:
             return None
+        progress = _progress_from_records(run, run_records, limit=limit)
+        degraded = self.index_degraded_reason()
+        if degraded is not None:
+            progress["ledger_index_degraded"] = degraded
+        return progress
 
-        unique_candidate_ids_by_kind: dict[str, set[str]] = {}
-        node_by_id: dict[str, dict[str, Any]] = {}
-        node_state_by_id: dict[str, str] = {}
-        final_node_verdict_by_id: dict[str, str] = {}
-        node_types_by_verdict: dict[str, Counter[str]] = {}
-        node_titles_by_verdict: dict[str, list[str]] = {}
-        node_samples_by_verdict: dict[str, list[dict[str, Any]]] = {}
-        relation_terminal_by_verdict: dict[str, Counter[str]] = {}
-        accepted_relation_predicates: Counter[str] = Counter()
-        queued_relation_predicates: Counter[str] = Counter()
-        relation_samples_by_verdict: dict[str, list[dict[str, Any]]] = {}
-        comparison_methods: Counter[str] = Counter()
-        comparison_verdicts: Counter[str] = Counter()
-        audit_modes: Counter[str] = Counter()
-        durations_by_method: dict[str, list[float]] = {}
-        tokens_by_method: dict[str, dict[str, int]] = {}
-        active_node_total: int | None = None
-        active_edge_total: int | None = None
-        # ADR 0039 T9: which comparison method last revised each denominator.
-        active_node_total_source: str | None = None
-        active_edge_total_source: str | None = None
 
-        candidate_rows = 0
-        comparison_rows = 0
-        commit_plans = 0
-        commit_records = 0
-        for record in run_records:
-            kind = str(record.get("kind") or "")
-            candidate_id = str(record.get("candidate_id") or "")
-            if kind == "candidate":
-                candidate_rows += 1
-                candidate_kind = str(record.get("candidate_kind") or "unknown")
-                if candidate_id:
-                    unique_candidate_ids_by_kind.setdefault(candidate_kind, set()).add(candidate_id)
-                if candidate_kind == "node":
-                    if candidate_id and candidate_id not in node_by_id:
-                        node_by_id[candidate_id] = _node_candidate_payload(record)
-                    if candidate_id:
-                        node_state_by_id[candidate_id] = str(record.get("state") or "unknown")
-                continue
-            if kind == "commit_plan":
-                commit_plans += 1
-                continue
-            if kind == "commit_record":
-                commit_records += 1
-                continue
-            if kind != "comparison":
-                continue
+def _summarize_runs(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One summary row per ``run_id`` found in ``records`` (first-appearance order).
 
-            comparison_rows += 1
-            method = str(record.get("method") or "unknown")
-            verdict = str(record.get("verdict") or "unknown")
-            comparison_methods[method] += 1
-            comparison_verdicts[verdict] += 1
-            payload = record.get("payload") or {}
-            if isinstance(payload, dict):
-                duration_s = payload.get("duration_s")
-                if isinstance(duration_s, (int, float)):
-                    durations_by_method.setdefault(method, []).append(float(duration_s))
-                usage = payload.get("usage")
-                if isinstance(usage, dict):
-                    totals = tokens_by_method.setdefault(method, {})
-                    for key, value in usage.items():
-                        if isinstance(value, int):
-                            totals[key] = totals.get(key, 0) + value
-            if isinstance(payload, dict) and payload.get("audit_only") is True:
-                mode = "llm_skipped" if payload.get("llm_skipped") is True else "llm_reviewed"
-                audit_modes[mode] += 1
-                continue
-            if not isinstance(payload, dict):
-                payload = {}
-            after = payload.get("after")
-            if isinstance(after, dict):
-                if isinstance(after.get("nodes"), int):
-                    active_node_total = int(after["nodes"])
-                    active_node_total_source = method
-                if isinstance(after.get("edges"), int):
-                    active_edge_total = int(after["edges"])
-                    active_edge_total_source = method
-            survivors = payload.get("survivors")
-            if isinstance(survivors, list):
-                active_node_total = len(survivors)
-                active_node_total_source = method
-            nodes = payload.get("nodes")
-            if isinstance(nodes, list):
-                active_node_total = len(nodes)
-                active_node_total_source = method
-            edges = payload.get("edges")
-            if isinstance(edges, list):
-                active_edge_total = len(edges)
-                active_edge_total_source = method
-
-            if method == "curator":
-                final_node_verdict_by_id[candidate_id] = verdict
-                node_payload = node_by_id.get(candidate_id) or {}
-                node_type = str(node_payload.get("type") or "unknown")
-                title = str(node_payload.get("title") or candidate_id)
-                node_types_by_verdict.setdefault(verdict, Counter())[node_type] += 1
-                node_titles_by_verdict.setdefault(verdict, []).append(title)
-                node_samples = node_samples_by_verdict.setdefault(verdict, [])
-                if len(node_samples) < limit:
-                    node_samples.append(
-                        {
-                            "candidate_id": candidate_id,
-                            "type": node_type,
-                            "title": title,
-                        }
-                    )
-            elif method == "relation_curator":
-                terminal = str(payload.get("proposed_terminal_action") or "unknown")
-                relation_terminal_by_verdict.setdefault(verdict, Counter())[terminal] += 1
-                predicate = str(
-                    payload.get("canonical_predicate") or payload.get("type") or "unknown"
+    Rows depend only on their own run's rows, in ledger order, so a caller may pass
+    one run's rows or the whole ledger and get the same row for that run.
+    """
+    runs: dict[str, dict[str, Any]] = {}
+    for record in records:
+        run_id = str(record.get("run_id") or "")
+        if not run_id:
+            continue
+        row = runs.setdefault(
+            run_id,
+            {
+                "run_id": run_id,
+                "state": "unknown",
+                "started_at": None,
+                "completed_at": None,
+                "document_id": None,
+                "source": None,
+                "name": None,
+                "blocks_total": 0,
+                "model": None,
+                "summary": {},
+                "counts": {
+                    "candidates": 0,
+                    "comparisons": 0,
+                    "commit_plans": 0,
+                    "commit_records": 0,
+                },
+                "_candidate_ids": set(),
+            },
+        )
+        kind = record.get("kind")
+        if kind == "ingest_run":
+            state = str(record.get("state") or row["state"])
+            row["state"] = state
+            if state == "started":
+                row["started_at"] = record.get("ts")
+                row["document_id"] = record.get("document_id")
+                row["source"] = record.get("source")
+                row["name"] = os.path.basename(str(record.get("source") or "")) or None
+                row["blocks_total"] = int(record.get("blocks_total") or 0)
+                row["model"] = record.get("model")
+            elif state:
+                row["completed_at"] = record.get("ts")
+                row["summary"] = record.get("summary") or {}
+                row["post_semantic_policy_fingerprint"] = record.get(
+                    "post_semantic_policy_fingerprint"
                 )
-                if verdict == "commit" and terminal == "create_edge_or_claim":
-                    accepted_relation_predicates[predicate] += 1
-                elif verdict != "commit":
-                    queued_relation_predicates[predicate] += 1
-                relation_samples = relation_samples_by_verdict.setdefault(verdict, [])
-                if len(relation_samples) < limit:
-                    relation_samples.append(
-                        _relation_sample(
-                            candidate_id,
-                            payload,
-                            predicate=predicate,
-                            terminal=terminal,
-                            node_by_id=node_by_id,
-                        )
+        elif kind == "candidate":
+            if record.get("candidate_id"):
+                row["_candidate_ids"].add(str(record.get("candidate_id")))
+        elif kind == "comparison":
+            row["counts"]["comparisons"] += 1
+        elif kind == "commit_plan":
+            row["counts"]["commit_plans"] += 1
+        elif kind == "commit_record":
+            row["counts"]["commit_records"] += 1
+        elif kind == "integrity_outcome":
+            integrity = record.get("integrity")
+            if isinstance(integrity, dict):
+                summary = dict(row.get("summary") or {})
+                outcome = dict(summary.get("outcome") or {})
+                outcome["integrity"] = dict(integrity)
+                if record.get("quality"):
+                    outcome["quality"] = str(record["quality"])
+                summary["outcome"] = outcome
+                row["summary"] = summary
+                row["integrity"] = dict(integrity)
+    values = []
+    for row in runs.values():
+        row["counts"]["candidates"] = len(row.pop("_candidate_ids", set()))
+        values.append(row)
+    return values
+
+
+def _sort_run_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        rows,
+        key=lambda item: str(item.get("started_at") or item.get("completed_at") or ""),
+        reverse=True,
+    )
+
+
+def _run_detail_payload(
+    records: list[dict[str, Any]], row: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    if not records:
+        return None
+    compact = [_without_heavy_values(record) for record in records]
+    candidates = [
+        _candidate_summary(record) for record in compact if record.get("kind") == "candidate"
+    ]
+    return {
+        "run": row,
+        "records": compact,
+        "candidates": candidates,
+        "comparisons": [r for r in compact if r.get("kind") == "comparison"],
+        "commit_plans": [r for r in compact if r.get("kind") == "commit_plan"],
+        "commit_records": [r for r in compact if r.get("kind") == "commit_record"],
+        "integrity_outcomes": [r for r in compact if r.get("kind") == "integrity_outcome"],
+    }
+
+
+def _progress_from_records(
+    run: dict[str, Any], run_records: list[dict[str, Any]], *, limit: int
+) -> dict[str, Any]:
+    """The compact progress payload for one run's rows (see ``run_progress_summary``)."""
+    unique_candidate_ids_by_kind: dict[str, set[str]] = {}
+    node_by_id: dict[str, dict[str, Any]] = {}
+    node_state_by_id: dict[str, str] = {}
+    final_node_verdict_by_id: dict[str, str] = {}
+    node_types_by_verdict: dict[str, Counter[str]] = {}
+    node_titles_by_verdict: dict[str, list[str]] = {}
+    node_samples_by_verdict: dict[str, list[dict[str, Any]]] = {}
+    relation_terminal_by_verdict: dict[str, Counter[str]] = {}
+    accepted_relation_predicates: Counter[str] = Counter()
+    queued_relation_predicates: Counter[str] = Counter()
+    relation_samples_by_verdict: dict[str, list[dict[str, Any]]] = {}
+    comparison_methods: Counter[str] = Counter()
+    comparison_verdicts: Counter[str] = Counter()
+    audit_modes: Counter[str] = Counter()
+    durations_by_method: dict[str, list[float]] = {}
+    tokens_by_method: dict[str, dict[str, int]] = {}
+    active_node_total: int | None = None
+    active_edge_total: int | None = None
+    # ADR 0039 T9: which comparison method last revised each denominator.
+    active_node_total_source: str | None = None
+    active_edge_total_source: str | None = None
+
+    candidate_rows = 0
+    comparison_rows = 0
+    commit_plans = 0
+    commit_records = 0
+    for record in run_records:
+        kind = str(record.get("kind") or "")
+        candidate_id = str(record.get("candidate_id") or "")
+        if kind == "candidate":
+            candidate_rows += 1
+            candidate_kind = str(record.get("candidate_kind") or "unknown")
+            if candidate_id:
+                unique_candidate_ids_by_kind.setdefault(candidate_kind, set()).add(candidate_id)
+            if candidate_kind == "node":
+                if candidate_id and candidate_id not in node_by_id:
+                    node_by_id[candidate_id] = _node_candidate_payload(record)
+                if candidate_id:
+                    node_state_by_id[candidate_id] = str(record.get("state") or "unknown")
+            continue
+        if kind == "commit_plan":
+            commit_plans += 1
+            continue
+        if kind == "commit_record":
+            commit_records += 1
+            continue
+        if kind != "comparison":
+            continue
+
+        comparison_rows += 1
+        method = str(record.get("method") or "unknown")
+        verdict = str(record.get("verdict") or "unknown")
+        comparison_methods[method] += 1
+        comparison_verdicts[verdict] += 1
+        payload = record.get("payload") or {}
+        if isinstance(payload, dict):
+            duration_s = payload.get("duration_s")
+            if isinstance(duration_s, (int, float)):
+                durations_by_method.setdefault(method, []).append(float(duration_s))
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                totals = tokens_by_method.setdefault(method, {})
+                for key, value in usage.items():
+                    if isinstance(value, int):
+                        totals[key] = totals.get(key, 0) + value
+        if isinstance(payload, dict) and payload.get("audit_only") is True:
+            mode = "llm_skipped" if payload.get("llm_skipped") is True else "llm_reviewed"
+            audit_modes[mode] += 1
+            continue
+        if not isinstance(payload, dict):
+            payload = {}
+        after = payload.get("after")
+        if isinstance(after, dict):
+            if isinstance(after.get("nodes"), int):
+                active_node_total = int(after["nodes"])
+                active_node_total_source = method
+            if isinstance(after.get("edges"), int):
+                active_edge_total = int(after["edges"])
+                active_edge_total_source = method
+        survivors = payload.get("survivors")
+        if isinstance(survivors, list):
+            active_node_total = len(survivors)
+            active_node_total_source = method
+        nodes = payload.get("nodes")
+        if isinstance(nodes, list):
+            active_node_total = len(nodes)
+            active_node_total_source = method
+        edges = payload.get("edges")
+        if isinstance(edges, list):
+            active_edge_total = len(edges)
+            active_edge_total_source = method
+
+        if method == "curator":
+            final_node_verdict_by_id[candidate_id] = verdict
+            node_payload = node_by_id.get(candidate_id) or {}
+            node_type = str(node_payload.get("type") or "unknown")
+            title = str(node_payload.get("title") or candidate_id)
+            node_types_by_verdict.setdefault(verdict, Counter())[node_type] += 1
+            node_titles_by_verdict.setdefault(verdict, []).append(title)
+            node_samples = node_samples_by_verdict.setdefault(verdict, [])
+            if len(node_samples) < limit:
+                node_samples.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "type": node_type,
+                        "title": title,
+                    }
+                )
+        elif method == "relation_curator":
+            terminal = str(payload.get("proposed_terminal_action") or "unknown")
+            relation_terminal_by_verdict.setdefault(verdict, Counter())[terminal] += 1
+            predicate = str(payload.get("canonical_predicate") or payload.get("type") or "unknown")
+            if verdict == "commit" and terminal == "create_edge_or_claim":
+                accepted_relation_predicates[predicate] += 1
+            elif verdict != "commit":
+                queued_relation_predicates[predicate] += 1
+            relation_samples = relation_samples_by_verdict.setdefault(verdict, [])
+            if len(relation_samples) < limit:
+                relation_samples.append(
+                    _relation_sample(
+                        candidate_id,
+                        payload,
+                        predicate=predicate,
+                        terminal=terminal,
+                        node_by_id=node_by_id,
                     )
+                )
 
-        committed_node_ids = {
-            candidate_id
-            for candidate_id, verdict in final_node_verdict_by_id.items()
-            if verdict == "commit" and node_state_by_id.get(candidate_id) != "superseded"
-        }
-        queued_node_ids = {
-            candidate_id
-            for candidate_id, verdict in final_node_verdict_by_id.items()
-            if verdict != "commit"
-        }
-        relation_commit_terminals = relation_terminal_by_verdict.get("commit") or Counter()
-        relation_queue_terminals: Counter[str] = Counter()
-        for verdict, counts in relation_terminal_by_verdict.items():
-            if verdict != "commit":
-                relation_queue_terminals.update(counts)
+    committed_node_ids = {
+        candidate_id
+        for candidate_id, verdict in final_node_verdict_by_id.items()
+        if verdict == "commit" and node_state_by_id.get(candidate_id) != "superseded"
+    }
+    queued_node_ids = {
+        candidate_id
+        for candidate_id, verdict in final_node_verdict_by_id.items()
+        if verdict != "commit"
+    }
+    relation_commit_terminals = relation_terminal_by_verdict.get("commit") or Counter()
+    relation_queue_terminals: Counter[str] = Counter()
+    for verdict, counts in relation_terminal_by_verdict.items():
+        if verdict != "commit":
+            relation_queue_terminals.update(counts)
 
-        candidate_counts = {
-            kind: len(ids) for kind, ids in sorted(unique_candidate_ids_by_kind.items())
-        }
-        active_candidate_counts = dict(candidate_counts)
-        if active_node_total is not None:
-            active_candidate_counts["node"] = active_node_total
-        if active_edge_total is not None:
-            active_candidate_counts["edge"] = active_edge_total
-        node_total = active_candidate_counts.get("node", 0)
-        edge_total = active_candidate_counts.get("edge", 0)
-        # ADR 0039 T9: prefilter/dedup legitimately shrink the live population.
-        # Publish that as a declared revision instead of letting the
-        # denominator silently move under the same percentage.
-        node_population_revision = (
-            _population_revision(
-                previous_total=candidate_counts.get("node", 0),
-                total=node_total,
-                reason="active_population_recomputed",
-                source=active_node_total_source,
-            )
-            if active_node_total is not None and node_total != candidate_counts.get("node", 0)
-            else None
+    candidate_counts = {
+        kind: len(ids) for kind, ids in sorted(unique_candidate_ids_by_kind.items())
+    }
+    active_candidate_counts = dict(candidate_counts)
+    if active_node_total is not None:
+        active_candidate_counts["node"] = active_node_total
+    if active_edge_total is not None:
+        active_candidate_counts["edge"] = active_edge_total
+    node_total = active_candidate_counts.get("node", 0)
+    edge_total = active_candidate_counts.get("edge", 0)
+    # ADR 0039 T9: prefilter/dedup legitimately shrink the live population.
+    # Publish that as a declared revision instead of letting the
+    # denominator silently move under the same percentage.
+    node_population_revision = (
+        _population_revision(
+            previous_total=candidate_counts.get("node", 0),
+            total=node_total,
+            reason="active_population_recomputed",
+            source=active_node_total_source,
         )
-        edge_population_revision = (
-            _population_revision(
-                previous_total=candidate_counts.get("edge", 0),
-                total=edge_total,
-                reason="active_population_recomputed",
-                source=active_edge_total_source,
-            )
-            if active_edge_total is not None and edge_total != candidate_counts.get("edge", 0)
-            else None
+        if active_node_total is not None and node_total != candidate_counts.get("node", 0)
+        else None
+    )
+    edge_population_revision = (
+        _population_revision(
+            previous_total=candidate_counts.get("edge", 0),
+            total=edge_total,
+            reason="active_population_recomputed",
+            source=active_edge_total_source,
         )
-        node_curator_done = (
-            len(final_node_verdict_by_id)
-            if active_node_total is not None
-            else int(comparison_methods.get("curator") or 0)
-        )
-        relation_curator_done = (
-            sum(sum(counts.values()) for counts in relation_terminal_by_verdict.values())
-            if active_edge_total is not None
-            else int(comparison_methods.get("relation_curator") or 0)
-        )
-        return {
-            "run": run,
-            "counts": {
-                "candidates": sum(candidate_counts.values()),
-                "candidate_rows": candidate_rows,
-                "comparisons": comparison_rows,
-                "commit_plans": commit_plans,
-                "commit_records": commit_records,
-            },
-            "candidate_kinds": candidate_counts,
-            "active_candidate_kinds": active_candidate_counts,
-            "comparison_methods": _top_counts(comparison_methods, limit=limit),
-            "comparison_verdicts": _top_counts(comparison_verdicts, limit=limit),
-            "audit_modes": _top_counts(audit_modes, limit=limit),
-            "llm_timing": {
-                method: _timing_stats(values, tokens=tokens_by_method.get(method))
-                for method, values in sorted(durations_by_method.items())
-            },
-            "progress": {
-                "node_curator": _progress(
-                    node_curator_done,
-                    node_total,
-                    population="node_candidates",
-                    revision=node_population_revision,
-                ),
-                "relation_curator": _progress(
-                    relation_curator_done,
-                    edge_total,
-                    population="edge_candidates",
-                    revision=edge_population_revision,
-                ),
-            },
-            "pending_commit_preview": {
-                "nodes": {
-                    "accepted_for_write": len(committed_node_ids),
-                    "queued_or_abstained": len(queued_node_ids),
-                    "types_by_verdict": {
-                        verdict: _top_counts(counts, limit=limit)
-                        for verdict, counts in sorted(node_types_by_verdict.items())
-                    },
-                    "sample_titles_by_verdict": {
-                        verdict: sorted(titles, key=str.casefold)[:limit]
-                        for verdict, titles in sorted(node_titles_by_verdict.items())
-                    },
-                    "sample_candidates_by_verdict": {
-                        verdict: rows for verdict, rows in sorted(node_samples_by_verdict.items())
-                    },
+        if active_edge_total is not None and edge_total != candidate_counts.get("edge", 0)
+        else None
+    )
+    node_curator_done = (
+        len(final_node_verdict_by_id)
+        if active_node_total is not None
+        else int(comparison_methods.get("curator") or 0)
+    )
+    relation_curator_done = (
+        sum(sum(counts.values()) for counts in relation_terminal_by_verdict.values())
+        if active_edge_total is not None
+        else int(comparison_methods.get("relation_curator") or 0)
+    )
+    return {
+        "run": run,
+        "counts": {
+            "candidates": sum(candidate_counts.values()),
+            "candidate_rows": candidate_rows,
+            "comparisons": comparison_rows,
+            "commit_plans": commit_plans,
+            "commit_records": commit_records,
+        },
+        "candidate_kinds": candidate_counts,
+        "active_candidate_kinds": active_candidate_counts,
+        "comparison_methods": _top_counts(comparison_methods, limit=limit),
+        "comparison_verdicts": _top_counts(comparison_verdicts, limit=limit),
+        "audit_modes": _top_counts(audit_modes, limit=limit),
+        "llm_timing": {
+            method: _timing_stats(values, tokens=tokens_by_method.get(method))
+            for method, values in sorted(durations_by_method.items())
+        },
+        "progress": {
+            "node_curator": _progress(
+                node_curator_done,
+                node_total,
+                population="node_candidates",
+                revision=node_population_revision,
+            ),
+            "relation_curator": _progress(
+                relation_curator_done,
+                edge_total,
+                population="edge_candidates",
+                revision=edge_population_revision,
+            ),
+        },
+        "pending_commit_preview": {
+            "nodes": {
+                "accepted_for_write": len(committed_node_ids),
+                "queued_or_abstained": len(queued_node_ids),
+                "types_by_verdict": {
+                    verdict: _top_counts(counts, limit=limit)
+                    for verdict, counts in sorted(node_types_by_verdict.items())
                 },
-                "relations": {
-                    "accepted_for_write": int(
-                        relation_commit_terminals.get("create_edge_or_claim") or 0
-                    ),
-                    "canonicalized_originals": int(
-                        relation_commit_terminals.get("canonicalize_predicate") or 0
-                    ),
-                    "endpoint_dead_letters": int(relation_commit_terminals.get("dead_letter") or 0),
-                    "queued_or_abstained": sum(relation_queue_terminals.values()),
-                    "terminals_by_verdict": {
-                        verdict: _top_counts(counts, limit=limit)
-                        for verdict, counts in sorted(relation_terminal_by_verdict.items())
-                    },
-                    "accepted_predicates": _top_counts(accepted_relation_predicates, limit=limit),
-                    "queued_predicates": _top_counts(queued_relation_predicates, limit=limit),
-                    "sample_relations_by_verdict": {
-                        verdict: rows
-                        for verdict, rows in sorted(relation_samples_by_verdict.items())
-                    },
+                "sample_titles_by_verdict": {
+                    verdict: sorted(titles, key=str.casefold)[:limit]
+                    for verdict, titles in sorted(node_titles_by_verdict.items())
+                },
+                "sample_candidates_by_verdict": {
+                    verdict: rows for verdict, rows in sorted(node_samples_by_verdict.items())
                 },
             },
-        }
+            "relations": {
+                "accepted_for_write": int(
+                    relation_commit_terminals.get("create_edge_or_claim") or 0
+                ),
+                "canonicalized_originals": int(
+                    relation_commit_terminals.get("canonicalize_predicate") or 0
+                ),
+                "endpoint_dead_letters": int(relation_commit_terminals.get("dead_letter") or 0),
+                "queued_or_abstained": sum(relation_queue_terminals.values()),
+                "terminals_by_verdict": {
+                    verdict: _top_counts(counts, limit=limit)
+                    for verdict, counts in sorted(relation_terminal_by_verdict.items())
+                },
+                "accepted_predicates": _top_counts(accepted_relation_predicates, limit=limit),
+                "queued_predicates": _top_counts(queued_relation_predicates, limit=limit),
+                "sample_relations_by_verdict": {
+                    verdict: rows for verdict, rows in sorted(relation_samples_by_verdict.items())
+                },
+            },
+        },
+    }
 
 
 def _node_ref_summary(ref: Any, node_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -2798,6 +4193,7 @@ __all__ = [
     "CommitPlanSnapshot",
     "CandidateLedger",
     "LEDGER_FILENAME",
+    "LEDGER_INDEX_FILENAME",
     "LedgerCompleteness",
     "LedgerScanResult",
     "MalformedLedgerLine",

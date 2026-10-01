@@ -3855,11 +3855,12 @@ def _semantic_governance_payload(state: Any) -> dict[str, Any]:
         else None
     )
 
-    scan = CandidateLedger(vault_path / ".marginalia").scan()
+    # Run rows only, read by offset: the cost follows the number of runs, not the ledger.
+    run_rows = CandidateLedger(vault_path / ".marginalia").ingest_run_records()
     starts: dict[str, dict[str, Any]] = {}
     completed_runs: list[dict[str, str]] = []
     latest_by_document: dict[str, dict[str, str]] = {}
-    for record in scan.parsed_records:
+    for record in run_rows:
         if record.get("ledger_version") not in _ACCEPTED_LEDGER_VERSIONS:
             continue
         if record.get("kind") != "ingest_run":

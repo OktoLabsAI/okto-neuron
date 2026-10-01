@@ -165,6 +165,35 @@ The existing `review_queue.json` becomes a projection of ledger state, not a sep
 of truth. A queued candidate is simply a candidate whose terminal state is `queued` and whose
 review action is pending.
 
+### Read path and the index sidecar
+
+`candidate-ledger.jsonl` is append-only and grows with every ingest, so no reader may
+hold it in memory. `records()` and `scan()` stream it in chunks (`iter_records()` is the
+unbounded-consumer form, and `scan(kinds=...)` keeps only the row kinds a caller reads).
+The run list, run detail, progress summary and the sealed-plan recovery reads do not scan
+at all: they use `candidate-ledger.jsonl.index`, a small file next to the ledger.
+
+The sidecar is a cache and never a source of truth. The ledger format is unchanged and every
+fact in the sidecar is derivable from the ledger by one streaming pass, so deleting the file
+is always safe. It holds, per run, the byte span of its rows and the fields that order runs,
+plus the open-plan set (plans with a sealed `commit_plan` and no `commit_record` or
+`plan_abandoned`). The index is maintained inside `append()` under the same lock as the
+write, and checkpointed atomically (temp file, fsync, rename) every few MiB of ledger.
+
+On first use the sidecar is trusted only if it has the current format version, a matching
+checksum, and the ledger still contains the bytes it was built from (the ledger is not
+shorter and the last covered bytes are identical). A ledger that is longer than the index
+covers, because another process appended or a crash fell between the ledger write and the
+index update, is caught up by scanning only the new tail. Anything else (missing file,
+corruption, other version, truncated or rewritten ledger) rebuilds the index from the
+ledger. A plan lifecycle that is not the clean plan, receipts, one terminal row sequence
+sets an anomaly flag; the reader then re-derives its verdict with the whole-ledger
+validation, so the errors raised for a damaged ledger are the ones it always raised.
+
+Known limits. Callers that need the index itself (plan validation, resume, receipts, index checkpoint) still run the in-lock sync. They run inside the semantic writer lease where no concurrent appender exists, and the startup prewarm makes their cold case rare. If an end-to-end ingest shows a stall there, this is reopened. The prewarm covers only the vaults that are open when the daemon starts; a vault opened later pays its cold build on its first read.
+
+The lock-held catch-up of the index is bounded by the inline tail (8 MiB) plus the bytes appended between the gap check and the lock. Measured at most 8.36 MB in a single lock-held section under sustained appends of about 18 MB/s, and 13.8 KB at a realistic ingest rate.
+
 ### Agentic workflow shape
 
 The first version is not "many agents." It is one durable workflow with worker roles:
