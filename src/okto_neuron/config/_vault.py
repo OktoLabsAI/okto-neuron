@@ -84,6 +84,20 @@ def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
     return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
 
 
+def _provider_registry_stat() -> tuple[str, tuple[int, int, int, int] | None]:
+    """Stat key of the one file ``provider_ref`` validation reads, without loading it.
+
+    ``ProviderRegistry.load`` consults only ``providers.yaml`` under the app home
+    (no legacy-home fallback, no includes; credential secrets are never read, only
+    their env names). Included for every vault, whether or not it names a
+    ``provider_ref``, exactly like ``defaults.yaml``.
+    """
+    from okto_neuron.providers import ProviderRegistry
+
+    path = ProviderRegistry.path_for_user()
+    return str(path), _stat_key(path)
+
+
 def _cache_get(cache: OrderedDict[tuple[Any, ...], Any], key: tuple[Any, ...]) -> Any:
     with _CONFIG_CACHE_LOCK:
         if key not in cache:
@@ -1897,8 +1911,9 @@ class VaultConfig(BaseModel):
         """Load a vault config, extending application defaults only when opted in.
 
         Successful loads are cached process-wide, keyed by the stat tuple of the
-        vault yaml and of the application ``defaults.yaml`` it may inherit (a
-        missing defaults file is its own key). Every call returns a deep copy, so
+        vault yaml, of the application ``defaults.yaml`` it may inherit, and of
+        ``providers.yaml`` (``provider_ref`` validation reads it); a missing
+        file is its own key. Every call returns a deep copy, so
         a caller mutating its model never reaches the cache. An explicit
         ``application_defaults`` argument bypasses the cache.
         """
@@ -1909,7 +1924,15 @@ class VaultConfig(BaseModel):
         if vault_stat is None:
             return cls._load_uncached(config_path, None)[0]
         defaults_path = cls.application_defaults_path()
-        key = ("load", config_path, cls, vault_stat, str(defaults_path), _stat_key(defaults_path))
+        key = (
+            "load",
+            config_path,
+            cls,
+            vault_stat,
+            str(defaults_path),
+            _stat_key(defaults_path),
+            *_provider_registry_stat(),
+        )
         cached = _cache_get(_LOAD_CACHE, key)
         if cached is not _MISSING:
             model, missing_version = cached
