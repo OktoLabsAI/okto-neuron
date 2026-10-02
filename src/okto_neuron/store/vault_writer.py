@@ -47,7 +47,8 @@ _API_EQUIVALENT: dict[str, str] = {
 }
 
 
-_DEFAULT_REST_PORT = 7777  # server/runtime.py DEFAULT_REST_PORT (kept literal: store/ never imports server/)
+# server/runtime.py DEFAULT_REST_PORT (kept literal: store/ never imports server/)
+_DEFAULT_REST_PORT = 7777
 
 
 def _reembed_remedy(vault_path: Path | str | None) -> str:
