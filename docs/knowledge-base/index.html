@@ -14957,25 +14957,32 @@ legacy shape, which resolves to <code>ladybug</code>, not the new <code>grafx</c
 other creation surface pins <code>grafx</code> explicitly.</p>
 <h2 id="docs__backends__grafx--operational-differences-from-ladybug">Operational differences from Ladybug</h2>
 <ul>
-<li><strong>On-disk shape.</strong> A Grafx vault has <code>graph.grafx/</code> (a directory), not
+<li>
+<p><strong>On-disk shape.</strong> A Grafx vault has <code>graph.grafx/</code> (a directory), not
 Ladybug's single <code>graph.lbug</code> file. Any tooling that hardcodes the
 <code>graph.lbug</code> filename (some acceptance-scenario assertions, the REST
 rollback checkpoint gate) does not yet apply to Grafx vaults; see the known
-gaps below.</li>
-<li><strong>Staging and rebuild.</strong> Rebuild, heal, reembed, reindex, and rollback all
+gaps below.</p>
+</li>
+<li>
+<p><strong>Staging and rebuild.</strong> Rebuild, heal, reembed, reindex, and rollback all
 work against a staged copy that is swapped onto the live path with an
 atomic rename chain over the whole <code>graph.grafx/</code> directory (<code>GrafxStaging</code>
 in <code>store/staging.py</code>), rather than Ladybug's single-file swap. A repeated
 commit under the same backup tag (e.g. heal running right after reembed)
-is supported and does not leave stray directories behind.</li>
-<li><strong>Concurrency model.</strong> Grafx uses optimistic MVCC: two concurrent writers
+is supported and does not leave stray directories behind.</p>
+</li>
+<li>
+<p><strong>Concurrency model.</strong> Grafx uses optimistic MVCC: two concurrent writers
 to the same row can conflict at commit time. Okto Neuron retries under
 <code>storage.retry</code> (<code>RetryConfig</code> in <code>config/_vault.py</code>): full-jitter
 exponential backoff from <code>backoff_base_ms</code> (default 50ms) up to
 <code>backoff_cap_ms</code> (default 2000ms), bounded by <code>max_attempts</code> (default 8)
 and a wall-clock <code>total_cap_s</code> ceiling (default 30s), whichever is hit
-first. A losing writer re-reads the winning row rather than overwriting it.</li>
-<li><strong>Buffer pool budget.</strong> Grafx's own pool defaults to 64 MiB, which thrashes
+first. A losing writer re-reads the winning row rather than overwriting it.</p>
+</li>
+<li>
+<p><strong>Buffer pool budget.</strong> Grafx's own pool defaults to 64 MiB, which thrashes
 on a graph near 180 MB. Okto Neuron passes <code>buffer_budget_bytes</code> to
 <code>okto_grafx.connect</code> from <code>storage.buffer_budget</code> in the vault yaml (an
 integer byte count or a string such as <code>256MiB</code>; accepted range 16 MiB to
@@ -14986,15 +14993,33 @@ max(256 MiB, 1.5 x current graph size), capped at 1 GiB. The open logs the
 vault name, graph size, chosen budget and its source (<code>default</code> or
 <code>config</code>), and <code>GET /api/v1/status</code> reports <code>grafx_buffer_budget_bytes</code> in
 each vault's block. Staged rebuild/heal/reembed copies read the same vault
-yaml. Grafx stays in exclusive mode.</li>
-<li><strong>Checkpoint.</strong> <code>GrafxStore.checkpoint()</code> currently reports itself as a
+yaml. Grafx stays in exclusive mode.</p>
+</li>
+<li>
+<p><strong>Checkpoint.</strong> <code>GrafxStore.checkpoint()</code> currently reports itself as a
 no-op in <code>BackendCapabilities</code> (<code>checkpoint_is_noop=True</code>). A direct probe
 against the underlying <code>okto_grafx.Database.checkpoint()</code> (bypassing that
 wrapper) shows it does real WAL-recycling work and returns immediately
 without blocking a concurrent open writer on a separate connection — see
 the M4 gate evidence (D-56) in the internal ADR 0041 plan for the full
 observation. Flipping the capability flag and wiring a real
-<code>checkpoint()</code> body is deliberately left for a later milestone.</li>
+<code>checkpoint()</code> body is deliberately left for a later milestone.</p>
+</li>
+<li>
+<p><strong>Integrity status and the write fence.</strong> Only Ladybug enforces the
+generation-scoped integrity fence on writes (<code>BackendCapabilities.write_fence</code>
+is true for Ladybug only): its first write audits the graph generation and a
+failed or incomplete audit blocks semantic writes. Grafx never audits or
+blocks a write on its own, so a grafx vault that was never audited reports
+<code>integrity.status: &quot;unverified&quot;</code> with <code>writer_fenced: false</code> and a reason
+saying that no audit has run, that grafx does not fence writes and that an
+audit is optional, instead of the Ladybug &quot;integrity state is missing&quot;
+fence. The on-demand audit is real on grafx (<code>POST /api/v1/graph/integrity</code>,
+<code>audit_supported</code> stays true) and records <code>verified</code> or a failure. A
+recorded <code>failed</code> or <code>incomplete</code> audit keeps its <code>writer_fenced: true</code> and
+its <code>integrity_fenced</code> degraded reason on grafx too, even though grafx does
+not block writes on it.</p>
+</li>
 </ul>
 <h2 id="docs__backends__grafx--dialect-gaps-closed-for-grafx">Dialect gaps closed for Grafx</h2>
 <p>Grafx speaks a Kuzu-flavored Cypher dialect with a few differences from what
