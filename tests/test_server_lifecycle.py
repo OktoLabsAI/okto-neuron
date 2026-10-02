@@ -2096,3 +2096,34 @@ def test_stream_is_file_matches_only_the_same_file(tmp_path: Path) -> None:
         assert not stream_is_file(handle, tmp_path / "missing.log")
     assert not stream_is_file(io.StringIO(), target)  # no file descriptor
 
+
+
+def test_default_log_rotates_at_the_bound_and_stdout_follows_the_new_file(tmp_path: Path) -> None:
+    """The daemon child's stdout/stderr are the log file; rotation keeps its name and re-points them."""
+    import textwrap
+
+    log = tmp_path / "logs" / "okto-neuron-serve.log"
+    log.parent.mkdir()
+    script = textwrap.dedent(
+        """
+        import os, sys
+        from pathlib import Path
+        from okto_neuron.server.lifecycle import configure_logging
+        log = Path(sys.argv[1])
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        os.dup2(fd, 1); os.dup2(fd, 2); os.close(fd)
+        logger = configure_logging(
+            None, log_file=log, rotate_max_bytes=600, rotate_backups=2, follow_std_fds=True
+        )
+        for i in range(12):
+            logger.warning("record-%02d %s", i, "x" * 80)
+        os.write(2, b"raw-stderr-after-rotation\\n")
+        """
+    )
+    subprocess.run([sys.executable, "-c", script, str(log)], check=True, cwd=tmp_path)
+    assert log.is_file()
+    backups = sorted(p.name for p in log.parent.iterdir() if p.name != log.name)
+    assert backups == ["okto-neuron-serve.log.1", "okto-neuron-serve.log.2"]  # standard names, capped
+    assert "raw-stderr-after-rotation" in log.read_text()  # fd 2 followed the rotation
+    assert log.stat().st_size <= 600 + 200
+    assert "record-11" in log.read_text()

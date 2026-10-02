@@ -893,6 +893,37 @@ def stream_is_file(stream: Any, path: Path) -> bool:
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
+class _FdFollowingRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotating handler for a log file that the process's stdout/stderr (fd 1 and 2) also point at.
+
+    The detached daemon child inherits fd 1/2 on the log file (uvicorn and tracebacks write there
+    directly). A plain rotation renames the file and leaves those fds on the renamed backup, so after
+    the first rollover the active file would only get this handler's records. After each rollover the
+    fds that were on the old file are re-pointed at the new active file.
+    """
+
+    def doRollover(self) -> None:
+        followers: list[int] = []
+        if self.stream is not None:
+            try:
+                ident = os.fstat(self.stream.fileno())
+                for fd in (1, 2):
+                    st = os.fstat(fd)
+                    if (st.st_dev, st.st_ino) == (ident.st_dev, ident.st_ino):
+                        followers.append(fd)
+            except OSError:
+                followers = []
+        super().doRollover()
+        if followers and self.stream is None:  # delay=True leaves the new file unopened until the next emit
+            self.stream = self._open()
+        if self.stream is not None:
+            for fd in followers:
+                try:
+                    os.dup2(self.stream.fileno(), fd)
+                except OSError:
+                    pass
+
+
 def configure_logging(
     vault: Path | None,
     *,
@@ -903,6 +934,7 @@ def configure_logging(
     rotate_backups: int = DEFAULT_LOG_ROTATE_BACKUPS,
     logger_name: str = "okto_neuron",
     also_stream: Any = None,
+    follow_std_fds: bool = False,
 ) -> logging.Logger:
     """Install :class:`JsonLogFormatter` on ``logger_name``.
 
@@ -943,7 +975,10 @@ def configure_logging(
                 log_file.parent.mkdir(parents=True, exist_ok=True)
                 with open(log_file, "ab"):  # fail now, not on the first record
                     pass
-                file_handler = logging.handlers.RotatingFileHandler(
+                rotating_cls = (
+                    _FdFollowingRotatingFileHandler if follow_std_fds else logging.handlers.RotatingFileHandler
+                )
+                file_handler = rotating_cls(
                     log_file,
                     maxBytes=rotate_max_bytes,
                     backupCount=rotate_backups,

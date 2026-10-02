@@ -3075,14 +3075,20 @@ def serve(
         return
 
     tee_stream = None
+    follow_std_fds = False
     if log_file is None:
-        # Always keep a log file (the launcher may send stdout/stderr to /dev/null): the default file
-        # plus the console. The detached daemon child already has stdout redirected to that same
-        # file, so it keeps the stream-only handler (one writer, no duplicate lines).
-        default_log = default_daemon_log_path()
-        if not stream_is_file(sys.stdout, default_log):
-            log_file, tee_stream = default_log, sys.stdout
-    logger = configure_logging(resolved, log_file=log_file, also_stream=tee_stream)
+        # Always keep a size-rotated log file (the launcher may send stdout/stderr to /dev/null): the
+        # default file plus the console. The detached daemon child already has stdout/stderr on that
+        # same file, so it writes only the file (no console copy, no duplicate lines) and rotation
+        # re-points those fds at the new file.
+        log_file = default_daemon_log_path()
+        if stream_is_file(sys.stdout, log_file):
+            follow_std_fds = True
+        else:
+            tee_stream = sys.stdout
+    logger = configure_logging(
+        resolved, log_file=log_file, also_stream=tee_stream, follow_std_fds=follow_std_fds
+    )
     from okto_neuron.llm._telemetry import missing_mlflow_warning
 
     telemetry_warning = missing_mlflow_warning()
