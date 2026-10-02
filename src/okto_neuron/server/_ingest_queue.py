@@ -1028,6 +1028,42 @@ def summary(state: "ServerState") -> dict:
     }
 
 
+_INLINE_KEYS = ("processing", "done", "error")
+
+
+class InlineCall:
+    """One inline MCP ``remember`` call, counted apart from queue items.
+
+    MCP ``remember`` runs inline (never enqueued), so it has no ``IngestItem``.
+    This records it in a per-vault counter dict (``state.inline_remember``):
+    ``processing`` while it runs, ``done``/``error`` afterwards. Mutated only on
+    the event loop. It is deliberately NOT part of ``summary()``'s queue counts.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict | None = None
+
+    def start(self, state: "ServerState") -> None:
+        counts = getattr(state, "inline_remember", None)
+        if isinstance(counts, dict) and self._counts is None:
+            self._counts = counts
+            counts["processing"] = counts.get("processing", 0) + 1
+
+    def finish(self, *, ok: bool) -> None:
+        counts, self._counts = self._counts, None
+        if counts is None:
+            return
+        counts["processing"] = max(0, counts.get("processing", 0) - 1)
+        key = "done" if ok else "error"
+        counts[key] = counts.get(key, 0) + 1
+
+
+def inline_summary(state: "ServerState") -> dict:
+    """Counts of inline MCP ``remember`` calls: processing / done / error."""
+    counts = getattr(state, "inline_remember", None) or {}
+    return {key: int(counts.get(key, 0)) for key in _INLINE_KEYS}
+
+
 def snapshot(state: "ServerState") -> dict:
     """Queue + summary counts for the UI poll."""
     return {
@@ -1895,6 +1931,8 @@ __all__ = [
     "enqueue_paths",
     "enqueue_uploads",
     "record_completed",
+    "InlineCall",
+    "inline_summary",
     "record_event",
     "snapshot",
     "item_detail",

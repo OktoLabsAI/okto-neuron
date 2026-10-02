@@ -141,6 +141,7 @@ def test_operational_status_is_separate_from_public_liveness(client):
         "cancelled": 0,
         "active": False,
         "cancel_requested": False,
+        "inline": {"processing": 0, "done": 0, "error": 0},
     }
 
 

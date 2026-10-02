@@ -86,7 +86,7 @@ The payload has exactly these keys.
 <ResponseField name="vaults" type="array">Per-vault summaries. Each entry carries `path`, `backend`, `draining`, `ingest`, `curation`, `maintenance` and `integrity`.</ResponseField>
 <ResponseField name="uptime_s" type="number">Daemon uptime in seconds.</ResponseField>
 <ResponseField name="queue_error_count" type="integer">Ingest items that failed or degraded. Defaults to `0`.</ResponseField>
-<ResponseField name="ingest" type="object">The ingest summary the text line is rendered from. Defaults to `{}`.</ResponseField>
+<ResponseField name="ingest" type="object">The ingest summary the text line is rendered from. Defaults to `{}`. Besides the queue counts it carries `inline` (`processing`, `done`, `error`), which counts MCP `remember` calls; those run inline and are not queue items, so they are not in `total`.</ResponseField>
 <ResponseField name="degraded_reasons" type="array">Reason strings. The server includes this key only when there is at least one reason; the CLI defaults it to an empty list.</ResponseField>
 <ResponseField name="marginalia_version" type="string">From `/version`; `unknown` when absent.</ResponseField>
 <ResponseField name="api_version" type="string">From `/version`; `unknown` when absent.</ResponseField>

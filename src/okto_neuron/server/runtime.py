@@ -1377,6 +1377,52 @@ def _mcp_progress_bridge() -> Callable[[str, int, int], None] | None:
     return _on_progress
 
 
+# Client idle timeout for HTTP MCP tool calls is 300 s (Claude Code); one long
+# LLM call can leave the per-block bridge silent for longer. A timer heartbeat
+# independent of block events keeps the client's idle timer alive.
+_MCP_HEARTBEAT_INTERVAL_S = 20.0
+
+
+@contextlib.asynccontextmanager
+async def _mcp_heartbeat():
+    """Send an MCP progress notification every interval while the body runs.
+
+    Started with the tool call and cancelled in ``finally`` (no notification
+    after completion). It never raises into the tool: no MCP context yields a
+    no-op, and ``report_progress`` itself no-ops without a ``progressToken``.
+    Progress is elapsed seconds; ``total`` is None (duration is unknown).
+    """
+    try:
+        from fastmcp.server.dependencies import get_context  # type: ignore
+
+        ctx = get_context()
+    except (RuntimeError, ImportError):
+        ctx = None
+    if ctx is None:
+        yield
+        return
+    started = time.monotonic()
+
+    async def _beat() -> None:
+        while True:
+            await asyncio.sleep(_MCP_HEARTBEAT_INTERVAL_S)
+            elapsed = time.monotonic() - started
+            try:
+                await ctx.report_progress(elapsed, None, f"remember in progress ({elapsed:.0f}s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - telemetry must never break ingest
+                _LOG.debug("mcp heartbeat notification failed", exc_info=True)
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
 _BARE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
 
@@ -1988,6 +2034,21 @@ def _build_mcp_server(state: ServerState):
         Before choosing, check the project directory for a ``.okto-neuron-vault``
         file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
         """
+        # The heartbeat covers the whole call (lock wait included); the inline
+        # counters record it in the vault's ingest summary (status "inline").
+        call = iq.InlineCall()
+        try:
+            async with _mcp_heartbeat():
+                result = await _remember_inline(source, sensitivity, vault, call)
+        except BaseException:
+            call.finish(ok=False)
+            raise
+        call.finish(ok=not result.get("provider_error"))
+        return result
+
+    async def _remember_inline(
+        source: str, sensitivity: str, vault: str | None, call: iq.InlineCall
+    ) -> dict[str, object]:
         # WRITE op — loopback-only, even under --allow-remote (writes never widen).
         # Matches REST /remember and the init_vault gate below.
         if not _mcp_kg_add_allowed():
@@ -2005,6 +2066,7 @@ def _build_mcp_server(state: ServerState):
             if runtime.shutting_down:
                 raise RuntimeError("shutting_down: server is shutting down")
             raise RuntimeError("maintenance: vault maintenance is in progress; writes are paused")
+        call.start(runtime)
         with lease as selected_vault:
             async with held_lock(runtime.writer_lock, "mcp-remember"):
                 try:

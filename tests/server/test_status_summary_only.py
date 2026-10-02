@@ -172,9 +172,10 @@ def test_status_payload_values_unchanged(state) -> None:
 
     payload = http_mod._status_payload(state)
 
-    assert payload["ingest"] == _old_ingest_summary(state)
+    zero_inline = {"inline": {"processing": 0, "done": 0, "error": 0}}
+    assert payload["ingest"] == _old_ingest_summary(state) | zero_inline
     (vault,) = payload["vaults"]
-    assert vault["ingest"] == _old_ingest_summary(state)
+    assert vault["ingest"] == _old_ingest_summary(state) | zero_inline
     assert vault["curation"] == _old_jobs_summary(state)
 
 

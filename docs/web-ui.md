@@ -1188,3 +1188,30 @@ names the breakdown in its `detail`. The scan-summary line under the drop zone
 shows the counts, and a **Show skipped files** disclosure lists the individual
 files and the rule each one hit. `POST /api/v1/ingest` (single paste/write) is
 unchanged — one operator-authored note is not a bulk source selection.
+
+## Addendum · 2026-10-02 — MCP `remember`: client idle timeout, timer heartbeat, inline counters
+
+**Client rule (measured with Claude Code 2.1.288 over the HTTP MCP transport).** A tool call is
+aborted when the client sees neither a response nor a progress notification for 300 s ("Tool
+aborting: no response or progress notification for 300s (idle timeout 300s)"). A tool that sent a
+notification every 20 s ran to completion past 300 s. The 300 s default applies to HTTP servers;
+stdio servers default to 1800 s. The client's own knobs are a per-server `timeout` (ms) and
+`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables). A separate hard wall-clock limit,
+`MCP_TOOL_TIMEOUT`, is not extended by progress notifications; its default is UNKNOWN (not
+determined, not guessed here).
+
+**Timer heartbeat.** The per-block progress bridge is silent while one long LLM call runs, so
+MCP `remember` also starts a timer task with the call that sends a progress notification every
+20 s (`runtime._MCP_HEARTBEAT_INTERVAL_S`) for the whole duration of the call, including the wait
+for the vault's writer lock. Progress is the elapsed seconds, total is omitted, the message is
+`remember in progress (Ns)`. The task is cancelled when the call ends (no notification after
+completion), never raises into the tool, and does nothing when there is no MCP context or the
+client sent no `progressToken`.
+
+**Inline counters.** MCP `remember` runs inline and never enqueues, so it has no queue item. It is
+recorded in a separate per-vault counter instead: `GET /api/v1/status` carries
+`ingest.inline = {processing, done, error}` on every vault's `ingest` block and on the aggregate
+`ingest` block. `processing` is 1 while an inline call runs (a call that returns a
+`provider_error` or raises counts as `error`, otherwise `done`). The queue counters (`total`,
+`queued`, `processing`, `done`, `error`, `cancelled`) and `/api/v1/ingest-queue` are unchanged;
+inline calls are not queue items. The counters are in memory and reset on daemon restart.
