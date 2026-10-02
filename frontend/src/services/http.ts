@@ -8,10 +8,16 @@ export const API_BASE = '/api/v1'
 export class HttpError extends Error {
   status: number
   code: string
-  constructor(message: string, status: number, code: string) {
+  /** Parsed JSON error body when the daemon sent one (e.g. the busy answer's `holder`). */
+  body: unknown
+  /** Retry-After header in seconds, when present. */
+  retryAfterS: number | null
+  constructor(message: string, status: number, code: string, body: unknown = null, retryAfterS: number | null = null) {
     super(message)
     this.status = status
     this.code = code
+    this.body = body
+    this.retryAfterS = retryAfterS
   }
 }
 
@@ -59,7 +65,14 @@ async function decodeResponse<T>(resp: Response): Promise<T> {
   if (!resp.ok) {
     const body = await resp.json().catch(() => null)
     const detail = body?.detail || body?.error || resp.statusText
-    throw new HttpError(detail, resp.status, body?.error || 'http_error')
+    const retryAfter = Number(resp.headers.get('Retry-After'))
+    throw new HttpError(
+      detail,
+      resp.status,
+      body?.error || 'http_error',
+      body,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null,
+    )
   }
   if (resp.status === 204) return undefined as T
   return resp.json()

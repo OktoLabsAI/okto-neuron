@@ -573,6 +573,23 @@ credential belongs to the application daemon, never to a browser session or sele
   and unlike those background jobs, a review-action click is a synchronous UI button. It now
   waits up to 5s (`_writer_lock_fast` in `server/http.py`) and returns `503 busy` if the
   lock isn't free in time, instead of leaving the button spinning behind the queue.
+- **The busy answer names the lock holder, and the review UI retries (a field report).**
+  The `503 busy` (and the `409 audit_busy` of the audit routes) keep their status, `error`
+  code and `detail` text, and now add `holder` (`kind`, `id`, `since`, `held_for_s`),
+  `retry_after_s`, and a `Retry-After` header (seconds). `kind` is one of `ingest-item`,
+  `mcp-remember`, `curation-job`, `rebuild-job`, `vault-maintenance` or `review-op`; `id`
+  is the queue item or job id (never a path, document name or text). `Retry-After` is 15 s
+  behind an ingest item or MCP remember, 30 s behind a curation or rebuild job, 10 s for
+  vault maintenance, 5 s behind another review action, and 10 s when the holder is
+  unknown. The companion review view, the reconcile review, the predicate-upkeep queue and
+  the authority view show `Busy: <kind> <id> has held the lock for N s; retrying in M s
+  (attempt k of 5)` with a **Stop retrying** button, and send the action again after a
+  capped exponential backoff of 2, 4, 8, 16 and 30 s (a longer `Retry-After` wins, at most
+  60 s). After the fifth retry the busy error is shown as before. The action is re-sent
+  only after a definitive busy answer, which the daemon gives before it changes anything,
+  so it is applied once; a request that timed out or dropped is never re-sent, and a
+  second click while an action is waiting is ignored. The logic lives in
+  `frontend/src/lib/busy-retry.ts` and `frontend/src/hooks/useBusyRetry.ts`.
 - **Endpoint permission belongs to a provider connection.** Named providers expose an
   `allow_remote` checkbox, on by default, which permits private-LAN and HTTPS endpoints. Test,
   LLM, and embedding calls through `provider_ref` use that provider-owned value. The older
