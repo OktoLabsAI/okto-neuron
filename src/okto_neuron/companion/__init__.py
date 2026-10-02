@@ -8851,14 +8851,22 @@ class Companion:
 
         return self._review_queue().page(limit, cursor)
 
-    def resolve_review(self, candidate_id: str, action: ReviewAction) -> CandidateOutcome:
+    def resolve_review(
+        self,
+        candidate_id: str,
+        action: ReviewAction,
+        *,
+        lease_timeout: float | None = None,
+    ) -> CandidateOutcome:
         """Act on a parked node candidate (commit / discard / merge).
 
-        Raises :class:`ReviewItemNotFoundError` for an unknown id.
+        Raises :class:`ReviewItemNotFoundError` for an unknown id. ``lease_timeout`` bounds the wait
+        for the cross-process semantic writer lease (``LeaseBusyError`` when it runs out); ``None``
+        waits forever.
         """
         for attempt in range(2):
             try:
-                return self._resolve_review_once(candidate_id, action)
+                return self._resolve_review_once(candidate_id, action, lease_timeout=lease_timeout)
             except _ManualReviewScopeChangedError:
                 if attempt:
                     raise
@@ -8868,6 +8876,8 @@ class Companion:
         self,
         candidate_id: str,
         action: ReviewAction,
+        *,
+        lease_timeout: float | None = None,
     ) -> CandidateOutcome:
         """Apply one sealed manual plan, abandoning a stale untouched scope."""
         if action not in {"commit", "discard", "merge"}:
@@ -8882,7 +8892,7 @@ class Companion:
         guard_factory = getattr(self._vault, "_integrity_write_guard", None)
         guard = guard_factory() if writes_graph and callable(guard_factory) else nullcontext()
         ledger = self._candidate_ledger()
-        with scan_guard, ledger.semantic_writer_lease():
+        with scan_guard, ledger.semantic_writer_lease(timeout=lease_timeout):
             # ReviewQueue is an in-memory snapshot of its durable file. Load it
             # only after the writer lease so a waiting resolver cannot replay a
             # candidate that the preceding transaction already acknowledged.

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from okto_neuron.companion import LLMUnavailableError, RememberCancelled
 from okto_neuron.server._integrity import IntegrityFenceError, require_write_allowed
+from okto_neuron.server._lock_holder import held_lock
 from okto_neuron.server._persist_coalesce import PersistCoalescer
 from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
@@ -1658,7 +1659,7 @@ async def _drain(
                 # A managed deletion fence can therefore prove this worker is
                 # finished before path-wide close.
                 with lease_context as leased_vault:
-                    async with state.writer_lock:
+                    async with held_lock(state.writer_lock, "ingest-item", item.id):
                         vault = leased_vault or getattr(state, "vault", None)
                         if vault is not None:
                             await store_io(require_write_allowed, state, vault)

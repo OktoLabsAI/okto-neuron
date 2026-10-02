@@ -358,7 +358,7 @@ def test_bare_review_batch_uses_immutable_request_vault(
         def __init__(self, vault_path: Path) -> None:
             self.vault_path = vault_path
 
-        def resolve_review(self, candidate_id: str, action: str) -> None:
+        def resolve_review(self, candidate_id: str, action: str, **_bounds: object) -> None:
             resolved.append((self.vault_path, candidate_id, action))
 
     def _selected_companion(runtime):

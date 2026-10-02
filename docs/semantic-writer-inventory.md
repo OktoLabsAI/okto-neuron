@@ -116,6 +116,25 @@ like any other. The node already exists, so `commit` receipts it as a re-mention
 *define* `add_node` / `add_edge` rather than call them. The closed-schema guard is
 enforced inside the two store implementations, so it covers every site above.
 
+## Review routes and a busy writer
+
+A `remember` or an ingest item holds the vault `writer_lock` and, inside the companion, the
+cross-process semantic writer lease (`.marginalia/.semantic-writer.lock`) for the whole item,
+which can take minutes. Review approve/reject (`POST /api/v1/resolve-review` and
+`POST /api/v1/review-queue/batch`, plus the bare aliases) never wait behind it without bound:
+
+- Both routes wait up to 5 s for `writer_lock`, then up to 5 s for the lease. The batch route
+  uses the same fail-fast path as the single route. The lease wait is a non-blocking acquire
+  loop; a timeout leaves nothing held. Callers that pass no timeout (for example `remember`
+  and the curation jobs) still block as before.
+- A timeout answers `503` with error `busy`, a `Retry-After` header, `retry_after_s`, and a
+  `holder` object. A `writer_lock` holder is `{kind, id, since, held_for_s}` where kind is one of
+  `mcp-remember`, `ingest-item`, `curation-job`, `rebuild-job`, `vault-maintenance`. A lease
+  held by another process is `{kind: "external-process", id: "-"}` (its age is unknown), with
+  `Retry-After: 15`.
+- A batch that is stopped by a busy lease keeps what it already resolved and reports it as
+  `resolved` and `skipped` in the same `503` body; retry with the remaining ids.
+
 ## Adding a writer
 
 1. Decide the class honestly. If a write depends on a model's judgement and is not

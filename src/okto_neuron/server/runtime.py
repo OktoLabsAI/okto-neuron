@@ -37,6 +37,7 @@ from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _gc_tuning
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._lock_holder import held_lock
 from okto_neuron.server._preload import preload_server_modules
 from okto_neuron.server._prewarm import start_ledger_prewarm
 from okto_neuron.server._store_io import (
@@ -2005,7 +2006,7 @@ def _build_mcp_server(state: ServerState):
                 raise RuntimeError("shutting_down: server is shutting down")
             raise RuntimeError("maintenance: vault maintenance is in progress; writes are paused")
         with lease as selected_vault:
-            async with runtime.writer_lock:
+            async with held_lock(runtime.writer_lock, "mcp-remember"):
                 try:
                     await store_io(graph_integrity.require_write_allowed, runtime, selected_vault)
                     ingest_source = await store_io(

@@ -14869,6 +14869,24 @@ like any other. The node already exists, so <code>commit</code> receipts it as a
 <p><code>store/protocol.py</code>, <code>store/memory.py</code>, and <code>store/ladybug.py</code> are skipped: they
 <em>define</em> <code>add_node</code> / <code>add_edge</code> rather than call them. The closed-schema guard is
 enforced inside the two store implementations, so it covers every site above.</p>
+<h2 id="docs__semantic-writer-inventory--review-routes-and-a-busy-writer">Review routes and a busy writer</h2>
+<p>A <code>remember</code> or an ingest item holds the vault <code>writer_lock</code> and, inside the companion, the
+cross-process semantic writer lease (<code>.marginalia/.semantic-writer.lock</code>) for the whole item,
+which can take minutes. Review approve/reject (<code>POST /api/v1/resolve-review</code> and
+<code>POST /api/v1/review-queue/batch</code>, plus the bare aliases) never wait behind it without bound:</p>
+<ul>
+<li>Both routes wait up to 5 s for <code>writer_lock</code>, then up to 5 s for the lease. The batch route
+uses the same fail-fast path as the single route. The lease wait is a non-blocking acquire
+loop; a timeout leaves nothing held. Callers that pass no timeout (for example <code>remember</code>
+and the curation jobs) still block as before.</li>
+<li>A timeout answers <code>503</code> with error <code>busy</code>, a <code>Retry-After</code> header, <code>retry_after_s</code>, and a
+<code>holder</code> object. A <code>writer_lock</code> holder is <code>{kind, id, since, held_for_s}</code> where kind is one of
+<code>mcp-remember</code>, <code>ingest-item</code>, <code>curation-job</code>, <code>rebuild-job</code>, <code>vault-maintenance</code>. A lease
+held by another process is <code>{kind: &quot;external-process&quot;, id: &quot;-&quot;}</code> (its age is unknown), with
+<code>Retry-After: 15</code>.</li>
+<li>A batch that is stopped by a busy lease keeps what it already resolved and reports it as
+<code>resolved</code> and <code>skipped</code> in the same <code>503</code> body; retry with the remaining ids.</li>
+</ul>
 <h2 id="docs__semantic-writer-inventory--adding-a-writer">Adding a writer</h2>
 <ol>
 <li>Decide the class honestly. If a write depends on a model's judgement and is not
