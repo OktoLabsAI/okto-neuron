@@ -18318,6 +18318,10 @@ leases for that runtime, wait for existing requests, release the one pool-owned 
 the wipe or atomic swap, install the replacement while still fenced, and only then resume the
 vault. Maintenance control/status routes do not borrow a graph lease, so the initiating request
 cannot wait on itself and reembed progress stays pollable. Other vault runtimes remain available.</p>
+<p>While a daemon holds the vault, the CLI <code>okto-neuron kg reembed</code> is refused and prints a
+<code>curl -X POST &lt;daemon REST URL&gt;/api/v1/vaults/reembed</code> line (or points at the Re-embed button in
+the vault manager). The URL comes from the daemon's lease record; a lease written by an older
+daemon without one falls back to the default port 7777.</p>
 <p><strong>Add.</strong> The write surface (implemented by <code>IngestView</code>): turn raw text into queryable knowledge without leaving the
 browser. Three ways in, all routing through the same companion <code>remember()</code> loop the CLI and
 MCP use:</p>
