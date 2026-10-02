@@ -23,6 +23,13 @@ class BackendCapabilities:
     concurrency_model: Literal["single_writer", "mvcc", "server"]
     # Beyond plan section 3.6's literal field list (M3 spec section 2.3, D-48).
     audit_supported: bool = True
+    # Whether this backend enforces the generation-scoped integrity fence on writes (a first write
+    # audits the generation, a failed or incomplete audit blocks semantic writes). Only the
+    # Ladybug bootstrap writes the integrity sidecar and only its store exposes the graph handle
+    # the fence needs (`server/_integrity.py` `require_write_allowed`). A backend with
+    # ``write_fence=False`` still supports an on-demand audit (``audit_supported``): it just never
+    # blocks a write on one.
+    write_fence: bool = False
     checkpoint_is_noop: bool = False
     # M4 spec section 2: CLI/onboarding/frontend-only gate (D-12) for a
     # pre-alpha-format backend -- never read by store/registry.py's
@@ -36,6 +43,7 @@ LADYBUG_CAPABILITIES = BackendCapabilities(
     native_traversal=True,
     requires_network=False,
     concurrency_model="single_writer",
+    write_fence=True,
     # Ladybug's checkpoint() does real WAL-merge work (store/ladybug.py); the
     # no-op default matches InMemoryStore's checkpoint() instead (D-16's
     # future Grafx supports_checkpoint flag, generalized).
