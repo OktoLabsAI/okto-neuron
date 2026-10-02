@@ -46,7 +46,7 @@ Open the local UI once the server is ready.
 </ParamField>
 
 <ParamField path="--log-file" type="path">
-Write server logs to this file, size-rotated. With `--daemon` the default is `~/.okto-neuron/logs/okto-neuron-serve.log`; pass `/dev/null` to silence. Without `--daemon`, logs go to stdout unless you set this. Rotation defaults are 10 MiB per file with 3 backups; a character device such as `/dev/null` is written without rotation.
+Write server logs to this file, size-rotated. The default is `~/.okto-neuron/logs/okto-neuron-serve.log`, always written (foreground and `--daemon`); the foreground command also echoes to the console. Pass `/dev/null` to silence the file. A file that cannot be opened gives one stderr warning and serving continues. Rotation defaults are 10 MiB per file with 3 backups; a character device such as `/dev/null` is written without rotation.
 </ParamField>
 
 <ParamField path="--foreground / --no-foreground" type="boolean" default="--foreground">

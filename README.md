@@ -262,6 +262,12 @@ If the daemon is already running, open `http://127.0.0.1:7777/` directly; `okto-
 a compatibility alias for that URL. Browser profiles, private windows, and additional tabs do not
 need a bootstrap command, credential, or session cookie.
 
+Every `serve` (foreground or daemon) writes `~/.okto-neuron/logs/okto-neuron-serve.log`, even when
+its stdout and stderr are discarded; the foreground command also echoes the records to the console.
+The file is size-rotated (10 MiB, 3 backups: `.1`, `.2`, `.3`). `--log-file PATH` changes the path and
+`--log-file /dev/null` silences the file. A file that cannot be opened gives one warning on stderr
+and the server keeps running.
+
 ```
 web UI : http://127.0.0.1:7777
 REST   : http://127.0.0.1:7777/api/v1/...

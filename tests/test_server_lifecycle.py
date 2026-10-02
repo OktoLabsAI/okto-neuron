@@ -25,6 +25,7 @@ from okto_neuron.server.lifecycle import (
     read_pid,
     send_stop,
     stop_server,
+    stream_is_file,
 )
 from okto_neuron.server import lifecycle as lifecycle_module
 
@@ -2045,3 +2046,84 @@ def test_pid_record_removal_failure_is_logged_not_swallowed(
     assert failures
     assert any("PID record" in r.getMessage() for r in failures)
     assert all(r.levelno == logging.WARNING for r in failures)
+
+
+def test_configure_logging_tees_to_the_file_and_the_console(tmp_path: Path) -> None:
+    buf = io.StringIO()
+    log_path = tmp_path / "logs" / "serve.log"
+    logger = configure_logging(
+        tmp_path, log_file=log_path, also_stream=buf, logger_name="okto_neuron.test_tee"
+    )
+    handlers = [h for h in logger.handlers if getattr(h, "_okto_neuron_json", False)]
+    assert len(handlers) == 2
+    logger.info("both", extra={"component": "c", "event": "e"})
+    for h in handlers:
+        h.flush()
+    assert json.loads(buf.getvalue().strip())["msg"] == "both"
+    assert json.loads(log_path.read_text(encoding="utf-8").strip())["msg"] == "both"
+
+
+def test_unwritable_log_file_warns_once_and_falls_back_to_the_console(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x", encoding="utf-8")  # a file where the log directory should be
+    buf = io.StringIO()
+    logger = configure_logging(
+        tmp_path,
+        log_file=blocker / "serve.log",
+        also_stream=buf,
+        logger_name="okto_neuron.test_unwritable",
+    )
+    logger.info("still logging", extra={"component": "c", "event": "e"})
+    handlers = [h for h in logger.handlers if getattr(h, "_okto_neuron_json", False)]
+    assert len(handlers) == 1
+    for h in handlers:
+        h.flush()
+    assert json.loads(buf.getvalue().strip())["msg"] == "still logging"
+    err = capsys.readouterr().err
+    assert err.count("cannot write the log file") == 1
+
+
+def test_stream_is_file_matches_only_the_same_file(tmp_path: Path) -> None:
+    target = tmp_path / "a.log"
+    other = tmp_path / "b.log"
+    target.write_text("", encoding="utf-8")
+    other.write_text("", encoding="utf-8")
+    with open(target, "ab") as handle:
+        assert stream_is_file(handle, target)
+        assert not stream_is_file(handle, other)
+        assert not stream_is_file(handle, tmp_path / "missing.log")
+    assert not stream_is_file(io.StringIO(), target)  # no file descriptor
+
+
+
+def test_default_log_rotates_at_the_bound_and_stdout_follows_the_new_file(tmp_path: Path) -> None:
+    """The daemon child's stdout/stderr are the log file; rotation keeps its name and re-points them."""
+    import textwrap
+
+    log = tmp_path / "logs" / "okto-neuron-serve.log"
+    log.parent.mkdir()
+    script = textwrap.dedent(
+        """
+        import os, sys
+        from pathlib import Path
+        from okto_neuron.server.lifecycle import configure_logging
+        log = Path(sys.argv[1])
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        os.dup2(fd, 1); os.dup2(fd, 2); os.close(fd)
+        logger = configure_logging(
+            None, log_file=log, rotate_max_bytes=600, rotate_backups=2, follow_std_fds=True
+        )
+        for i in range(12):
+            logger.warning("record-%02d %s", i, "x" * 80)
+        os.write(2, b"raw-stderr-after-rotation\\n")
+        """
+    )
+    subprocess.run([sys.executable, "-c", script, str(log)], check=True, cwd=tmp_path)
+    assert log.is_file()
+    backups = sorted(p.name for p in log.parent.iterdir() if p.name != log.name)
+    assert backups == ["okto-neuron-serve.log.1", "okto-neuron-serve.log.2"]  # standard names, capped
+    assert "raw-stderr-after-rotation" in log.read_text()  # fd 2 followed the rotation
+    assert log.stat().st_size <= 600 + 200
+    assert "record-11" in log.read_text()

@@ -138,10 +138,10 @@ esac
 
 ## The daemon log
 
-By default a daemonized server writes to `~/.okto-neuron/logs/okto-neuron-serve.log`. Structured
+By default every server, foreground or daemonized, writes to `~/.okto-neuron/logs/okto-neuron-serve.log`. Structured
 records are JSON, one per line. The daemon's raw stdout and stderr are redirected to the same file,
 so uncaught tracebacks and third-party output also appear there and are not JSON. Parse
-defensively. The file is size-rotated at 10 MiB with 3 backups kept. If the path already exists and is not
+defensively. The file is size-rotated at 10 MiB with 3 backups kept (`.1`, `.2`, `.3`); the active file keeps its name, and the daemon's stdout and stderr follow it after a rotation. If the path already exists and is not
 a regular file (a character device such as `/dev/null`), it is written without rotation.
 
 When a start fails, read the tail of that file. The installer does the same thing: on a failed
