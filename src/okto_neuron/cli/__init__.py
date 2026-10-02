@@ -2933,9 +2933,10 @@ def kg_pilot(vault_path: Path, report_dir: Path) -> None:
     "--log-file",
     type=click.Path(path_type=Path),
     default=None,
-    help="Write server logs to this file (size-rotated). With --daemon the default is "
-    "~/.okto-neuron/logs/okto-neuron-serve.log; pass /dev/null to silence. "
-    "Without --daemon logs go to stdout unless this is set.",
+    help="Write server logs to this file (size-rotated). The default is "
+    "~/.okto-neuron/logs/okto-neuron-serve.log (always written, in the foreground too, "
+    "where it is also echoed to the console); pass /dev/null to silence the file. "
+    "A file that cannot be opened falls back to the console with one warning.",
 )
 @click.option(
     "--foreground/--no-foreground",
@@ -2995,6 +2996,7 @@ def serve(
         default_daemon_log_path,
         pid_file_path,
         send_stop,
+        stream_is_file,
     )
 
     explicit_vault = ctx.get_parameter_source("vault") == ParameterSource.COMMANDLINE
@@ -3072,7 +3074,15 @@ def serve(
         click.echo(f"  Logs: {log_file}")
         return
 
-    logger = configure_logging(resolved, log_file=log_file)
+    tee_stream = None
+    if log_file is None:
+        # Always keep a log file (the launcher may send stdout/stderr to /dev/null): the default file
+        # plus the console. The detached daemon child already has stdout redirected to that same
+        # file, so it keeps the stream-only handler (one writer, no duplicate lines).
+        default_log = default_daemon_log_path()
+        if not stream_is_file(sys.stdout, default_log):
+            log_file, tee_stream = default_log, sys.stdout
+    logger = configure_logging(resolved, log_file=log_file, also_stream=tee_stream)
     from okto_neuron.llm._telemetry import missing_mlflow_warning
 
     telemetry_warning = missing_mlflow_warning()

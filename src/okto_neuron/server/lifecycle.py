@@ -879,6 +879,20 @@ def default_daemon_log_path() -> Path:
     return default_app_home() / "logs" / "okto-neuron-serve.log"
 
 
+def stream_is_file(stream: Any, path: Path) -> bool:
+    """True when ``stream`` is an open handle on the same file as ``path`` (same device and inode).
+
+    The detached daemon child has its stdout redirected to the log file by the parent; a second file
+    handler on that file would write every record twice and rotate it away from the raw stdout fd.
+    """
+    try:
+        a = os.fstat(stream.fileno())
+        b = os.stat(Path(path).expanduser())
+    except (OSError, ValueError, AttributeError):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
 def configure_logging(
     vault: Path | None,
     *,
@@ -888,12 +902,18 @@ def configure_logging(
     rotate_max_bytes: int = DEFAULT_LOG_ROTATE_BYTES,
     rotate_backups: int = DEFAULT_LOG_ROTATE_BACKUPS,
     logger_name: str = "okto_neuron",
+    also_stream: Any = None,
 ) -> logging.Logger:
     """Install :class:`JsonLogFormatter` on ``logger_name``.
 
     Writes to ``stream`` (default stdout), or — when ``log_file`` is given —
     to a size-rotated file instead (``/dev/null`` and other character devices
-    are written without rotation).
+    are written without rotation). ``also_stream`` additionally tees every
+    record to that stream (the console) when a file is used.
+
+    A log file that cannot be opened (missing permission, read-only volume) never
+    stops the server: one warning goes to stderr and the logger falls back to the
+    stream handler.
 
     Idempotent: removes pre-existing handlers we previously installed so that
     repeated invocations (tests, daemonization re-init) do not duplicate
@@ -911,25 +931,41 @@ def configure_logging(
     for handler in list(logger.handlers):
         if getattr(handler, "_okto_neuron_json", False):
             logger.removeHandler(handler)
-    handler: logging.Handler
+    formatter = JsonLogFormatter(vault=str(vault) if vault is not None else None)
+    handlers: list[logging.Handler] = []
     if log_file is not None:
         log_file = log_file.expanduser()
-        if log_file.exists() and not log_file.is_file():
-            # Character devices (/dev/null) cannot be size-rotated.
-            handler = logging.FileHandler(log_file, delay=True)
-        else:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            handler = logging.handlers.RotatingFileHandler(
-                log_file,
-                maxBytes=rotate_max_bytes,
-                backupCount=rotate_backups,
-                delay=True,
+        try:
+            if log_file.exists() and not log_file.is_file():
+                # Character devices (/dev/null) cannot be size-rotated.
+                file_handler: logging.Handler = logging.FileHandler(log_file, delay=True)
+            else:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_file, "ab"):  # fail now, not on the first record
+                    pass
+                file_handler = logging.handlers.RotatingFileHandler(
+                    log_file,
+                    maxBytes=rotate_max_bytes,
+                    backupCount=rotate_backups,
+                    delay=True,
+                )
+            handlers.append(file_handler)
+        except OSError as exc:
+            print(
+                f"okto-neuron: cannot write the log file {log_file} ({type(exc).__name__}: "
+                f"{exc.strerror or exc}); logging to the console only",
+                file=sys.stderr,
+            )
+        if also_stream is not None or not handlers:
+            handlers.append(
+                logging.StreamHandler(also_stream if also_stream is not None else stream or sys.stdout)
             )
     else:
-        handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
-    handler.setFormatter(JsonLogFormatter(vault=str(vault) if vault is not None else None))
-    handler._okto_neuron_json = True  # type: ignore[attr-defined]
-    logger.addHandler(handler)
+        handlers.append(logging.StreamHandler(stream if stream is not None else sys.stdout))
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        handler._okto_neuron_json = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
     return logger
 
 
