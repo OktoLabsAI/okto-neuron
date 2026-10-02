@@ -143,7 +143,7 @@ okto-neuron kg reembed [VAULT]
 
 `VAULT` is optional and there are no flags. Reembed is vectors only. It replays the existing graph's stored text through the configured embedder and rebuilds the graph at the configured width. It performs no LLM re-extraction.
 
-The `embedding` block reembed reads is documented at [/config/embedding-model](/config/embedding-model). For when each lifecycle command applies, see [/vault/rebuilding](/vault/rebuilding).
+While a daemon holds the vault the command is refused and prints the route to use instead: `POST /api/v1/vaults/reembed` with `{"vault": "<vault name>"}` (loopback only), which also works when the vault cannot be opened because its stored width differs from the configured one. The `embedding` block reembed reads is documented at [/config/embedding-model](/config/embedding-model). For when each lifecycle command applies, see [/vault/rebuilding](/vault/rebuilding).
 
 ### Sequence
 

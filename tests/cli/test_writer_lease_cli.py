@@ -38,7 +38,8 @@ _HOLDER = textwrap.dedent(
     """
     import sys
     from okto_neuron.store.writer_lease import acquire_writer_lease
-    acquire_writer_lease(sys.argv[1], role=sys.argv[2], operation="serve")
+    endpoint = sys.argv[3] if len(sys.argv) > 3 else None
+    acquire_writer_lease(sys.argv[1], role=sys.argv[2], operation="serve", endpoint=endpoint)
     print("ready", flush=True)
     sys.stdin.read()
     """
@@ -54,9 +55,11 @@ def _clean(monkeypatch: pytest.MonkeyPatch):
     VaultConnection.close_all()
 
 
-def spawn_holder(vault: Path, role: str = "daemon") -> subprocess.Popen:
+def spawn_holder(
+    vault: Path, role: str = "daemon", endpoint: str | None = None
+) -> subprocess.Popen:
     proc = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER, str(vault), role],
+        [sys.executable, "-c", _HOLDER, str(vault), role, *([endpoint] if endpoint else [])],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
@@ -106,7 +109,7 @@ def guarded_cases(vault: Path, tmp_path: Path) -> list[tuple[str, list[str], str
         ("init-wipe", ["init", v, "--wipe"], "POST /api/v1/reset"),
         ("kg-init", ["kg", "init", v], stop),
         ("kg-rebuild", ["kg", "rebuild", v], "POST /api/v1/curation/rebuild"),
-        ("kg-reembed", ["kg", "reembed", v], "POST /api/v1/curation/reembed"),
+        ("kg-reembed", ["kg", "reembed", v], "/api/v1/vaults/reembed"),
         ("kg-reindex", ["kg", "reindex", v], stop),
         ("reconcile-propose", ["kg", "reconcile", "propose", v], "/api/v1/reconcile/propose"),
         ("reconcile-apply", ["kg", "reconcile", "apply", v], "/api/v1/reconcile/apply"),
@@ -396,3 +399,72 @@ def test_refusal_is_a_writer_lease_held_error_with_the_remedy(tmp_path: Path) ->
         assert "okto-neuron stop" in info.value.user_message()
     finally:
         stop_holder(holder)
+
+
+# --- the holding daemon's REST URL travels in the lease (a field report: the printed
+# remedy named the default port while the daemon served on another one) ---
+
+
+@pytest.mark.parametrize("endpoint", ["http://127.0.0.1:17791", None])
+def test_lease_record_round_trips_the_holders_endpoint(tmp_path: Path, endpoint) -> None:
+    vault = make_vault(tmp_path)
+    holder = spawn_holder(vault, endpoint=endpoint)
+    try:
+        with pytest.raises(WriterLeaseHeld) as info:
+            acquire_writer_lease(vault, role="cli", operation="kg reembed")
+        assert info.value.holder.pid == holder.pid
+        assert info.value.holder.endpoint == endpoint
+    finally:
+        stop_holder(holder)
+
+
+def test_a_lease_record_written_without_an_endpoint_key_still_parses() -> None:
+    from okto_neuron.store.writer_lease import _holder_from_record
+
+    old = {
+        "version": 1,
+        "pid": os.getpid(),
+        "start_token": "",
+        "role": "daemon",
+        "operation": "serve",
+        "acquired_at": "2026-09-30T00:00:00+00:00",
+    }
+    holder = _holder_from_record(old)
+    assert holder.endpoint is None
+    assert (holder.pid, holder.role, holder.operation) == (os.getpid(), "daemon", "serve")
+
+
+def test_daemon_leases_record_the_daemon_rest_url(tmp_path: Path, monkeypatch) -> None:
+    from okto_neuron.server import _vault_pool
+
+    monkeypatch.setattr(_vault_pool, "_DAEMON_ENDPOINT", None)
+    _vault_pool.set_daemon_endpoint("http://127.0.0.1:17791")
+    vault = make_vault(tmp_path)
+    _vault_pool.acquire_daemon_writer_lease(vault)
+    record = json.loads((vault / LEASE_FILENAME).read_text(encoding="utf-8"))
+    assert record["role"] == "daemon"
+    assert record["endpoint"] == "http://127.0.0.1:17791"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "url", "absent"),
+    [
+        ("http://127.0.0.1:17791", "http://127.0.0.1:17791/api/v1/vaults/reembed", "7777"),
+        (None, "http://127.0.0.1:7777/api/v1/vaults/reembed", "17791"),
+        # never echo a non-loopback URL from a lease file: fall back to the default port
+        ("http://10.1.2.3:17791", "http://127.0.0.1:7777/api/v1/vaults/reembed", "10.1.2.3"),
+    ],
+)
+def test_kg_reembed_refusal_prints_the_holding_daemons_url(
+    tmp_path: Path, endpoint, url, absent
+) -> None:
+    vault = make_vault(tmp_path)
+    holder = spawn_holder(vault, endpoint=endpoint)
+    try:
+        result = invoke(["kg", "reembed", str(vault)])
+    finally:
+        stop_holder(holder)
+    assert result.exit_code == 5, (result.output, result.stderr)
+    assert f"curl -X POST {url} " in result.stderr, result.stderr
+    assert absent not in result.stderr, result.stderr
+    assert "Authorization" not in result.stderr  # the REST surface takes no token

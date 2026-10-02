@@ -2183,7 +2183,81 @@ def _changed_paths(before: VaultConfig, after: VaultConfig) -> list[str]:
     return changed
 
 
+_NEW_VAULT_EMBEDDING_KEYS = frozenset(
+    {"provider", "model", "dimension", "api_base", "api_key_env", "allow_remote"}
+)
+
+
+def validate_new_vault_embedding_spec(spec: object) -> dict[str, Any]:
+    """Validate the optional embedding spec a NEW vault is created with.
+
+    The graph is created at the configured width on its first open, and the vector column
+    is fixed-width afterwards (a later change needs a re-embed). Creating a vault with
+    its embedding spec makes the width right from the start; this returns the sparse
+    ``embedding`` patch to write into the vault config BEFORE that first open.
+
+    Unknown keys, wrong types and everything :class:`EmbeddingConfig` refuses (provider
+    name, loopback-or-``allow_remote`` ``api_base``, ``api_key_env`` namespace, a
+    non-positive ``dimension``) raise ``ValueError``. One more rule: a width other than the
+    default must name the provider/model that produces it; "dimension 4096" alone, or
+    with the default local model, would create a graph no embedder can feed.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("embedding must be an object")
+    unknown = sorted(set(spec) - _NEW_VAULT_EMBEDDING_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown embedding field(s) {unknown}; allowed: {sorted(_NEW_VAULT_EMBEDDING_KEYS)}"
+        )
+    patch: dict[str, Any] = {}
+    for key in ("provider", "model", "api_base", "api_key_env"):
+        if key in spec and spec[key] is not None:
+            value = spec[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"embedding.{key} must be a non-empty string")
+            patch[key] = value.strip()
+    if "dimension" in spec and spec["dimension"] is not None:
+        dimension = spec["dimension"]
+        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
+            raise ValueError("embedding.dimension must be a positive integer")
+        patch["dimension"] = dimension
+    if "allow_remote" in spec and spec["allow_remote"] is not None:
+        if not isinstance(spec["allow_remote"], bool):
+            raise ValueError("embedding.allow_remote must be a boolean")
+        patch["allow_remote"] = spec["allow_remote"]
+    try:
+        checked = EmbeddingConfig(**patch)
+    except ValueError as exc:  # pydantic.ValidationError is a ValueError
+        details = getattr(exc, "errors", None)
+        if callable(details):
+            reasons = "; ".join(
+                f"{'.'.join(['embedding', *(str(part) for part in item['loc'])])}: "
+                f"{str(item['msg']).removeprefix('Value error, ')}"
+                for item in details()
+            )
+            raise ValueError(f"invalid embedding spec: {reasons}") from exc
+        raise ValueError(f"invalid embedding spec: {exc}") from exc
+    if "provider" in patch:
+        patch["provider"] = checked.provider  # canonical name (aliases resolved)
+    default = EmbeddingConfig()
+    if checked.dimension != default.dimension:
+        names_source = "provider" in patch and patch["provider"] != default.provider
+        if not (names_source or "model" in patch):
+            raise ValueError(
+                f"embedding.dimension {checked.dimension} differs from the default width "
+                f"{default.dimension}: name the embedding provider/model that produces it"
+            )
+        if checked.provider == default.provider and checked.model == default.model:
+            raise ValueError(
+                f"embedding.dimension {checked.dimension} does not match the default local "
+                f"model ({default.model}, width {default.dimension}); name the model that "
+                "produces that width"
+            )
+    return patch
+
+
 __all__ = [
+    "validate_new_vault_embedding_spec",
     "ConsolidationConfig",
     "CurationSchedulerConfig",
     "CustomStorageConfig",

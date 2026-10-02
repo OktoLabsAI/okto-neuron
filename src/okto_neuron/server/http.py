@@ -92,6 +92,7 @@ from okto_neuron.server._store_io import (
 )
 from okto_neuron.consolidate.ledger import LeaseBusyError
 from okto_neuron.consolidate.review_queue_sqlite import ReviewQueueMigrationRequired
+from okto_neuron.server._open_failure import client_open_failure
 from okto_neuron.server._vault_pool import VaultPoolError, acquire_daemon_writer_lease
 from okto_neuron.store.writer_lease import degraded_leases, held_writer_lease
 from okto_neuron.server.lifecycle import request_id as bind_request_id
@@ -524,9 +525,10 @@ def _vault_open_warning(vault_path: Path, exc: EmbeddingDimMismatch) -> dict[str
         "detail": exc.user_message(),
         "remedy": (
             "Rebuild vectors at the configured embedding width through the running "
-            "daemon (POST /api/v1/curation/reembed, or the Curation page in the UI); "
-            "`okto-neuron kg reembed` is refused while the daemon holds the vault. "
-            "Or switch to another vault."
+            "daemon (POST /api/v1/vaults/reembed with {\"vault\": \"<vault name>\"}, which "
+            "works while the vault cannot be opened, or the vault manager's Re-embed "
+            "button); `okto-neuron kg reembed` is refused while the daemon holds the "
+            "vault. Or switch to another vault."
         ),
     }
 
@@ -851,6 +853,20 @@ _VAULT_LEASE_EXEMPT_PATHS: frozenset[str] = frozenset(
 )
 
 
+def _pool_open_error_response(exc: VaultPoolError) -> JSONResponse:
+    """REST answer for a failed vault open/lease.
+
+    A width mismatch gets the stable ``embedding_dim_mismatch`` code, the real reason and
+    the working remedy, path-free; every other pool error keeps its code and text.
+    """
+    mismatch = client_open_failure(exc)
+    if mismatch is not None:
+        _LOG.warning("vault open refused (embedding width mismatch): %s", exc)
+        return _err(409, mismatch[0], mismatch[1])
+    status = 503 if exc.code == "pool_full" else 409
+    return _err(status, exc.code, str(exc))
+
+
 def _request_is_vault_scoped(path: str) -> bool:
     """Return whether one REST path operates against a selected vault."""
 
@@ -949,8 +965,7 @@ class ActiveVaultMiddleware:
             await response(scope, receive, send)
             return
         except VaultPoolError as exc:
-            status = 503 if exc.code == "pool_full" else 409
-            response = _err(status, exc.code, str(exc))
+            response = _pool_open_error_response(exc)
             await response(scope, receive, send)
             return
         except Exception:  # noqa: BLE001
@@ -987,8 +1002,7 @@ class ActiveVaultMiddleware:
             # or large graph): never on the loop that also serves /health.
             lease = await acquire_off_loop(runtime.lease_vault)
         except VaultPoolError as exc:
-            status = 503 if exc.code == "pool_full" else 409
-            response = _err(status, exc.code, str(exc))
+            response = _pool_open_error_response(exc)
             await response(scope, receive, send)
             return
 
@@ -1448,8 +1462,13 @@ def _initialize_managed_vault(
     storage_credential_env: str | None = None,
     storage_database: str | None = None,
     allow_remote_db: bool = False,
+    embedding_spec: dict[str, Any] | None = None,
 ) -> None:
     """Create and mark one named vault under the worker-owned mutation lock.
+
+    ``embedding_spec`` is the validated sparse ``embedding`` block the vault is created
+    with (see ``validate_new_vault_embedding_spec``); it reaches the vault config before
+    the graph is first opened, so the graph is born at the spec's width.
 
     ``backend`` defaults to ``DEFAULT_NEW_VAULT_BACKEND`` (grafx, D-94) so the
     MCP ``init_vault`` tool (``server/runtime.py``) keeps calling this without
@@ -1476,6 +1495,9 @@ def _initialize_managed_vault(
         create_kwargs: dict[str, Any] = dict(
             packs=packs, embedding_provider=embedding_provider
         )
+        if embedding_spec:
+            # Only widened when a spec was given: the no-spec call stays exactly as before.
+            create_kwargs["embedding_spec"] = embedding_spec
         if backend != DEFAULT_NEW_VAULT_BACKEND:
             create_kwargs["backend"] = backend
             create_kwargs["storage_uri"] = storage_uri
@@ -1501,8 +1523,14 @@ def _create_inheriting_vault(
     storage_credential_env: str | None = None,
     storage_database: str | None = None,
     storage_allow_remote: bool = False,
+    embedding_spec: dict[str, Any] | None = None,
 ) -> Vault:
     """Create one vault whose sparse config extends the application defaults.
+
+    ``embedding_spec`` (provider/model/dimension/api_base/api_key_env/allow_remote, already
+    validated) is merged into the sparse ``embedding`` override BEFORE the first open of the
+    graph, which is created at the configured width; without it the width is the
+    application default.
 
     ``backend`` defaults to ``DEFAULT_NEW_VAULT_BACKEND``, NOT ``Vault.scaffold``'s
     own bare "ladybug" default (see the comment on ``Vault.scaffold``): every
@@ -1531,6 +1559,8 @@ def _create_inheriting_vault(
         overrides["packs"] = packs
     if embedding_provider is not None:
         overrides["embedding"] = {"provider": embedding_provider}
+    if embedding_spec:
+        overrides["embedding"] = {**overrides.get("embedding", {}), **embedding_spec}
     if overrides:
         VaultConfig.apply_patch(target_path, overrides)
     return Vault.open(target_path)
@@ -1547,6 +1577,7 @@ async def api_vault_create(request: Request) -> JSONResponse:
         embedder = payload.get("embedder")
         if embedder is not None and (not isinstance(embedder, str) or not embedder.strip()):
             raise _BadRequest("embedder must be a non-empty string")
+        embedding_spec = _parse_embedding_spec(payload.get("embedding"), embedder)
         backend_raw = payload.get("backend")
         if backend_raw is not None and (
             not isinstance(backend_raw, str) or not backend_raw.strip()
@@ -1644,6 +1675,7 @@ async def api_vault_create(request: Request) -> JSONResponse:
                 ),
                 storage_database=storage_database.strip() if storage_database else None,
                 allow_remote_db=allow_remote_db,
+                embedding_spec=embedding_spec,
             )
             # Its graph handle opens lazily on the first scoped request rather
             # than retaining the init handle from a worker whose caller may have
@@ -1659,7 +1691,39 @@ async def api_vault_create(request: Request) -> JSONResponse:
             _LOG.exception("vault create failed")
             return _err(500, "vault_create_failed", f"vault create failed: {exc}")
 
-    return JSONResponse(await store_io(_vault_created_payload, state, target_path))
+    created_payload = await store_io(_vault_created_payload, state, target_path)
+    if embedding_spec:
+        # Echo what the graph was created with: the width is fixed from here on.
+        created_payload["embedding"] = dict(embedding_spec)
+    return JSONResponse(created_payload)
+
+
+def _parse_embedding_spec(raw: object, embedder: object = None) -> dict[str, Any] | None:
+    """Validate the optional ``embedding`` object of a vault-create request (REST and MCP).
+
+    ``None`` means "no spec": the vault is created exactly as before, at the application
+    default width. A spec that names a provider different from the legacy ``embedder``
+    string is refused rather than silently preferring one of them.
+    """
+    if raw is None:
+        return None
+    from okto_neuron.config._vault import validate_new_vault_embedding_spec
+
+    try:
+        spec = validate_new_vault_embedding_spec(raw)
+    except ValueError as exc:
+        raise _BadRequest(str(exc)) from exc
+    if (
+        isinstance(embedder, str)
+        and embedder.strip()
+        and "provider" in spec
+        and spec["provider"] != embedder.strip()
+    ):
+        raise _BadRequest(
+            f"embedder {embedder.strip()!r} and embedding.provider {spec['provider']!r} disagree; "
+            "send only embedding.provider"
+        )
+    return spec or None
 
 
 def _vault_create_target(name: str) -> tuple[Path, bool]:
@@ -4428,6 +4492,77 @@ def _prepare_config_patch(patch: dict[str, Any]) -> str | None:
     return None
 
 
+def _stored_embedding_width(vault: Any) -> int | None:
+    """The vector width an OPEN vault's graph was built at, read from the live handle.
+
+    Never opens or leases anything: a cold graph cannot be read without a writable open
+    (a read-only grafx open needs a checkpoint-complete database), so a vault that is not
+    open reports ``None`` and is checked when it opens.
+    """
+    store = getattr(vault, "store", None)
+    for holder, attr in (
+        (store, "_embedding_dim"),
+        (getattr(store, "_graph_handle", None), "embedding_dim"),
+    ):
+        value = getattr(holder, attr, None) if holder is not None else None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _embedding_width_report(
+    state: ServerState | VaultRuntime,
+    entries: list[tuple[Path, int | None, int | None]],
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Per-vault stored-vs-configured width after an embedding config change.
+
+    ``entries`` are ``(vault path, configured width before, configured width after)``.
+    Names only (never paths). A vault whose graph is open is compared exactly; one that is
+    not open is reported as not checked, with the conditional consequence. The remedy
+    names the route that works while a vault cannot be opened.
+    """
+    from okto_neuron.server._open_failure import reembed_remedy, registered_vault_name
+
+    report: list[dict[str, object]] = []
+    notes: list[str] = []
+    for path, before, after in entries:
+        name = registered_vault_name(path)
+        label = f"vault '{name}'" if name else "a vault"
+        stored = _stored_embedding_width(state.vault_pool.peek(path))
+        item: dict[str, object] = {
+            "vault": name,
+            "configured_before": before,
+            "configured_after": after,
+            "stored": stored,
+            "checked": stored is not None,
+            "refuses_to_open": (stored != after) if stored is not None and after else None,
+        }
+        report.append(item)
+        if stored is not None and after and stored != after:
+            notes.append(
+                f"{label}: stored graph width {stored} differs from the configured width {after}; "
+                "it will refuse to open (embedding_dim_mismatch) until it is re-embedded. "
+                f"{reembed_remedy(name)}"
+            )
+        elif stored is None and before != after:
+            notes.append(
+                f"{label}: its stored graph width was not read (graph not open); the configured "
+                f"width changed {before} -> {after}. If the graph was built at {before} it will "
+                "refuse to open (embedding_dim_mismatch) until it is re-embedded. "
+                f"{reembed_remedy(name)}"
+            )
+    return report, notes
+
+
+def _configured_embedding_dimension(vault_path: Path) -> int | None:
+    from okto_neuron.config import VaultConfig
+
+    try:
+        return int(VaultConfig.load(vault_path).embedding.dimension)
+    except Exception:  # noqa: BLE001 - a width hint is never worth failing a config write
+        return None
+
+
 async def api_config_patch(request: Request) -> JSONResponse:
     state = get_state()
     if state.draining:
@@ -4458,6 +4593,7 @@ async def api_config_patch(request: Request) -> JSONResponse:
     async with state.config_lock:
         if state.draining:
             return _draining_response()
+        width_before = await store_io(_configured_embedding_dimension, state.vault_path)
         try:
             cfg, changed = await store_io(_apply_vault_config_patch, state, patch)
         except ValueError as exc:
@@ -4522,19 +4658,27 @@ async def api_config_patch(request: Request) -> JSONResponse:
         applied = "live"
         notes.append("no fields changed")
 
+    width_report: list[dict[str, object]] = []
+    if reembed:
+        width_report, width_notes = _embedding_width_report(
+            state, [(state.vault_path, width_before, int(cfg.embedding.dimension))]
+        )
+        notes.extend(width_notes)
+
     payload = await store_io(_config_payload, cfg, scope="vault")
     payload["status"] = "ok"
-    return JSONResponse(
-        {
-            "status": "ok",
-            "config": payload,
-            "applied": applied,
-            "changed": changed,
-            "notes": notes,
-            "affected_vaults": [str(state.vault_path)] if reembed or semantic_rebuild else [],
-            "rebuild_required_vaults": ([str(state.vault_path)] if semantic_rebuild else []),
-        }
-    )
+    response: dict[str, object] = {
+        "status": "ok",
+        "config": payload,
+        "applied": applied,
+        "changed": changed,
+        "notes": notes,
+        "affected_vaults": [str(state.vault_path)] if reembed or semantic_rebuild else [],
+        "rebuild_required_vaults": ([str(state.vault_path)] if semantic_rebuild else []),
+    }
+    if width_report:
+        response["embedding_width"] = width_report
+    return JSONResponse(response)
 
 
 def _apply_vault_config_patch(
@@ -4559,8 +4703,12 @@ def _apply_vault_config_patch(
 
 def _apply_application_config_patch(
     state: ServerState, patch: dict[str, Any]
-) -> tuple[Any, list[str], list[str], list[str], list[str]]:
-    """Store op: write the app defaults and walk every inheriting vault's YAML."""
+) -> tuple[Any, list[str], list[str], list[str], list[str], list[tuple[Path, int | None, int | None]]]:
+    """Store op: write the app defaults and walk every inheriting vault's YAML.
+
+    The last element is ``(path, width before, width after)`` for each inheriting vault whose
+    embedding space changed, for the stored-vs-configured width report.
+    """
     from okto_neuron.config import VaultConfig
 
     before = VaultConfig.load_application_defaults()
@@ -4570,7 +4718,19 @@ def _apply_application_config_patch(
         cached = state.vault_pool.peek(Path(path))
         if cached is not None:
             cached.invalidate_runtime_caches()
-    return cfg, changed, embedding_changed, reembed_vaults, rebuild_vaults
+    widths: list[tuple[Path, int | None, int | None]] = []
+    for path in reembed_vaults:
+        try:
+            widths.append(
+                (
+                    Path(path),
+                    int(VaultConfig.load(Path(path), application_defaults=before).embedding.dimension),
+                    int(VaultConfig.load(Path(path), application_defaults=cfg).embedding.dimension),
+                )
+            )
+        except Exception:  # noqa: BLE001 - a width hint is never worth failing a config write
+            widths.append((Path(path), None, None))
+    return cfg, changed, embedding_changed, reembed_vaults, rebuild_vaults, widths
 
 
 def _application_config_effects(
@@ -4636,6 +4796,7 @@ async def api_application_config_patch(request: Request) -> JSONResponse:
                 _embedding_changed,
                 reembed_vaults,
                 rebuild_vaults,
+                width_entries,
             ) = await store_io(_apply_application_config_patch, state, patch)
         except ValueError as exc:
             return _err(400, "bad_request", str(exc))
@@ -4696,19 +4857,25 @@ async def api_application_config_patch(request: Request) -> JSONResponse:
         applied = "live"
         notes.append("no fields changed")
 
+    width_report: list[dict[str, object]] = []
+    if reembed_vaults:
+        width_report, width_notes = _embedding_width_report(state, width_entries)
+        notes.extend(width_notes)
+
     payload = await store_io(_config_payload, cfg, scope="application")
     payload["status"] = "ok"
-    return JSONResponse(
-        {
-            "status": "ok",
-            "config": payload,
-            "applied": applied,
-            "changed": changed,
-            "notes": notes,
-            "affected_vaults": sorted(set(reembed_vaults) | set(rebuild_vaults)),
-            "rebuild_required_vaults": rebuild_vaults,
-        }
-    )
+    response: dict[str, object] = {
+        "status": "ok",
+        "config": payload,
+        "applied": applied,
+        "changed": changed,
+        "notes": notes,
+        "affected_vaults": sorted(set(reembed_vaults) | set(rebuild_vaults)),
+        "rebuild_required_vaults": rebuild_vaults,
+    }
+    if width_report:
+        response["embedding_width"] = width_report
+    return JSONResponse(response)
 
 
 def _contains_literal_secret_field(value: Any) -> bool:

@@ -51,6 +51,7 @@ from okto_neuron.server._store_io import (
     store_io,
     wait_executors_idle_async,
 )
+from okto_neuron.server._open_failure import client_open_failure
 from okto_neuron.server._vault_pool import (
     VaultLease,
     VaultPoolError,
@@ -734,9 +735,10 @@ def _vault_open_warning(vault_path: Path, exc: EmbeddingDimMismatch) -> dict[str
         "detail": exc.user_message(),
         "remedy": (
             "Rebuild vectors at the configured embedding width through the running "
-            "daemon (POST /api/v1/curation/reembed, or the Curation page in the UI); "
-            "`okto-neuron kg reembed` is refused while the daemon holds the vault. "
-            "Or switch to another vault."
+            "daemon (POST /api/v1/vaults/reembed with {\"vault\": \"<vault name>\"}, which "
+            "works while the vault cannot be opened, or the vault manager's Re-embed "
+            "button); `okto-neuron kg reembed` is refused while the daemon holds the "
+            "vault. Or switch to another vault."
         ),
     }
 
@@ -926,6 +928,11 @@ def _pool_error(exc: VaultPoolError, *, selector: str | None) -> VaultResolution
     original is logged for the operator.
     """
     _LOG.warning("vault pool error %s for selector %r: %s", exc.code, selector, exc, exc_info=True)
+    # A width mismatch is a diagnosable, path-free fact with a working remedy: say so
+    # instead of "see the server log" (a field report).
+    mismatch = client_open_failure(exc)
+    if mismatch is not None:
+        return VaultResolutionError(mismatch[0], mismatch[1])
     return VaultResolutionError(
         exc.code,
         # No ``exc.code`` in the text: the MCP layer already renders it as
@@ -2197,6 +2204,12 @@ def _build_mcp_server(state: ServerState):
         storage_credential_env: str | None = None,
         storage_database: str | None = None,
         allow_remote_db: bool = False,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_dimension: int | None = None,
+        embedding_api_base: str | None = None,
+        embedding_api_key_env: str | None = None,
+        embedding_allow_remote: bool = False,
     ) -> dict[str, object]:
         """Create one application-managed named vault without selecting it.
 
@@ -2219,6 +2232,16 @@ def _build_mcp_server(state: ServerState):
         instead of silently connecting to a remote endpoint. Returns ``{name, path}``,
         plus ``hint`` when the new vault has no usable LLM model — creation succeeded
         but ``remember`` will refuse until ``llm.defaults.model`` is set.
+
+        ``embedding_provider``/``embedding_model``/``embedding_dimension``/
+        ``embedding_api_base``/``embedding_api_key_env``/``embedding_allow_remote`` create
+        the vault with its embedding spec, so its graph is born at that width (the vector
+        column is fixed-width afterwards; changing the width later needs a re-embed).
+        Omit them all for the application default (a 384-wide local model). A width other
+        than 384 must name the provider/model that produces it. ``embedding_api_base`` is
+        loopback-only unless ``embedding_allow_remote`` is ``True``; ``embedding_api_key_env``
+        must name an ``OKTO_NEURON_*`` variable. When given, the result also carries the
+        ``embedding`` spec the vault was created with.
         """
         if state.draining:
             if state.shutting_down:
@@ -2228,7 +2251,12 @@ def _build_mcp_server(state: ServerState):
             raise RuntimeError("forbidden: vault creation is restricted to loopback callers")
 
         from okto_neuron.config._vault import DEFAULT_NEW_VAULT_BACKEND, _classify_storage_endpoint
-        from okto_neuron.server.http import _initialize_managed_vault, _parse_packs
+        from okto_neuron.server.http import (
+            _BadRequest,
+            _initialize_managed_vault,
+            _parse_embedding_spec,
+            _parse_packs,
+        )
         from okto_neuron.store.registry import NoSuchBackendError, resolve_graph_backend
         from okto_neuron.vault_registry import (
             ensure_global_layout,
@@ -2260,6 +2288,20 @@ def _build_mcp_server(state: ServerState):
                     "set allow_remote_db=True to confirm remote storage egress"
                 )
 
+        spec_fields = {
+            "provider": embedding_provider,
+            "model": embedding_model,
+            "dimension": embedding_dimension,
+            "api_base": embedding_api_base,
+            "api_key_env": embedding_api_key_env,
+            "allow_remote": True if embedding_allow_remote else None,
+        }
+        given_spec = {key: value for key, value in spec_fields.items() if value is not None}
+        try:
+            embedding_spec = _parse_embedding_spec(given_spec) if given_spec else None
+        except _BadRequest as exc:
+            raise RuntimeError(f"bad_request: {exc.detail}") from exc
+
         try:
             pack_list = _parse_packs(packs)
             target, exists = await store_io(_init_target, name.strip())
@@ -2287,11 +2329,14 @@ def _build_mcp_server(state: ServerState):
                     ),
                     storage_database=storage_database.strip() if storage_database else None,
                     allow_remote_db=allow_remote_db,
+                    embedding_spec=embedding_spec,
                 )
             except FileExistsError:
                 raise RuntimeError(f"vault_exists: vault already exists at {target}")
             await store_io(state.runtime_for, target, rehydrate=True)
         created: dict[str, object] = {"name": name.strip(), "path": str(target)}
+        if embedding_spec:
+            created["embedding"] = dict(embedding_spec)
         hint = await store_io(_vault_llm_model_hint, target)
         if hint:
             created["hint"] = hint
@@ -2313,6 +2358,12 @@ async def _run_async(
         raise RuntimeError(
             "direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel"
         )
+    # Before the first lease (the startup vault below): every lease this daemon takes
+    # names its REST URL, so a refused CLI command points at this daemon's port.
+    from okto_neuron.server._vault_pool import set_daemon_endpoint
+
+    url_host = f"[{host}]" if ":" in host else host
+    set_daemon_endpoint(f"http://{url_host}:{rest_port}")
     vault, active_vault_path, vault_warning = _open_startup_vault(vault_path)
     # Keep the compatibility state field explicit for isolated middleware policy
     # tests. Production startup rejects every remote bind/allow_remote request
@@ -2340,6 +2391,7 @@ async def _run_async(
 
     orchestrator = GracefulShutdown()
     state.shutdown = orchestrator
+    state.rest_port = rest_port
     rest_app = _TrackedASGIApp(build_rest_app(state), orchestrator)
     # The MCP surface is a separate privileged ASGI app on its own port. REST/UI
     # is credential-free on loopback; MCP alone retains bearer authentication.
