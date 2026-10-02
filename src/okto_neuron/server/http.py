@@ -1623,6 +1623,7 @@ async def api_vault_create(request: Request) -> JSONResponse:
                 ),
                 storage_database=storage_database.strip() if storage_database else None,
                 allow_remote_db=allow_remote_db,
+                embedding_spec=embedding_spec,
             )
             # Its graph handle opens lazily on the first scoped request rather
             # than retaining the init handle from a worker whose caller may have
@@ -1637,7 +1638,6 @@ async def api_vault_create(request: Request) -> JSONResponse:
         except Exception as exc:  # noqa: BLE001
             _LOG.exception("vault create failed")
             return _err(500, "vault_create_failed", f"vault create failed: {exc}")
-                embedding_spec=embedding_spec,
 
     created_payload = await store_io(_vault_created_payload, state, target_path)
     if embedding_spec:
@@ -4404,20 +4404,6 @@ def _prepare_config_patch(patch: dict[str, Any]) -> str | None:
     return None
 
 
-async def api_config_patch(request: Request) -> JSONResponse:
-    state = get_state()
-    if state.draining:
-        return _draining_response()
-    # M1: config-write is a sensitive route and is always loopback-only.
-    if not remote_config_allowed(request):
-        return _err(
-            403,
-            "forbidden",
-            "config write is restricted to loopback callers; use a "
-            "loopback-preserving SSH tunnel for remote administration",
-        )
-    try:
-        patch = await _read_json(request)
 def _stored_embedding_width(vault: Any) -> int | None:
     """The vector width an OPEN vault's graph was built at, read from the live handle.
 
@@ -4489,6 +4475,20 @@ def _configured_embedding_dimension(vault_path: Path) -> int | None:
         return None
 
 
+async def api_config_patch(request: Request) -> JSONResponse:
+    state = get_state()
+    if state.draining:
+        return _draining_response()
+    # M1: config-write is a sensitive route and is always loopback-only.
+    if not remote_config_allowed(request):
+        return _err(
+            403,
+            "forbidden",
+            "config write is restricted to loopback callers; use a "
+            "loopback-preserving SSH tunnel for remote administration",
+        )
+    try:
+        patch = await _read_json(request)
     except _BadRequest as exc:
         return _err(400, "bad_request", exc.detail)
     patch_error = _prepare_config_patch(patch)
@@ -4505,6 +4505,7 @@ def _configured_embedding_dimension(vault_path: Path) -> int | None:
     async with state.config_lock:
         if state.draining:
             return _draining_response()
+        width_before = await store_io(_configured_embedding_dimension, state.vault_path)
         try:
             cfg, changed = await store_io(_apply_vault_config_patch, state, patch)
         except ValueError as exc:
@@ -4519,7 +4520,6 @@ def _configured_embedding_dimension(vault_path: Path) -> int | None:
     if semantic_rebuild:
         applied = "rebuild"
         notes.append(
-        width_before = await store_io(_configured_embedding_dimension, state.vault_path)
             "semantic model stage changed: rebuild existing sources before treating "
             "the stored graph as representative of the new materialization policy"
         )
@@ -4570,6 +4570,13 @@ def _configured_embedding_dimension(vault_path: Path) -> int | None:
         applied = "live"
         notes.append("no fields changed")
 
+    width_report: list[dict[str, object]] = []
+    if reembed:
+        width_report, width_notes = _embedding_width_report(
+            state, [(state.vault_path, width_before, int(cfg.embedding.dimension))]
+        )
+        notes.extend(width_notes)
+
     payload = await store_io(_config_payload, cfg, scope="vault")
     payload["status"] = "ok"
     response: dict[str, object] = {
@@ -4584,13 +4591,6 @@ def _configured_embedding_dimension(vault_path: Path) -> int | None:
     if width_report:
         response["embedding_width"] = width_report
     return JSONResponse(response)
-
-    width_report: list[dict[str, object]] = []
-    if reembed:
-        width_report, width_notes = _embedding_width_report(
-            state, [(state.vault_path, width_before, int(cfg.embedding.dimension))]
-        )
-        notes.extend(width_notes)
 
 
 def _apply_vault_config_patch(
@@ -4630,7 +4630,19 @@ def _apply_application_config_patch(
         cached = state.vault_pool.peek(Path(path))
         if cached is not None:
             cached.invalidate_runtime_caches()
-    return cfg, changed, embedding_changed, reembed_vaults, rebuild_vaults
+    widths: list[tuple[Path, int | None, int | None]] = []
+    for path in reembed_vaults:
+        try:
+            widths.append(
+                (
+                    Path(path),
+                    int(VaultConfig.load(Path(path), application_defaults=before).embedding.dimension),
+                    int(VaultConfig.load(Path(path), application_defaults=cfg).embedding.dimension),
+                )
+            )
+        except Exception:  # noqa: BLE001 - a width hint is never worth failing a config write
+            widths.append((Path(path), None, None))
+    return cfg, changed, embedding_changed, reembed_vaults, rebuild_vaults, widths
 
 
 def _application_config_effects(
@@ -4696,6 +4708,7 @@ async def api_application_config_patch(request: Request) -> JSONResponse:
                 _embedding_changed,
                 reembed_vaults,
                 rebuild_vaults,
+                width_entries,
             ) = await store_io(_apply_application_config_patch, state, patch)
         except ValueError as exc:
             return _err(400, "bad_request", str(exc))
@@ -4756,19 +4769,25 @@ async def api_application_config_patch(request: Request) -> JSONResponse:
         applied = "live"
         notes.append("no fields changed")
 
+    width_report: list[dict[str, object]] = []
+    if reembed_vaults:
+        width_report, width_notes = _embedding_width_report(state, width_entries)
+        notes.extend(width_notes)
+
     payload = await store_io(_config_payload, cfg, scope="application")
     payload["status"] = "ok"
-    return JSONResponse(
-        {
-            "status": "ok",
-            "config": payload,
-            "applied": applied,
-            "changed": changed,
-            "notes": notes,
-            "affected_vaults": sorted(set(reembed_vaults) | set(rebuild_vaults)),
-            "rebuild_required_vaults": rebuild_vaults,
-        }
-    )
+    response: dict[str, object] = {
+        "status": "ok",
+        "config": payload,
+        "applied": applied,
+        "changed": changed,
+        "notes": notes,
+        "affected_vaults": sorted(set(reembed_vaults) | set(rebuild_vaults)),
+        "rebuild_required_vaults": rebuild_vaults,
+    }
+    if width_report:
+        response["embedding_width"] = width_report
+    return JSONResponse(response)
 
 
 def _contains_literal_secret_field(value: Any) -> bool:

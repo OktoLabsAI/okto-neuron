@@ -2316,6 +2316,7 @@ async def _run_async(
 
     orchestrator = GracefulShutdown()
     state.shutdown = orchestrator
+    state.rest_port = rest_port
     rest_app = _TrackedASGIApp(build_rest_app(state), orchestrator)
     # The MCP surface is a separate privileged ASGI app on its own port. REST/UI
     # is credential-free on loopback; MCP alone retains bearer authentication.
@@ -2354,7 +2355,6 @@ async def _run_async(
     # (default False) so inert unless configured. Global — not reset by switch_vault.
     #
     # Task 4 (silent-failure visibility): the loop body is wrapped in a crash guard,
-    state.rest_port = rest_port
     # but if the task EVER exits with an exception (something outside the guard, e.g.
     # in the sleep/scaffolding), auto-ingest would stop forever with no signal. The
     # ``_supervise_folder_watch`` done-callback restarts a CRASHED task (bounded by
