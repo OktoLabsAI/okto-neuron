@@ -156,10 +156,26 @@ def test_a_busy_answer_without_a_known_holder_still_carries_retry_after() -> Non
 # ── review routes: batch fast-fail and the bounded semantic-lease wait ───────────────────────
 
 _REVIEW_PATHS = ("/api/v1/resolve-review", "/api/v1/review-queue/batch")
-_BODIES = {
-    "/api/v1/resolve-review": {"candidate_id": "missing", "action": "discard"},
-    "/api/v1/review-queue/batch": {"candidate_ids": ["missing"], "action": "discard"},
-}
+
+
+def _body(path: str, ids: list[str]) -> dict:
+    if path.endswith("/batch"):
+        return {"candidate_ids": ids, "action": "discard"}
+    return {"candidate_id": ids[0], "action": "discard"}
+
+
+def _seed(vault: Vault) -> list[str]:
+    from okto_neuron.consolidate import NodeCandidate
+    from okto_neuron.consolidate.review_queue import ReviewQueue
+
+    queue = ReviewQueue(Path(vault.path) / ".marginalia", vault.store)
+    return [
+        queue.enqueue(
+            NodeCandidate(type="Concept", title=f"item {i}", facets={"block_id": f"b{i}"}),
+            "low_confidence",
+        ).candidate_id
+        for i in range(2)
+    ]
 
 
 def _fast(monkeypatch: pytest.MonkeyPatch, timeout: float = 0.2) -> None:
@@ -169,18 +185,22 @@ def _fast(monkeypatch: pytest.MonkeyPatch, timeout: float = 0.2) -> None:
     monkeypatch.setattr(http_mod, "_CURATION_LOCK_TIMEOUT_S", timeout)
 
 
-def _post(tmp_path: Path, path: str, hold) -> tuple[httpx.Response, float]:  # type: ignore[no-untyped-def]
-    """POST one review route while ``hold(state)`` (an async CM factory) is in effect."""
+def _post(tmp_path: Path, path: str, hold, *, seed: bool = True) -> tuple[httpx.Response, float]:  # type: ignore[no-untyped-def]
+    """POST one review route while ``hold(state)`` (an async CM factory) is in effect.
+
+    ``seed`` parks two real candidates and acts on them; otherwise the ids are unknown.
+    """
 
     async def scenario() -> tuple[httpx.Response, float]:
         reset_state_for_tests()
         vault = Vault.init(tmp_path / "v", packs=["core"])
+        ids = _seed(vault) if seed else ["missing"]
         state = init_state(vault, vault.path)
         transport = httpx.ASGITransport(app=build_rest_app(state))
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
             async with hold(state):
                 started = time.monotonic()
-                response = await client.post(path, json=_BODIES[path])
+                response = await client.post(path, json=_body(path, ids))
                 return response, time.monotonic() - started
 
     try:
@@ -198,11 +218,14 @@ def test_both_review_routes_fail_fast_with_holder_and_retry_after(
         tmp_path, path, lambda state: held_lock(state.writer_lock, "mcp-remember", "-")
     )
     assert took < 3, took  # the batch route used to wait without bound
-    assert response.status_code == 503, response.text
+    # A busy vault queues the action (202) and names the holder; it no longer fails.
+    assert response.status_code == 202, response.text
     body = response.json()
-    assert body["error"] == "busy"
+    assert body["status"] == "queued"
     assert body["holder"]["kind"] == "mcp-remember"
-    assert body["retry_after_s"] == 15 and response.headers["Retry-After"] == "15"
+    assert body["retry_after_s"] == 15
+    queued = body["actions"] if path.endswith("/batch") else [body["action"]]
+    assert queued and all(row["status"] == "queued" for row in queued)
 
 
 @pytest.mark.parametrize("path", _REVIEW_PATHS)
@@ -213,7 +236,7 @@ def test_a_review_with_free_locks_still_works(tmp_path: Path, path: str) -> None
     async def nothing(state):  # type: ignore[no-untyped-def]
         yield
 
-    response, _ = _post(tmp_path, path, nothing)
+    response, _ = _post(tmp_path, path, nothing, seed=False)
     if path.endswith("/batch"):
         assert response.status_code == 200, response.text
         assert response.json() == {"status": "ok", "resolved": 0, "skipped": 1, "errors": []}
@@ -259,10 +282,11 @@ def test_a_flock_held_by_another_process_surfaces_as_busy_external_process(
         proc.terminate()
         proc.wait(timeout=10)
     assert took < 3, took
-    assert response.status_code == 503, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
+    assert body["status"] == "queued"
     assert body["holder"] == {"kind": "external-process", "id": "-"}
-    assert body["retry_after_s"] == 15 and response.headers["Retry-After"] == "15"
+    assert body["retry_after_s"] == 15
     assert "external-process" in body["detail"]
 
 
@@ -352,5 +376,5 @@ def test_one_process_holding_both_locks_does_not_deadlock_a_review(
                 yield
 
     response, took = _post(tmp_path, "/api/v1/resolve-review", both)
-    assert took < 3 and response.status_code == 503
+    assert took < 3 and response.status_code == 202
     assert response.json()["holder"]["kind"] == "mcp-remember"

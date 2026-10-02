@@ -712,14 +712,17 @@ def _supervise_folder_watch(state: ServerState, task: "asyncio.Task") -> None:
 def _resume_durable_runtime_work(state: ServerState) -> None:
     """Discover every registered vault and restart its durable queued work.
 
+    Review actions queued while a vault was busy restart their applier too.
     Runtime creation reads only queue/job sidecars. Graph handles stay closed
     until a worker takes its scoped lease, so startup scales independently of
     ``VaultPool.max_open``.
     """
-    from okto_neuron.server import _ingest_queue, _jobs
+    from okto_neuron.server import _ingest_queue, _jobs, _review_actions
     from okto_neuron.server.http import _companion
 
     for runtime in state.runtimes(discover=True):
+        if _review_actions.has_queued(runtime):
+            _review_actions.ensure_applier(runtime)
         if any(item.status == "queued" for item in runtime.ingest_queue):
             _ingest_queue.ensure_worker(runtime, _companion)
         if any(job.status == "queued" for job in runtime.curation_jobs):

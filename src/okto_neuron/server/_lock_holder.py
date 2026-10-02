@@ -29,6 +29,7 @@ _RETRY_AFTER_S = {
     "rebuild-job": 30,
     "vault-maintenance": 10,
     "review-op": 5,
+    "review-queue": 5,
     # The semantic writer lease is held by something this process cannot name.
     "external-process": 15,
     "semantic-writer": 10,
