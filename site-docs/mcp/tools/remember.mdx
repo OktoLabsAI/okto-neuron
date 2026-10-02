@@ -243,6 +243,16 @@ Two details matter for a client:
 
 `report_progress` no-ops when the client did not send a `progressToken`.
 
+### Timer heartbeat and the client idle timeout
+
+The per-block notifications are silent while one long model call runs. Claude Code aborts an HTTP MCP tool call after 300 s with no response and no progress notification (measured with Claude Code 2.1.288; stdio servers default to 1800 s). So `remember` also sends a progress notification every 20 s for the whole duration of the call, from a timer that does not depend on block events. It carries the elapsed seconds, no total, and stops when the call ends. It never fails the call, and it does nothing when there is no MCP context or no `progressToken`.
+
+The client's own settings are a per-server `timeout` (ms) and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables). A separate hard wall-clock limit, `MCP_TOOL_TIMEOUT`, is not extended by progress notifications; its default is unknown (not determined).
+
+### Visibility in status
+
+An inline `remember` is not a queue item. `okto-neuron status --json` reports it under `ingest.inline` as `{processing, done, error}` per vault and in the aggregate; the queue counters are unchanged.
+
 <Note>
 The notification payload shape that reaches a given client was not verified for this page, so treat the fields above as what the server computes rather than as a wire contract.
 </Note>

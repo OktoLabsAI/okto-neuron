@@ -1005,6 +1005,10 @@ def _aggregate_ingest_summaries(summaries: list[dict]) -> dict[str, object]:
     } | {
         "active": any(bool(summary.get("active")) for summary in summaries),
         "cancel_requested": any(bool(summary.get("cancel_requested")) for summary in summaries),
+        "inline": {
+            key: sum(int((summary.get("inline") or {}).get(key) or 0) for summary in summaries)
+            for key in ("processing", "done", "error")
+        },
     }
 
 
@@ -1167,11 +1171,14 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
     for lease_vault, lease_reason in sorted(degraded_leases().items()):
         reasons.append(f"writer_lease_degraded: {lease_vault.name}: {lease_reason}")
     # One summary-only pass per vault, reused for the aggregate and per-vault rows.
-    runtime_ingest = {runtime.vault_path: iq.summary(runtime) for runtime in runtimes}
+    runtime_ingest = {
+        runtime.vault_path: iq.summary(runtime) | {"inline": iq.inline_summary(runtime)}
+        for runtime in runtimes
+    }
     ingest_summary = (
         _aggregate_ingest_summaries(list(runtime_ingest.values()))
         if application_scope
-        else iq.summary(state)
+        else iq.summary(state) | {"inline": iq.inline_summary(state)}
     )
     queue_refusals = {
         runtime.vault_path: _queue_layout_refusal(runtime.vault_path) for runtime in runtimes

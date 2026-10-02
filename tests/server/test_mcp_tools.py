@@ -1789,3 +1789,145 @@ def test_remember_progress_dispatch_does_not_block_worker_thread(
 
     assert futures, "no notification was dispatched"
     assert call.data["document_id"] == expected.document_id
+
+
+# --------------------------------------------------------------------------
+# Timer heartbeat + inline counters for MCP ``remember`` (client idle timeout).
+# --------------------------------------------------------------------------
+
+
+def _silent_ingest(seconds: float):
+    import time
+
+    def emit(on_progress):
+        time.sleep(seconds)  # one long LLM call: no block events at all
+
+    return emit
+
+
+def test_remember_heartbeat_flows_while_block_call_is_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(runtime, "_MCP_HEARTBEAT_INTERVAL_S", 0.1)
+    state, server, expected = _progress_fixture(
+        tmp_path, monkeypatch, "hb-silent", _silent_ingest(0.65)
+    )
+    seen: list[tuple[float, float | None, str | None]] = []
+    try:
+        call = _run_remember_collecting_progress(server, seen)
+    finally:
+        state.close()
+
+    beats = [s for s in seen if s[2] and s[2].startswith("remember in progress")]
+    assert 4 <= len(beats) <= 7  # ~0.65 s / 0.1 s, interval honoured
+    assert all(b[1] is None for b in beats)
+    assert [b[0] for b in beats] == sorted(b[0] for b in beats)
+    assert call.data["document_id"] == expected.document_id
+
+
+def test_remember_heartbeat_stops_after_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import asyncio
+
+    monkeypatch.setattr(runtime, "_MCP_HEARTBEAT_INTERVAL_S", 0.05)
+    state, server, _ = _progress_fixture(tmp_path, monkeypatch, "hb-stop", _silent_ingest(0.2))
+    seen: list[tuple[float, float | None, str | None]] = []
+    try:
+        _run_remember_collecting_progress(server, seen)
+        n = len(seen)
+        asyncio.run(asyncio.sleep(0.3))
+    finally:
+        state.close()
+    assert n >= 2 and len(seen) == n
+
+
+def test_remember_heartbeat_cancelled_on_exception_and_no_token_ok():
+    import asyncio
+
+    async def exercise():
+        # No MCP context: a no-op that neither raises nor leaks a task.
+        before = len(asyncio.all_tasks())
+        with pytest.raises(ValueError):
+            async with runtime._mcp_heartbeat():
+                raise ValueError("boom")
+        assert len(asyncio.all_tasks()) == before
+
+    asyncio.run(exercise())
+
+
+def test_remember_heartbeat_task_cancelled_when_body_raises(monkeypatch: pytest.MonkeyPatch):
+    import asyncio
+
+    import fastmcp.server.dependencies as deps
+
+    sent: list[float] = []
+
+    class _Ctx:
+        async def report_progress(self, progress, total, message):
+            sent.append(progress)
+
+    monkeypatch.setattr(deps, "get_context", lambda: _Ctx())
+    monkeypatch.setattr(runtime, "_MCP_HEARTBEAT_INTERVAL_S", 0.02)
+
+    async def exercise():
+        before = len(asyncio.all_tasks())
+        with pytest.raises(ValueError):
+            async with runtime._mcp_heartbeat():
+                await asyncio.sleep(0.1)
+                raise ValueError("boom")
+        assert len(asyncio.all_tasks()) == before
+        n = len(sent)
+        await asyncio.sleep(0.1)
+        assert len(sent) == n >= 2
+
+    asyncio.run(exercise())
+
+
+def test_remember_inline_counters_visible_while_running_and_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from okto_neuron.server import _ingest_queue as iq
+
+    holder: dict = {}
+
+    def emit(on_progress):
+        holder["during"] = iq.inline_summary(holder["runtime"])
+        holder["queue_during"] = iq.summary(holder["runtime"])
+
+    state, server, _ = _progress_fixture(tmp_path, monkeypatch, "inline-ok", emit)
+    holder["runtime"] = state.runtime_for(state.vault_path)
+    try:
+        _run_remember_collecting_progress(server, [])
+        after = iq.inline_summary(holder["runtime"])
+        queue_after = iq.summary(holder["runtime"])
+    finally:
+        state.close()
+    assert holder["during"] == {"processing": 1, "done": 0, "error": 0}
+    assert after == {"processing": 0, "done": 1, "error": 0}
+    # Normal queue counters are untouched: an inline call is not a queue item.
+    assert holder["queue_during"] == queue_after
+    assert queue_after["total"] == 0 and queue_after["processing"] == 0
+
+
+def test_remember_inline_counters_record_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from okto_neuron.server import _ingest_queue as iq
+
+    def emit(on_progress):
+        raise RuntimeError("provider exploded")
+
+    state, server, _ = _progress_fixture(tmp_path, monkeypatch, "inline-err", emit)
+    rt = state.runtime_for(state.vault_path)
+    try:
+        with pytest.raises(Exception):
+            _run_remember_collecting_progress(server, [])
+        after = iq.inline_summary(rt)
+    finally:
+        state.close()
+    assert after == {"processing": 0, "done": 0, "error": 1}
+
+
+def test_inline_summary_defaults_to_zero_for_legacy_state():
+    from okto_neuron.server import _ingest_queue as iq
+
+    assert iq.inline_summary(object()) == {"processing": 0, "done": 0, "error": 0}

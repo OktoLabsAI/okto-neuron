@@ -114,6 +114,7 @@ class VaultRuntime:
     ingest_worker_task: "asyncio.Task | None" = field(default=None, repr=False)
     ingest_cancel_requested: bool = False
     ingest_seq: int = 0
+    inline_remember: dict = field(default_factory=dict)
     curation_jobs: list = field(default_factory=list)
     curation_worker_active: bool = False
     curation_worker_task: "asyncio.Task | None" = field(default=None, repr=False)
