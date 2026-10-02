@@ -276,6 +276,21 @@ def test_add_same_basename_different_directories_mints_distinct_document_ids(
     assert runtime.vault.store.get_node(doc_id_b) is not None
 
 
+def test_remember_outside_root_is_a_403_that_names_the_roots(client: TestClient, tmp_path: Path) -> None:
+    """Field report, REST side: same wording as the MCP tool."""
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("# elsewhere\n", encoding="utf-8")
+
+    response = client.post("/remember", json={"source": str(outside)})
+
+    assert response.status_code == 403, response.text
+    body = response.json()
+    assert body["error"] == "forbidden"
+    detail = body.get("detail") or body.get("message") or ""
+    assert "refusing to remember source outside the vault and watch roots" in detail
+    assert "Allowed roots" in detail and "folder_watch.roots" in detail
+
+
 def test_graph_integrity_audit_verifies_current_generation(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

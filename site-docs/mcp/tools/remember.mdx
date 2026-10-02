@@ -42,7 +42,7 @@ The **name** of a registered vault to write to, never a path. Omit it to use the
 ```json
 { "source": "/Users/you/notes/retention-policy.md" }
 ```
-The path is passed through unchanged. It has to resolve, and it has to sit inside the vault root or a configured watch root.
+The path is read in place and never copied. It has to resolve, and it has to sit inside the vault root or a configured watch root (`folder_watch.roots` in the vault config). Files elsewhere are refused with the roots named (see [Errors](#errors)).
 </Tab>
 <Tab title="Raw text">
 ```json
@@ -81,7 +81,7 @@ A single-line `source` is treated as a **path** when any of these hold:
 Anything else, including any ordinary single-line sentence, is raw text. A sentence like `~5 minutes to set up` contains a space, so the tilde rule does not fire and it stays text.
 
 <Warning>
-A path-shaped `source` is passed through unchanged. If it does not resolve, the call fails loudly as a path error. It is never silently ingested as a document whose body is the literal path string.
+A path-shaped `source` is read in place: the vault keeps no copy of the file and references the original. If it does not resolve, the call fails loudly as a path error. It is never silently ingested as a document whose body is the literal path string. Raw text is the only form that is copied (into the vault's `.marginalia/sources/`), so the vault then keeps its own copy of that text.
 </Warning>
 
 Detected raw text is materialized first: it is written to a file under `<vault>/.marginalia/sources/`, and that file is what gets ingested. This is the same durable-copy convention the HTTP ingest endpoints use, and it exists because a Block's provenance anchors to the path on disk, so the bytes have to persist. The filename comes from a short hash of the content. If that name already exists with **different** content, the file is re-minted under the full content hash instead of overwriting, so an earlier source's byte-anchored provenance stays intact. Re-pasting identical content reuses the same file and stays idempotent.
@@ -194,7 +194,7 @@ The runtime is draining for maintenance rather than shutdown. Writes are paused.
 </Accordion>
 
 <Accordion title="forbidden: refusing to remember source outside the vault and watch roots: …">
-The path-shaped source resolved outside the vault root and outside every configured folder-watch root. This guard runs before any read, so a traversal attempt never pulls an out-of-tree file into the graph. It is normalized the same way the HTTP surface reports it.
+The path-shaped source resolved outside the vault root and outside every configured folder-watch root. This guard runs before any read, so a traversal attempt never pulls an out-of-tree file into the graph. The message names the allowed roots (the vault and each configured folder-watch root, or `none configured`) and the three ways forward: copy the file under one of those roots, add its folder to `folder_watch.roots` in the vault config, or pass the file's text as raw text (saved under the vault's `.marginalia/sources/` and ingested from that copy). It is normalized the same way the HTTP surface reports it. `remember` is loopback-only, so the absolute roots are shown to local callers only.
 </Accordion>
 
 <Accordion title="ladybug_write_failed: ladybug write failed: …">
