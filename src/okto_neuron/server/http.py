@@ -72,6 +72,14 @@ from okto_neuron.server import _curation, _gc_tuning, _jobs, _projection, _sched
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
+from okto_neuron.server._lock_holder import (
+    LockHolder,
+    busy_detail,
+    clear_holder,
+    current_holder,
+    held_lock,
+    record_holder,
+)
 from okto_neuron.server._store_io import (
     acquire_off_loop,
     encode_json,
@@ -423,7 +431,30 @@ _CURATION_LOCK_TIMEOUT_S = 5.0
 
 
 class _LockBusy(Exception):
-    """Raised by :func:`_writer_lock_fast` when writer_lock isn't free in time."""
+    """Raised by :func:`_writer_lock_fast` when writer_lock isn't free in time.
+
+    ``holder`` is the descriptor of whoever held the lock when the wait timed out (``None`` when
+    it is unknown), so the busy answer can name it (see :func:`_lock_busy_response`).
+    """
+
+    def __init__(self, holder: LockHolder | None = None) -> None:
+        super().__init__("writer lock is busy")
+        self.holder = holder
+
+
+def _lock_busy_response(
+    exc: _LockBusy, status: int, code: str, detail: str, **extra: Any
+) -> JSONResponse:
+    """The busy answer: the old status/code/detail, plus the holder and ``Retry-After``."""
+    holder = exc.holder
+    response = _err(status, code, busy_detail(detail, holder), **extra)
+    if holder is not None:
+        payload = json.loads(response.body)
+        payload["holder"] = holder.to_public()
+        payload["retry_after_s"] = holder.retry_after_s()
+        response = JSONResponse(payload, status_code=status)
+    response.headers["Retry-After"] = str(holder.retry_after_s() if holder is not None else 10)
+    return response
 
 
 @contextlib.asynccontextmanager
@@ -461,13 +492,15 @@ async def _writer_lock_fast(
         await asyncio.wait_for(writer_lock.acquire(), timeout=timeout)
         acquired = True
     except asyncio.TimeoutError:
-        raise _LockBusy from None
+        raise _LockBusy(current_holder(writer_lock)) from None
+    record_holder(writer_lock, "review-op")
     try:
         if verify_write_allowed:
             await store_io(graph_integrity.require_write_allowed, state, state.vault)
         yield
     finally:
         if acquired:
+            clear_holder(writer_lock)
             writer_lock.release()
 
 
@@ -1761,7 +1794,7 @@ async def api_vault_delete(request: Request) -> JSONResponse:
                 leases=leases,
             )
 
-        async with runtime.writer_lock, runtime.config_lock, state.config_lock:
+        async with held_lock(runtime.writer_lock, "vault-maintenance", "delete"), runtime.config_lock, state.config_lock:
             busy = _runtime_delete_busy(runtime)
             leases = pool.lease_count(entry.path)
             if any(bool(value) for value in busy.values()) or leases:
@@ -2032,7 +2065,7 @@ async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
     released = False
     try:
         await _wait_for_runtime_leases(runtime, timeout=_VAULT_MAINTENANCE_LEASE_WAIT_S)
-        async with runtime.writer_lock, runtime.config_lock:
+        async with held_lock(runtime.writer_lock, "vault-maintenance", "release"), runtime.config_lock:
             # The fence makes this a stable zero: no graph user can enter between
             # release and the replacement install.
             if pool.lease_count(runtime.vault_path):
@@ -2065,7 +2098,7 @@ async def _run_runtime_reembed(runtime: VaultRuntime) -> None:
             and pool.peek(runtime.vault_path) is None
         ):
             try:
-                async with runtime.writer_lock, runtime.config_lock:
+                async with held_lock(runtime.writer_lock, "vault-maintenance", "reopen"), runtime.config_lock:
                     await _open_and_install_fenced(runtime)
             except Exception:  # noqa: BLE001
                 _LOG.exception(
@@ -2367,7 +2400,7 @@ async def add(request: Request) -> JSONResponse:
     except _BadRequest as exc:
         return _err(400, "bad_request", exc.detail)
 
-    async with state.writer_lock:
+    async with held_lock(state.writer_lock, "ingest-item", "add"):
         if state.draining:
             return _draining_response()
         try:
@@ -3003,8 +3036,9 @@ async def resolve_review(request: Request) -> JSONResponse:
             outcome = await store_io(_resolve_review_op, state, candidate_id, action)
     except IntegrityFenceError as exc:
         return _integrity_fenced_response(exc)
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             503,
             "busy",
             "vault is busy ingesting/curating — retry when the current item finishes",
@@ -4137,8 +4171,9 @@ async def api_semantic_quality(request: Request) -> JSONResponse:
                     state,
                     recall_samples=recall_samples,
                 )
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             409,
             "audit_busy",
             "semantic quality audit needs a stable graph snapshot; retry after the active "
@@ -6873,8 +6908,9 @@ async def api_reconcile_review_confirm(request: Request) -> JSONResponse:
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected reconcile confirm failure")
                 return _err(500, "reconcile_confirm_failed", str(exc))
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             503,
             "busy",
             "vault is busy ingesting/curating — retry when the current item finishes",
@@ -6900,8 +6936,9 @@ async def api_reconcile_review_reject(request: Request) -> JSONResponse:
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected reconcile reject failure")
                 return _err(500, "reconcile_reject_failed", str(exc))
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             503,
             "busy",
             "vault is busy ingesting/curating — retry when the current item finishes",
@@ -7109,8 +7146,9 @@ async def api_predicate_upkeep_confirm(request: Request) -> JSONResponse:
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected predicate confirm failure")
                 return _err(500, "predicate_confirm_failed", str(exc))
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             503,
             "busy",
             "vault is busy ingesting/curating — retry when the current item finishes",
@@ -7136,8 +7174,9 @@ async def api_predicate_upkeep_reject(request: Request) -> JSONResponse:
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected predicate reject failure")
                 return _err(500, "predicate_reject_failed", str(exc))
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             503,
             "busy",
             "vault is busy ingesting/curating — retry when the current item finishes",
@@ -7194,8 +7233,9 @@ async def api_authority_unmerge(request: Request) -> JSONResponse:
             except Exception as exc:  # noqa: BLE001
                 _LOG.exception("unexpected authority unmerge failure")
                 return _err(500, "authority_unmerge_failed", str(exc))
-    except _LockBusy:
-        return _err(
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
             503,
             "busy",
             "vault is busy ingesting/curating — retry when the current item finishes",

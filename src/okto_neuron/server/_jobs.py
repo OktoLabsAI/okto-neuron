@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._lock_holder import held_lock
 from okto_neuron.server._persist_coalesce import PersistCoalescer
 from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
@@ -663,7 +664,11 @@ async def _drain(state: "ServerState") -> None:
                 leased_vault = stack.enter_context(lease_context)
                 try:
                     if writes or verified_snapshot:
-                        async with state.writer_lock:
+                        async with held_lock(
+                            state.writer_lock,
+                            "rebuild-job" if job.kind in _NON_RESUMABLE_ON_RESTART_KINDS else "curation-job",
+                            job.id,
+                        ):
                             vault = leased_vault or getattr(state, "vault", None)
                             if vault is not None and job.kind not in _INTEGRITY_RECOVERY_KINDS:
                                 await store_io(
