@@ -227,34 +227,70 @@ def _partial_top_level_kind(fragment: bytes) -> str | None:
             return None
 
 
+class LeaseBusyError(Exception):
+    """A bounded wait for the semantic writer lease ran out.
+
+    ``in_process`` is True when another thread of this process holds it (the process-local half),
+    False when the cross-process file lock is held, which means another process.
+    """
+
+    def __init__(self, *, in_process: bool) -> None:
+        super().__init__("semantic writer lease is busy")
+        self.in_process = in_process
+
+
+_LOCK_POLL_S = 0.05
+
+
 @contextmanager
-def _exclusive_lock(path: Path):
+def _exclusive_lock(path: Path, *, timeout: float | None = None):
     # POSIX flock locks alone do not serialize independent threads reliably:
     # they are process-scoped on the supported platforms. Pair the file lock
     # with one process-local lock keyed by the canonical lock-file path.
+    #
+    # ``timeout=None`` blocks forever (every historical caller). A number bounds the whole wait
+    # (both halves) and raises LeaseBusyError, leaving nothing held.
     key = str(path.resolve())
     with _PROCESS_LOCKS_GUARD:
         process_lock = _PROCESS_LOCKS.setdefault(key, threading.Lock())
-    with process_lock, path.open("a+b") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        elif msvcrt is not None:  # pragma: no cover - exercised on Windows
-            lock_file.seek(0)
-            if not lock_file.read(1):
-                lock_file.write(b"0")
-                lock_file.flush()
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        else:  # pragma: no cover - all supported platforms provide one
-            raise OSError("no candidate-ledger file locking backend available")
-        try:
-            yield
-        finally:
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    if deadline is None:
+        process_lock.acquire()
+    elif not process_lock.acquire(timeout=max(0.0, timeout)):
+        raise LeaseBusyError(in_process=True)
+    try:
+        with path.open("a+b") as lock_file:
             if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                if deadline is None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                else:
+                    while True:
+                        try:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise LeaseBusyError(in_process=False) from None
+                            time.sleep(_LOCK_POLL_S)
             elif msvcrt is not None:  # pragma: no cover - exercised on Windows
                 lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                if not lock_file.read(1):
+                    lock_file.write(b"0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            else:  # pragma: no cover - all supported platforms provide one
+                raise OSError("no candidate-ledger file locking backend available")
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:  # pragma: no cover - exercised on Windows
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        process_lock.release()
 
 
 def _jsonable(value: Any) -> Any:
@@ -2728,11 +2764,14 @@ class CandidateLedger:
         )
 
     @contextmanager
-    def semantic_writer_lease(self):
-        """Hold the cross-process vault writer lease for one semantic transaction."""
+    def semantic_writer_lease(self, *, timeout: float | None = None):
+        """Hold the cross-process vault writer lease for one semantic transaction.
+
+        ``timeout`` (seconds) bounds the wait and raises :class:`LeaseBusyError`; ``None`` blocks.
+        """
 
         self.dir.mkdir(parents=True, exist_ok=True)
-        with _exclusive_lock(self.dir / ".semantic-writer.lock"):
+        with _exclusive_lock(self.dir / ".semantic-writer.lock", timeout=timeout):
             yield
 
     def append(self, kind: RecordKind, **payload: Any) -> None:

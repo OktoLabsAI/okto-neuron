@@ -79,6 +79,7 @@ from okto_neuron.server._lock_holder import (
     current_holder,
     held_lock,
     record_holder,
+    untracked_holder,
 )
 from okto_neuron.server._store_io import (
     acquire_off_loop,
@@ -89,6 +90,7 @@ from okto_neuron.server._store_io import (
     single_flight,
     store_io,
 )
+from okto_neuron.consolidate.ledger import LeaseBusyError
 from okto_neuron.consolidate.review_queue_sqlite import ReviewQueueMigrationRequired
 from okto_neuron.server._vault_pool import VaultPoolError, acquire_daemon_writer_lease
 from okto_neuron.store.writer_lease import degraded_leases, held_writer_lease
@@ -428,6 +430,16 @@ def _internal_error() -> JSONResponse:
 # --------------------------- fail-fast writer_lock (curation UI actions) ---------------------------
 
 _CURATION_LOCK_TIMEOUT_S = 5.0
+
+
+def _lease_busy(exc: LeaseBusyError) -> _LockBusy:
+    """Map a timed-out semantic-lease wait to a busy answer.
+
+    Whoever holds the lease inside this process also holds writer_lock, and the review route owns
+    that by now, so a timeout here means another process (``external-process``) or a writer this
+    process cannot name (``semantic-writer``).
+    """
+    return _LockBusy(untracked_holder("semantic-writer" if exc.in_process else "external-process"))
 
 
 class _LockBusy(Exception):
@@ -3006,8 +3018,19 @@ def _attach_block_excerpt(evidence: dict[str, Any], blocks: dict[str, Any]) -> N
 
 
 def _resolve_review_op(state: ServerState | VaultRuntime, candidate_id: str, action: str) -> Any:
-    """Store op: apply one review decision (graph write under the writer lock)."""
-    return _companion(state).resolve_review(candidate_id, action)  # type: ignore[arg-type]
+    """Store op: apply one review decision (graph write under the writer lock).
+
+    The wait for the cross-process semantic writer lease is bounded like the writer_lock wait; a
+    timeout surfaces as :class:`_LockBusy` so the route answers busy instead of parking a worker.
+    """
+    try:
+        return _companion(state).resolve_review(
+            candidate_id,
+            action,  # type: ignore[arg-type]
+            lease_timeout=_CURATION_LOCK_TIMEOUT_S,
+        )
+    except LeaseBusyError as exc:
+        raise _lease_busy(exc) from None
 
 
 _REVIEW_ACTIONS = {"commit", "discard", "merge"}
@@ -3092,10 +3115,16 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
         errors: list[dict[str, str]] = []
         for candidate_id in candidate_ids:
             try:
-                companion.resolve_review(candidate_id, action)  # type: ignore[arg-type]
+                companion.resolve_review(  # type: ignore[arg-type]
+                    candidate_id, action, lease_timeout=_CURATION_LOCK_TIMEOUT_S
+                )
                 resolved += 1
             except ReviewItemNotFoundError:
                 skipped += 1
+            except LeaseBusyError as exc:
+                # Stop at the first busy lease: the rest would wait just as long. What was
+                # already resolved stays resolved and is reported with the busy answer.
+                return {"busy": _lease_busy(exc), "resolved": resolved, "skipped": skipped}
             except Exception as exc:  # noqa: BLE001
                 errors.append({"id": candidate_id, "error": str(exc)})
         return {
@@ -3106,11 +3135,18 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
         }
 
     try:
-        async with state.writer_lock:
-            await store_io(graph_integrity.require_write_allowed, state, state.vault)
+        # Same fail-fast wait and busy answer as the single review route.
+        async with _writer_lock_fast(state):
             result = await store_io(_run_batch)
     except IntegrityFenceError as exc:
         return _integrity_fenced_response(exc)
+    except _LockBusy as busy_exc:
+        return _lock_busy_response(
+            busy_exc,
+            503,
+            "busy",
+            "vault is busy ingesting/curating — retry when the current item finishes",
+        )
     except VaultClosedError as exc:
         return _err(503, "vault_closed", str(exc))
     except OktoNeuronError as exc:
@@ -3119,6 +3155,16 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
         _LOG.exception("unexpected resolve_review_batch failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
 
+    busy = result.get("busy")
+    if busy is not None:
+        return _lock_busy_response(
+            busy,
+            503,
+            "busy",
+            "vault is busy ingesting/curating — retry when the current item finishes",
+            resolved=result["resolved"],
+            skipped=result["skipped"],
+        )
     return JSONResponse(result)
 
 

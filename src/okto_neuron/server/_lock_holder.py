@@ -29,6 +29,9 @@ _RETRY_AFTER_S = {
     "rebuild-job": 30,
     "vault-maintenance": 10,
     "review-op": 5,
+    # The semantic writer lease is held by something this process cannot name.
+    "external-process": 15,
+    "semantic-writer": 10,
 }
 _DEFAULT_RETRY_AFTER_S = 10
 
@@ -41,6 +44,8 @@ class LockHolder:
     ident: str
     since_epoch: float
     since_monotonic: float
+    #: False when the holder is not tracked here (another process): no duration to report.
+    timed: bool = True
 
     def held_for_s(self) -> float:
         return max(0.0, time.monotonic() - self.since_monotonic)
@@ -49,12 +54,19 @@ class LockHolder:
         return _RETRY_AFTER_S.get(self.kind, _DEFAULT_RETRY_AFTER_S)
 
     def to_public(self) -> dict[str, object]:
+        if not self.timed:
+            return {"kind": self.kind, "id": self.ident}
         return {
             "kind": self.kind,
             "id": self.ident,
             "since": self.since_epoch,
             "held_for_s": round(self.held_for_s(), 1),
         }
+
+
+def untracked_holder(kind: str) -> LockHolder:
+    """A holder this process cannot time (another process, or the semantic writer lease)."""
+    return LockHolder(kind, "-", time.time(), time.monotonic(), timed=False)
 
 
 def record_holder(lock: object, kind: str, ident: str = "-") -> LockHolder:
@@ -86,6 +98,8 @@ def busy_detail(base: str, holder: LockHolder | None) -> str:
     """The human sentence of a busy answer, naming the holder when it is known."""
     if holder is None:
         return base
+    if not holder.timed:
+        return f"{base} (held by {holder.kind}; retry in about {holder.retry_after_s()} s)"
     return (
         f"{base} (held by {holder.kind} {holder.ident} for {int(holder.held_for_s())} s; "
         f"retry in about {holder.retry_after_s()} s)"
