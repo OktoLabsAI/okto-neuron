@@ -1421,6 +1421,11 @@ before opening the UI, then prints its PID, URL, status command, exact stop comm
 If the daemon is already running, open <code>http://127.0.0.1:7777/</code> directly; <code>okto-neuron ui</code> remains
 a compatibility alias for that URL. Browser profiles, private windows, and additional tabs do not
 need a bootstrap command, credential, or session cookie.</p>
+<p>Every <code>serve</code> (foreground or daemon) writes <code>~/.okto-neuron/logs/okto-neuron-serve.log</code>, even when
+its stdout and stderr are discarded; the foreground command also echoes the records to the console.
+The file is size-rotated (10 MiB, 3 backups: <code>.1</code>, <code>.2</code>, <code>.3</code>). <code>--log-file PATH</code> changes the path and
+<code>--log-file /dev/null</code> silences the file. A file that cannot be opened gives one warning on stderr
+and the server keeps running.</p>
 <pre><code>web UI : http://127.0.0.1:7777
 REST   : http://127.0.0.1:7777/api/v1/...
 MCP    : http://127.0.0.1:8201/mcp   (requires the daemon bearer credential)

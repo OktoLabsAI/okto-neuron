@@ -25,7 +25,7 @@ The message names the extra you are missing. Install the application with the `s
 okto-neuron serve
 ```
 
-This binds REST and the web UI on `127.0.0.1:7777` and FastMCP on `127.0.0.1:8201`. Both listeners live in one process, sharing one handle pool. With no `--log-file`, foreground logs go to stdout, so you watch them in the terminal you started from. The process stays attached to that terminal; stopping it is Ctrl-C, or `okto-neuron stop` from another shell.
+This binds REST and the web UI on `127.0.0.1:7777` and FastMCP on `127.0.0.1:8201`. Both listeners live in one process, sharing one handle pool. With no `--log-file`, foreground logs go to the terminal you started from and are also written to the default log file (`~/.okto-neuron/logs/okto-neuron-serve.log`), so they survive a launcher that discards stdout and stderr. The process stays attached to that terminal; stopping it is Ctrl-C, or `okto-neuron stop` from another shell.
 
 By default the server opens the local UI in your browser once it is ready. Pass `--no-open` if you do not want that.
 
@@ -78,7 +78,7 @@ okto-neuron serve --daemon --log-file /dev/null
 
 `/dev/null` cannot be size-rotated, so the server uses a plain file handler for it rather than the rotating one.
 
-Without `--daemon`, logs go to stdout unless you pass `--log-file` yourself.
+Without `--daemon`, logs go to stdout and to the same default file unless you pass `--log-file` yourself. If the log file cannot be opened (no permission, read-only volume), the server prints one warning on stderr and keeps logging to the console.
 
 For reading what ends up in there, see [status and logs](/server/status-and-logs).
 
