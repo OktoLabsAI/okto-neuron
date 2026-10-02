@@ -100,6 +100,32 @@ Async. Creates one application-managed named vault and does **not** select it.
   Required to confirm remote storage egress when `storage_uri` does not classify as loopback. The refusal applies whatever `backend` is, but the value itself reaches vault creation only when `backend` is set to a value other than `grafx`.
 </ParamField>
 
+<ParamField body="embedding_provider" type="string | null" default="null">
+  Creates the vault with this embedding provider, so its graph is born at the matching width. Omit every `embedding_*` parameter for the application default (a 384-wide local model).
+</ParamField>
+
+<ParamField body="embedding_model" type="string | null" default="null">
+  The embedding model name for the vault config.
+</ParamField>
+
+<ParamField body="embedding_dimension" type="integer | null" default="null">
+  The vector width. The column is fixed-width after the first open; a later change needs a re-embed. A width other than 384 must name the provider or model that produces it.
+</ParamField>
+
+<ParamField body="embedding_api_base" type="string | null" default="null">
+  Endpoint of an OpenAI-compatible embedder. Loopback only unless `embedding_allow_remote` is `true`.
+</ParamField>
+
+<ParamField body="embedding_api_key_env" type="string | null" default="null">
+  The *name* of the environment variable holding the key (an `OKTO_NEURON_*` name), not the key itself.
+</ParamField>
+
+<ParamField body="embedding_allow_remote" type="boolean" default="false">
+  Allows a non-loopback `embedding_api_base`.
+</ParamField>
+
+When any `embedding_*` value is given, the result also carries an `embedding` object with the spec the vault was created with.
+
 <Warning>
 Nothing validates pack *names*. The parser splits the string on commas, strips each piece and keeps the non-empty ones. It rejects a value that is neither a string nor a list of non-empty strings, and nothing more. A misspelled pack name passes this check.
 
@@ -173,6 +199,7 @@ Every error is raised as a `RuntimeError` whose message begins with a code.
 | `bad_request` | `bad_request: <backend resolution error>` | The `backend` name did not resolve in the graph-backend registry. |
 | `bad_request` | `bad_request: <storage URI classification error>` | `storage_uri` could not be classified. |
 | `bad_request` | `bad_request: storage_uri '<uri>' is not loopback; set allow_remote_db=True to confirm remote storage egress` | A remote `storage_uri` without `allow_remote_db`. |
+| `bad_request` | `bad_request: invalid embedding spec: <reason>` | An `embedding_*` value was refused: unknown provider, a non-positive dimension, a remote `embedding_api_base` without `embedding_allow_remote`, an `embedding_api_key_env` outside the `OKTO_NEURON_*` namespace, or a non-default dimension without the provider or model that produces it. |
 | `bad_vault_name` | `bad_vault_name: vault name must start with a letter or number and contain only letters, numbers, '.', '_' or '-'` (or the length rule) | The vault name failed validation while computing the target path. |
 | `vault_exists` | `vault_exists: vault already exists at <path>` | A vault already exists at the target path. Raised both by the pre-check and by a `FileExistsError` from the creation worker. |
 

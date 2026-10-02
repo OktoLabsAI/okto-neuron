@@ -198,7 +198,7 @@ okto-neuron kg reembed /path/to/vault
 `kg reembed` rebuilds the vault's vectors. It runs under cross-process graph ownership, taking a rebuild lock on the vault. If you did not intend to change the embedding configuration, revert `okto-neuron.yaml` instead of re-embedding.
 </Warning>
 
-If the server was started against a vault it could not open for this reason, it starts without that vault and reports a warning carrying `code: "embedding_dim_mismatch"`, the vault path, the detail and a remedy line naming the `kg reembed` command for that path. The alternative the warning offers is to switch to another vault.
+If the server was started against a vault it could not open for this reason, it starts without that vault and reports a warning carrying `code: "embedding_dim_mismatch"`, the vault path, the detail and a remedy line naming the daemon route `POST /api/v1/vaults/reembed` with the vault name (it works while the vault cannot be opened; `okto-neuron kg reembed` is refused while the daemon holds the vault). The alternative the warning offers is to switch to another vault. A request that borrows such a vault over MCP or REST is answered with the code `embedding_dim_mismatch`, the stored and configured widths and the same remedy.
 
 Background on which settings are load-bearing: [/config/embedding-model](/config/embedding-model).
 
