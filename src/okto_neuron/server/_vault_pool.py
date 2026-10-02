@@ -50,6 +50,20 @@ class VaultPoolError(OktoNeuronError):
         super().__init__(message)
 
 
+_DAEMON_ENDPOINT: str | None = None
+"""This daemon's REST base URL, recorded in every lease it takes (see :func:`set_daemon_endpoint`)."""
+
+
+def set_daemon_endpoint(endpoint: str | None) -> None:
+    """Record the REST base URL a refused CLI command should send its daemon-side remedy to.
+
+    Set once at serve startup, before the first lease, so ``kg reembed`` refused by this
+    daemon prints a curl that reaches THIS daemon rather than the default port.
+    """
+    global _DAEMON_ENDPOINT
+    _DAEMON_ENDPOINT = endpoint
+
+
 def acquire_daemon_writer_lease(path: Path | str) -> WriterLease:
     """Take (idempotently, without waiting) the writer lease for a vault this daemon serves.
 
@@ -59,7 +73,9 @@ def acquire_daemon_writer_lease(path: Path | str) -> WriterLease:
     holder's pid and operation.
     """
     try:
-        return acquire_writer_lease(path, role="daemon", operation="serve")
+        return acquire_writer_lease(
+            path, role="daemon", operation="serve", endpoint=_DAEMON_ENDPOINT
+        )
     except WriterLeaseHeld as exc:
         raise VaultPoolError("vault_busy", exc.message) from exc
 
@@ -639,4 +655,10 @@ class VaultPool:
         return list(self._paths_snapshot)
 
 
-__all__ = ["VaultLease", "VaultPool", "VaultPoolError", "acquire_daemon_writer_lease"]
+__all__ = [
+    "VaultLease",
+    "VaultPool",
+    "VaultPoolError",
+    "acquire_daemon_writer_lease",
+    "set_daemon_endpoint",
+]

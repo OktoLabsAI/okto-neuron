@@ -2289,6 +2289,12 @@ async def _run_async(
         raise RuntimeError(
             "direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel"
         )
+    # Before the first lease (the startup vault below): every lease this daemon takes
+    # names its REST URL, so a refused CLI command points at this daemon's port.
+    from okto_neuron.server._vault_pool import set_daemon_endpoint
+
+    url_host = f"[{host}]" if ":" in host else host
+    set_daemon_endpoint(f"http://{url_host}:{rest_port}")
     vault, active_vault_path, vault_warning = _open_startup_vault(vault_path)
     # Keep the compatibility state field explicit for isolated middleware policy
     # tests. Production startup rejects every remote bind/allow_remote request
