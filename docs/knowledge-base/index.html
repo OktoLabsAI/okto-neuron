@@ -15018,7 +15018,10 @@ fence. The on-demand audit is real on grafx (<code>POST /api/v1/graph/integrity<
 <code>audit_supported</code> stays true) and records <code>verified</code> or a failure. A
 recorded <code>failed</code> or <code>incomplete</code> audit keeps its <code>writer_fenced: true</code> and
 its <code>integrity_fenced</code> degraded reason on grafx too, even though grafx does
-not block writes on it.</p>
+not block writes on it. The <code>remember</code> outcome's <code>integrity</code> block says the
+same thing in its own terms: status <code>not_applicable</code> (the write fence is not
+enforced on this backend) with a <code>reason</code> that the backend does not fence
+writes and that an audit is optional.</p>
 </li>
 </ul>
 <h2 id="docs__backends__grafx--dialect-gaps-closed-for-grafx">Dialect gaps closed for Grafx</h2>

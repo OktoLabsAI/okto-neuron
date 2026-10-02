@@ -147,7 +147,10 @@ other creation surface pins `grafx` explicitly.
   `audit_supported` stays true) and records `verified` or a failure. A
   recorded `failed` or `incomplete` audit keeps its `writer_fenced: true` and
   its `integrity_fenced` degraded reason on grafx too, even though grafx does
-  not block writes on it.
+  not block writes on it. The `remember` outcome's `integrity` block says the
+  same thing in its own terms: status `not_applicable` (the write fence is not
+  enforced on this backend) with a `reason` that the backend does not fence
+  writes and that an audit is optional.
 
 ## Dialect gaps closed for Grafx
 

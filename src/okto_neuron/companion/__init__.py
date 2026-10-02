@@ -2443,8 +2443,17 @@ def _guard_live_graph_write(method):  # type: ignore[no-untyped-def]
 def _current_integrity_outcome(vault: Any) -> dict[str, Any]:
     handle = getattr(vault.store, "_graph_handle", None)
     if handle is None:
+        from okto_neuron.vault_registry import resolve_vault_backend
+
+        # "not_applicable" answers "is the write fence enforced?": it is not on this backend. The reason is
+        # the same explanation the server status gives for a never-audited vault of this kind.
+        backend = resolve_vault_backend(vault.path)
         return {
             "status": "not_applicable",
+            "reason": (
+                f"the {backend} backend does not fence writes; an audit is optional "
+                "(POST /api/v1/graph/integrity runs one)"
+            ),
             "audit_id": None,
             "graph_generation": None,
         }
