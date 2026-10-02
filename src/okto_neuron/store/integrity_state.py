@@ -29,6 +29,14 @@ INCOMPLETE_GUIDANCE: Final = (
 )
 
 
+# The three conservative "no usable record" verdicts ``load_integrity_state`` synthesizes. They are
+# named so a caller that knows its backend has no write fence can tell "never audited" from a
+# recorded verdict without comparing free text.
+REASON_MISSING: Final = "integrity state is missing"
+REASON_UNREADABLE_PREFIX: Final = "integrity state is unreadable"
+REASON_STALE_GENERATION: Final = "integrity state belongs to a different graph generation"
+
+
 @dataclass(frozen=True, slots=True)
 class GraphIntegrityState:
     """Integrity verdict and independent semantic-writer fence for one generation."""
@@ -68,6 +76,23 @@ class IntegrityFenceError(RuntimeError):
         return f"{INTEGRITY_FENCED_CODE}: {reason}. {guidance}"
 
 
+def is_unrecorded_state(state: GraphIntegrityState) -> bool:
+    """True when ``state`` is the synthesized "no usable record" verdict, not a persisted audit result.
+
+    Exactly the three verdicts ``load_integrity_state`` fabricates (missing, unreadable, stale
+    generation): ``unverified`` with no audit id. A persisted ``verifying`` marker, a drift fence
+    or a recovery invalidation is NOT unrecorded and never matches.
+    """
+    if state.status is not AuditStatus.UNVERIFIED or state.audit_id is not None:
+        return False
+    reason = state.reason or ""
+    return (
+        reason == REASON_MISSING
+        or reason.startswith(REASON_UNREADABLE_PREFIX)
+        or reason == REASON_STALE_GENERATION
+    )
+
+
 def integrity_state_path(vault_path: Path | str) -> Path:
     """Return the sidecar path without opening the graph database."""
     return Path(vault_path).expanduser().resolve(strict=False) / _STATE_RELATIVE_PATH
@@ -92,12 +117,12 @@ def load_integrity_state(
         payload = json.loads(path.read_text(encoding="utf-8"))
         state = _state_from_payload(payload)
     except FileNotFoundError:
-        return _unverified(expected, "integrity state is missing")
+        return _unverified(expected, REASON_MISSING)
     except (OSError, TypeError, ValueError) as exc:
-        return _unverified(expected, f"integrity state is unreadable: {type(exc).__name__}")
+        return _unverified(expected, f"{REASON_UNREADABLE_PREFIX}: {type(exc).__name__}")
 
     if expected_graph_generation is not _UNSET and state.graph_generation != expected:
-        return _unverified(expected, "integrity state belongs to a different graph generation")
+        return _unverified(expected, REASON_STALE_GENERATION)
     return state
 
 
@@ -386,11 +411,15 @@ __all__ = [
     "INCOMPLETE_GUIDANCE",
     "INTEGRITY_FENCED_CODE",
     "IntegrityFenceError",
+    "REASON_MISSING",
+    "REASON_STALE_GENERATION",
+    "REASON_UNREADABLE_PREFIX",
     "RECOVERY_GUIDANCE",
     "guarded_store_write",
     "initialize_integrity_state",
     "invalidate_integrity_state",
     "integrity_state_path",
+    "is_unrecorded_state",
     "load_integrity_state",
     "require_store_write_allowed",
     "require_unfenced_generation",

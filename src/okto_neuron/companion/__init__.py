@@ -2348,6 +2348,31 @@ def _source_is_ingestable_path(
     return any(_is_within_root(str(resolved), root) for root in roots)
 
 
+def _source_outside_roots_message(
+    source: "str | PathLike[str]",
+    vault_root: "str | PathLike[str]",
+    watch_roots: "list[str]",
+) -> str:
+    """The refusal for a path-shaped ``remember`` source outside every allowed root.
+
+    Names the roots the guard actually checked and the three ways forward, so the caller does not
+    have to read the server log or the source. ``remember`` is a loopback-only write surface (the
+    MCP tool and REST ``/remember`` both refuse non-loopback callers before reaching this), so
+    showing the absolute roots discloses nothing to a remote client. The wording keeps the historical prefix
+    that clients and docs match on.
+    """
+    roots = (
+        ", ".join(repr(str(root)) for root in watch_roots) if watch_roots else "none configured"
+    )
+    return (
+        f"refusing to remember source outside the vault and watch roots: {str(source)!r}. "
+        f"Allowed roots: the vault {str(vault_root)!r}; folder-watch roots: {roots}. "
+        "Either copy the file under one of those roots, add its folder to the vault config "
+        "`folder_watch.roots`, or pass the file's text as raw text (raw text is saved under the "
+        "vault's .marginalia/sources/ and ingested from that copy)."
+    )
+
+
 def _is_local_provider(provider: "LLMProvider") -> bool:
     """A provider is local if it has no hosted ``api_base`` (StubLLM) or its
     ``api_base`` host is loopback. Pure attribute check — never touches the wire."""
@@ -2418,8 +2443,17 @@ def _guard_live_graph_write(method):  # type: ignore[no-untyped-def]
 def _current_integrity_outcome(vault: Any) -> dict[str, Any]:
     handle = getattr(vault.store, "_graph_handle", None)
     if handle is None:
+        from okto_neuron.vault_registry import resolve_vault_backend
+
+        # "not_applicable" answers "is the write fence enforced?": it is not on this backend. The reason is
+        # the same explanation the server status gives for a never-audited vault of this kind.
+        backend = resolve_vault_backend(vault.path)
         return {
             "status": "not_applicable",
+            "reason": (
+                f"the {backend} backend does not fence writes; an audit is optional "
+                "(POST /api/v1/graph/integrity runs one)"
+            ),
             "audit_id": None,
             "graph_generation": None,
         }
@@ -2832,7 +2866,7 @@ class Companion:
         watch_roots = list(self._vault_config().folder_watch.roots)
         if not _source_is_ingestable_path(source, self._vault.path, watch_roots):
             raise SourceOutsideVaultError(
-                f"refusing to remember source outside the vault and watch roots: {source!r}"
+                _source_outside_roots_message(source, self._vault.path, watch_roots)
             )
 
         _emit("parsing", 0, 0)

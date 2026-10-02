@@ -419,6 +419,59 @@ def test_remember_accepts_exact_local_only_value(tmp_path: Path, monkeypatch: py
 # --------------------------------------------------------------------------
 
 
+def test_remember_outside_root_refusal_names_the_roots_and_the_remedies(tmp_path: Path):
+    """Field report: the refusal must say what IS allowed and how to proceed."""
+    import asyncio
+
+    from fastmcp import Client
+
+    vault, path = _new_vault(tmp_path, "outside-roots")
+    outside = tmp_path / "elsewhere" / "decision.md"
+    outside.parent.mkdir()
+    outside.write_text("# decision\n\nsome text\n", encoding="utf-8")
+    state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
+    server = runtime._build_mcp_server(state)
+
+    async def exercise():
+        async with Client(server) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool("remember", {"source": str(outside)})
+            return str(exc_info.value)
+
+    try:
+        message = asyncio.run(exercise())
+    finally:
+        state.close()
+    assert "forbidden: refusing to remember source outside the vault and watch roots" in message
+    assert "Allowed roots" in message
+    assert str(path) in message
+    assert "none configured" in message
+    assert "folder_watch.roots" in message
+    assert "raw text" in message
+
+
+def test_remember_tool_description_is_truthful_about_paths_and_raw_text(tmp_path: Path):
+    """The tool description used to say path-shaped sources are "passed through unchanged"."""
+    import asyncio
+
+    vault, path = _new_vault(tmp_path, "describe")
+    state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
+    server = runtime._build_mcp_server(state)
+
+    async def description() -> str:
+        tool = await server.get_tool("remember")
+        return tool.description or ""
+
+    try:
+        text = asyncio.run(description())
+    finally:
+        state.close()
+    assert "passed through unchanged" not in text
+    assert "IN PLACE" in text and "never copied" in text
+    assert "folder_watch.roots" in text
+    assert ".marginalia/sources/" in text and "raw text" in text.lower()
+
+
 def test_remember_normalizes_source_outside_vault_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

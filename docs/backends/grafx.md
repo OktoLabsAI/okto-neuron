@@ -135,6 +135,23 @@ other creation surface pins `grafx` explicitly.
   observation. Flipping the capability flag and wiring a real
   `checkpoint()` body is deliberately left for a later milestone.
 
+- **Integrity status and the write fence.** Only Ladybug enforces the
+  generation-scoped integrity fence on writes (`BackendCapabilities.write_fence`
+  is true for Ladybug only): its first write audits the graph generation and a
+  failed or incomplete audit blocks semantic writes. Grafx never audits or
+  blocks a write on its own, so a grafx vault that was never audited reports
+  `integrity.status: "unverified"` with `writer_fenced: false` and a reason
+  saying that no audit has run, that grafx does not fence writes and that an
+  audit is optional, instead of the Ladybug "integrity state is missing"
+  fence. The on-demand audit is real on grafx (`POST /api/v1/graph/integrity`,
+  `audit_supported` stays true) and records `verified` or a failure. A
+  recorded `failed` or `incomplete` audit keeps its `writer_fenced: true` and
+  its `integrity_fenced` degraded reason on grafx too, even though grafx does
+  not block writes on it. The `remember` outcome's `integrity` block says the
+  same thing in its own terms: status `not_applicable` (the write fence is not
+  enforced on this backend) with a `reason` that the backend does not fence
+  writes and that an audit is optional.
+
 ## Dialect gaps closed for Grafx
 
 Grafx speaks a Kuzu-flavored Cypher dialect with a few differences from what

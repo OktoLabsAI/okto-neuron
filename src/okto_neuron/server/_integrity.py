@@ -12,10 +12,13 @@ from okto_neuron.store.integrity_state import (
     INTEGRITY_FENCED_CODE,
     RECOVERY_GUIDANCE,
     GraphIntegrityState,
+    REASON_UNREADABLE_PREFIX,
     IntegrityFenceError,
+    is_unrecorded_state,
     load_integrity_state,
     write_integrity_state,
 )
+from okto_neuron.store.capabilities import capabilities_for
 
 if TYPE_CHECKING:
     from okto_neuron.server.state import VaultRuntime
@@ -131,9 +134,64 @@ def require_write_allowed(
     return state
 
 
+# What a grafx vault says when nothing was ever audited. Plain on purpose: nothing is wrong, no write
+# is blocked, an audit is optional. (Ladybug keeps its fenced "unverified" until the first write.)
+NO_FENCE_UNAUDITED_REASON = (
+    "no integrity audit has run for this graph; the {backend} backend does not fence writes, "
+    "so an audit is optional (POST /api/v1/graph/integrity runs one)"
+)
+
+
+def write_fence_enforced(runtime: "VaultRuntime", vault: "Vault | None" = None) -> bool:
+    """Whether writes to this vault are gated by the integrity fence.
+
+    The same predicate ``require_write_allowed`` uses when a store is open (only a store with a
+    graph handle is fenced); without an open store it falls back to the backend's declared
+    capability, resolved from the vault's pin without opening the graph. An unknown backend is
+    treated as fenced: that is the conservative reading and the previous behaviour.
+    """
+    store = getattr(vault, "store", None) if vault is not None else None
+    if store is not None:
+        return getattr(store, "_graph_handle", None) is not None
+    from okto_neuron.vault_registry import resolve_vault_backend
+
+    capabilities = capabilities_for(resolve_vault_backend(runtime.vault_path))
+    return True if capabilities is None else capabilities.write_fence
+
+
+def _backend_label(runtime: "VaultRuntime") -> str:
+    from okto_neuron.vault_registry import resolve_vault_backend
+
+    return resolve_vault_backend(runtime.vault_path)
+
+
+def _truthful_state(
+    runtime: "VaultRuntime", vault: "Vault | None", state: GraphIntegrityState
+) -> GraphIntegrityState:
+    """Report "never audited" truthfully for a backend that has no write fence.
+
+    Only the synthesized no-record verdicts are rewritten (``is_unrecorded_state``): on such a
+    backend ``writer_fenced=True`` would claim a fence nothing enforces and nothing ever lifts.
+    A recorded verifying/failed/incomplete result, a drift fence and every Ladybug state keep
+    their stored fence, so a real failed audit still raises the degraded alarm.
+    """
+    if not is_unrecorded_state(state) or write_fence_enforced(runtime, vault):
+        return state
+    reason = NO_FENCE_UNAUDITED_REASON.format(backend=_backend_label(runtime))
+    if (state.reason or "").startswith(REASON_UNREADABLE_PREFIX):
+        reason = f"{state.reason}; {reason}"
+    return GraphIntegrityState(
+        status=state.status,
+        graph_generation=state.graph_generation,
+        writer_fenced=False,
+        reason=reason,
+        audit_id=None,
+    )
+
+
 def summary(runtime: "VaultRuntime", vault: "Vault | None" = None) -> dict[str, object]:
     """Return compact diagnostics, optionally enriched by this process's last run."""
-    state = read_state(runtime, vault)
+    state = _truthful_state(runtime, vault, read_state(runtime, vault))
     payload: dict[str, object] = {
         "status": state.status.value,
         "graph_generation": state.graph_generation,

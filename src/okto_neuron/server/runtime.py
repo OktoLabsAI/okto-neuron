@@ -1968,11 +1968,17 @@ def _build_mcp_server(state: ServerState):
         string counts as raw text only when it is NOT path-shaped (path-shaped =
         an existing file/dir, contains a slash or backslash, a Windows drive
         prefix, a space-free ``~`` prefix, or a space-free name with a short
-        file suffix like ``note.pdf``). Path-shaped sources are passed through
-        unchanged and fail loudly as path errors. Detected raw text is
-        first materialized to a durable ``.marginalia/sources/`` file (same
-        convention as REST /add and /api/v1/ingest) and that file is then
-        ingested. ``sensitivity`` must be exactly ``local_only`` or ``default``
+        file suffix like ``note.pdf``). A path-shaped source is read IN PLACE
+        and never copied: it must be an existing file inside the vault root or a
+        configured folder-watch root (``folder_watch.roots`` in the vault
+        config); a missing path fails loudly as a path error, and a file outside
+        those roots is refused with ``forbidden: ...`` naming the allowed roots
+        and how to proceed (copy it under one, add its folder to
+        ``folder_watch.roots``, or pass its text as raw text). Detected raw text
+        is the only form that is copied: it is first materialized to a durable
+        ``.marginalia/sources/`` file in the vault (same convention as REST /add
+        and /api/v1/ingest) and that copy is then ingested, so the vault keeps
+        its own text and does not reference any original file. ``sensitivity`` must be exactly ``local_only`` or ``default``
         (enforced by the tool schema — no other value is accepted); ``local_only``
         keeps the source off any remote LLM path.
 

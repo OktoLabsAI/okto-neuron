@@ -21,6 +21,7 @@ from okto_neuron.companion import (
     SourceOutsideVaultError,
     _source_context_for_hits,
     _source_is_ingestable_path,
+    _source_outside_roots_message,
 )
 from okto_neuron.server import runtime as runtime_mod
 from okto_neuron.server.http import AuthTokenMiddleware, build_rest_app
@@ -128,6 +129,36 @@ def test_companion_remember_rejects_out_of_vault_file(tmp_path):
     companion = Companion(_StubVault(vault))
     with pytest.raises(SourceOutsideVaultError):
         companion.remember(str(outside))
+
+
+def test_outside_root_message_lists_vault_watch_roots_and_remedies(tmp_path):
+    vault = tmp_path / "vault"
+    watched = tmp_path / "watched"
+    message = _source_outside_roots_message("../notes/a.md", vault, [str(watched), "/srv/drop"])
+
+    assert message.startswith(
+        "refusing to remember source outside the vault and watch roots: '../notes/a.md'."
+    )
+    assert repr(str(vault)) in message
+    assert repr(str(watched)) in message and "'/srv/drop'" in message
+    assert "none configured" not in message
+    for remedy in ("copy the file under", "`folder_watch.roots`", "raw text", ".marginalia/sources/"):
+        assert remedy in message
+
+
+def test_companion_remember_outside_message_says_no_watch_roots_are_configured(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "notes.md"
+    outside.write_text("secret", encoding="utf-8")
+
+    with pytest.raises(SourceOutsideVaultError) as exc_info:
+        Companion(_StubVault(vault)).remember(str(outside))
+
+    message = str(exc_info.value)
+    assert repr(str(outside)) in message
+    assert repr(str(vault)) in message
+    assert "folder-watch roots: none configured" in message
 
 
 # ── Fix 3: the DEFAULT ask path threads vault_root into the byte-read guard ─────
