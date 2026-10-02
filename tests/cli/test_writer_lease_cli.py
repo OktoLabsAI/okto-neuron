@@ -106,7 +106,7 @@ def guarded_cases(vault: Path, tmp_path: Path) -> list[tuple[str, list[str], str
         ("init-wipe", ["init", v, "--wipe"], "POST /api/v1/reset"),
         ("kg-init", ["kg", "init", v], stop),
         ("kg-rebuild", ["kg", "rebuild", v], "POST /api/v1/curation/rebuild"),
-        ("kg-reembed", ["kg", "reembed", v], "POST /api/v1/curation/reembed"),
+        ("kg-reembed", ["kg", "reembed", v], "/api/v1/vaults/reembed"),
         ("kg-reindex", ["kg", "reindex", v], stop),
         ("reconcile-propose", ["kg", "reconcile", "propose", v], "/api/v1/reconcile/propose"),
         ("reconcile-apply", ["kg", "reconcile", "apply", v], "/api/v1/reconcile/apply"),
