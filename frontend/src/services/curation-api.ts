@@ -6,6 +6,7 @@
 import { apiFetch, qs } from './http'
 import { fetchGraphStats } from './graph-stats'
 import { reviewQueueQuery } from '@/lib/review-queue'
+import type { QueuedReviewAction, ReviewActionStatus } from '@/lib/review-actions'
 
 // ── P1: health + dashboard ──────────────────────────────────────────────────--
 export interface HealthResponse {
@@ -238,6 +239,7 @@ export async function getReviewQueueTotal(): Promise<number> {
 }
 export type ReviewAction = 'commit' | 'discard' | 'merge'
 export type ReviewBatchAction = 'commit' | 'discard'
+// A busy vault answers 202 with status "queued" (see lib/review-actions.ts) instead of applying.
 export function resolveReview(candidateId: string, action: ReviewAction): Promise<unknown> {
   return apiFetch('/resolve-review', {
     method: 'POST',
@@ -245,10 +247,32 @@ export function resolveReview(candidateId: string, action: ReviewAction): Promis
   })
 }
 export interface ReviewBatchResponse {
+  /** "ok" when applied, "queued" when the vault was busy and `actions` were queued. */
   status: string
   resolved: number
   skipped: number
   errors: { id: string; error: string }[]
+  actions?: QueuedReviewAction[]
+}
+export interface ReviewActionsResponse {
+  items: QueuedReviewAction[]
+  queued: number
+}
+export function getReviewActions(
+  opts: { status?: ReviewActionStatus[]; limit?: number } = {},
+): Promise<ReviewActionsResponse> {
+  return apiFetch<ReviewActionsResponse>(
+    `/review-actions${qs({ status: opts.status?.join(','), limit: opts.limit })}`,
+    { timeoutMs: 15_000 },
+  )
+}
+export function cancelReviewAction(
+  actionId: string,
+): Promise<{ status: string; action: QueuedReviewAction }> {
+  return apiFetch(`/review-actions/${encodeURIComponent(actionId)}/cancel`, {
+    method: 'POST',
+    body: '{}',
+  })
 }
 export function resolveReviewBatch(
   candidateIds: string[],

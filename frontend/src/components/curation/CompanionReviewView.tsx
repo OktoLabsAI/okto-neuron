@@ -2,12 +2,16 @@
 // POST /resolve-review. Lists parked candidates from the companion contradiction
 // gate; actions commit | discard | merge. SEPARATE from the reconcile
 // review queue by design (ADR 0009 locked decision).
+// A busy vault queues an action (202) instead of failing: the view tracks queued actions,
+// polls GET /review-actions until each is final, and offers Cancel while one is queued.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Bot, CheckSquare, RefreshCw, Square, Trash2 } from 'lucide-react'
 import { Spinner, ErrorBox, Badge } from '@/components/ui'
 import {
+  cancelReviewAction,
   companionTriage,
   getJob,
+  getReviewActions,
   getReviewQueue,
   resolveReview,
   resolveReviewBatch,
@@ -17,9 +21,22 @@ import {
   type ReviewAction,
 } from '@/services/curation-api'
 import { appendPage, REVIEW_PAGE_SIZE } from '@/lib/review-queue'
-import { BusyRetryNotice } from './BusyRetryNotice'
-import { useBusyRetry } from '@/hooks/useBusyRetry'
-import { isBusyRetryStopped } from '@/lib/busy-retry'
+import { HttpError } from '@/services/http'
+import {
+  cancellable,
+  describe,
+  hasPending,
+  isFinal,
+  isQueuedAnswer,
+  mergeListing,
+  newlyFinal,
+  pendingFor,
+  POLL_MS,
+  queuedActions,
+  track,
+  type QueuedReviewAction,
+  type TrackedReviewAction,
+} from '@/lib/review-actions'
 
 const ACTIONS: ReviewAction[] = ['commit', 'discard', 'merge']
 const TYPES = ['Agent', 'Concept', 'Place', 'InformationObject', 'Activity']
@@ -52,6 +69,13 @@ function inBucket(it: CompanionReviewItem, bucket: ConfidenceBucket): boolean {
   return confidence > 0.85
 }
 
+function actionTone(status: string): 'default' | 'accent' | 'warn' | 'danger' {
+  if (status === 'applied') return 'accent'
+  if (status === 'failed') return 'danger'
+  if (status === 'queued') return 'warn'
+  return 'default'
+}
+
 function triageSummary(job: CurationJob | null): string {
   if (!job) return ''
   if (job.status === 'error') return job.error || 'triage failed'
@@ -73,7 +97,10 @@ export function CompanionReviewView() {
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [total, setTotal] = useState<number | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
-  const { run: runBusy, wait: busyWait, stop: stopBusy } = useBusyRetry()
+  const [tracked, setTracked] = useState<TrackedReviewAction[]>([])
+  const trackedRef = useRef<TrackedReviewAction[]>(tracked)
+  trackedRef.current = tracked
+  const [pollTick, setPollTick] = useState(0)
   const [typeFilter, setTypeFilter] = useState('all')
   const [confidenceFilter, setConfidenceFilter] = useState<ConfidenceBucket>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -120,8 +147,40 @@ export function CompanionReviewView() {
 
   useEffect(() => {
     refresh()
+    // Actions queued earlier (another tab, or before a reload) are still being applied.
+    getReviewActions({ status: ['queued'], limit: 500 })
+      .then((resp) =>
+        setTracked((prev) => track(prev, resp.items.map((a) => ({ ...a, holderText: null })))),
+      )
+      .catch(() => {
+        /* the review queue still works without the list */
+      })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Poll while an action is queued; a final outcome changes the review queue, so reload it.
+  useEffect(() => {
+    if (!hasPending(tracked)) return
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      try {
+        const listing = await getReviewActions({ limit: 500 })
+        if (cancelled) return
+        const before = trackedRef.current
+        const next = mergeListing(before, listing.items)
+        if (next !== before) setTracked(next)
+        if (newlyFinal(before, next).length) await refresh()
+      } catch {
+        /* keep polling */
+      }
+      if (!cancelled) setPollTick((t) => t + 1)
+    }, POLL_MS)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tracked, pollTick])
 
   useEffect(() => {
     const ids = new Set(items.filter((item) => itemKind(item) === 'node').map(itemId).filter(Boolean))
@@ -185,13 +244,38 @@ export function CompanionReviewView() {
     setBusy(`${id}:${action}`)
     setError(null)
     try {
-      await runBusy(() => resolveReview(id, action))
-      await refresh()
+      const resp = await resolveReview(id, action)
+      if (isQueuedAnswer(resp)) setTracked((prev) => track(prev, queuedActions(resp)))
+      else await refresh()
     } catch (e) {
-      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
+  }
+
+  function replaceTracked(action: QueuedReviewAction) {
+    setTracked((prev) =>
+      prev.map((a) => (a.id === action.id ? { ...a, ...action, holderText: a.holderText } : a)),
+    )
+  }
+
+  async function cancelQueued(actionId: string) {
+    setError(null)
+    try {
+      const resp = await cancelReviewAction(actionId)
+      replaceTracked(resp.action)
+    } catch (e) {
+      // 409 not_cancellable carries the action as it is now (being applied, or already final).
+      const current =
+        e instanceof HttpError ? (e.body as { action?: QueuedReviewAction } | null)?.action : null
+      if (current) replaceTracked(current)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  function clearFinished() {
+    setTracked((prev) => prev.filter((a) => !isFinal(a.status)))
   }
 
   function toggleSelected(id: string) {
@@ -227,15 +311,17 @@ export function CompanionReviewView() {
     setError(null)
     setBatchOutcome(null)
     try {
-      const resp = await runBusy(() => resolveReviewBatch([...selected], action))
+      const resp = await resolveReviewBatch([...selected], action)
+      const queued = queuedActions(resp)
+      if (queued.length) setTracked((prev) => track(prev, queued))
       setBatchOutcome(
-        `${resp.resolved} resolved · ${resp.skipped} skipped${resp.errors.length ? ` · ${resp.errors.length} errors` : ''}`,
+        `${resp.resolved} resolved · ${resp.skipped} skipped${resp.errors.length ? ` · ${resp.errors.length} errors` : ''}${queued.length ? ` · ${queued.length} queued (the vault is busy; applied when it is free)` : ''}`,
       )
       setSelected(new Set())
       setConfirmAction(null)
-      await refresh()
+      if (!isQueuedAnswer(resp) || resp.resolved > 0) await refresh()
     } catch (e) {
-      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
@@ -292,8 +378,43 @@ export function CompanionReviewView() {
         </div>
       </div>
 
-      <BusyRetryNotice wait={busyWait} onStop={stopBusy} />
       {error && <ErrorBox message={error} />}
+      {tracked.length > 0 && (
+        <div
+          role="status"
+          className="space-y-1.5 rounded-lg border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-medium text-amber-300">Review actions</span>
+            {tracked.some((a) => isFinal(a.status)) && (
+              <button
+                onClick={clearFinished}
+                className="rounded-md border border-surface-700 px-2 py-0.5 text-surface-400 hover:bg-surface-800"
+              >
+                Clear finished
+              </button>
+            )}
+          </div>
+          {tracked.map((a) => {
+            const item = items.find((it) => itemId(it) === a.candidate_id)
+            return (
+              <div key={a.id} className="flex flex-wrap items-center gap-2">
+                <Badge tone={actionTone(a.status)}>{a.status}</Badge>
+                <span className="text-surface-300">{String(item?.title ?? a.candidate_id)}</span>
+                <span className="text-surface-400">{describe(a)}</span>
+                {cancellable(a) && (
+                  <button
+                    onClick={() => cancelQueued(a.id)}
+                    className="rounded-md border border-amber-700/60 px-2 py-0.5 text-amber-200 hover:bg-amber-900/40"
+                  >
+                    Cancel
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       {(activeTriageJob || batchOutcome) && (
         <div className="rounded-lg border border-surface-800 bg-surface-950 px-3 py-2 text-xs text-surface-400">
           {activeTriageJob && (
@@ -387,6 +508,7 @@ export function CompanionReviewView() {
       <div className="space-y-2">
         {visibleItems.map((it) => {
           const id = itemId(it)
+          const pending = pendingFor(tracked, id)
           const confidence = itemConfidence(it)
           const relation = itemKind(it) === 'relation'
           const evidence = it.source_evidence
@@ -414,6 +536,11 @@ export function CompanionReviewView() {
                   <div className="flex flex-wrap items-center gap-2">
                     {it.type ? <Badge tone="violet">{String(it.type)}</Badge> : null}
                     {confidence !== null && <Badge>conf {confidence.toFixed(2)}</Badge>}
+                    {pending && (
+                      <Badge tone="warn">
+                        {pending.applying ? 'applying' : 'queued'}: {pending.action}
+                      </Badge>
+                    )}
                     {it.reason ? (
                       <span className="text-xs text-surface-500">{String(it.reason)}</span>
                     ) : null}
@@ -450,7 +577,7 @@ export function CompanionReviewView() {
                         <button
                           key={a}
                           onClick={() => act(id, a)}
-                          disabled={busy !== null}
+                          disabled={busy !== null || pending !== null}
                           className="rounded-md border border-surface-700 px-2.5 py-1 text-xs text-surface-300 hover:bg-surface-800 disabled:opacity-50"
                         >
                           {busy === `${id}:${a}` ? '...' : a}

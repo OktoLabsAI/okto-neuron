@@ -147,9 +147,11 @@ This table records which UI service module calls which route. It is not a contra
 | `/api/v1/vaults/reembed` | POST | `services/vault-api.ts:46` |
 | `/api/v1/vaults/reembed/status` | GET | `services/vault-api.ts:55` |
 | `/api/v1/detect-drift` | POST | `services/curation-api.ts:189` |
-| `/api/v1/review-queue` | GET | `services/curation-api.ts:222` |
-| `/api/v1/review-queue/batch` | POST | `services/curation-api.ts:242` |
-| `/api/v1/resolve-review` | POST | `services/curation-api.ts:227` |
+| `/api/v1/review-queue` | GET | `services/curation-api.ts:230` |
+| `/api/v1/review-queue/batch` | POST | `services/curation-api.ts:277` |
+| `/api/v1/resolve-review` | POST | `services/curation-api.ts:243` |
+| `/api/v1/review-actions` | GET | `services/curation-api.ts:261` |
+| `/api/v1/review-actions/{action_id}/cancel` | POST | `services/curation-api.ts:269` |
 
 Four `/config/defaults/...` rows share a caller with their vault-scoped twin. `llm-test-api.ts:23` and `embedding-api.ts:31` pick between the two paths on a `scope` argument: `application` sends the `/config/defaults/...` form, anything else sends the vault-scoped one. The same branch appears at `llm-test-api.ts:45` and `embedding-api.ts:52`, and at `config-api.ts:15` and `:26` for `/api/v1/config/defaults` against `/api/v1/config`.
 
