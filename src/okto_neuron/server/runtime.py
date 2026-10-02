@@ -50,6 +50,7 @@ from okto_neuron.server._store_io import (
     store_io,
     wait_executors_idle_async,
 )
+from okto_neuron.server._open_failure import client_open_failure
 from okto_neuron.server._vault_pool import (
     VaultLease,
     VaultPoolError,
@@ -733,9 +734,10 @@ def _vault_open_warning(vault_path: Path, exc: EmbeddingDimMismatch) -> dict[str
         "detail": exc.user_message(),
         "remedy": (
             "Rebuild vectors at the configured embedding width through the running "
-            "daemon (POST /api/v1/curation/reembed, or the Curation page in the UI); "
-            "`okto-neuron kg reembed` is refused while the daemon holds the vault. "
-            "Or switch to another vault."
+            "daemon (POST /api/v1/vaults/reembed with {\"vault\": \"<vault name>\"}, which "
+            "works while the vault cannot be opened, or the vault manager's Re-embed "
+            "button); `okto-neuron kg reembed` is refused while the daemon holds the "
+            "vault. Or switch to another vault."
         ),
     }
 
@@ -925,6 +927,11 @@ def _pool_error(exc: VaultPoolError, *, selector: str | None) -> VaultResolution
     original is logged for the operator.
     """
     _LOG.warning("vault pool error %s for selector %r: %s", exc.code, selector, exc, exc_info=True)
+    # A width mismatch is a diagnosable, path-free fact with a working remedy: say so
+    # instead of "see the server log" (a field report).
+    mismatch = client_open_failure(exc)
+    if mismatch is not None:
+        return VaultResolutionError(mismatch[0], mismatch[1])
     return VaultResolutionError(
         exc.code,
         # No ``exc.code`` in the text: the MCP layer already renders it as
@@ -2309,6 +2316,7 @@ async def _run_async(
     # (default False) so inert unless configured. Global — not reset by switch_vault.
     #
     # Task 4 (silent-failure visibility): the loop body is wrapped in a crash guard,
+    state.rest_port = rest_port
     # but if the task EVER exits with an exception (something outside the guard, e.g.
     # in the sleep/scaffolding), auto-ingest would stop forever with no signal. The
     # ``_supervise_folder_watch`` done-callback restarts a CRASHED task (bounded by

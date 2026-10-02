@@ -352,6 +352,8 @@ class ServerState:
     The separate MCP port remains bearer-authenticated, and the token is stored
     once under the application runtime directory rather than under a vault.
     """
+    rest_port: int | None = None
+    """The loopback REST port this daemon serves (set at startup; client error text names it)."""
     started_at: float = field(default_factory=time.monotonic)
     pid: int = field(default_factory=os.getpid)
     multi_vault_runtime_enabled: bool = False

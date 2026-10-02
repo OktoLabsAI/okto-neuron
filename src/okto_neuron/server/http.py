@@ -82,6 +82,7 @@ from okto_neuron.server._store_io import (
     store_io,
 )
 from okto_neuron.consolidate.review_queue_sqlite import ReviewQueueMigrationRequired
+from okto_neuron.server._open_failure import client_open_failure
 from okto_neuron.server._vault_pool import VaultPoolError, acquire_daemon_writer_lease
 from okto_neuron.store.writer_lease import degraded_leases, held_writer_lease
 from okto_neuron.server.lifecycle import request_id as bind_request_id
@@ -479,9 +480,10 @@ def _vault_open_warning(vault_path: Path, exc: EmbeddingDimMismatch) -> dict[str
         "detail": exc.user_message(),
         "remedy": (
             "Rebuild vectors at the configured embedding width through the running "
-            "daemon (POST /api/v1/curation/reembed, or the Curation page in the UI); "
-            "`okto-neuron kg reembed` is refused while the daemon holds the vault. "
-            "Or switch to another vault."
+            "daemon (POST /api/v1/vaults/reembed with {\"vault\": \"<vault name>\"}, which "
+            "works while the vault cannot be opened, or the vault manager's Re-embed "
+            "button); `okto-neuron kg reembed` is refused while the daemon holds the "
+            "vault. Or switch to another vault."
         ),
     }
 
@@ -806,6 +808,20 @@ _VAULT_LEASE_EXEMPT_PATHS: frozenset[str] = frozenset(
 )
 
 
+def _pool_open_error_response(exc: VaultPoolError) -> JSONResponse:
+    """REST answer for a failed vault open/lease.
+
+    A width mismatch gets the stable ``embedding_dim_mismatch`` code, the real reason and
+    the working remedy, path-free; every other pool error keeps its code and text.
+    """
+    mismatch = client_open_failure(exc)
+    if mismatch is not None:
+        _LOG.warning("vault open refused (embedding width mismatch): %s", exc)
+        return _err(409, mismatch[0], mismatch[1])
+    status = 503 if exc.code == "pool_full" else 409
+    return _err(status, exc.code, str(exc))
+
+
 def _request_is_vault_scoped(path: str) -> bool:
     """Return whether one REST path operates against a selected vault."""
 
@@ -904,8 +920,7 @@ class ActiveVaultMiddleware:
             await response(scope, receive, send)
             return
         except VaultPoolError as exc:
-            status = 503 if exc.code == "pool_full" else 409
-            response = _err(status, exc.code, str(exc))
+            response = _pool_open_error_response(exc)
             await response(scope, receive, send)
             return
         except Exception:  # noqa: BLE001
@@ -942,8 +957,7 @@ class ActiveVaultMiddleware:
             # or large graph): never on the loop that also serves /health.
             lease = await acquire_off_loop(runtime.lease_vault)
         except VaultPoolError as exc:
-            status = 503 if exc.code == "pool_full" else 409
-            response = _err(status, exc.code, str(exc))
+            response = _pool_open_error_response(exc)
             await response(scope, receive, send)
             return
 
