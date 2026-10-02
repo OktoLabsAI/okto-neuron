@@ -5,6 +5,9 @@
 import { useEffect, useState } from 'react'
 import { RefreshCw, Check, X } from 'lucide-react'
 import { Spinner, ErrorBox, Badge } from '@/components/ui'
+import { BusyRetryNotice } from './BusyRetryNotice'
+import { useBusyRetry } from '@/hooks/useBusyRetry'
+import { isBusyRetryStopped } from '@/lib/busy-retry'
 import {
   getReconcileQueue,
   reconcileConfirm,
@@ -18,6 +21,7 @@ export function ReconcileReviewView() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState(false)
+  const { run: runBusy, wait: busyWait, stop: stopBusy } = useBusyRetry()
 
   async function refresh() {
     setLoading(true)
@@ -49,11 +53,11 @@ export function ReconcileReviewView() {
     setBusy(true)
     setError(null)
     try {
-      if (action === 'confirm') await reconcileConfirm(id)
-      else await reconcileReject(id)
+      if (action === 'confirm') await runBusy(() => reconcileConfirm(id))
+      else await runBusy(() => reconcileReject(id))
       await refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -64,12 +68,12 @@ export function ReconcileReviewView() {
     setError(null)
     try {
       for (const id of selected) {
-        if (action === 'confirm') await reconcileConfirm(id)
-        else await reconcileReject(id)
+        if (action === 'confirm') await runBusy(() => reconcileConfirm(id))
+        else await runBusy(() => reconcileReject(id))
       }
       await refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -93,6 +97,7 @@ export function ReconcileReviewView() {
         </button>
       </div>
 
+      <BusyRetryNotice wait={busyWait} onStop={stopBusy} />
       {error && <ErrorBox message={error} />}
       {loading && entries.length === 0 && <Spinner label="Loading queue…" />}
       {!loading && entries.length === 0 && !error && (

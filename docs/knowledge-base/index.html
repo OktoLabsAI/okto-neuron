@@ -18480,6 +18480,22 @@ those same side files under that lock, so a second lock here would race it. But
 and unlike those background jobs, a review-action click is a synchronous UI button. It now
 waits up to 5s (<code>_writer_lock_fast</code> in <code>server/http.py</code>) and returns <code>503 busy</code> if the
 lock isn't free in time, instead of leaving the button spinning behind the queue.</li>
+<li><strong>The busy answer names the lock holder, and the review UI retries (a field report).</strong>
+The <code>503 busy</code> (and the <code>409 audit_busy</code> of the audit routes) keep their status, <code>error</code>
+code and <code>detail</code> text, and now add <code>holder</code> (<code>kind</code>, <code>id</code>, <code>since</code>, <code>held_for_s</code>),
+<code>retry_after_s</code>, and a <code>Retry-After</code> header (seconds). <code>kind</code> is one of <code>ingest-item</code>,
+<code>mcp-remember</code>, <code>curation-job</code>, <code>rebuild-job</code>, <code>vault-maintenance</code> or <code>review-op</code>; <code>id</code>
+is the queue item or job id (never a path, document name or text). <code>Retry-After</code> is 15 s
+behind an ingest item or MCP remember, 30 s behind a curation or rebuild job, 10 s for
+vault maintenance, 5 s behind another review action, and 10 s when the holder is
+unknown. The companion review view, the reconcile review, the predicate-upkeep queue and
+the authority view show <code>Busy: &lt;kind&gt; &lt;id&gt; has held the lock for N s; retrying in M s (attempt k of 5)</code> with a <strong>Stop retrying</strong> button, and send the action again after a
+capped exponential backoff of 2, 4, 8, 16 and 30 s (a longer <code>Retry-After</code> wins, at most
+60 s). After the fifth retry the busy error is shown as before. The action is re-sent
+only after a definitive busy answer, which the daemon gives before it changes anything,
+so it is applied once; a request that timed out or dropped is never re-sent, and a
+second click while an action is waiting is ignored. The logic lives in
+<code>frontend/src/lib/busy-retry.ts</code> and <code>frontend/src/hooks/useBusyRetry.ts</code>.</li>
 <li><strong>Endpoint permission belongs to a provider connection.</strong> Named providers expose an
 <code>allow_remote</code> checkbox, on by default, which permits private-LAN and HTTPS endpoints. Test,
 LLM, and embedding calls through <code>provider_ref</code> use that provider-owned value. The older

@@ -3,6 +3,9 @@
 import { useState } from 'react'
 import { Check, RefreshCw, X } from 'lucide-react'
 import { Badge, ErrorBox, Spinner } from '@/components/ui'
+import { BusyRetryNotice } from './BusyRetryNotice'
+import { useBusyRetry } from '@/hooks/useBusyRetry'
+import { isBusyRetryStopped } from '@/lib/busy-retry'
 import {
   predicateUpkeepConfirm,
   predicateUpkeepReject,
@@ -49,6 +52,7 @@ export function PredicateUpkeepView() {
   const [actionError, setActionError] = useState<string | null>(null)
   const error = actionError ?? snapshotError
   const [busyId, setBusyId] = useState<string | null>(null)
+  const { run: runBusy, wait: busyWait, stop: stopBusy } = useBusyRetry()
 
   async function refresh() {
     setActionError(null)
@@ -59,11 +63,11 @@ export function PredicateUpkeepView() {
     setBusyId(recordId)
     setActionError(null)
     try {
-      if (action === 'confirm') await predicateUpkeepConfirm(recordId)
-      else await predicateUpkeepReject(recordId)
+      if (action === 'confirm') await runBusy(() => predicateUpkeepConfirm(recordId))
+      else await runBusy(() => predicateUpkeepReject(recordId))
       await refresh()
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setActionError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusyId(null)
     }
@@ -87,6 +91,7 @@ export function PredicateUpkeepView() {
         </button>
       </div>
 
+      <BusyRetryNotice wait={busyWait} onStop={stopBusy} />
       {error && <ErrorBox message={error} />}
       {loading && records.length === 0 && <Spinner label="Loading predicate queue..." />}
       {!loading && records.length === 0 && !error && (

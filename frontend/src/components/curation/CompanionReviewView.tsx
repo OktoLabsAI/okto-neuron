@@ -17,6 +17,9 @@ import {
   type ReviewAction,
 } from '@/services/curation-api'
 import { appendPage, REVIEW_PAGE_SIZE } from '@/lib/review-queue'
+import { BusyRetryNotice } from './BusyRetryNotice'
+import { useBusyRetry } from '@/hooks/useBusyRetry'
+import { isBusyRetryStopped } from '@/lib/busy-retry'
 
 const ACTIONS: ReviewAction[] = ['commit', 'discard', 'merge']
 const TYPES = ['Agent', 'Concept', 'Place', 'InformationObject', 'Activity']
@@ -70,6 +73,7 @@ export function CompanionReviewView() {
   const [nextCursor, setNextCursor] = useState<string | null>(null)
   const [total, setTotal] = useState<number | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
+  const { run: runBusy, wait: busyWait, stop: stopBusy } = useBusyRetry()
   const [typeFilter, setTypeFilter] = useState('all')
   const [confidenceFilter, setConfidenceFilter] = useState<ConfidenceBucket>('all')
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -181,10 +185,10 @@ export function CompanionReviewView() {
     setBusy(`${id}:${action}`)
     setError(null)
     try {
-      await resolveReview(id, action)
+      await runBusy(() => resolveReview(id, action))
       await refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
@@ -223,7 +227,7 @@ export function CompanionReviewView() {
     setError(null)
     setBatchOutcome(null)
     try {
-      const resp = await resolveReviewBatch([...selected], action)
+      const resp = await runBusy(() => resolveReviewBatch([...selected], action))
       setBatchOutcome(
         `${resp.resolved} resolved · ${resp.skipped} skipped${resp.errors.length ? ` · ${resp.errors.length} errors` : ''}`,
       )
@@ -231,7 +235,7 @@ export function CompanionReviewView() {
       setConfirmAction(null)
       await refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
@@ -288,6 +292,7 @@ export function CompanionReviewView() {
         </div>
       </div>
 
+      <BusyRetryNotice wait={busyWait} onStop={stopBusy} />
       {error && <ErrorBox message={error} />}
       {(activeTriageJob || batchOutcome) && (
         <div className="rounded-lg border border-surface-800 bg-surface-950 px-3 py-2 text-xs text-surface-400">
