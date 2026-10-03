@@ -47,6 +47,10 @@ def _queue(vault: Vault) -> ReviewQueue:
     return ReviewQueue(Path(vault.path) / ".marginalia", vault.store)
 
 
+def _concept_titles(vault: Vault) -> list[str]:
+    return sorted(str(node.title) for node in vault.store.list_nodes(type="Concept"))
+
+
 def _seed(vault: Vault, n: int) -> list[str]:
     queue = _queue(vault)
     return [queue.enqueue(_candidate(i), "low_confidence").candidate_id for i in range(n)]
@@ -164,9 +168,11 @@ def test_a_busy_approve_is_queued_and_applied_when_the_lock_frees(tmp_path: Path
             listing = (await client.get(ACTIONS)).json()
             assert listing["queued"] == 1 and listing["items"][0]["status"] == "queued"
             assert _queue(vault).fingerprint(ids[0]) is not None  # not applied while busy
-        return queued, await _settled(client), _queue(vault).fingerprint(ids[0])
+        settled = await _settled(client)
+        return queued, settled, _queue(vault).fingerprint(ids[0]), _concept_titles(vault)
 
-    queued, rows, after = _run(tmp_path, 1, body)  # type: ignore[misc]
+    queued, rows, after, titles = _run(tmp_path, 1, body)  # type: ignore[misc]
+    assert titles == ["item 0"]  # the commit really reached the graph
     assert queued["status"] == "queued" and queued["queued_ahead"] == 0
     assert queued["holder"]["kind"] == "mcp-remember" and queued["retry_after_s"] == 15
     assert queued["action"]["candidate_id"] and queued["action"]["status"] == "queued"
@@ -220,11 +226,11 @@ def test_an_item_resolved_elsewhere_before_the_apply_is_superseded(tmp_path: Pat
             assert response.status_code == 202
             # another path (a job) resolves the item while the action waits
             _queue(vault).acknowledge(ids[0])
-        return await _settled(client), vault.store.get_node(ids[0])
+        return await _settled(client), _concept_titles(vault)
 
-    rows, node = _run(tmp_path, 1, body)  # type: ignore[misc]
+    rows, titles = _run(tmp_path, 1, body)  # type: ignore[misc]
     assert [r["status"] for r in rows] == ["superseded"] and rows[0]["reason"] == REASON_GONE
-    assert node is None  # the commit was not applied
+    assert titles == []  # the commit was not applied
 
 
 def test_an_item_that_changed_since_it_was_queued_is_superseded_not_applied(
