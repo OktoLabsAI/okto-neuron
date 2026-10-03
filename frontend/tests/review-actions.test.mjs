@@ -8,11 +8,13 @@ import {
   hasPending,
   holderText,
   isQueuedAnswer,
+  label,
   mergeListing,
   newlyFinal,
   pendingFor,
   queuedActions,
   track,
+  withTitles,
 } from '../src/lib/review-actions.ts'
 
 function row(over = {}) {
@@ -98,4 +100,30 @@ test('only an unclaimed queued action can be cancelled; pendingFor finds the new
   const list = [a, { ...a, id: 'ra_2', action: 'discard' }, { ...a, id: 'ra_3', candidate_id: 'c2' }]
   assert.equal(pendingFor(list, 'c1').id, 'ra_2')
   assert.equal(pendingFor(list, 'zz'), null)
+})
+
+test('the title captured at queue time survives the item leaving the list (panel shows it, not the id)', () => {
+  const titles = { c1: 'item 0' }
+  const titleOf = (id) => titles[id] ?? null
+  const t = track([], queuedActions(single, titleOf))
+  assert.equal(t[0].title, 'item 0')
+  assert.equal(label(t[0]), 'item 0')
+  // applied: the daemon listing has no title and the item is gone from the review list
+  delete titles.c1
+  for (const status of ['applied', 'superseded', 'cancelled', 'failed']) {
+    const done = mergeListing(t, [row({ status, reason: status === 'queued' ? null : 'x' })])
+    assert.equal(done[0].status, status)
+    assert.equal(label(done[0]), 'item 0')
+  }
+  // without a known title the panel falls back to the candidate id
+  const [anon] = queuedActions(single)
+  assert.equal(anon.title, null)
+  assert.equal(label(anon), 'c1')
+})
+
+test('withTitles fills only unknown titles and keeps identity when nothing is known', () => {
+  const listed = [{ ...row(), holderText: null, title: null }, { ...row({ id: 'ra_2', candidate_id: 'c2' }), holderText: null, title: 'kept' }]
+  assert.equal(withTitles(listed, () => null), listed)
+  const filled = withTitles(listed, (id) => (id === 'c1' ? 'item 0' : 'other'))
+  assert.deepEqual(filled.map(label), ['item 0', 'kept'])
 })

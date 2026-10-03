@@ -28,12 +28,14 @@ import {
   hasPending,
   isFinal,
   isQueuedAnswer,
+  label,
   mergeListing,
   newlyFinal,
   pendingFor,
   POLL_MS,
   queuedActions,
   track,
+  withTitles,
   type QueuedReviewAction,
   type TrackedReviewAction,
 } from '@/lib/review-actions'
@@ -150,7 +152,7 @@ export function CompanionReviewView() {
     // Actions queued earlier (another tab, or before a reload) are still being applied.
     getReviewActions({ status: ['queued'], limit: 500 })
       .then((resp) =>
-        setTracked((prev) => track(prev, resp.items.map((a) => ({ ...a, holderText: null })))),
+        setTracked((prev) => track(prev, resp.items.map((a) => ({ ...a, holderText: null, title: null })))),
       )
       .catch(() => {
         /* the review queue still works without the list */
@@ -185,7 +187,15 @@ export function CompanionReviewView() {
   useEffect(() => {
     const ids = new Set(items.filter((item) => itemKind(item) === 'node').map(itemId).filter(Boolean))
     setSelected((prev) => new Set([...prev].filter((id) => ids.has(id))))
+    // Actions listed at load time get their title once the item is in the list.
+    setTracked((prev) => withTitles(prev, titleOf))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items])
+
+  function titleOf(candidateId: string): string | null {
+    const title = items.find((it) => itemId(it) === candidateId)?.title
+    return title === undefined || title === null || title === '' ? null : String(title)
+  }
 
   useEffect(() => {
     setPage(0)
@@ -245,7 +255,7 @@ export function CompanionReviewView() {
     setError(null)
     try {
       const resp = await resolveReview(id, action)
-      if (isQueuedAnswer(resp)) setTracked((prev) => track(prev, queuedActions(resp)))
+      if (isQueuedAnswer(resp)) setTracked((prev) => track(prev, queuedActions(resp, titleOf)))
       else await refresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -256,7 +266,7 @@ export function CompanionReviewView() {
 
   function replaceTracked(action: QueuedReviewAction) {
     setTracked((prev) =>
-      prev.map((a) => (a.id === action.id ? { ...a, ...action, holderText: a.holderText } : a)),
+      prev.map((a) => (a.id === action.id ? { ...a, ...action, holderText: a.holderText, title: a.title } : a)),
     )
   }
 
@@ -312,7 +322,7 @@ export function CompanionReviewView() {
     setBatchOutcome(null)
     try {
       const resp = await resolveReviewBatch([...selected], action)
-      const queued = queuedActions(resp)
+      const queued = queuedActions(resp, titleOf)
       if (queued.length) setTracked((prev) => track(prev, queued))
       setBatchOutcome(
         `${resp.resolved} resolved · ${resp.skipped} skipped${resp.errors.length ? ` · ${resp.errors.length} errors` : ''}${queued.length ? ` · ${queued.length} queued (the vault is busy; applied when it is free)` : ''}`,
@@ -396,11 +406,10 @@ export function CompanionReviewView() {
             )}
           </div>
           {tracked.map((a) => {
-            const item = items.find((it) => itemId(it) === a.candidate_id)
             return (
               <div key={a.id} className="flex flex-wrap items-center gap-2">
                 <Badge tone={actionTone(a.status)}>{a.status}</Badge>
-                <span className="text-surface-300">{String(item?.title ?? a.candidate_id)}</span>
+                <span className="text-surface-300">{label(a)}</span>
                 <span className="text-surface-400">{describe(a)}</span>
                 {cancellable(a) && (
                   <button

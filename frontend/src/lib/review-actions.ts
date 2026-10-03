@@ -24,7 +24,12 @@ export interface QueuedReviewAction {
 export interface TrackedReviewAction extends QueuedReviewAction {
   /** Who held the vault when the action was queued, as the daemon described it. */
   holderText: string | null
+  /** The candidate's title, captured while it was still listed (an applied item leaves the list). */
+  title: string | null
 }
+
+/** Looks up the title of a candidate the review list currently shows. */
+export type TitleOf = (candidateId: string) => string | null
 
 /** Poll interval while at least one tracked action is still queued. */
 export const POLL_MS = 2000
@@ -59,13 +64,34 @@ export function holderText(body: unknown): string | null {
   return `${holder.kind}${id}${held}`
 }
 
-/** The actions a 202 body carries (single route: `action`; batch: `actions`). */
-export function queuedActions(body: unknown): TrackedReviewAction[] {
+/** The actions a 202 body carries (single route: `action`; batch: `actions`), with their titles. */
+export function queuedActions(body: unknown, titleOf: TitleOf = () => null): TrackedReviewAction[] {
   if (!isQueuedAnswer(body)) return []
   const b = body as QueuedBody
   const raw = Array.isArray(b.actions) ? b.actions : b.action ? [b.action] : []
   const text = holderText(body)
-  return raw.filter(isAction).map((a) => ({ ...a, holderText: text }))
+  return raw.filter(isAction).map((a) => ({ ...a, holderText: text, title: titleOf(a.candidate_id) }))
+}
+
+/** Fill in titles still unknown (actions listed at load time) from the current review list. */
+export function withTitles(
+  tracked: TrackedReviewAction[],
+  titleOf: TitleOf,
+): TrackedReviewAction[] {
+  let changed = false
+  const next = tracked.map((a) => {
+    if (a.title !== null) return a
+    const title = titleOf(a.candidate_id)
+    if (title === null) return a
+    changed = true
+    return { ...a, title }
+  })
+  return changed ? next : tracked
+}
+
+/** What the panel names an action by: the captured title, else the candidate id. */
+export function label(a: TrackedReviewAction): string {
+  return a.title ?? a.candidate_id
 }
 
 /** Add newly queued actions to the tracked list (an id already tracked is kept once). */
@@ -78,7 +104,7 @@ export function track(
   return fresh.length ? [...tracked, ...fresh] : tracked
 }
 
-/** Apply a GET /review-actions listing to the tracked actions (keeps the holder text). */
+/** Apply a GET /review-actions listing to the tracked actions (keeps the holder text and title). */
 export function mergeListing(
   tracked: TrackedReviewAction[],
   listing: QueuedReviewAction[],
@@ -96,7 +122,7 @@ export function mergeListing(
       return a
     }
     changed = true
-    return { ...a, ...fresh, holderText: a.holderText }
+    return { ...a, ...fresh, holderText: a.holderText, title: a.title }
   })
   return changed ? next : tracked
 }
