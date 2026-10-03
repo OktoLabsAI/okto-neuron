@@ -14878,19 +14878,35 @@ enforced inside the two store implementations, so it covers every site above.</p
 <p>A <code>remember</code> or an ingest item holds the vault <code>writer_lock</code> and, inside the companion, the
 cross-process semantic writer lease (<code>.marginalia/.semantic-writer.lock</code>) for the whole item,
 which can take minutes. Review approve/reject (<code>POST /api/v1/resolve-review</code> and
-<code>POST /api/v1/review-queue/batch</code>, plus the bare aliases) never wait behind it without bound:</p>
+<code>POST /api/v1/review-queue/batch</code>, plus the bare aliases) never wait behind it and never fail
+because of it: a busy vault queues the action.</p>
 <ul>
-<li>Both routes wait up to 5 s for <code>writer_lock</code>, then up to 5 s for the lease. The batch route
-uses the same fail-fast path as the single route. The lease wait is a non-blocking acquire
-loop; a timeout leaves nothing held. Callers that pass no timeout (for example <code>remember</code>
-and the curation jobs) still block as before.</li>
-<li>A timeout answers <code>503</code> with error <code>busy</code>, a <code>Retry-After</code> header, <code>retry_after_s</code>, and a
-<code>holder</code> object. A <code>writer_lock</code> holder is <code>{kind, id, since, held_for_s}</code> where kind is one of
-<code>mcp-remember</code>, <code>ingest-item</code>, <code>curation-job</code>, <code>rebuild-job</code>, <code>vault-maintenance</code>. A lease
-held by another process is <code>{kind: &quot;external-process&quot;, id: &quot;-&quot;}</code> (its age is unknown), with
-<code>Retry-After: 15</code>.</li>
-<li>A batch that is stopped by a busy lease keeps what it already resolved and reports it as
-<code>resolved</code> and <code>skipped</code> in the same <code>503</code> body; retry with the remaining ids.</li>
+<li>Both routes wait up to 5 s for <code>writer_lock</code>, then up to 5 s for the lease (a non-blocking
+acquire loop; a timeout leaves nothing held). Callers that pass no timeout (for example
+<code>remember</code> and the curation jobs) still block as before.</li>
+<li>When either wait runs out, the route stores the action in the vault's
+<code>.marginalia/review_queue.sqlite</code> (table <code>review_actions</code>: <code>id</code>, <code>candidate_id</code>, <code>action</code>,
+<code>payload</code>, <code>expected_sha256</code>, <code>created_at</code>, <code>status</code>, <code>reason</code>, <code>claimed_at</code>, <code>finished_at</code>,
+<code>outcome</code>) and answers <code>202</code> with <code>status: &quot;queued&quot;</code>, the action, <code>queued_ahead</code>, and the
+<code>holder</code> and <code>retry_after_s</code> of the lock it found busy. <code>expected_sha256</code> is the queue entry
+digest of the candidate at that moment (the state the user acted on). An id that is not in
+the review queue still answers <code>404</code> (single) or counts as <code>skipped</code> (batch); nothing is
+queued for it.</li>
+<li>While earlier actions of the vault are still queued, a new action queues behind them even if
+the lock is free, so actions apply in arrival order.</li>
+<li>One applier task per vault (<code>server/_review_actions.py</code>) applies queued actions oldest first,
+under <code>writer_lock</code> (holder kind <code>review-queue</code>) and the semantic lease, the same locks the
+direct path takes. It starts when an action is queued, at daemon startup for every vault with
+queued rows (so actions survive a restart), and when <code>GET /api/v1/review-actions</code> sees queued
+rows. A busy lease releases <code>writer_lock</code> and retries after 2 s.</li>
+<li>Before applying, the applier reads the candidate's current digest. Missing (resolved by
+another action or a job, or removed) or different (parked again with other content) marks the
+action <code>superseded</code> with the reason; it is never applied blindly. An error marks it <code>failed</code>
+with the error text. Otherwise it is <code>applied</code> with the companion outcome.</li>
+<li>A batch that is stopped by a busy lease keeps what it already resolved (<code>resolved</code>,
+<code>skipped</code>, <code>errors</code> in the <code>202</code> body) and queues the rest under one <code>batch_id</code>.</li>
+<li><code>503 busy</code> is no longer an answer of these two routes. The other fail-fast routes
+(reconcile, predicate upkeep, authority unmerge) still answer <code>503 busy</code> with the holder.</li>
 </ul>
 <h2 id="docs__semantic-writer-inventory--adding-a-writer">Adding a writer</h2>
 <ol>
@@ -18497,14 +18513,30 @@ code and <code>detail</code> text, and now add <code>holder</code> (<code>kind</
 is the queue item or job id (never a path, document name or text). <code>Retry-After</code> is 15 s
 behind an ingest item or MCP remember, 30 s behind a curation or rebuild job, 10 s for
 vault maintenance, 5 s behind another review action, and 10 s when the holder is
-unknown. The companion review view, the reconcile review, the predicate-upkeep queue and
-the authority view show <code>Busy: &lt;kind&gt; &lt;id&gt; has held the lock for N s; retrying in M s (attempt k of 5)</code> with a <strong>Stop retrying</strong> button, and send the action again after a
+unknown. The reconcile review, the predicate-upkeep queue and the authority view show <code>Busy: &lt;kind&gt; &lt;id&gt; has held the lock for N s; retrying in M s (attempt k of 5)</code> with a <strong>Stop retrying</strong> button, and send the action again after a
 capped exponential backoff of 2, 4, 8, 16 and 30 s (a longer <code>Retry-After</code> wins, at most
 60 s). After the fifth retry the busy error is shown as before. The action is re-sent
 only after a definitive busy answer, which the daemon gives before it changes anything,
 so it is applied once; a request that timed out or dropped is never re-sent, and a
 second click while an action is waiting is ignored. The logic lives in
 <code>frontend/src/lib/busy-retry.ts</code> and <code>frontend/src/hooks/useBusyRetry.ts</code>.</li>
+<li><strong>Companion review actions queue on a busy vault instead of failing (a field report).</strong>
+<code>POST /api/v1/resolve-review</code> and <code>POST /api/v1/review-queue/batch</code> answer <code>202</code> with
+<code>status: &quot;queued&quot;</code> and the action id when the writer lock or the semantic lease stays busy
+past 5 s, store the action in the vault's <code>review_queue.sqlite</code>, and apply it in arrival
+order once the vault is free (also after a daemon restart). A queued action ends <code>applied</code>,
+<code>superseded</code> (the candidate was resolved elsewhere or changed meanwhile; never applied
+blindly), <code>failed</code> or <code>cancelled</code>. <code>GET /api/v1/review-actions</code> lists them and
+<code>POST /api/v1/review-actions/{id}/cancel</code> cancels one that is still queued. See
+<code>docs/semantic-writer-inventory.md</code>. The companion review view no longer retries these
+routes: on a <code>202</code> it marks the item <code>queued: &lt;action&gt;</code> (its buttons stay disabled) and lists
+the action under <strong>Review actions</strong> with the holder that made it wait, polls
+<code>GET /api/v1/review-actions</code> every 2 s until the action is final, then shows <code>applied</code>,
+<code>not applied, &lt;reason&gt;</code> (superseded) or <code>failed, &lt;reason&gt;</code> and reloads the queue. <strong>Cancel</strong>
+is offered while the action is queued and not yet being applied; <strong>Clear finished</strong> hides
+the final ones. Actions that are still queued are listed again after a page reload. A batch
+shows <code>N queued</code> next to its resolved/skipped counts. The logic lives in
+<code>frontend/src/lib/review-actions.ts</code>.</li>
 <li><strong>Endpoint permission belongs to a provider connection.</strong> Named providers expose an
 <code>allow_remote</code> checkbox, on by default, which permits private-LAN and HTTPS endpoints. Test,
 LLM, and embedding calls through <code>provider_ref</code> use that provider-owned value. The older

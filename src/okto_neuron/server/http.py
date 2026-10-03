@@ -68,7 +68,14 @@ from okto_neuron.semantic_quality import (
     evaluate_ledger_scan as evaluate_semantic_ledger_scan,
 )
 from okto_neuron.semantic_quality import evaluate_store as evaluate_semantic_quality
-from okto_neuron.server import _curation, _gc_tuning, _jobs, _projection, _scheduler
+from okto_neuron.server import (
+    _curation,
+    _gc_tuning,
+    _jobs,
+    _projection,
+    _review_actions,
+    _scheduler,
+)
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _integrity as graph_integrity
 from okto_neuron.server._integrity import IntegrityFenceError
@@ -3106,6 +3113,61 @@ def _resolve_review_op(state: ServerState | VaultRuntime, candidate_id: str, act
 
 _REVIEW_ACTIONS = {"commit", "discard", "merge"}
 _REVIEW_BATCH_ACTIONS = {"commit", "discard"}
+_REVIEW_BUSY_DETAIL = "vault is busy ingesting/curating — retry when the current item finishes"
+_REVIEW_QUEUED_DETAIL = (
+    "vault is busy; the action is queued and is applied in arrival order once the vault is free"
+)
+
+
+def _queue_review_actions(
+    state: ServerState | VaultRuntime,
+    candidate_ids: list[str],
+    action: str,
+    batch_id: str | None = None,
+) -> tuple[list[_review_actions.ReviewAction], list[str]]:
+    """Store op: queue ``action`` for every candidate still in the review queue.
+
+    Each row records the entry digest the candidate has right now (the state the user acted on);
+    the applier compares it before applying. Returns ``(queued, missing ids)``.
+    """
+    from okto_neuron.consolidate.review_queue import ReviewQueue
+
+    queue = ReviewQueue(Path(state.vault.path) / ".marginalia", state.vault.store)
+    store = _review_actions.store_for(state)
+    queued: list[_review_actions.ReviewAction] = []
+    missing: list[str] = []
+    for candidate_id in candidate_ids:
+        fingerprint = queue.fingerprint(candidate_id)
+        if fingerprint is None:
+            missing.append(candidate_id)
+            continue
+        payload = {"batch_id": batch_id} if batch_id else {}
+        queued.append(store.enqueue(candidate_id, action, fingerprint, payload))
+    return queued, missing
+
+
+def _queued_review_response(
+    state: ServerState | VaultRuntime,
+    queued: list[_review_actions.ReviewAction],
+    busy: _LockBusy | None,
+    **extra: Any,
+) -> JSONResponse:
+    """The 202 answer of a review action that was queued instead of applied."""
+    holder = busy.holder if busy is not None else current_holder(state.writer_lock)
+    body: dict[str, Any] = {
+        "status": "queued",
+        "detail": busy_detail(_REVIEW_QUEUED_DETAIL, holder),
+        "holder": holder.to_public() if holder is not None else None,
+        "retry_after_s": holder.retry_after_s() if holder is not None else None,
+        "actions_url": "/api/v1/review-actions",
+        **extra,
+    }
+    return JSONResponse(body, status_code=202)
+
+
+async def _review_actions_waiting(state: ServerState | VaultRuntime) -> bool:
+    """Whether earlier review actions still wait; a new one then queues behind them (FIFO)."""
+    return await store_io(lambda: _review_actions.store_for(state).queued_count() > 0)
 
 
 async def resolve_review(request: Request) -> JSONResponse:
@@ -3125,18 +3187,27 @@ async def resolve_review(request: Request) -> JSONResponse:
 
     from okto_neuron.companion import ReviewItemNotFoundError
 
+    busy: _LockBusy | None = None
     try:
-        async with _writer_lock_fast(state):
-            outcome = await store_io(_resolve_review_op, state, candidate_id, action)
+        if await _review_actions_waiting(state):
+            busy = _LockBusy(current_holder(state.writer_lock))
+        else:
+            try:
+                async with _writer_lock_fast(state):
+                    outcome = await store_io(_resolve_review_op, state, candidate_id, action)
+            except _LockBusy as busy_exc:
+                busy = busy_exc
+        if busy is not None:
+            queued, _missing = await store_io(_queue_review_actions, state, [candidate_id], action)
+            if not queued:
+                raise ReviewItemNotFoundError(f"no review item with id {candidate_id!r}")
+            _review_actions.ensure_applier(state)
+            ahead = await store_io(_review_actions.store_for(state).queued_count, queued[0].seq)
+            return _queued_review_response(
+                state, queued, busy, action=queued[0].to_public(), queued_ahead=ahead
+            )
     except IntegrityFenceError as exc:
         return _integrity_fenced_response(exc)
-    except _LockBusy as busy_exc:
-        return _lock_busy_response(
-            busy_exc,
-            503,
-            "busy",
-            "vault is busy ingesting/curating — retry when the current item finishes",
-        )
     except ReviewItemNotFoundError as exc:
         return _err(404, "review_item_not_found", str(exc))
     except VaultClosedError as exc:
@@ -3184,7 +3255,7 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
         resolved = 0
         skipped = 0
         errors: list[dict[str, str]] = []
-        for candidate_id in candidate_ids:
+        for index, candidate_id in enumerate(candidate_ids):
             try:
                 companion.resolve_review(  # type: ignore[arg-type]
                     candidate_id, action, lease_timeout=_CURATION_LOCK_TIMEOUT_S
@@ -3194,8 +3265,14 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
                 skipped += 1
             except LeaseBusyError as exc:
                 # Stop at the first busy lease: the rest would wait just as long. What was
-                # already resolved stays resolved and is reported with the busy answer.
-                return {"busy": _lease_busy(exc), "resolved": resolved, "skipped": skipped}
+                # already resolved stays resolved; the rest is queued by the caller.
+                return {
+                    "busy": _lease_busy(exc),
+                    "resolved": resolved,
+                    "skipped": skipped,
+                    "errors": errors,
+                    "rest": list(candidate_ids[index:]),
+                }
             except Exception as exc:  # noqa: BLE001
                 errors.append({"id": candidate_id, "error": str(exc)})
         return {
@@ -3206,18 +3283,48 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
         }
 
     try:
-        # Same fail-fast wait and busy answer as the single review route.
-        async with _writer_lock_fast(state):
-            result = await store_io(_run_batch)
+        if await _review_actions_waiting(state):
+            result = {
+                "busy": _LockBusy(current_holder(state.writer_lock)),
+                "resolved": 0,
+                "skipped": 0,
+                "errors": [],
+                "rest": list(candidate_ids),
+            }
+        else:
+            try:
+                # Same fail-fast wait as the single review route.
+                async with _writer_lock_fast(state):
+                    result = await store_io(_run_batch)
+            except _LockBusy as busy_exc:
+                result = {
+                    "busy": busy_exc,
+                    "resolved": 0,
+                    "skipped": 0,
+                    "errors": [],
+                    "rest": list(candidate_ids),
+                }
+        busy = result.get("busy")
+        if busy is None:
+            return JSONResponse(result)
+        batch_id = f"rb_{uuid.uuid4().hex[:12]}"
+        queued, missing = await store_io(
+            _queue_review_actions, state, result["rest"], action, batch_id
+        )
+        if queued:
+            _review_actions.ensure_applier(state)
+        return _queued_review_response(
+            state,
+            queued,
+            busy,
+            resolved=result["resolved"],
+            skipped=result["skipped"] + len(missing),
+            errors=result["errors"],
+            batch_id=batch_id,
+            actions=[row.to_public() for row in queued],
+        )
     except IntegrityFenceError as exc:
         return _integrity_fenced_response(exc)
-    except _LockBusy as busy_exc:
-        return _lock_busy_response(
-            busy_exc,
-            503,
-            "busy",
-            "vault is busy ingesting/curating — retry when the current item finishes",
-        )
     except VaultClosedError as exc:
         return _err(503, "vault_closed", str(exc))
     except OktoNeuronError as exc:
@@ -3226,17 +3333,57 @@ async def resolve_review_batch(request: Request) -> JSONResponse:
         _LOG.exception("unexpected resolve_review_batch failure")
         return _err(500, "internal", f"unexpected server error: {exc}")
 
-    busy = result.get("busy")
-    if busy is not None:
-        return _lock_busy_response(
-            busy,
-            503,
-            "busy",
-            "vault is busy ingesting/curating — retry when the current item finishes",
-            resolved=result["resolved"],
-            skipped=result["skipped"],
+
+_REVIEW_ACTIONS_LIMIT_MAX = 500
+
+
+async def api_review_actions(request: Request) -> JSONResponse:
+    """GET: review actions of this vault, newest first (``?status=queued,failed&limit=50``)."""
+    state = get_state()
+    raw_status = request.query_params.get("status", "")
+    statuses = tuple(part for part in (s.strip() for s in raw_status.split(",")) if part)
+    unknown = [s for s in statuses if s not in _review_actions.STATUSES]
+    if unknown:
+        return _err(400, "bad_request", f"status must be among {list(_review_actions.STATUSES)}")
+    try:
+        limit = int(request.query_params.get("limit", "50"))
+    except ValueError:
+        return _err(400, "bad_request", "limit must be an integer")
+    limit = max(1, min(limit, _REVIEW_ACTIONS_LIMIT_MAX))
+    store = _review_actions.store_for(state)
+
+    def _read() -> dict[str, Any]:
+        return {
+            "items": [row.to_public() for row in store.recent(statuses=statuses, limit=limit)],
+            "queued": store.queued_count(),
+        }
+
+    body = await store_io(_read)
+    if body["queued"] and not state.draining:
+        # A poll also restarts an applier that stopped for maintenance.
+        _review_actions.ensure_applier(state)
+    return JSONResponse(body)
+
+
+async def api_review_action_cancel(request: Request) -> JSONResponse:
+    """POST: cancel a review action that is still queued (not yet being applied)."""
+    state = get_state()
+    if not remote_config_allowed(request):
+        return _err(403, "forbidden", "review actions are restricted to loopback callers")
+    action_id = request.path_params["action_id"]
+    store = _review_actions.store_for(state)
+    try:
+        cancelled = await store_io(store.cancel, action_id)
+    except _review_actions.ActionNotCancellable as exc:
+        return _err(
+            409,
+            "not_cancellable",
+            "only a queued action that is not being applied can be cancelled",
+            action=exc.action.to_public(),
         )
-    return JSONResponse(result)
+    if cancelled is None:
+        return _err(404, "review_action_not_found", f"no review action with id {action_id!r}")
+    return JSONResponse({"status": "ok", "action": cancelled.to_public()})
 
 
 # --------------------------- /api/v1 — KG browser (read-only) ---------------------------
@@ -7923,6 +8070,12 @@ def _routes() -> list[Route]:
             methods=["POST"],
         ),
         Route("/api/v1/resolve-review", resolve_review, methods=["POST"]),
+        Route("/api/v1/review-actions", api_review_actions, methods=["GET"]),
+        Route(
+            "/api/v1/review-actions/{action_id}/cancel",
+            api_review_action_cancel,
+            methods=["POST"],
+        ),
         # ── existing bare routes — KEEP (the CLI speaks these over loopback) ──
         Route("/add", add, methods=["POST"]),
         Route("/query", query, methods=["POST"]),

@@ -917,6 +917,16 @@ class ReviewQueue:
             return None
         return self._entry_from_row(row, verify=True).candidate  # type: ignore[union-attr]
 
+    def fingerprint(self, candidate_id: str) -> str | None:
+        """The persisted entry digest of ``candidate_id`` (None when it is not queued).
+
+        Any change to the entry (re-park with another reason, new correlations) changes it, so a
+        deferred action can tell whether the item is still the one its user looked at.
+        """
+
+        row = self._rows.get(candidate_id, with_embedding=False)
+        return None if row is None else row.entry_sha256
+
     def resolution_scope(self, candidate_id: str) -> dict[str, str]:
         """Bind a manual resolution plan to the exact persisted queue entry."""
 

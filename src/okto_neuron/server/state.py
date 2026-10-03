@@ -119,6 +119,9 @@ class VaultRuntime:
     curation_worker_active: bool = False
     curation_worker_task: "asyncio.Task | None" = field(default=None, repr=False)
     maintenance_tasks: "set[asyncio.Task]" = field(default_factory=set, repr=False)
+    # Applier of review actions queued while the vault was busy (server/_review_actions.py).
+    review_action_task: "asyncio.Task | None" = field(default=None, repr=False)
+    review_action_kick: bool = False
     # Startup ledger-index warm-up; not busy work, but shutdown must see it.
     prewarm_task: "asyncio.Task | None" = field(default=None, repr=False)
     last_ingest_at: float | None = None
@@ -714,7 +717,11 @@ class ServerState:
         """Every background task owned by all vault contexts."""
         tasks: set[asyncio.Task] = set()
         for runtime in tuple(self._vault_runtimes.values()):
-            for task in (runtime.ingest_worker_task, runtime.curation_worker_task):
+            for task in (
+                runtime.ingest_worker_task,
+                runtime.curation_worker_task,
+                runtime.review_action_task,
+            ):
                 if task is not None:
                     tasks.add(task)
             tasks.update(runtime.maintenance_tasks)

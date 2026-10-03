@@ -586,8 +586,7 @@ credential belongs to the application daemon, never to a browser session or sele
   is the queue item or job id (never a path, document name or text). `Retry-After` is 15 s
   behind an ingest item or MCP remember, 30 s behind a curation or rebuild job, 10 s for
   vault maintenance, 5 s behind another review action, and 10 s when the holder is
-  unknown. The companion review view, the reconcile review, the predicate-upkeep queue and
-  the authority view show `Busy: <kind> <id> has held the lock for N s; retrying in M s
+  unknown. The reconcile review, the predicate-upkeep queue and the authority view show `Busy: <kind> <id> has held the lock for N s; retrying in M s
   (attempt k of 5)` with a **Stop retrying** button, and send the action again after a
   capped exponential backoff of 2, 4, 8, 16 and 30 s (a longer `Retry-After` wins, at most
   60 s). After the fifth retry the busy error is shown as before. The action is re-sent
@@ -595,6 +594,23 @@ credential belongs to the application daemon, never to a browser session or sele
   so it is applied once; a request that timed out or dropped is never re-sent, and a
   second click while an action is waiting is ignored. The logic lives in
   `frontend/src/lib/busy-retry.ts` and `frontend/src/hooks/useBusyRetry.ts`.
+- **Companion review actions queue on a busy vault instead of failing (a field report).**
+  `POST /api/v1/resolve-review` and `POST /api/v1/review-queue/batch` answer `202` with
+  `status: "queued"` and the action id when the writer lock or the semantic lease stays busy
+  past 5 s, store the action in the vault's `review_queue.sqlite`, and apply it in arrival
+  order once the vault is free (also after a daemon restart). A queued action ends `applied`,
+  `superseded` (the candidate was resolved elsewhere or changed meanwhile; never applied
+  blindly), `failed` or `cancelled`. `GET /api/v1/review-actions` lists them and
+  `POST /api/v1/review-actions/{id}/cancel` cancels one that is still queued. See
+  `docs/semantic-writer-inventory.md`. The companion review view no longer retries these
+  routes: on a `202` it marks the item `queued: <action>` (its buttons stay disabled) and lists
+  the action under **Review actions** with the holder that made it wait, polls
+  `GET /api/v1/review-actions` every 2 s until the action is final, then shows `applied`,
+  `not applied, <reason>` (superseded) or `failed, <reason>` and reloads the queue. **Cancel**
+  is offered while the action is queued and not yet being applied; **Clear finished** hides
+  the final ones. Actions that are still queued are listed again after a page reload. A batch
+  shows `N queued` next to its resolved/skipped counts. The logic lives in
+  `frontend/src/lib/review-actions.ts`.
 - **Endpoint permission belongs to a provider connection.** Named providers expose an
   `allow_remote` checkbox, on by default, which permits private-LAN and HTTPS endpoints. Test,
   LLM, and embedding calls through `provider_ref` use that provider-owned value. The older
