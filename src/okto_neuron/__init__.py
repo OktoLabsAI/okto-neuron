@@ -26,7 +26,7 @@ from okto_neuron.primitives import (
 )
 from okto_neuron.vault import Vault
 
-__version__ = "0.3.2"
+__version__ = "0.3.3.dev1"
 __all__ = [
     "Vault",
     "QueryHit",
