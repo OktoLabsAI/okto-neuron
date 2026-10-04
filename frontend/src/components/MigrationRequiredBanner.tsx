@@ -21,7 +21,7 @@ export function MigrationRequiredBanner() {
         {pending.map(({ vault, remedy }) => (
           <li key={vault} data-vault={vault} className="min-w-0">
             <span className="font-medium">{vault}</span>: run{' '}
-            <code className="select-all break-all rounded bg-amber-900/60 px-1.5 py-0.5 text-xs">
+            <code className="select-all break-all rounded-sm bg-amber-900/60 px-1.5 py-0.5 text-xs">
               {remedy}
             </code>
           </li>

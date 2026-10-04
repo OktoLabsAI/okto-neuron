@@ -305,7 +305,7 @@ const MANAGED_EMBEDDING_API_KEY_PROVIDERS = new Set([
 const LOCAL_EMBEDDING_PROVIDERS = new Set(['stub', 'fastembed', 'sentence-transformers'])
 
 const inputCls =
-  'rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none w-full'
+  'rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden w-full'
 
 // ── tiny layout helpers ───────────────────────────────────────────────────────
 
@@ -356,7 +356,7 @@ function FolderWatchRootsEditor({
               <button
                 type="button"
                 onClick={() => onChange(roots.filter((r) => r !== root))}
-                className="shrink-0 rounded p-0.5 text-surface-500 hover:bg-surface-800 hover:text-rose-300"
+                className="shrink-0 rounded-sm p-0.5 text-surface-500 hover:bg-surface-800 hover:text-rose-300"
                 aria-label={`Remove ${root}`}
               >
                 <XIcon size={14} />
@@ -376,7 +376,7 @@ function FolderWatchRootsEditor({
             }
           }}
           placeholder="/absolute/path/to/folder"
-          className="h-9 min-w-0 flex-1 rounded-lg border border-surface-700 bg-surface-950 px-3 text-xs text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+          className="h-9 min-w-0 flex-1 rounded-lg border border-surface-700 bg-surface-950 px-3 text-xs text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
         />
         <button
           type="button"
@@ -561,7 +561,7 @@ function CapacityNotice({ capacity }: { capacity?: CapacityReport }) {
     (n): n is string => Boolean(n),
   )
   return (
-    <div className="mb-4 rounded border border-surface-700 bg-surface-800/40 p-3">
+    <div className="mb-4 rounded-sm border border-surface-700 bg-surface-800/40 p-3">
       <h3 className="text-[11px] font-semibold uppercase tracking-wide text-surface-300">
         Effective LLM concurrency
       </h3>

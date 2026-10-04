@@ -108,7 +108,7 @@ export function IngestView() {
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="Title (optional) — becomes the source filename"
-            className="rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none"
+            className="rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden"
           />
 
           <textarea
@@ -121,7 +121,7 @@ export function IngestView() {
               }
             }}
             placeholder="Write or paste markdown here…  (⌘/Ctrl+Enter to add)"
-            className="min-h-[260px] flex-1 resize-y rounded-lg border border-surface-700 bg-surface-900 px-3 py-3 font-mono text-sm leading-relaxed text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none"
+            className="min-h-[260px] flex-1 resize-y rounded-lg border border-surface-700 bg-surface-900 px-3 py-3 font-mono text-sm leading-relaxed text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden"
           />
 
           <div className="flex items-center gap-3">

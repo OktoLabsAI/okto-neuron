@@ -263,7 +263,7 @@ function seedRelated(hits: QueryHit[]): Record<string, RelatedState> {
 function FieldHelp({ text }: { text: string }) {
   return (
     <span
-      className="group/help relative inline-flex h-4 w-4 items-center justify-center rounded-full text-surface-500 hover:text-accent-300 focus:text-accent-300 focus:outline-none"
+      className="group/help relative inline-flex h-4 w-4 items-center justify-center rounded-full text-surface-500 hover:text-accent-300 focus:text-accent-300 focus:outline-hidden"
       tabIndex={0}
       aria-label={text}
       title={text}
@@ -347,7 +347,7 @@ function RelationshipTypePicker({
             }
             if (e.key === 'Escape') setQuery('')
           }}
-          className="min-w-0 flex-1 bg-transparent text-xs text-surface-100 placeholder:text-surface-600 focus:outline-none"
+          className="min-w-0 flex-1 bg-transparent text-xs text-surface-100 placeholder:text-surface-600 focus:outline-hidden"
         />
         {query && (
           <button
@@ -372,7 +372,7 @@ function RelationshipTypePicker({
               <button
                 type="button"
                 onClick={() => remove(type)}
-                className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-accent-300 hover:bg-accent-800/50 hover:text-white"
+                className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-accent-300 hover:bg-accent-800/50 hover:text-white"
                 title={`Remove ${type}`}
               >
                 <X size={11} />
@@ -449,7 +449,7 @@ function NumberControl({
           step={step ?? 1}
           value={value}
           onChange={(e) => onChange({ [keyName]: Number(e.target.value) })}
-          className="h-8 rounded-lg border border-surface-700 bg-surface-900 px-2 text-xs text-surface-100 focus:border-accent-600 focus:outline-none"
+          className="h-8 rounded-lg border border-surface-700 bg-surface-900 px-2 text-xs text-surface-100 focus:border-accent-600 focus:outline-hidden"
         />
       </div>
     </ControlField>
@@ -492,7 +492,7 @@ function RetrievalControls({
         <select
           value={policy.source_block_policy ?? 'on_coverage_miss'}
           onChange={(e) => onChange({ source_block_policy: e.target.value as SourceBlockPolicy })}
-          className="h-9 rounded-lg border border-surface-700 bg-surface-900 px-2 text-xs text-surface-100 focus:border-accent-600 focus:outline-none"
+          className="h-9 rounded-lg border border-surface-700 bg-surface-900 px-2 text-xs text-surface-100 focus:border-accent-600 focus:outline-hidden"
         >
           <option value="never">never</option>
           <option value="on_coverage_miss">on coverage miss</option>
@@ -1104,7 +1104,7 @@ export function QueryView() {
               rows={1}
               placeholder={mode === 'ask' ? 'Ask a question…' : 'Recall claims about…'}
               aria-label={mode === 'ask' ? 'Ask a question' : 'Recall claims'}
-              className="max-h-32 min-h-[40px] flex-1 resize-none rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none"
+              className="max-h-32 min-h-[40px] flex-1 resize-none rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden"
             />
             <button
               type="button"

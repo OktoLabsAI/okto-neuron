@@ -39,7 +39,7 @@ function JobCard({ title, job }: { title: string; job: CurationJob | null }) {
       </div>
       {job.error && <p className="mt-1 text-xs text-rose-400">{job.error}</p>}
       {job.result && (
-        <pre className="mt-2 overflow-auto rounded bg-surface-950 p-2 text-xs text-surface-400">
+        <pre className="mt-2 overflow-auto rounded-sm bg-surface-950 p-2 text-xs text-surface-400">
           {JSON.stringify(job.result, null, 2)}
         </pre>
       )}

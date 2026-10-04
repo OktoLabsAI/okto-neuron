@@ -276,7 +276,7 @@ export default function App() {
         className="hidden w-56 shrink-0 flex-col border-r border-surface-800 bg-surface-900 md:flex"
       >
         <div className="flex items-center gap-2 px-5 py-5">
-          <div className="h-7 w-7 rounded-lg bg-gradient-to-br from-accent-500 to-violet-500" />
+          <div className="h-7 w-7 rounded-lg bg-linear-to-br from-accent-500 to-violet-500" />
           <div>
             <div className="text-sm font-semibold leading-tight">Okto Neuron</div>
             <div className="text-[11px] text-surface-500">knowledge graph</div>
@@ -360,7 +360,7 @@ export default function App() {
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <div className="shrink-0 border-b border-surface-800 bg-surface-900 md:hidden">
           <div className="flex items-center gap-2 px-3 py-3">
-            <div className="h-7 w-7 shrink-0 rounded-lg bg-gradient-to-br from-accent-500 to-violet-500" />
+            <div className="h-7 w-7 shrink-0 rounded-lg bg-linear-to-br from-accent-500 to-violet-500" />
             <div className="min-w-0 flex-1">
               <div className="text-sm font-semibold leading-tight">Okto Neuron</div>
               <div className="truncate text-[11px] text-surface-500">
@@ -563,7 +563,7 @@ function VaultSelector({
             value={current?.path ?? ''}
             disabled={loading || vaults.length === 0}
             onChange={(event) => void onSwitch(event.target.value)}
-            className="min-w-0 flex-1 bg-transparent text-xs text-surface-200 outline-none disabled:text-surface-600"
+            className="min-w-0 flex-1 bg-transparent text-xs text-surface-200 outline-hidden disabled:text-surface-600"
             title={current?.path ?? 'Vault'}
           >
             {!current && vaults.length > 0 && <option value="">Select vault</option>}
@@ -613,7 +613,7 @@ function VaultSelector({
             value={name}
             onChange={(event) => setName(event.target.value)}
             placeholder="vault name"
-            className="min-w-0 flex-1 rounded-lg border border-surface-800 bg-surface-950 px-2 py-1.5 text-xs text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+            className="min-w-0 flex-1 rounded-lg border border-surface-800 bg-surface-950 px-2 py-1.5 text-xs text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
           />
           <button
             type="submit"
@@ -790,16 +790,16 @@ function VaultManager({
                           <span className="truncate text-sm font-medium text-surface-100">
                             {vault.name}
                           </span>
-                          <span className="shrink-0 rounded border border-surface-700 px-1.5 py-0.5 text-[10px] uppercase text-surface-500">
+                          <span className="shrink-0 rounded-sm border border-surface-700 px-1.5 py-0.5 text-[10px] uppercase text-surface-500">
                             {vault.backend}
                           </span>
                           {vault.issue && (
-                            <span className="shrink-0 rounded border border-amber-700/60 bg-amber-950/30 px-1.5 py-0.5 text-[10px] uppercase text-amber-300">
+                            <span className="shrink-0 rounded-sm border border-amber-700/60 bg-amber-950/30 px-1.5 py-0.5 text-[10px] uppercase text-amber-300">
                               repair
                             </span>
                           )}
                           {!vault.managed && (
-                            <span className="shrink-0 rounded border border-surface-700 px-1.5 py-0.5 text-[10px] uppercase text-surface-500">
+                            <span className="shrink-0 rounded-sm border border-surface-700 px-1.5 py-0.5 text-[10px] uppercase text-surface-500">
                               external
                             </span>
                           )}
@@ -837,7 +837,7 @@ function VaultManager({
                 value={name}
                 onChange={(event) => setName(event.target.value)}
                 placeholder="demo-notes"
-                className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+                className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
               />
             </label>
             <label className="mb-3 block">
@@ -845,7 +845,7 @@ function VaultManager({
               <select
                 value={backend}
                 onChange={(event) => onBackendChange(event.target.value)}
-                className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-none focus:border-accent-600"
+                className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-hidden focus:border-accent-600"
               >
                 {backends.map((option) => (
                   <option key={option.name} value={option.name}>
@@ -866,7 +866,7 @@ function VaultManager({
                     value={storageUri}
                     onChange={(event) => setStorageUri(event.target.value)}
                     placeholder="bolt://host:7687"
-                    className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+                    className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
                   />
                 </label>
                 <label className="block">
@@ -875,7 +875,7 @@ function VaultManager({
                     value={storageCredentialEnv}
                     onChange={(event) => setStorageCredentialEnv(event.target.value)}
                     placeholder="OKTO_NEURON_NEO4J_PASSWORD"
-                    className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+                    className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
                   />
                 </label>
                 <label className="block">
@@ -884,7 +884,7 @@ function VaultManager({
                     value={storageDatabase}
                     onChange={(event) => setStorageDatabase(event.target.value)}
                     placeholder="neo4j"
-                    className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+                    className="w-full rounded-lg border border-surface-700 bg-surface-950 px-3 py-2 text-sm text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
                   />
                 </label>
                 {isRemoteStorageUri && (
@@ -1012,7 +1012,7 @@ function DeleteVaultDialog({
             autoFocus
             value={confirmation}
             onChange={(event) => setConfirmation(event.target.value)}
-            className="w-full rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 outline-none focus:border-red-700"
+            className="w-full rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 outline-hidden focus:border-red-700"
           />
         </label>
         <div className="mt-5 flex justify-end gap-2">
@@ -1079,7 +1079,7 @@ function VaultWarning({
             {issue.detail}
           </div>
           {issue.remedy && !compact && (
-            <div className="mt-2 rounded border border-amber-800/60 bg-surface-950/40 px-2 py-1.5 font-mono text-[11px] text-amber-100">
+            <div className="mt-2 rounded-sm border border-amber-800/60 bg-surface-950/40 px-2 py-1.5 font-mono text-[11px] text-amber-100">
               {issue.remedy}
             </div>
           )}

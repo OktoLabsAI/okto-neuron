@@ -110,7 +110,7 @@ export function KGBrowser() {
                 setOffset(0)
               }}
               placeholder="filter by name…"
-              className="w-56 bg-transparent px-2 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:outline-none"
+              className="w-56 bg-transparent px-2 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:outline-hidden"
             />
           </div>
           <label
