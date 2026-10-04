@@ -29,7 +29,6 @@ import hashlib
 import inspect
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -250,7 +249,7 @@ def test_write_parked_before_commit_is_absent_and_committed_writes_survive(tmp_p
         stop = daemon.stop_cli(DRAIN_S)
         code = daemon.proc.wait(timeout=90)
         log = daemon.log()
-        print("\n".join(l for l in log.splitlines() if "shutdown." in l or "store close" in l))
+        print("\n".join(line for line in log.splitlines() if "shutdown." in line or "store close" in line))
         print("stop cli:", stop.returncode, (stop.stdout + stop.stderr).strip())
         print("daemon exit code:", code)
     finally:
@@ -456,7 +455,7 @@ def test_stop_under_a_real_write_stream_loses_no_acked_write(tmp_path: Path) -> 
         code = daemon.proc.wait(timeout=60)
         stop_output = stop.stdout + stop.stderr
         log = daemon.log()
-        summary = [l for l in log.splitlines() if "shutdown.summary" in l]
+        summary = [line for line in log.splitlines() if "shutdown.summary" in line]
         print("shutdown.summary:", summary)
         print("stop cli:", stop.returncode, stop_output.strip())
     finally:
