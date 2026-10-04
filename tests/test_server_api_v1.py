@@ -3257,7 +3257,7 @@ def test_config_patch_dimension_change_fails_closed_on_open_handle(
 
     assert r.status_code == 200, r.text
     assert r.json()["applied"] == "reembed"
-    with pytest.raises(EmbeddingDimMismatch, match="run `kg reembed`"):
+    with pytest.raises(EmbeddingDimMismatch, match=r"re-embed the vault at the configured width \(`kg reembed`"):
         _ = state.vault.embedder
 
 

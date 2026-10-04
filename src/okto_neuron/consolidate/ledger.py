@@ -893,6 +893,9 @@ class CommitPlanSnapshot:
     plan_hash: str
     operations: tuple[dict[str, Any], ...]
     context: dict[str, Any]
+    sealed_at: str = ""
+    """The commit_plan row's own ``ts`` — when the plan was sealed (operator
+    recovery listings; empty only for snapshots built by older test doubles)."""
 
 
 @dataclass(frozen=True)
@@ -1436,6 +1439,7 @@ def _validate_plan_group(
         plan_hash=plan_hash,
         operations=tuple(dict(operation) for operation in operations),
         context=dict(context),
+        sealed_at=str(plan.get("ts") or ""),
     )
     expected = {
         str(operation.get("operation_id") or ""): str(operation.get("operation") or "")
@@ -1489,7 +1493,23 @@ def _validate_plan_group(
         if abandoned_position <= plan_position:
             raise ValueError(f"abandoned plan record precedes its plan: {plan_id}")
         if plan_receipts:
-            raise ValueError(f"abandoned plan has operation receipts: {plan_id}")
+            # An abandoned plan with receipts is a force-partial abandon (the
+            # operator accepted the orphaned graph writes): the row must say
+            # so and must name exactly the receipts that exist, so a stale or
+            # forged terminal row can never silently discard applied work.
+            evidence = abandoned_row.get("evidence")
+            declared = evidence.get("partial_receipts") if isinstance(evidence, dict) else None
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("force_partial") is not True
+                or not isinstance(declared, dict)
+            ):
+                raise ValueError(f"abandoned plan has operation receipts: {plan_id}")
+            if set(declared) != set(plan_receipts) or any(
+                str(declared[operation_id]) != str(receipt.get("status"))
+                for operation_id, (_position, receipt) in plan_receipts.items()
+            ):
+                raise ValueError(f"abandoned plan partial receipt evidence mismatch: {plan_id}")
         if not str(abandoned_row.get("reason") or "").strip():
             raise ValueError(f"abandoned plan lacks a reason: {plan_id}")
         if not isinstance(abandoned_row.get("evidence"), dict):
@@ -2741,8 +2761,17 @@ class CandidateLedger:
         plan_hash: str,
         reason: str,
         evidence: dict[str, Any] | None = None,
+        force_partial: bool = False,
     ) -> None:
-        """Durably close an untouched plan whose pinned source no longer matches."""
+        """Durably close a sealed plan so new ingest work can proceed.
+
+        Normally only an untouched plan (zero operation receipts) may be
+        abandoned: its graph effect is exactly nothing. A partially applied
+        plan CAN be abandoned with ``force_partial=True`` (the operator
+        recovery escape hatch, ``kg plans abandon --force-partial``): the row
+        records precisely which operation receipts existed at abandon time,
+        so the already-applied graph writes stay inspectable forever.
+        """
 
         plans = [plan for plan in self.unreceipted_commit_plans() if plan.plan_id == plan_id]
         if len(plans) != 1:
@@ -2750,17 +2779,29 @@ class CandidateLedger:
         plan = plans[0]
         if plan.run_id != run_id or plan.plan_hash != plan_hash:
             raise ValueError("abandoned plan identity does not match its sealed plan")
-        if self.operation_receipts(plan):
-            raise ValueError("a partially applied plan cannot be abandoned")
+        receipts = self.operation_receipts(plan)
+        if receipts and not force_partial:
+            applied = ", ".join(sorted(receipts))
+            raise ValueError(
+                "a partially applied plan cannot be abandoned without "
+                f"--force-partial (operation receipts exist: {applied})"
+            )
         if not reason.strip():
             raise ValueError("abandoned plan requires a reason")
+        abandon_evidence: dict[str, Any] = dict(evidence or {})
+        if receipts:
+            abandon_evidence["force_partial"] = True
+            abandon_evidence["partial_receipts"] = {
+                operation_id: str(receipt.get("status"))
+                for operation_id, receipt in sorted(receipts.items())
+            }
         self.append(
             "plan_abandoned",
             run_id=run_id,
             plan_id=plan_id,
             plan_hash=plan_hash,
             reason=reason.strip(),
-            evidence=evidence or {},
+            evidence=abandon_evidence,
         )
 
     @contextmanager
@@ -3481,6 +3522,32 @@ class CandidateLedger:
             if document_id is None
             or str(snapshot.context.get("document_id") or "") == str(document_id)
         )
+
+    def pending_plan_summaries(self) -> tuple[dict[str, Any], ...]:
+        """Operator-facing summaries of every sealed, unreceipted plan.
+
+        The read behind ``GET /api/v1/ledger/pending-plans`` and
+        ``kg plans list``: one dict per plan carrying its run id, source,
+        receipt/operation counts, and seal time, in ledger (seal) order.
+        """
+
+        summaries: list[dict[str, Any]] = []
+        for plan in self.unreceipted_commit_plans():
+            receipts = self.operation_receipts(plan)
+            summaries.append(
+                {
+                    "run_id": plan.run_id,
+                    "plan_id": plan.plan_id,
+                    "source": str(plan.context.get("source") or ""),
+                    "document_id": str(plan.context.get("document_id") or ""),
+                    "intent": str(plan.context.get("intent") or "ingest"),
+                    "sealed_at": plan.sealed_at or None,
+                    "operations": len(plan.operations),
+                    "receipts": len(receipts),
+                    "receipt_operation_ids": sorted(receipts),
+                }
+            )
+        return tuple(summaries)
 
     def _validate_plans_full(self) -> list[CommitPlanSnapshot]:
         """Validate every plan in the ledger; return the unreceipted ones in ledger order.
