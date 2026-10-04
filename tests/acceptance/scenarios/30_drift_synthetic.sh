@@ -65,9 +65,30 @@ log "ingest took ${add_dt}s for $md_count files"
 # are what the scenario actually cares about and cannot drift with storage layout.
 log "asserting graph population via /api/v1/graph/stats"
 kg_stats="$work_dir/graph_stats.json"
-curl -fsS "$OKTO_NEURON_ENDPOINT/api/v1/graph/stats" \
-  -H "X-Okto-Neuron-Vault: $VAULT" >"$kg_stats" 2>"$work_dir/graph_stats.stderr"
-assert_exit_code 0 "$?"
+# /api/v1/graph/stats is projection-served (server/_projection.py): the first
+# read on a vault without a projection answers 202 {"status":"building"} and
+# only starts the build. Poll (bounded) until the projection is ready instead
+# of reading the 202 body as a node count of zero.
+stats_deadline=$(( $(date +%s) + 60 ))
+stats_status=""
+while :; do
+  stats_status="$(curl -sS -o "$kg_stats" -w '%{http_code}' \
+    "$OKTO_NEURON_ENDPOINT/api/v1/graph/stats" \
+    -H "X-Okto-Neuron-Vault: $VAULT" 2>"$work_dir/graph_stats.stderr")"
+  if [[ "$stats_status" == "200" ]] && \
+     python3 -c "import json,sys; json.load(open(sys.argv[1]))['total_nodes']" \
+       "$kg_stats" 2>/dev/null; then
+    break
+  fi
+  if [[ "$(date +%s)" -ge "$stats_deadline" ]]; then
+    log "FAIL graph/stats not ready after 60s (last status=$stats_status)"
+    log "last body: $(head -c 400 "$kg_stats" 2>/dev/null)"
+    log "last stderr: $(head -c 400 "$work_dir/graph_stats.stderr" 2>/dev/null)"
+    _failures+=("graph_stats_timeout last_status=$stats_status")
+    finish
+  fi
+  sleep 0.5
+done
 graph_nodes=$(python3 -c "import json,sys;print(json.load(open('$kg_stats'))['total_nodes'])")
 graph_docs=$(python3 -c "
 import json
