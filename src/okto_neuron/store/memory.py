@@ -88,6 +88,14 @@ class InMemoryStore:
         self._closed = True
 
     @property
+    def embedding_dim(self) -> int | None:
+        """Always ``None`` (see GraphStore.embedding_dim): an in-process dict
+        stores whatever vector width it is given — there is no fixed stored
+        identity to compare a configured dimension against, so the guard skips.
+        """
+        return None
+
+    @property
     def is_closed(self) -> bool:
         return self._closed
 

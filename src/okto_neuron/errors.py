@@ -388,8 +388,10 @@ class EmbeddingDimMismatch(OktoNeuronError):
 
     The embedding column is fixed-width, so a model/``dimension`` change cannot be
     applied in place. Raised on open/ingest/query against a graph whose recorded
-    width differs from config; the remedy is ``kg reembed`` (recompute vectors at
-    the configured width). Reembed's own re-width bootstrap bypasses this guard.
+    width differs from config; the remedy is to re-embed the vault at the
+    configured width — ``kg reembed`` or the web UI's Re-embed action — or to
+    revert the embedding config to the stored width. Reembed's own re-width
+    bootstrap bypasses this guard.
     """
 
     EXIT_CODE: ClassVar[int] = 14
@@ -410,8 +412,9 @@ class EmbeddingDimMismatch(OktoNeuronError):
         if message is None and stored_dim is not None and configured_dim is not None:
             message = (
                 f"embedding dimension {configured_dim} does not match the stored graph "
-                f"width {stored_dim}; run `kg reembed` to rebuild vectors at the "
-                "configured width"
+                f"width {stored_dim}; re-embed the vault at the configured width "
+                "(`kg reembed`, or the Re-embed action in the web UI) or revert "
+                "the embedding config to the stored width"
             )
         super().__init__(message, vault_path=vault_path, file_path=file_path, cause=cause)
 

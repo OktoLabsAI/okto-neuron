@@ -564,6 +564,17 @@ class GrafxStore:
     # ------------------------------------------------------------------
 
     @property
+    def embedding_dim(self) -> int | None:
+        """The width of the vectors this graph stores (``GraphStore`` member).
+
+        Adopted from the schema-metadata node at open (``self._embedding_dim``
+        below); the vector column is fixed-width once bootstrapped, so this is
+        the stored identity the vault's dimension guard compares the configured
+        embedding width against.
+        """
+        return self._embedding_dim
+
+    @property
     def is_closed(self) -> bool:
         return self._closed
 

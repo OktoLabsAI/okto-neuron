@@ -45,6 +45,10 @@ class _GraphStoreMissingAddEdge:
     def close(self): ...
 
     @property
+    def embedding_dim(self):
+        return None
+
+    @property
     def is_closed(self):
         return False
 
@@ -74,6 +78,10 @@ class _GraphStoreIncompatibleAddEdge:
 
     def checkpoint(self): ...
     def close(self): ...
+
+    @property
+    def embedding_dim(self):
+        return None
 
     @property
     def is_closed(self):
@@ -138,6 +146,11 @@ class _GraphStoreIsClosedAsMethod:
 
     def checkpoint(self): ...
     def close(self): ...
+
+    @property
+    def embedding_dim(self):
+        return None
+
     def is_closed(self):
         return False
 

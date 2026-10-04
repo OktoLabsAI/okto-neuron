@@ -178,6 +178,13 @@ class StubGraphStore:
         self._dump()
 
     @property
+    def embedding_dim(self) -> int | None:
+        """Always ``None`` (see ``GraphStore.embedding_dim``): a dict-based
+        store has no fixed stored vector width, so the dimension guard skips.
+        """
+        return None
+
+    @property
     def is_closed(self) -> bool:
         return self._closed
 

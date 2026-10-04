@@ -430,6 +430,12 @@ class Neo4jStore(GenerationScopedBackendMixin):
     # ------------------------------------------------------------------
 
     @property
+    def embedding_dim(self) -> int | None:
+        """The width of the vectors this graph stores (``GraphStore`` member),
+        adopted from the schema-metadata node at open."""
+        return self._embedding_dim
+
+    @property
     def is_closed(self) -> bool:
         return self._closed
 
