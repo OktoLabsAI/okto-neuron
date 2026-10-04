@@ -141,6 +141,7 @@ def test_operational_status_is_separate_from_public_liveness(client):
         "cancelled": 0,
         "active": False,
         "cancel_requested": False,
+        "inline": {"processing": 0, "done": 0, "error": 0},
     }
 
 
@@ -358,7 +359,7 @@ def test_bare_review_batch_uses_immutable_request_vault(
         def __init__(self, vault_path: Path) -> None:
             self.vault_path = vault_path
 
-        def resolve_review(self, candidate_id: str, action: str) -> None:
+        def resolve_review(self, candidate_id: str, action: str, **_bounds: object) -> None:
             resolved.append((self.vault_path, candidate_id, action))
 
     def _selected_companion(runtime):
@@ -2069,11 +2070,16 @@ def test_failed_nonactive_delete_restores_default_and_pool_handle(
 
     restored = _StubVault()
     monkeypatch.setattr(http_mod.Vault, "open", staticmethod(lambda target: restored))
-    monkeypatch.setattr(
-        http_mod.shutil,
-        "rmtree",
-        lambda target: (_ for _ in ()).throw(OSError("simulated rmtree failure")),
-    )
+    from okto_neuron.store.writer_lease import acquire_writer_lease, held_writer_lease
+
+    acquire_writer_lease(path, role="daemon", operation="serve")
+    lease_held_at_rmtree: list[bool] = []
+
+    def _failing_rmtree(target):
+        lease_held_at_rmtree.append(held_writer_lease(path) is not None)
+        raise OSError("simulated rmtree failure")
+
+    monkeypatch.setattr(http_mod.shutil, "rmtree", _failing_rmtree)
 
     response = c.request(
         "DELETE",
@@ -2083,6 +2089,9 @@ def test_failed_nonactive_delete_restores_default_and_pool_handle(
 
     assert response.status_code == 500
     assert path.exists()
+    # The writer lease is released before the rmtree and re-acquired on rollback.
+    assert lease_held_at_rmtree == [False]
+    assert held_writer_lease(path) is not None
     assert resolve_vault_reference(None) == path.resolve(strict=False)
     runtime = state.runtime_for(path)
     assert state.vault_pool.peek(path) is restored

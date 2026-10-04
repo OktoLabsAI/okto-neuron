@@ -251,10 +251,10 @@ If nothing is listening, `status` reports the endpoint as unreachable and exits 
 okto-neuron stop
 ```
 
-It prints the shutdown line, waits for a drain and escalates automatically, then confirms:
+It prints the shutdown line, waits for the daemon to drain and close its stores, then confirms:
 
 ```text
-stopping okto-neuron server (pid=<pid>); waiting up to <timeout>s for drain, then escalating automatically
+stopping okto-neuron server (pid=<pid>); waiting up to <timeout>s for drain plus the store-close budget (no automatic escalation; use --force to skip the drain)
 stopped okto-neuron server (pid=<pid>)
 ```
 

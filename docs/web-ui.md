@@ -391,6 +391,11 @@ the wipe or atomic swap, install the replacement while still fenced, and only th
 vault. Maintenance control/status routes do not borrow a graph lease, so the initiating request
 cannot wait on itself and reembed progress stays pollable. Other vault runtimes remain available.
 
+While a daemon holds the vault, the CLI `okto-neuron kg reembed` is refused and prints a
+`curl -X POST <daemon REST URL>/api/v1/vaults/reembed` line (or points at the Re-embed button in
+the vault manager). The URL comes from the daemon's lease record; a lease written by an older
+daemon without one falls back to the default port 7777.
+
 **Add.** The write surface (implemented by `IngestView`): turn raw text into queryable knowledge without leaving the
 browser. Three ways in, all routing through the same companion `remember()` loop the CLI and
 MCP use:
@@ -573,6 +578,39 @@ credential belongs to the application daemon, never to a browser session or sele
   and unlike those background jobs, a review-action click is a synchronous UI button. It now
   waits up to 5s (`_writer_lock_fast` in `server/http.py`) and returns `503 busy` if the
   lock isn't free in time, instead of leaving the button spinning behind the queue.
+- **The busy answer names the lock holder, and the review UI retries (a field report).**
+  The `503 busy` (and the `409 audit_busy` of the audit routes) keep their status, `error`
+  code and `detail` text, and now add `holder` (`kind`, `id`, `since`, `held_for_s`),
+  `retry_after_s`, and a `Retry-After` header (seconds). `kind` is one of `ingest-item`,
+  `mcp-remember`, `curation-job`, `rebuild-job`, `vault-maintenance` or `review-op`; `id`
+  is the queue item or job id (never a path, document name or text). `Retry-After` is 15 s
+  behind an ingest item or MCP remember, 30 s behind a curation or rebuild job, 10 s for
+  vault maintenance, 5 s behind another review action, and 10 s when the holder is
+  unknown. The reconcile review, the predicate-upkeep queue and the authority view show `Busy: <kind> <id> has held the lock for N s; retrying in M s
+  (attempt k of 5)` with a **Stop retrying** button, and send the action again after a
+  capped exponential backoff of 2, 4, 8, 16 and 30 s (a longer `Retry-After` wins, at most
+  60 s). After the fifth retry the busy error is shown as before. The action is re-sent
+  only after a definitive busy answer, which the daemon gives before it changes anything,
+  so it is applied once; a request that timed out or dropped is never re-sent, and a
+  second click while an action is waiting is ignored. The logic lives in
+  `frontend/src/lib/busy-retry.ts` and `frontend/src/hooks/useBusyRetry.ts`.
+- **Companion review actions queue on a busy vault instead of failing (a field report).**
+  `POST /api/v1/resolve-review` and `POST /api/v1/review-queue/batch` answer `202` with
+  `status: "queued"` and the action id when the writer lock or the semantic lease stays busy
+  past 5 s, store the action in the vault's `review_queue.sqlite`, and apply it in arrival
+  order once the vault is free (also after a daemon restart). A queued action ends `applied`,
+  `superseded` (the candidate was resolved elsewhere or changed meanwhile; never applied
+  blindly), `failed` or `cancelled`. `GET /api/v1/review-actions` lists them and
+  `POST /api/v1/review-actions/{id}/cancel` cancels one that is still queued. See
+  `docs/semantic-writer-inventory.md`. The companion review view no longer retries these
+  routes: on a `202` it marks the item `queued: <action>` (its buttons stay disabled) and lists
+  the action under **Review actions** with the holder that made it wait, polls
+  `GET /api/v1/review-actions` every 2 s until the action is final, then shows `applied`,
+  `not applied, <reason>` (superseded) or `failed, <reason>` and reloads the queue. **Cancel**
+  is offered while the action is queued and not yet being applied; **Clear finished** hides
+  the final ones. Actions that are still queued are listed again after a page reload. A batch
+  shows `N queued` next to its resolved/skipped counts. The logic lives in
+  `frontend/src/lib/review-actions.ts`.
 - **Endpoint permission belongs to a provider connection.** Named providers expose an
   `allow_remote` checkbox, on by default, which permits private-LAN and HTTPS endpoints. Test,
   LLM, and embedding calls through `provider_ref` use that provider-owned value. The older
@@ -1171,3 +1209,30 @@ names the breakdown in its `detail`. The scan-summary line under the drop zone
 shows the counts, and a **Show skipped files** disclosure lists the individual
 files and the rule each one hit. `POST /api/v1/ingest` (single paste/write) is
 unchanged — one operator-authored note is not a bulk source selection.
+
+## Addendum · 2026-10-02 — MCP `remember`: client idle timeout, timer heartbeat, inline counters
+
+**Client rule (measured with Claude Code 2.1.288 over the HTTP MCP transport).** A tool call is
+aborted when the client sees neither a response nor a progress notification for 300 s ("Tool
+aborting: no response or progress notification for 300s (idle timeout 300s)"). A tool that sent a
+notification every 20 s ran to completion past 300 s. The 300 s default applies to HTTP servers;
+stdio servers default to 1800 s. The client's own knobs are a per-server `timeout` (ms) and
+`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables). A separate hard wall-clock limit,
+`MCP_TOOL_TIMEOUT`, is not extended by progress notifications; its default is UNKNOWN (not
+determined, not guessed here).
+
+**Timer heartbeat.** The per-block progress bridge is silent while one long LLM call runs, so
+MCP `remember` also starts a timer task with the call that sends a progress notification every
+20 s (`runtime._MCP_HEARTBEAT_INTERVAL_S`) for the whole duration of the call, including the wait
+for the vault's writer lock. Progress is the elapsed seconds, total is omitted, the message is
+`remember in progress (Ns)`. The task is cancelled when the call ends (no notification after
+completion), never raises into the tool, and does nothing when there is no MCP context or the
+client sent no `progressToken`.
+
+**Inline counters.** MCP `remember` runs inline and never enqueues, so it has no queue item. It is
+recorded in a separate per-vault counter instead: `GET /api/v1/status` carries
+`ingest.inline = {processing, done, error}` on every vault's `ingest` block and on the aggregate
+`ingest` block. `processing` is 1 while an inline call runs (a call that returns a
+`provider_error` or raises counts as `error`, otherwise `done`). The queue counters (`total`,
+`queued`, `processing`, `done`, `error`, `cancelled`) and `/api/v1/ingest-queue` are unchanged;
+inline calls are not queue items. The counters are in memory and reset on daemon restart.

@@ -24,6 +24,7 @@ from starlette.testclient import TestClient
 from okto_neuron import Vault
 from okto_neuron._internal.infra import INFRA_FACET
 from okto_neuron.companion import Companion
+from okto_neuron.config._vault import DEFAULT_CURATION_CALL_TIMEOUT_S
 from okto_neuron.consolidate import NodeCandidate
 from okto_neuron.consolidate.ledger import CandidateLedger
 from okto_neuron.core.schema import Edge, Node
@@ -273,6 +274,21 @@ def test_add_same_basename_different_directories_mints_distinct_document_ids(
     assert runtime is not None
     assert runtime.vault.store.get_node(doc_id_a) is not None
     assert runtime.vault.store.get_node(doc_id_b) is not None
+
+
+def test_remember_outside_root_is_a_403_that_names_the_roots(client: TestClient, tmp_path: Path) -> None:
+    """Field report, REST side: same wording as the MCP tool."""
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("# elsewhere\n", encoding="utf-8")
+
+    response = client.post("/remember", json={"source": str(outside)})
+
+    assert response.status_code == 403, response.text
+    body = response.json()
+    assert body["error"] == "forbidden"
+    detail = body.get("detail") or body.get("message") or ""
+    assert "refusing to remember source outside the vault and watch roots" in detail
+    assert "Allowed roots" in detail and "folder_watch.roots" in detail
 
 
 def test_graph_integrity_audit_verifies_current_generation(
@@ -1455,7 +1471,7 @@ def test_config_get_exposes_adr0015_knobs(client: TestClient) -> None:
     assert r.status_code == 200, r.text
     cons = r.json()["consolidation"]
     assert cons["curation_max_concurrent"] == 1
-    assert cons["curation_call_timeout_s"] is None
+    assert cons["curation_call_timeout_s"] == DEFAULT_CURATION_CALL_TIMEOUT_S  # issue #24
     assert cons["curation_batch_size"] == 1
     assert cons["prefilter"]["enabled"] is False
     assert cons["prefilter"]["established_entity_fastpath"] is True

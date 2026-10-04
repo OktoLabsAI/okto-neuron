@@ -26,6 +26,7 @@ from okto_neuron.server import _curation
 from okto_neuron.server import http as http_mod
 from okto_neuron.server.http import build_rest_app
 from okto_neuron.server.state import init_state, reset_state_for_tests
+from tests._settled import get_settled
 from okto_neuron.store.memory import InMemoryStore
 from okto_neuron.store import vault as vault_module
 from okto_neuron.store.ladybug import VaultConnection
@@ -468,9 +469,26 @@ def test_apply_job_is_off_graph(client: TestClient, monkeypatch) -> None:
 
 
 def test_predicate_upkeep_propose_apply_confirm_reject_flow(
-    predicate_client: TestClient,
+    predicate_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    snapshot = predicate_client.get("/api/v1/upkeep/predicates")
+    from okto_neuron import predicates as predicates_pkg
+    from okto_neuron.server import _projection
+
+    scans: list[str] = []
+    real_build = _projection.build_predicate_stats
+    monkeypatch.setattr(
+        _projection,
+        "build_predicate_stats",
+        lambda store: scans.append("scan") or real_build(store),
+    )
+
+    def _no_direct_vocabulary_scan(store):  # noqa: ARG001
+        raise AssertionError("run_predicate_propose must use the projection, not scan")
+
+    monkeypatch.setattr(
+        predicates_pkg, "collect_predicate_vocabulary", _no_direct_vocabulary_scan
+    )
+    snapshot = get_settled(predicate_client, "/api/v1/upkeep/predicates")
     assert snapshot.status_code == 200, snapshot.text
     assert snapshot.json()["vocabulary_size"] == 2
 
@@ -488,6 +506,8 @@ def test_predicate_upkeep_propose_apply_confirm_reject_flow(
     assert result["queued"] == 1
     assert result["outcomes"][0]["duration_s"] == 0.03
     assert result["outcomes"][0]["usage"] == {"total_tokens": 7}
+
+    assert scans == ["scan"], "the snapshot poll and the propose job must share ONE scan"
 
     # Propose-only: the ledger is still empty until apply runs.
     assert predicate_client.get("/api/v1/upkeep/predicates").json()["counts"]["queued"] == 0

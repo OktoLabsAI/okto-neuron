@@ -21,8 +21,10 @@ import logging
 import os
 import re
 import signal
+import threading
+import time
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 import uvicorn
 from pydantic import ValidationError
@@ -33,10 +35,36 @@ from okto_neuron.errors import EmbeddingDimMismatch, OptionalDependencyError
 from okto_neuron.llm._cli_provider import kill_active_cli_processes
 from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
+from okto_neuron.server import _gc_tuning
 from okto_neuron.server import _integrity as graph_integrity
-from okto_neuron.server._vault_pool import VaultLease, VaultPoolError
+from okto_neuron.server._lock_holder import held_lock
+from okto_neuron.server._preload import preload_server_modules
+from okto_neuron.server._prewarm import start_ledger_prewarm
+from okto_neuron.server._store_io import (
+    DEFAULT_JOB_WORKERS,
+    DEFAULT_STORE_WORKERS,
+    acquire_off_loop,
+    cancel_queued_work,
+    configure_executors,
+    job_io,
+    shutdown_executors,
+    store_io,
+    wait_executors_idle_async,
+)
+from okto_neuron.server._open_failure import client_open_failure
+from okto_neuron.server._vault_pool import (
+    VaultLease,
+    VaultPoolError,
+    acquire_daemon_writer_lease,
+)
 from okto_neuron.server.http import build_rest_app
-from okto_neuron.server.lifecycle import GracefulShutdown
+from okto_neuron.server.lifecycle import (
+    GracefulShutdown,
+    close_budget,
+    last_stop_request,
+    set_shutdown_hard_deadline,
+    shutdown_phase,
+)
 from okto_neuron.server.state import (
     ServerState,
     VaultRuntime,
@@ -60,8 +88,47 @@ DEFAULT_HOST = "127.0.0.1"
 _LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
+def _configure_projection() -> None:
+    """``[server] projection_min_interval_s`` / ``projection_max_age_s`` (defaults 5 s / 600 s);
+    a broken app config falls back to the defaults, like the executor sizes."""
+    from okto_neuron.config import OktoNeuronConfig
+    from okto_neuron.server import _projection
+
+    try:
+        server = OktoNeuronConfig.load().server
+        _projection.configure(
+            min_interval_s=float(server.projection_min_interval_s),
+            max_age_s=float(server.projection_max_age_s),
+        )
+    except Exception as exc:  # noqa: BLE001 - startup must not die on this knob
+        _LOG.warning("could not read [server] projection settings (%s); using defaults", exc)
+
+
+def _configured_executor_workers() -> tuple[int, int]:
+    """``[server] store_workers`` / ``job_workers`` from ``okto-neuron.toml``
+    (defaults 4 and 2).
+
+    A broken or unreadable app config never stops ``serve``; it falls back to the
+    defaults and says so, because the same file is re-read (and reported) by the
+    commands that actually depend on it.
+    """
+    from okto_neuron.config import OktoNeuronConfig
+
+    try:
+        server = OktoNeuronConfig.load().server
+        return int(server.store_workers), int(server.job_workers)
+    except Exception as exc:  # noqa: BLE001 - startup must not die on this knob
+        _LOG.warning(
+            "could not read [server] store_workers/job_workers (%s); using %d/%d",
+            exc,
+            DEFAULT_STORE_WORKERS,
+            DEFAULT_JOB_WORKERS,
+        )
+        return DEFAULT_STORE_WORKERS, DEFAULT_JOB_WORKERS
+
+
 class _ShutdownSignalHandler:
-    """First signal starts one bounded drain; a repeat exits immediately."""
+    """First signal starts one bounded drain; a repeat (or ``stop --force``) exits immediately."""
 
     def __init__(
         self,
@@ -81,7 +148,8 @@ class _ShutdownSignalHandler:
         self.triggered = False
 
     def __call__(self, signum: int | None = None) -> None:
-        if self.triggered:
+        request = last_stop_request()
+        if self.triggered or (request is not None and request.force):
             self._orchestrator.request_force_shutdown()
             cancelled = kill_active_cli_processes() + cancel_active_litellm_calls()
             self._rest_server.force_exit = True
@@ -99,8 +167,17 @@ class _ShutdownSignalHandler:
             return
 
         self.triggered = True
-        self._orchestrator.request_shutdown(timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        _LOG.info("shutdown signal received; entering drain")
+        drain_timeout = (
+            request.drain_timeout
+            if request is not None and request.drain_timeout is not None
+            else SHUTDOWN_DRAIN_TIMEOUT
+        )
+        self._orchestrator.request_shutdown(timeout=drain_timeout)
+        _LOG.info(
+            "shutdown signal received; entering drain (drain_timeout=%.1fs, close_budget=%.1fs)",
+            drain_timeout,
+            close_budget(drain_timeout),
+        )
         self._state.mark_shutting_down()
         cancelled = kill_active_cli_processes() + cancel_active_litellm_calls()
         if cancelled:
@@ -156,29 +233,18 @@ class _ShutdownDeadlineExpired(RuntimeError):
 
 
 def _hard_exit(exit_code: int) -> None:
-    """Exit without waiting for Python's executor shutdown after a hard deadline."""
+    """Exit without waiting for Python's executor shutdown after a hard deadline.
+
+    ``os._exit`` skips ``atexit``, so flush telemetry and the log handlers first
+    (the final ``shutdown.summary`` line must reach the serve log).
+    """
+    from okto_neuron.server.lifecycle import flush_before_exit
+
+    flush_before_exit(_HARD_EXIT_FLUSH_SECONDS)
     os._exit(exit_code)
 
 
-def _force_shutdown(
-    *,
-    reason: str,
-    orchestrator: GracefulShutdown,
-    rest_server: uvicorn.Server,
-    mcp_server: uvicorn.Server,
-    tasks: set[asyncio.Task],
-    force_process_exit: Callable[[int], None],
-) -> None:
-    """Escalate a missed absolute deadline; production callback never returns."""
-    orchestrator.request_force_shutdown()
-    rest_server.force_exit = True
-    mcp_server.force_exit = True
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    _LOG.error("graceful shutdown deadline exhausted during %s; forcing exit", reason)
-    force_process_exit(1)
-    raise _ShutdownDeadlineExpired(reason)
+_HARD_EXIT_FLUSH_SECONDS = 2.0
 
 
 async def _wait_for_tasks(
@@ -219,6 +285,12 @@ def _runtime_tasks(state: ServerState) -> set[asyncio.Task]:
     return tasks
 
 
+def _projection_tasks() -> set[asyncio.Task]:
+    from okto_neuron.server._projection import projection_tasks
+
+    return set(projection_tasks())
+
+
 def _runtime_writer_locks(state: ServerState) -> tuple[asyncio.Lock, ...]:
     """Return every distinct writer lock that must be clear before pool close."""
     locks = [state.writer_lock]
@@ -234,6 +306,34 @@ def _runtime_writer_locks(state: ServerState) -> tuple[asyncio.Lock, ...]:
     return tuple(unique)
 
 
+def _grafx_calls_in_flight(state: ServerState) -> dict[str, int]:
+    """Grafx calls executing per vault right now (empty for other backends)."""
+    pool = getattr(state, "vault_pool", None)
+    counter = getattr(pool, "calls_in_flight", None)
+    return dict(counter()) if callable(counter) else {}
+
+
+def _flush_sidecars(state: Any) -> int:
+    """Final write of every coalesced sidecar (ingest queue, curation jobs); returns how many wrote."""
+    from okto_neuron.server import _jobs
+
+    written = 0
+    runtimes = getattr(state, "runtimes", None)
+    try:
+        targets = [*(runtimes() if callable(runtimes) else ()), state]
+    except Exception:  # noqa: BLE001 - shutdown must not fail on a discovery error
+        targets = [state]
+    for target in targets:
+        if getattr(target, "vault_path", None) is None:
+            continue
+        for flush in (iq.shutdown_flush, _jobs.shutdown_flush):
+            try:
+                written += int(bool(flush(target)))
+            except Exception:  # noqa: BLE001 - a failed sidecar write must not block shutdown
+                _LOG.warning("final sidecar flush failed", exc_info=True)
+    return written
+
+
 async def _graceful_shutdown(
     *,
     state: ServerState,
@@ -243,99 +343,244 @@ async def _graceful_shutdown(
     transport_tasks: tuple[asyncio.Task, asyncio.Task],
     force_process_exit: Callable[[int], None] = _hard_exit,
 ) -> None:
-    """Stop every owned activity and close the vault under one absolute deadline."""
+    """Stop every owned activity and close the stores within two budgets.
+
+    The drain budget (``stop --timeout``, default 30 s) covers transports,
+    workers and in-flight requests. When it runs out the work is cancelled, NOT
+    abandoned with the stores open: a further close budget
+    (``max(5 s, 25 %)``, see :func:`close_budget`) is reserved so the stores
+    still close. Only a grafx call that is still executing at the hard deadline
+    (drain + close budget) prevents the close: the process then exits without
+    closing and relies on WAL recovery; closing under a running statement is
+    never attempted.
+    """
+    started = time.monotonic()
     orchestrator.request_shutdown(timeout=SHUTDOWN_DRAIN_TIMEOUT)
-    state.mark_shutting_down()
-    rest_server.should_exit = True
-    mcp_server.should_exit = True
+    drain_timeout = orchestrator.drain_timeout
+    if drain_timeout is None:
+        drain_timeout = SHUTDOWN_DRAIN_TIMEOUT
+    deadline = orchestrator.deadline
+    drain_deadline = deadline if deadline is not None else started + drain_timeout
+    budget = close_budget(drain_timeout)
+    hard_deadline = drain_deadline + budget
+    set_shutdown_hard_deadline(hard_deadline)
+    summary: dict[str, Any] = {"drain_expired": False, "store_closed": False, "outcome": "error"}
 
-    scheduler_task = state.scheduler_task
-    folder_watch_task = state.folder_watch_task
-    for task in (scheduler_task, folder_watch_task):
-        if task is not None and not task.done():
-            task.cancel()
+    def drain_left() -> float:
+        return max(0.0, drain_deadline - time.monotonic())
 
-    owned_tasks = set(transport_tasks) | _runtime_tasks(state)
-    for task in (scheduler_task, folder_watch_task):
-        if task is not None:
-            owned_tasks.add(task)
+    owned_tasks: set[asyncio.Task] = set(transport_tasks)
 
-    pending = await _wait_for_tasks(owned_tasks, orchestrator)
-    if pending:
-        _force_shutdown(
-            reason="transports or background workers",
-            orchestrator=orchestrator,
-            rest_server=rest_server,
-            mcp_server=mcp_server,
-            tasks=owned_tasks,
-            force_process_exit=force_process_exit,
-        )
-
-    if not await _wait_for_request_drain(orchestrator):
-        _force_shutdown(
-            reason="in-flight requests",
-            orchestrator=orchestrator,
-            rest_server=rest_server,
-            mcp_server=mcp_server,
-            tasks=owned_tasks,
-            force_process_exit=force_process_exit,
-        )
-
-    # A request already in flight when SIGTERM arrived may have submitted a
-    # worker or maintenance task after the first snapshot. Request drain closes
-    # that race; resnapshot ALL runtime-owned tasks before any handle can close.
-    late_runtime_tasks = _runtime_tasks(state) - owned_tasks
-    if late_runtime_tasks:
-        owned_tasks.update(late_runtime_tasks)
-        pending = await _wait_for_tasks(late_runtime_tasks, orchestrator)
-        if pending:
-            _force_shutdown(
-                reason="late per-vault workers",
-                orchestrator=orchestrator,
-                rest_server=rest_server,
-                mcp_server=mcp_server,
-                tasks=owned_tasks,
-                force_process_exit=force_process_exit,
+    def abandon_drain(reason: str) -> None:
+        """Drain budget spent: cancel what is left and go on to the store close."""
+        first = not summary["drain_expired"]
+        summary["drain_expired"] = True
+        orchestrator.request_force_shutdown()
+        rest_server.force_exit = True
+        mcp_server.force_exit = True
+        cancelled_tasks = 0
+        for task in owned_tasks:
+            if not task.done():
+                task.cancel()
+                cancelled_tasks += 1
+        stopped_calls = kill_active_cli_processes() + cancel_active_litellm_calls()
+        cancelled_queued = cancel_queued_work()
+        if first:
+            _LOG.warning(
+                "shutdown.drain_expired reason=%s cancelled_tasks=%d cancelled_queued_calls=%d "
+                "stopped_model_calls=%d; continuing to the store close (%.1fs left)",
+                reason,
+                cancelled_tasks,
+                cancelled_queued,
+                stopped_calls,
+                max(0.0, hard_deadline - time.monotonic()),
             )
+
+    summary_logged = False
+
+    def log_summary() -> None:
+        nonlocal summary_logged
+        if summary_logged:
+            return
+        summary_logged = True
+        _LOG.info(
+            "shutdown.summary total_ms=%d drain_timeout_s=%.1f close_budget_s=%.1f "
+            "drain_expired=%s store_closed=%s outcome=%s",
+            int((time.monotonic() - started) * 1000),
+            drain_timeout,
+            budget,
+            str(summary["drain_expired"]).lower(),
+            str(summary["store_closed"]).lower(),
+            summary["outcome"],
+        )
 
     acquired: list[asyncio.Lock] = []
     try:
-        for writer_lock in _runtime_writer_locks(state):
-            remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
-            if remaining <= 0:
-                _force_shutdown(
-                    reason="writer locks",
-                    orchestrator=orchestrator,
-                    rest_server=rest_server,
-                    mcp_server=mcp_server,
-                    tasks=owned_tasks,
-                    force_process_exit=force_process_exit,
+        with shutdown_phase("signal_quiesce"):
+            state.mark_shutting_down()
+            rest_server.should_exit = True
+            mcp_server.should_exit = True
+            scheduler_task = state.scheduler_task
+            folder_watch_task = state.folder_watch_task
+            for task in (scheduler_task, folder_watch_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            owned_tasks |= _runtime_tasks(state) | _projection_tasks()
+            for task in (scheduler_task, folder_watch_task):
+                if task is not None:
+                    owned_tasks.add(task)
+
+        with shutdown_phase("transports_and_workers") as detail:
+            pending = await _wait_for_tasks(owned_tasks, orchestrator)
+            detail["pending"] = len(pending)
+            if pending:
+                abandon_drain("transports or background workers")
+                await asyncio.wait(
+                    pending, timeout=min(1.0, max(0.0, hard_deadline - time.monotonic()))
                 )
-            await asyncio.wait_for(writer_lock.acquire(), timeout=remaining)
-            acquired.append(writer_lock)
-        remaining = orchestrator.remaining(default_timeout=SHUTDOWN_DRAIN_TIMEOUT)
-        if remaining <= 0:
-            _force_shutdown(
-                reason="vault close",
-                orchestrator=orchestrator,
-                rest_server=rest_server,
-                mcp_server=mcp_server,
-                tasks=owned_tasks,
-                force_process_exit=force_process_exit,
+
+        with shutdown_phase("request_drain") as detail:
+            drained = await _wait_for_request_drain(orchestrator)
+            detail["in_flight"] = orchestrator.in_flight
+            if not drained:
+                abandon_drain("in-flight requests")
+
+        # A request already in flight when SIGTERM arrived may have submitted a
+        # worker or maintenance task after the first snapshot. Request drain closes
+        # that race; resnapshot ALL runtime-owned tasks before any handle can close.
+        with shutdown_phase("late_workers") as detail:
+            late_runtime_tasks = _runtime_tasks(state) - owned_tasks
+            detail["late"] = len(late_runtime_tasks)
+            if late_runtime_tasks:
+                owned_tasks.update(late_runtime_tasks)
+                pending = await _wait_for_tasks(late_runtime_tasks, orchestrator)
+                if pending:
+                    abandon_drain("late per-vault workers")
+                    await asyncio.wait(
+                        pending, timeout=min(1.0, max(0.0, hard_deadline - time.monotonic()))
+                    )
+
+        with shutdown_phase("writer_locks") as detail:
+            skipped = 0
+            for writer_lock in _runtime_writer_locks(state):
+                try:
+                    await asyncio.wait_for(writer_lock.acquire(), timeout=drain_left())
+                except asyncio.TimeoutError:
+                    # A stuck holder. The close does not depend on this lock: it
+                    # is gated on the in-flight grafx count below.
+                    skipped += 1
+                    abandon_drain("writer locks")
+                else:
+                    acquired.append(writer_lock)
+            detail["held"] = len(acquired)
+            detail["skipped"] = skipped
+
+        # A pool call whose awaiting task was cancelled keeps running on its
+        # worker; give it the rest of the drain budget before handles close.
+        with shutdown_phase("wait_store_idle") as detail:
+            idle = await wait_executors_idle_async(drain_left())
+            detail["idle"] = idle
+            if not idle:
+                # Busy workers are in an LLM/network wait or a grafx call; the
+                # grafx count below tells which. Nothing queued may start now.
+                abandon_drain("busy executors")
+
+        # Coalesced sidecar writes (#37): stop the background flushers and write once
+        # more what is still pending, so a clean stop loses no progress event.
+        with shutdown_phase("flush_sidecars") as detail:
+            detail["flushed"] = _flush_sidecars(state)
+
+        # Close from a dedicated thread: the store executor may be wedged, and
+        # the close must not queue behind a stuck worker.
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+        outcome: dict[str, Any] = {}
+
+        def close_stores() -> None:
+            try:
+                state.close()
+                outcome["ok"] = True
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = exc
+            finally:
+                loop.call_soon_threadsafe(finished.set)
+
+        with shutdown_phase("grafx_quiesce") as detail:
+            while True:
+                inflight = _grafx_calls_in_flight(state)
+                if not any(inflight.values()) or time.monotonic() >= hard_deadline:
+                    break
+                await asyncio.sleep(0.02)
+            detail["grafx_calls_in_flight"] = sum(inflight.values())
+
+        blocked = sum(inflight.values())
+        if blocked:
+            summary["outcome"] = "close_skipped"
+            _LOG.error(
+                "store close skipped: %d grafx calls in flight, relying on WAL recovery", blocked
             )
-        await asyncio.wait_for(asyncio.to_thread(state.close), timeout=remaining)
-    except asyncio.TimeoutError:
-        _force_shutdown(
-            reason="writer lock or vault close",
-            orchestrator=orchestrator,
-            rest_server=rest_server,
-            mcp_server=mcp_server,
-            tasks=owned_tasks,
-            force_process_exit=force_process_exit,
-        )
+            _LOG.error(
+                "shutdown.close_skipped per_vault=%s",
+                ",".join(f"{name}:{count}" for name, count in sorted(inflight.items()) if count),
+            )
+            raise_exit = True
+        else:
+            raise_exit = False
+            closer = threading.Thread(
+                target=close_stores, name="okto-neuron-shutdown-close", daemon=True
+            )
+            with shutdown_phase("store_close_total") as detail:
+                closer.start()
+                try:
+                    await asyncio.wait_for(
+                        finished.wait(), timeout=max(0.001, hard_deadline - time.monotonic())
+                    )
+                except asyncio.TimeoutError:
+                    detail["completed"] = False
+                else:
+                    detail["completed"] = "error" not in outcome
+            if not finished.is_set():
+                # The close thread is still running: a grafx call started after
+                # the quiesce check (close then waits for it) or the native close
+                # itself is stuck. Exit; the next open recovers from the WAL.
+                inflight = _grafx_calls_in_flight(state)
+                blocked = sum(inflight.values())
+                summary["outcome"] = "close_timeout"
+                if blocked:
+                    _LOG.error(
+                        "store close skipped: %d grafx calls in flight, relying on WAL recovery",
+                        blocked,
+                    )
+                else:
+                    _LOG.error(
+                        "store close did not finish before the hard deadline, "
+                        "relying on WAL recovery"
+                    )
+                raise_exit = True
+            elif "error" in outcome:
+                summary["outcome"] = "close_error"
+                raise outcome["error"]
+            else:
+                summary["store_closed"] = True
+                summary["outcome"] = "closed"
+                from okto_neuron.server.lifecycle import write_shutdown_outcome
+
+                write_shutdown_outcome("closed")
+        if raise_exit:
+            orchestrator.request_force_shutdown()
+            rest_server.force_exit = True
+            mcp_server.force_exit = True
+            if blocked:
+                from okto_neuron.server.lifecycle import write_close_skipped_outcome
+
+                write_close_skipped_outcome(inflight)
+            log_summary()
+            force_process_exit(1)
+            raise _ShutdownDeadlineExpired(str(summary["outcome"]))
     finally:
         for writer_lock in reversed(acquired):
             writer_lock.release()
+        log_summary()
 
 
 def auth_token_path(vault_path: Path | None, rest_port: int) -> Path:
@@ -468,14 +713,17 @@ def _supervise_folder_watch(state: ServerState, task: "asyncio.Task") -> None:
 def _resume_durable_runtime_work(state: ServerState) -> None:
     """Discover every registered vault and restart its durable queued work.
 
+    Review actions queued while a vault was busy restart their applier too.
     Runtime creation reads only queue/job sidecars. Graph handles stay closed
     until a worker takes its scoped lease, so startup scales independently of
     ``VaultPool.max_open``.
     """
-    from okto_neuron.server import _ingest_queue, _jobs
+    from okto_neuron.server import _ingest_queue, _jobs, _review_actions
     from okto_neuron.server.http import _companion
 
     for runtime in state.runtimes(discover=True):
+        if _review_actions.has_queued(runtime):
+            _review_actions.ensure_applier(runtime)
         if any(item.status == "queued" for item in runtime.ingest_queue):
             _ingest_queue.ensure_worker(runtime, _companion)
         if any(job.status == "queued" for job in runtime.curation_jobs):
@@ -489,8 +737,11 @@ def _vault_open_warning(vault_path: Path, exc: EmbeddingDimMismatch) -> dict[str
         "path": str(resolved),
         "detail": exc.user_message(),
         "remedy": (
-            f"Run `okto-neuron kg reembed {resolved}` to rebuild vectors at the "
-            "configured embedding width, or switch to another vault."
+            "Rebuild vectors at the configured embedding width through the running "
+            "daemon (POST /api/v1/vaults/reembed with {\"vault\": \"<vault name>\"}, which "
+            "works while the vault cannot be opened, or the vault manager's Re-embed "
+            "button); `okto-neuron kg reembed` is refused while the daemon holds the "
+            "vault. Or switch to another vault."
         ),
     }
 
@@ -501,6 +752,28 @@ def _open_startup_vault(
     if vault_path is None:
         return None, None, None
     resolved = Path(vault_path).expanduser().resolve(strict=False)
+    from okto_neuron.consolidate.review_queue import layout_refusal, log_layout_refusal_once
+
+    # BEFORE the writer lease and the graph open (#14): a v1 vault is refused
+    # untouched; the daemon starts without it, status shows the same refusal.
+    refusal = layout_refusal(resolved)
+    if refusal is not None:
+        log_layout_refusal_once(resolved, refusal)
+        return None, None, dict(refusal)
+    try:
+        acquire_daemon_writer_lease(resolved)
+    except VaultPoolError as exc:
+        _LOG.warning("startup fallback vault is busy; starting the application without it: %s", exc)
+        return (
+            None,
+            None,
+            {
+                "code": exc.code,
+                "path": str(resolved),
+                "detail": str(exc),
+                "remedy": "Stop the process holding the vault, then select it again.",
+            },
+        )
     try:
         return Vault.open(resolved), resolved, None
     except EmbeddingDimMismatch as exc:
@@ -657,15 +930,17 @@ def _pool_error(exc: VaultPoolError, *, selector: str | None) -> VaultResolution
     branch on, so it is preserved; only the human text is sanitised, and the full
     original is logged for the operator.
     """
-    _LOG.warning(
-        "vault pool error %s for selector %r: %s", exc.code, selector, exc, exc_info=True
-    )
+    _LOG.warning("vault pool error %s for selector %r: %s", exc.code, selector, exc, exc_info=True)
+    # A width mismatch is a diagnosable, path-free fact with a working remedy: say so
+    # instead of "see the server log" (a field report).
+    mismatch = client_open_failure(exc)
+    if mismatch is not None:
+        return VaultResolutionError(mismatch[0], mismatch[1])
     return VaultResolutionError(
         exc.code,
         # No ``exc.code`` in the text: the MCP layer already renders it as
         # ``f"{exc.code}: {exc}"``.
-        f"{_safe_selector_label(selector)} is not available; "
-        "see the server log for details",
+        f"{_safe_selector_label(selector)} is not available; see the server log for details",
     )
 
 
@@ -785,8 +1060,7 @@ def _resolve_vault_path_selector_unguarded(
             # already knows which one it asked about.
             raise VaultResolutionError(
                 "unknown_vault",
-                "no vault at the requested path; create one first (init_vault) "
-                "or check the path",
+                "no vault at the requested path; create one first (init_vault) or check the path",
             )
         return target
 
@@ -874,7 +1148,6 @@ def _validate_name_only_override(override: str) -> str:
             "instead",
         )
     return candidate
-
 
 
 def _canonical_vault_name(name: str) -> str:
@@ -1114,6 +1387,52 @@ def _mcp_progress_bridge() -> Callable[[str, int, int], None] | None:
     return _on_progress
 
 
+# Client idle timeout for HTTP MCP tool calls is 300 s (Claude Code); one long
+# LLM call can leave the per-block bridge silent for longer. A timer heartbeat
+# independent of block events keeps the client's idle timer alive.
+_MCP_HEARTBEAT_INTERVAL_S = 20.0
+
+
+@contextlib.asynccontextmanager
+async def _mcp_heartbeat():
+    """Send an MCP progress notification every interval while the body runs.
+
+    Started with the tool call and cancelled in ``finally`` (no notification
+    after completion). It never raises into the tool: no MCP context yields a
+    no-op, and ``report_progress`` itself no-ops without a ``progressToken``.
+    Progress is elapsed seconds; ``total`` is None (duration is unknown).
+    """
+    try:
+        from fastmcp.server.dependencies import get_context  # type: ignore
+
+        ctx = get_context()
+    except (RuntimeError, ImportError):
+        ctx = None
+    if ctx is None:
+        yield
+        return
+    started = time.monotonic()
+
+    async def _beat() -> None:
+        while True:
+            await asyncio.sleep(_MCP_HEARTBEAT_INTERVAL_S)
+            elapsed = time.monotonic() - started
+            try:
+                await ctx.report_progress(elapsed, None, f"remember in progress ({elapsed:.0f}s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - telemetry must never break ingest
+                _LOG.debug("mcp heartbeat notification failed", exc_info=True)
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
 _BARE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
 
@@ -1290,6 +1609,34 @@ def _build_mcp_server(state: ServerState):
             # RuntimeError style so existing MCP clients keep parsing the message).
             raise RuntimeError(f"{exc.code}: {exc}") from exc
 
+    def _release_pair(pair: tuple[VaultRuntime, VaultLease[Vault]]) -> None:
+        pair[1].release()
+
+    async def _run_leased(
+        io: Callable[..., Awaitable[Any]],
+        lease: VaultLease[Vault],
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run ``fn`` on ``io`` holding an already-taken ``lease``.
+
+        The lease is released when the dispatched call settles, not when this
+        await is cancelled: a cancelled caller must not hand the handle back to
+        eviction while its worker is still reading it, and a call cancelled
+        while still queued (it never runs) must not leak the lease.
+        """
+        task = asyncio.ensure_future(io(fn, *args, **kwargs))
+
+        def _settled(done: asyncio.Future[Any]) -> None:
+            lease.release()
+            if not done.cancelled():
+                done.exception()  # consume it: nobody awaits a cancelled caller's task
+
+        task.add_done_callback(_settled)
+        return await asyncio.shield(task)
+
     def _lease(
         vault_override: str | None = None,
         override_ignored: list[str] | None = None,
@@ -1317,7 +1664,7 @@ def _build_mcp_server(state: ServerState):
             raise RuntimeError(f"{sanitised.code}: {sanitised}") from exc
 
     @mcp.tool()
-    def ask(
+    async def ask(
         question: str,
         k: int = 20,
         hops: int = 1,
@@ -1420,8 +1767,61 @@ def _build_mcp_server(state: ServerState):
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
-        _ignored: list[str] = []
-        _runtime, lease = _lease(vault, _ignored)
+        # Resolving reads the registry and leasing may open the vault: take the
+        # lease off-loop first, so a call waiting on another vault's open never
+        # occupies a job worker. The answer itself is seconds to minutes: job executor.
+        ignored: list[str] = []
+        runtime, lease = await acquire_off_loop(_lease, vault, ignored, release=_release_pair)
+        return await _run_leased(
+            job_io,
+            lease,
+            functools.partial(
+                _ask_impl,
+                runtime=runtime,
+                lease=lease,
+                ignored=ignored,
+                question=question,
+                k=k,
+                hops=hops,
+                enable_subgraph=enable_subgraph,
+                source_block_policy=source_block_policy,
+                seed_k=seed_k,
+                max_degree_per_seed=max_degree_per_seed,
+                neighbour_budget_tokens=neighbour_budget_tokens,
+                source_block_budget_tokens=source_block_budget_tokens,
+                coverage_threshold=coverage_threshold,
+                min_claim_confidence=min_claim_confidence,
+                max_nodes=max_nodes,
+                max_relationships=max_relationships,
+                max_claims=max_claims,
+                relationship_types=relationship_types,
+                include_sources=include_sources,
+            )
+        )
+
+    def _ask_impl(
+        runtime: VaultRuntime,
+        lease: VaultLease[Vault],
+        ignored: list[str],
+        question: str,
+        k: int = 20,
+        hops: int = 1,
+        enable_subgraph: bool | None = None,
+        source_block_policy: Literal["never", "on_coverage_miss", "always", "blend"] | None = None,
+        seed_k: int | None = None,
+        max_degree_per_seed: int | None = None,
+        neighbour_budget_tokens: int | None = None,
+        source_block_budget_tokens: int | None = None,
+        coverage_threshold: float | None = None,
+        min_claim_confidence: float | None = None,
+        max_nodes: int | None = None,
+        max_relationships: int | None = None,
+        max_claims: int | None = None,
+        relationship_types: list[str] | None = None,
+        include_sources: bool = False,
+    ) -> dict[str, object]:
+        if state.shutting_down:
+            raise RuntimeError("shutting_down: server is shutting down")
         with lease as selected_vault:
             # Default to the vault's configured retrieval mode (block) — the grounded
             # eval showed block-dump answers (0.792) beat the subgraph path (0.6) while
@@ -1489,11 +1889,11 @@ def _build_mcp_server(state: ServerState):
         retrieval.setdefault("hops", effective_hops if enable_subgraph_effective else None)
         # Which vault actually answered. Injected HERE, in the MCP layer, so the
         # companion's trace (and its REST consumers / regression pins) is untouched.
-        retrieval["vault"] = _serving_vault_name(_runtime)
-        if _ignored:
+        retrieval["vault"] = _serving_vault_name(runtime)
+        if ignored:
             # The connection's ?vault= won; say so instead of letting the caller
             # believe their argument routed the call.
-            retrieval["vault_override_ignored"] = _ignored[0]
+            retrieval["vault_override_ignored"] = ignored[0]
         return {
             # "ok" only for a clean answer; "degraded" otherwise, with the
             # reason in retrieval.synthesis_status (same rule as REST /ask).
@@ -1509,7 +1909,7 @@ def _build_mcp_server(state: ServerState):
         }
 
     @mcp.tool()
-    def explore(
+    async def explore(
         topic: str = "",
         node_id: str | None = None,
         hops: int = 1,
@@ -1558,8 +1958,40 @@ def _build_mcp_server(state: ServerState):
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
-        _ignored: list[str] = []
-        _runtime, lease = _lease(vault, _ignored)
+        # Pure graph read (no LLM): the whole call is one store op (issue #13),
+        # after a lease taken off-loop so waiting on an open never holds a worker.
+        ignored: list[str] = []
+        runtime, lease = await acquire_off_loop(_lease, vault, ignored, release=_release_pair)
+        return await _run_leased(
+            store_io,
+            lease,
+            _explore_impl,
+            runtime,
+            lease,
+            ignored,
+            topic,
+            node_id,
+            hops,
+            k,
+            relationship_types,
+            min_claim_confidence,
+            max_degree_per_seed,
+        )
+
+    def _explore_impl(
+        runtime: VaultRuntime,
+        lease: VaultLease[Vault],
+        ignored: list[str],
+        topic: str,
+        node_id: str | None,
+        hops: int,
+        k: int,
+        relationship_types: list[str] | None,
+        min_claim_confidence: float | None,
+        max_degree_per_seed: int | None,
+    ) -> dict[str, object]:
+        if state.shutting_down:
+            raise RuntimeError("shutting_down: server is shutting down")
         with lease as selected_vault:
             result = companion_for(selected_vault).explore(
                 topic,
@@ -1573,9 +2005,9 @@ def _build_mcp_server(state: ServerState):
                 max_degree_per_seed=max_degree_per_seed,
             )
         retrieval = dict(result.get("retrieval") or {})
-        retrieval["vault"] = _serving_vault_name(_runtime)
-        if _ignored:
-            retrieval["vault_override_ignored"] = _ignored[0]
+        retrieval["vault"] = _serving_vault_name(runtime)
+        if ignored:
+            retrieval["vault_override_ignored"] = ignored[0]
         result["retrieval"] = retrieval
         return result
 
@@ -1593,11 +2025,17 @@ def _build_mcp_server(state: ServerState):
         string counts as raw text only when it is NOT path-shaped (path-shaped =
         an existing file/dir, contains a slash or backslash, a Windows drive
         prefix, a space-free ``~`` prefix, or a space-free name with a short
-        file suffix like ``note.pdf``). Path-shaped sources are passed through
-        unchanged and fail loudly as path errors. Detected raw text is
-        first materialized to a durable ``.marginalia/sources/`` file (same
-        convention as REST /add and /api/v1/ingest) and that file is then
-        ingested. ``sensitivity`` must be exactly ``local_only`` or ``default``
+        file suffix like ``note.pdf``). A path-shaped source is read IN PLACE
+        and never copied: it must be an existing file inside the vault root or a
+        configured folder-watch root (``folder_watch.roots`` in the vault
+        config); a missing path fails loudly as a path error, and a file outside
+        those roots is refused with ``forbidden: ...`` naming the allowed roots
+        and how to proceed (copy it under one, add its folder to
+        ``folder_watch.roots``, or pass its text as raw text). Detected raw text
+        is the only form that is copied: it is first materialized to a durable
+        ``.marginalia/sources/`` file in the vault (same convention as REST /add
+        and /api/v1/ingest) and that copy is then ingested, so the vault keeps
+        its own text and does not reference any original file. ``sensitivity`` must be exactly ``local_only`` or ``default``
         (enforced by the tool schema — no other value is accepted); ``local_only``
         keeps the source off any remote LLM path.
 
@@ -1606,6 +2044,21 @@ def _build_mcp_server(state: ServerState):
         Before choosing, check the project directory for a ``.okto-neuron-vault``
         file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
         """
+        # The heartbeat covers the whole call (lock wait included); the inline
+        # counters record it in the vault's ingest summary (status "inline").
+        call = iq.InlineCall()
+        try:
+            async with _mcp_heartbeat():
+                result = await _remember_inline(source, sensitivity, vault, call)
+        except BaseException:
+            call.finish(ok=False)
+            raise
+        call.finish(ok=not result.get("provider_error"))
+        return result
+
+    async def _remember_inline(
+        source: str, sensitivity: str, vault: str | None, call: iq.InlineCall
+    ) -> dict[str, object]:
         # WRITE op — loopback-only, even under --allow-remote (writes never widen).
         # Matches REST /remember and the init_vault gate below.
         if not _mcp_kg_add_allowed():
@@ -1615,23 +2068,25 @@ def _build_mcp_server(state: ServerState):
             )
         sens = sensitivity
         # Resolution happens here, AFTER the loopback write gate above, so an
-        # unknown vault name fails loudly before anything is written.
-        runtime, lease = _lease(vault)
+        # unknown vault name fails loudly before anything is written. Resolving
+        # reads the registry and leasing may open the vault: off-loop.
+        runtime, lease = await acquire_off_loop(_lease, vault, release=_release_pair)
         if runtime.draining:
             lease.release()
             if runtime.shutting_down:
                 raise RuntimeError("shutting_down: server is shutting down")
             raise RuntimeError("maintenance: vault maintenance is in progress; writes are paused")
+        call.start(runtime)
         with lease as selected_vault:
-            async with runtime.writer_lock:
+            async with held_lock(runtime.writer_lock, "mcp-remember"):
                 try:
-                    await asyncio.to_thread(
-                        graph_integrity.require_write_allowed, runtime, selected_vault
+                    await store_io(graph_integrity.require_write_allowed, runtime, selected_vault)
+                    ingest_source = await store_io(
+                        _materialize_raw_text_source, selected_vault, source
                     )
-                    ingest_source = _materialize_raw_text_source(selected_vault, source)
                     # Off-load the blocking extraction so the event loop stays
                     # responsive while this vault's lock serializes writes.
-                    result = await asyncio.to_thread(
+                    result = await job_io(
                         functools.partial(
                             companion_for(selected_vault).remember,
                             ingest_source,
@@ -1667,7 +2122,8 @@ def _build_mcp_server(state: ServerState):
                     raise
         from okto_neuron.server import _curation
 
-        remember_outcome = _curation.attach_verified_reconciliation_outcome(
+        remember_outcome = await store_io(
+            _curation.attach_verified_reconciliation_outcome,
             runtime,
             dict(getattr(result, "outcome", {}) or {}),
             trigger="verified_file_commit",
@@ -1689,7 +2145,7 @@ def _build_mcp_server(state: ServerState):
         }
 
     @mcp.tool()
-    def list_vaults() -> dict[str, object]:
+    async def list_vaults() -> dict[str, object]:
         """List the vault NAMES this server can reach, so you can pick one.
 
         Use this to discover what exists, then pass ``vault=<name>`` to
@@ -1708,6 +2164,10 @@ def _build_mcp_server(state: ServerState):
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
+        # Registry scan + selector resolution read YAML: one store op (issue #13).
+        return await store_io(_list_vaults_impl)
+
+    def _list_vaults_impl() -> dict[str, object]:
         # DELIBERATE NON-DISCLOSURE: this surface returns NAMES ONLY. No ``path``,
         # and no ``id`` either (the id is derived from the vault path). Do not
         # "fix" this by re-adding them or by switching to VaultEntry.to_json() /
@@ -1747,6 +2207,12 @@ def _build_mcp_server(state: ServerState):
         storage_credential_env: str | None = None,
         storage_database: str | None = None,
         allow_remote_db: bool = False,
+        embedding_provider: str | None = None,
+        embedding_model: str | None = None,
+        embedding_dimension: int | None = None,
+        embedding_api_base: str | None = None,
+        embedding_api_key_env: str | None = None,
+        embedding_allow_remote: bool = False,
     ) -> dict[str, object]:
         """Create one application-managed named vault without selecting it.
 
@@ -1769,6 +2235,16 @@ def _build_mcp_server(state: ServerState):
         instead of silently connecting to a remote endpoint. Returns ``{name, path}``,
         plus ``hint`` when the new vault has no usable LLM model — creation succeeded
         but ``remember`` will refuse until ``llm.defaults.model`` is set.
+
+        ``embedding_provider``/``embedding_model``/``embedding_dimension``/
+        ``embedding_api_base``/``embedding_api_key_env``/``embedding_allow_remote`` create
+        the vault with its embedding spec, so its graph is born at that width (the vector
+        column is fixed-width afterwards; changing the width later needs a re-embed).
+        Omit them all for the application default (a 384-wide local model). A width other
+        than 384 must name the provider/model that produces it. ``embedding_api_base`` is
+        loopback-only unless ``embedding_allow_remote`` is ``True``; ``embedding_api_key_env``
+        must name an ``OKTO_NEURON_*`` variable. When given, the result also carries the
+        ``embedding`` spec the vault was created with.
         """
         if state.draining:
             if state.shutting_down:
@@ -1778,7 +2254,12 @@ def _build_mcp_server(state: ServerState):
             raise RuntimeError("forbidden: vault creation is restricted to loopback callers")
 
         from okto_neuron.config._vault import DEFAULT_NEW_VAULT_BACKEND, _classify_storage_endpoint
-        from okto_neuron.server.http import _initialize_managed_vault, _parse_packs
+        from okto_neuron.server.http import (
+            _BadRequest,
+            _initialize_managed_vault,
+            _parse_embedding_spec,
+            _parse_packs,
+        )
         from okto_neuron.store.registry import NoSuchBackendError, resolve_graph_backend
         from okto_neuron.vault_registry import (
             ensure_global_layout,
@@ -1786,9 +2267,16 @@ def _build_mcp_server(state: ServerState):
             vault_path_for_name,
         )
 
+        def _init_target(vault_name: str) -> tuple[Path, bool]:
+            """Store op: ensure the app layout, map the name, probe the path."""
+            ensure_global_layout()
+            resolved = vault_path_for_name(vault_name).resolve(strict=False)
+            return resolved, is_vault(resolved)
+
         resolved_backend = (backend or "").strip() or DEFAULT_NEW_VAULT_BACKEND
         try:
-            resolve_graph_backend(resolved_backend)
+            # Entry-point discovery reads installed package metadata: off-loop.
+            await store_io(resolve_graph_backend, resolved_backend)
         except NoSuchBackendError as exc:
             raise RuntimeError(f"bad_request: {exc}") from exc
 
@@ -1803,13 +2291,26 @@ def _build_mcp_server(state: ServerState):
                     "set allow_remote_db=True to confirm remote storage egress"
                 )
 
+        spec_fields = {
+            "provider": embedding_provider,
+            "model": embedding_model,
+            "dimension": embedding_dimension,
+            "api_base": embedding_api_base,
+            "api_key_env": embedding_api_key_env,
+            "allow_remote": True if embedding_allow_remote else None,
+        }
+        given_spec = {key: value for key, value in spec_fields.items() if value is not None}
+        try:
+            embedding_spec = _parse_embedding_spec(given_spec) if given_spec else None
+        except _BadRequest as exc:
+            raise RuntimeError(f"bad_request: {exc.detail}") from exc
+
         try:
             pack_list = _parse_packs(packs)
-            ensure_global_layout()
-            target = vault_path_for_name(name.strip()).resolve(strict=False)
+            target, exists = await store_io(_init_target, name.strip())
         except ValueError as exc:
             raise RuntimeError(f"bad_vault_name: {exc}") from exc
-        if is_vault(target):
+        if exists:
             raise RuntimeError(f"vault_exists: vault already exists at {target}")
 
         # REST and MCP creation mutate the same registry/ownership boundary. The
@@ -1817,7 +2318,7 @@ def _build_mcp_server(state: ServerState):
         # cancelled tool task cannot release serialization while init continues.
         async with state.config_lock:
             try:
-                await asyncio.to_thread(
+                await store_io(
                     _initialize_managed_vault,
                     state,
                     target,
@@ -1831,12 +2332,15 @@ def _build_mcp_server(state: ServerState):
                     ),
                     storage_database=storage_database.strip() if storage_database else None,
                     allow_remote_db=allow_remote_db,
+                    embedding_spec=embedding_spec,
                 )
             except FileExistsError:
                 raise RuntimeError(f"vault_exists: vault already exists at {target}")
-            state.runtime_for(target, rehydrate=True)
+            await store_io(state.runtime_for, target, rehydrate=True)
         created: dict[str, object] = {"name": name.strip(), "path": str(target)}
-        hint = _vault_llm_model_hint(target)
+        if embedding_spec:
+            created["embedding"] = dict(embedding_spec)
+        hint = await store_io(_vault_llm_model_hint, target)
         if hint:
             created["hint"] = hint
         return created
@@ -1857,6 +2361,12 @@ async def _run_async(
         raise RuntimeError(
             "direct remote serving is disabled; bind to 127.0.0.1 and use an SSH tunnel"
         )
+    # Before the first lease (the startup vault below): every lease this daemon takes
+    # names its REST URL, so a refused CLI command points at this daemon's port.
+    from okto_neuron.server._vault_pool import set_daemon_endpoint
+
+    url_host = f"[{host}]" if ":" in host else host
+    set_daemon_endpoint(f"http://{url_host}:{rest_port}")
     vault, active_vault_path, vault_warning = _open_startup_vault(vault_path)
     # Keep the compatibility state field explicit for isolated middleware policy
     # tests. Production startup rejects every remote bind/allow_remote request
@@ -1870,6 +2380,13 @@ async def _run_async(
     # ``init_state`` already adopted the startup fallback vault into the pool (the
     # pool owns ALL handles, so shutdown closes it once via ``pool.close_all()``).
 
+    # Issue #13: two bounded executors own every blocking call the server makes
+    # (store/vault-file/config I/O, and long jobs/model work), so no request ever
+    # blocks the loop that serves /health, REST and MCP. Shut down in the
+    # ``finally`` below after the vaults close.
+    configure_executors(*_configured_executor_workers())
+    _configure_projection()
+
     # Pin the configured LLM providers' lazy imports (litellm, boto3) into this
     # process NOW, while the launch-time environment is intact — see the helper's
     # docstring for the venv-prune failure mode this prevents.
@@ -1877,6 +2394,7 @@ async def _run_async(
 
     orchestrator = GracefulShutdown()
     state.shutdown = orchestrator
+    state.rest_port = rest_port
     rest_app = _TrackedASGIApp(build_rest_app(state), orchestrator)
     # The MCP surface is a separate privileged ASGI app on its own port. REST/UI
     # is credential-free on loopback; MCP alone retains bearer authentication.
@@ -1993,6 +2511,17 @@ async def _run_async(
     )
     if ready_event is not None:
         ready_event.set()
+    # #38: the startup vault is open (_open_startup_vault), runtimes are discovered
+    # (_resume_durable_runtime_work) and no request has been served yet. Freeze the long-lived heap ONCE here, then raise the
+    # collector thresholds; the pause watch is installed regardless. Before the prewarm
+    # so no background thread is allocating while the freeze runs.
+    _gc_tuning.install_gc_watch()
+    _gc_tuning.apply_gc_tuning()
+    # Same point: shorter GIL switch interval so the event loop is not starved by a
+    # CPU-bound audit thread (what remains once the collector pauses are gone).
+    _gc_tuning.apply_switch_interval()
+    # After readiness: warm the ledger indexes of the vaults that opened (#14).
+    start_ledger_prewarm(state)
 
     # Both servers share Uvicorn's logger. Filter only the MCP task's duplicate
     # lifecycle INFO records; every warning/error still passes through.
@@ -2003,7 +2532,9 @@ async def _run_async(
         asyncio.create_task(rest_server.serve(), name="okto-neuron-rest"),
         asyncio.create_task(mcp_server.serve(), name="okto-neuron-mcp"),
     )
-    shutdown_waiter = asyncio.create_task(shutdown_wakeup.wait(), name="okto-neuron-shutdown-wakeup")
+    shutdown_waiter = asyncio.create_task(
+        shutdown_wakeup.wait(), name="okto-neuron-shutdown-wakeup"
+    )
     cancellation: asyncio.CancelledError | None = None
     try:
         # A signal wakes this wait immediately. A transport ending first is also
@@ -2039,6 +2570,7 @@ async def _run_async(
                         loop.remove_signal_handler(sig)
             uvicorn_error_logger.removeFilter(mcp_lifecycle_filter)
             reset_state_for_tests()
+            shutdown_executors()
 
     if cancellation is not None:  # pragma: no cover - defensive
         raise cancellation
@@ -2059,6 +2591,8 @@ def run(
     mcp_port: int = DEFAULT_MCP_PORT,
 ) -> None:
     """Synchronous entry point used by the ``okto-neuron serve`` CLI command."""
+    # Idempotent backstop for embedders: the CLI already ran it before any thread.
+    preload_server_modules()
     try:
         asyncio.run(
             _run_async(

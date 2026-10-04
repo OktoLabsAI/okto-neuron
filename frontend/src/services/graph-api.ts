@@ -4,6 +4,7 @@
 // graph fixtures, so the Graph view detects mock mode itself (lib/mode.isMock)
 // and renders a clean disabled state instead of issuing a live request.
 import { apiFetch, qs } from './http'
+import { fetchGraphStats } from './graph-stats'
 import type { GraphResponse, GraphStats, NeighborsResponse } from '@/types'
 
 export interface GraphFilters {
@@ -42,5 +43,5 @@ export function getNeighbors(
 }
 
 export function getGraphStats(): Promise<GraphStats> {
-  return apiFetch<GraphStats>('/graph/stats')
+  return fetchGraphStats()
 }

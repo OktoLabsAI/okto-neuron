@@ -1,15 +1,18 @@
 // Predicate upkeep review queue (ADR 0017). Separate from entity reconciliation:
 // these records canonicalize relation names, not nodes.
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Check, RefreshCw, X } from 'lucide-react'
 import { Badge, ErrorBox, Spinner } from '@/components/ui'
+import { BusyRetryNotice } from './BusyRetryNotice'
+import { useBusyRetry } from '@/hooks/useBusyRetry'
+import { isBusyRetryStopped } from '@/lib/busy-retry'
 import {
-  getPredicateUpkeep,
   predicateUpkeepConfirm,
   predicateUpkeepReject,
   type PredicateAliasRecord,
   type PredicateMapping,
 } from '@/services/curation-api'
+import { refreshPredicateSnapshot, usePredicateSnapshot } from '@/services/predicate-snapshot'
 
 const mappingStyles: Record<PredicateMapping, string> = {
   exact_match: 'border-cyan-500/50 bg-cyan-600/20 text-cyan-200',
@@ -40,40 +43,31 @@ function evidenceText(record: PredicateAliasRecord): string {
 }
 
 export function PredicateUpkeepView() {
-  const [records, setRecords] = useState<PredicateAliasRecord[]>([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // The queue comes from the shared predicate query (one timer for every panel, paused while
+  // the tab is hidden). A stale/rebuilding or still-building daemon answer keeps the last
+  // records on screen; it is never shown as an error.
+  const { snapshot, loading: snapshotLoading, error: snapshotError } = usePredicateSnapshot()
+  const records: PredicateAliasRecord[] = snapshot?.records.queued ?? []
+  const loading = snapshotLoading
+  const [actionError, setActionError] = useState<string | null>(null)
+  const error = actionError ?? snapshotError
   const [busyId, setBusyId] = useState<string | null>(null)
+  const { run: runBusy, wait: busyWait, stop: stopBusy } = useBusyRetry()
 
   async function refresh() {
-    setLoading(true)
-    setError(null)
-    try {
-      const snapshot = await getPredicateUpkeep()
-      setRecords(snapshot.records.queued ?? [])
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
+    setActionError(null)
+    await refreshPredicateSnapshot()
   }
-
-  useEffect(() => {
-    refresh()
-    const t = setInterval(refresh, 5000)
-    return () => clearInterval(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
 
   async function resolve(recordId: string, action: 'confirm' | 'reject') {
     setBusyId(recordId)
-    setError(null)
+    setActionError(null)
     try {
-      if (action === 'confirm') await predicateUpkeepConfirm(recordId)
-      else await predicateUpkeepReject(recordId)
+      if (action === 'confirm') await runBusy(() => predicateUpkeepConfirm(recordId))
+      else await runBusy(() => predicateUpkeepReject(recordId))
       await refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setActionError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusyId(null)
     }
@@ -97,6 +91,7 @@ export function PredicateUpkeepView() {
         </button>
       </div>
 
+      <BusyRetryNotice wait={busyWait} onStop={stopBusy} />
       {error && <ErrorBox message={error} />}
       {loading && records.length === 0 && <Spinner label="Loading predicate queue..." />}
       {!loading && records.length === 0 && !error && (

@@ -8,7 +8,7 @@ import yaml
 
 from okto_neuron.cli import app
 import okto_neuron.cli.kg as kg_module
-from okto_neuron.config._vault import VaultConfig
+from okto_neuron.config._vault import CURRENT_YAML_VERSION, VaultConfig
 from okto_neuron.errors import VaultPathNotADirectory
 from okto_neuron.store import vault as vault_module
 from okto_neuron.store.ladybug import VaultConnection
@@ -36,6 +36,7 @@ def test_kg_init_first_call_scaffolds_and_prints_layout(tmp_path: Path) -> None:
     assert config_path.is_file()
     assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == (
         VaultConfig.default().model_dump(mode="json", exclude_none=True)
+        | {"marginalia_yaml_version": CURRENT_YAML_VERSION}
     )
     _assert_layout(result.output, vault_path)
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import struct
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,10 @@ from okto_neuron.store.index.bm25 import BM25Scorer
 
 FORMAT_VERSION = 1
 DEFAULT_ENGINE = "ladybug_bm25+vector_scan"
+
+# Stamps written before the embedding went in as raw bytes carry no prefix; an
+# unprefixed stamp never matches and costs exactly one rebuild.
+STAMP_PREFIX = "v2:"
 
 CORPUS_FILENAME = "corpus.jsonl"
 META_FILENAME = "meta.json"
@@ -57,28 +63,39 @@ def _facet_p(obj: Any) -> Any:
     return (obj.facets or {}).get("P")
 
 
+def _embedding_bytes(embedding: list[float]) -> bytes:
+    """Little-endian float64 bytes of a vector; numpy and pure Python agree exactly."""
+    try:
+        import numpy as np
+    except ImportError:  # base install: numpy ships with the serve extra only
+        return struct.pack("<%dd" % len(embedding), *embedding)
+    return np.asarray(embedding, dtype="<f8").tobytes()
+
+
 def node_digest(node: Any) -> str:
     """Digest of every field that can move a search score, for one record.
 
     Works on both ``Node`` and ``IndexRecord`` objects: it reads ``facet_p``
     directly when present, and falls back to ``facets.get("P")`` otherwise.
     ``created_at`` is excluded on purpose (pinned at first write, never
-    changes).
+    changes). The text fields go in as compact JSON; the embedding follows as
+    raw float64 bytes behind a presence marker, which is what keeps the
+    4096-float vector out of ``json.dumps``.
     """
-    payload = json.dumps(
-        [
-            node.id,
-            node.type,
-            node.title,
-            node.content,
-            list(node.tags),
-            _facet_p(node),
-            node.embedding,
-        ],
-        separators=(",", ":"),
-        ensure_ascii=False,
+    h = hashlib.sha256()
+    h.update(
+        json.dumps(
+            [node.id, node.type, node.title, node.content, list(node.tags), _facet_p(node)],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if node.embedding is None:
+        h.update(b"\x00")
+    else:
+        h.update(b"\x01")
+        h.update(_embedding_bytes(node.embedding))
+    return h.hexdigest()
 
 
 def graph_generation(nodes_in_ascending_id_order: Iterable[Any]) -> str:
@@ -86,7 +103,7 @@ def graph_generation(nodes_in_ascending_id_order: Iterable[Any]) -> str:
     h = hashlib.sha256()
     for node in nodes_in_ascending_id_order:
         h.update(node_digest(node).encode("ascii"))
-    return h.hexdigest()
+    return STAMP_PREFIX + h.hexdigest()
 
 
 def _record_to_row(record: IndexRecord) -> dict[str, Any]:
@@ -153,14 +170,23 @@ class JsonlCorpusStore:
         engine: str = DEFAULT_ENGINE,
         format_version: int = FORMAT_VERSION,
     ) -> dict[str, Any]:
-        """Rewrite corpus.jsonl and meta.json in full and return the new meta."""
+        """Rewrite corpus.jsonl and meta.json in full and return the new meta.
+
+        Order matters: the stamp in meta.json is trusted on open without being
+        recomputed, so it must never claim records that are not on disk. The
+        corpus is replaced first, the stamp second, each through a temp file,
+        ``os.replace`` and a directory fsync. A crash between the two leaves the new records under the
+        previous stamp, which no longer matches the graph and forces a rebuild.
+        """
         self.index_dir.mkdir(parents=True, exist_ok=True)
+        self.discard_stale_tmp()
         ordered = sorted(records.values(), key=lambda record: record.id)
 
-        with self.corpus_path.open("w", encoding="utf-8") as handle:
-            for record in ordered:
-                handle.write(json.dumps(_record_to_row(record), separators=(",", ":"), ensure_ascii=False))
-                handle.write("\n")
+        lines = (
+            json.dumps(_record_to_row(record), separators=(",", ":"), ensure_ascii=False) + "\n"
+            for record in ordered
+        )
+        self._replace_atomically(self.corpus_path, lines)
 
         scorer = BM25Scorer(ordered)
         embedded_count = sum(1 for record in ordered if record.embedding is not None)
@@ -173,5 +199,35 @@ class JsonlCorpusStore:
             "embedded_count": embedded_count,
             "built_at": datetime.now(timezone.utc).isoformat(),
         }
-        self.meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._replace_atomically(self.meta_path, [json.dumps(meta, indent=2, sort_keys=True) + "\n"])
         return meta
+
+    def discard_stale_tmp(self) -> None:
+        """Remove temp files a crashed save left behind; they are never read as data."""
+        for path in (self.corpus_path, self.meta_path):
+            _tmp_path(path).unlink(missing_ok=True)
+
+    def _replace_atomically(self, path: Path, chunks: Iterable[str]) -> None:
+        tmp = _tmp_path(path)
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.writelines(chunks)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(path.parent)
+
+
+def _tmp_path(path: Path) -> Path:
+    return path.with_name(path.name + ".tmp")
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename durable across power loss. Best effort: not every platform allows it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass

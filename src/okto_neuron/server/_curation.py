@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from okto_neuron.config._capacity import curation_effective_max_concurrent
+from okto_neuron.llm import _scoped_call_timeout
 from okto_neuron.errors import RebuildAuditFailed, VaultCorrupted
 
 if TYPE_CHECKING:
@@ -93,7 +95,13 @@ async def _swap_under_runtime_fence(
             reopened.close()
             raise
         if validate_reopened is not None:
-            await asyncio.to_thread(validate_reopened, reopened)
+            # Store executor, NOT the job executor: this coroutine is awaited by a
+            # job runner that is itself parked on a job worker (the swap is
+            # marshaled onto the loop), so a job-pool hop here could deadlock
+            # once every job worker is such a parked runner.
+            from okto_neuron.server._store_io import store_io
+
+            await store_io(validate_reopened, reopened)
         safe_to_unfence = True
     except Exception:
         # The graph swap helper rolls its filesystem rename back where possible.
@@ -231,19 +239,21 @@ def _publish_linked_reconcile_outcome(
     outcome: dict[str, object],
     *,
     expected_job_id: str | None = None,
-) -> None:
+    persist_now: bool = True,
+) -> bool:
     """Project one propose job's state onto the ingest items that requested it.
 
     The graph commit and the semantic follow-up have deliberately separate
     outcomes.  Reconciliation may fail after a technically verified commit; in
     that case the ingest item stays ``done`` and only this additive semantic
-    outcome becomes ``failed``.
+    outcome becomes ``failed``. Returns whether any item changed;
+    ``persist_now=False`` leaves the sidecar write to an off-loop caller.
     """
     if not isinstance(ingest_item_ids, list):
-        return
+        return False
     item_ids = {str(value) for value in ingest_item_ids if str(value)}
     if not item_ids:
-        return
+        return False
     changed = False
     for item in getattr(state, "ingest_queue", ()):
         if str(getattr(item, "id", "")) not in item_ids:
@@ -259,13 +269,38 @@ def _publish_linked_reconcile_outcome(
         current["cross_document_reconciliation"] = dict(outcome)
         item.outcome = current
         changed = True
-    if changed:
+    if changed and persist_now:
         from okto_neuron.server import _ingest_queue
 
         _ingest_queue.persist(state)
+    return changed
+
+
+# Find-or-submit below must stay atomic: callers now run it on store-executor
+# threads (issue #13), where two verified commits could otherwise both miss the
+# queued pass and submit two proposals instead of coalescing into one.
+_SCHEDULE_LOCK = threading.RLock()
 
 
 def schedule_cross_document_reconciliation(
+    state: "ServerState",
+    *,
+    trigger: str,
+    ingest_item_id: str | None = None,
+    graph_generation: str | None = None,
+) -> dict[str, object]:
+    """Schedule one propose-only reconciliation pass (see
+    :func:`_schedule_cross_document_reconciliation`), atomically."""
+    with _SCHEDULE_LOCK:
+        return _schedule_cross_document_reconciliation(
+            state,
+            trigger=trigger,
+            ingest_item_id=ingest_item_id,
+            graph_generation=graph_generation,
+        )
+
+
+def _schedule_cross_document_reconciliation(
     state: "ServerState",
     *,
     trigger: str,
@@ -856,6 +891,10 @@ def _run_companion_triage_verdicts(
                 )
 
     if max_concurrent > 1 and len(batches) > 1:
+        # Exempt from the StoreExecutor/JobExecutor rule (issue #13): an
+        # LLM-internal fan-out of concurrent model calls, created and joined
+        # inside one job runner that already occupies a job worker. It never
+        # touches the store and never runs on the event loop.
         with ThreadPoolExecutor(max_workers=min(max_concurrent, len(batches))) as pool:
             futures = {
                 id(batch): pool.submit(
@@ -895,7 +934,11 @@ def _run_companion_triage_verdicts(
 
 def run_companion_triage(state: "ServerState", job: Any) -> dict:
     """Judge parked companion node candidates and auto-resolve clear cases."""
-    from okto_neuron.companion import Companion, ReviewItemNotFoundError
+    from okto_neuron.companion import (
+        Companion,
+        ReviewItemNotFoundError,
+        _claims_for_contradiction_scan,
+    )
     from okto_neuron.consolidate.review_queue import ReviewQueue
     from okto_neuron.curator import LLMCandidateCurator, _source_excerpt
     from okto_neuron.llm import sampler_overrides
@@ -928,9 +971,13 @@ def run_companion_triage(state: "ServerState", job: Any) -> dict:
     items: list[_TriageItem] = []
     errors: list[dict[str, str]] = []
     gate_threshold = consolidation.auto_commit_threshold
+    # This loop only reads the store (Claims are written later, by
+    # ``resolve_review``), so one Claim snapshot equals what each resolve() would
+    # have re-read per candidate. Runs on a job worker, like every store call here.
+    claim_snapshot = _claims_for_contradiction_scan(store, candidates)
     for candidate in candidates:
         try:
-            outcome = resolve(candidate, store, embedder=embedder)
+            outcome = resolve(candidate, store, embedder=embedder, claims=claim_snapshot)
             prompt = curator.build_prompt(
                 candidate,
                 outcome,
@@ -1085,16 +1132,23 @@ def run_propose(state: "ServerState", job: Any) -> dict:
     job.progress("clustering")
     clusters = generate_candidate_clusters(store, embedder=embedder, type=type_filter)
     rows: list[dict] = []
+    call_timeout_s = _load_config(state, vault_path=vault_path).consolidation.curation_call_timeout_s
     for i, cluster in enumerate(clusters):
         job.progress(f"adjudicating {i + 1}/{len(clusters)}")
-        verdict = adjudicate_cluster(
-            cluster,
-            store,
-            judge=judge,
-            embedder=embedder,
-            use_cluster_judge=use_cluster_judge,
-            merge_blocked=decisions.is_distinct,
-        )
+        # A wall-clock deadline per cluster (issue #24): with one in force, every
+        # judge call runs in the killable helper process instead of an
+        # unstoppable in-process request, so a model server that accepts the
+        # connection and never answers fails this cluster's verdict in bounded
+        # time instead of holding the writer lock forever.
+        with _scoped_call_timeout(call_timeout_s):
+            verdict = adjudicate_cluster(
+                cluster,
+                store,
+                judge=judge,
+                embedder=embedder,
+                use_cluster_judge=use_cluster_judge,
+                merge_blocked=decisions.is_distinct,
+            )
         rows.append(cluster_verdict_row(cluster, verdict))
 
     outcome = {
@@ -1188,10 +1242,8 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
 
     Runs against the SWEEP TARGET's handle/config/alias-index (the active
     vault, or a POOLED vault when the scheduler tagged this job — issue #5)."""
-    from okto_neuron.predicates import (
-        collect_predicate_vocabulary,
-        generate_predicate_candidates,
-    )
+    from okto_neuron.predicates import generate_predicate_candidates
+    from okto_neuron.server import _projection
     from okto_neuron.server._vault_pool import VaultPoolError
 
     try:
@@ -1202,9 +1254,11 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
     store = vault.store
     index = predicate_alias_index(state, vault_path=vault_path)
 
-    job.progress("scanning predicate vocabulary")
-    vocabulary = collect_predicate_vocabulary(store)
-    vocabulary_size = len(vocabulary)
+    # ONE set-based read of the graph, shared with the UI endpoints: the vault's maintained
+    # projection (joined or built here), not a vocabulary scan plus a candidate scan.
+    job.progress("reading predicate stats")
+    stats = _projection.manager_for(vault_path).stats_for_job(store)
+    vocabulary_size = len(stats.vocabulary)
     if not cfg.upkeep.enabled:
         return _predicate_propose_empty(
             vocabulary_size=vocabulary_size,
@@ -1213,8 +1267,9 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
 
     job.progress("generating predicate candidates")
     candidates = generate_predicate_candidates(
-        store,
+        None,
         vault.embedder,
+        stats=stats,
         alias_index=index,
         judged_pairs=_job_judged_pairs(job),
         cluster_threshold=cfg.upkeep.cluster_threshold,
@@ -1226,12 +1281,14 @@ def run_predicate_propose(state: "ServerState", job: Any) -> dict:
 
     judge = _build_predicate_judge(state, vault_path=vault_path)
     outcomes: list[dict] = []
+    call_timeout_s = _load_config(state, vault_path=vault_path).consolidation.curation_call_timeout_s
     for i, candidate in enumerate(candidates):
         job.progress(f"judging predicate pair {i + 1}/{len(candidates)}")
-        result = judge.judge(
-            candidate,
-            auto_fold_threshold=cfg.upkeep.auto_fold_threshold,
-        )
+        with _scoped_call_timeout(call_timeout_s):
+            result = judge.judge(
+                candidate,
+                auto_fold_threshold=cfg.upkeep.auto_fold_threshold,
+            )
         outcomes.append(predicate_outcome_row(result))
 
     auto_eligible = sum(1 for row in outcomes if row["status"] == "auto")
@@ -2530,7 +2587,7 @@ def run_heal(state: "ServerState", job: Any) -> dict:
         # Read the LIVE graph through the daemon's own handle (still open — NO second
         # handle). This is the source the deterministic copy folds.
         job.progress("reading")
-        nodes = list(state.vault.store.list_nodes())
+        nodes = list(state.vault.store.list_nodes(include_embedding=True))
         edges = list(state.vault.store.list_edges())
         # Bootstrap the tmp graph at the EXISTING vectors' width (the copy preserves
         # embeddings VERBATIM, so the fixed-width vector column must match the copied
@@ -2781,7 +2838,7 @@ def run_reembed(state: "ServerState", job: Any) -> dict:
         # Read the LIVE graph through the daemon's own handle (still open — no second
         # handle): list nodes/edges to replay through the embedder.
         job.progress("reading")
-        nodes = list(state.vault.store.list_nodes())
+        nodes = list(state.vault.store.list_nodes(include_embedding=True))
         edges = list(state.vault.store.list_edges())
 
         staging_port.discard(tmp_graph_path)

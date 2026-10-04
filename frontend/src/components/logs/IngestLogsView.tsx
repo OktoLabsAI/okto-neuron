@@ -21,6 +21,7 @@ import { getLedgerRun, getLedgerRuns, getLedgerSummary } from '@/services/ledger
 import { useFolderWatchStatus } from '@/hooks/useFolderWatchStatus'
 import { isIngestActive, useApp } from '@/store/app'
 import { Badge, ErrorBox } from '@/components/ui'
+import { eventPayloadView } from '@/lib/ingest-events'
 import type {
   IngestEvent,
   IngestItemStatus,
@@ -533,9 +534,21 @@ export function IngestLogsView() {
                   <div className="border-b border-surface-800 px-4 py-3 text-sm text-surface-200">
                     {selectedEvent.summary}
                   </div>
-                  <pre className="min-h-full overflow-auto p-4 text-[11px] leading-relaxed text-surface-300">
-                    {JSON.stringify(selectedEvent.payload, null, 2)}
-                  </pre>
+                  {(() => {
+                    const view = eventPayloadView(selectedEvent.payload)
+                    return (
+                      <>
+                        {view.note && (
+                          <div className="border-b border-surface-800 px-4 py-2 text-[11px] text-amber-300">
+                            {view.note}
+                          </div>
+                        )}
+                        <pre className="min-h-full overflow-auto p-4 text-[11px] leading-relaxed text-surface-300">
+                          {view.text}
+                        </pre>
+                      </>
+                    )
+                  })()}
                 </div>
               ) : (
                 <div className="flex min-h-0 flex-1 items-center justify-center px-4 py-8 text-xs text-surface-500">

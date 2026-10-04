@@ -106,8 +106,8 @@ def test_round_trip_preserves_nodes_and_edges(populated, target_store, corpus_ro
     assert load_report.embeddings_applied == expected_embedded_count
     assert load_report.skipped_embeddings is False
 
-    origin_nodes = {node.id: node for node in store.list_nodes()}
-    loaded_nodes = {node.id: node for node in target_store.list_nodes()}
+    origin_nodes = {node.id: node for node in store.list_nodes(include_embedding=True)}
+    loaded_nodes = {node.id: node for node in target_store.list_nodes(include_embedding=True)}
     assert set(origin_nodes) == set(loaded_nodes)
     for node_id, origin_node in origin_nodes.items():
         _assert_nodes_equal(origin_node, loaded_nodes[node_id])
@@ -147,7 +147,7 @@ def test_skip_embeddings_loads_without_vectors(populated, target_store, tmp_path
     assert load_report.skipped_embeddings is True
     assert load_report.embeddings_applied == 0
 
-    loaded_nodes = list(target_store.list_nodes())
+    loaded_nodes = list(target_store.list_nodes(include_embedding=True))
     assert loaded_nodes, "expected the corpus nodes to be loaded"
     assert all(node.embedding is None for node in loaded_nodes)
 
@@ -167,11 +167,11 @@ def test_load_twice_is_idempotent(populated, target_store, corpus_rows, tmp_path
     dump(store, dest, **_dump_kwargs(store))
 
     load(target_store, dest)
-    first_nodes = {node.id: node for node in target_store.list_nodes()}
+    first_nodes = {node.id: node for node in target_store.list_nodes(include_embedding=True)}
     first_edges = {edge.id: edge for edge in target_store.list_edges()}
 
     load(target_store, dest)
-    second_nodes = {node.id: node for node in target_store.list_nodes()}
+    second_nodes = {node.id: node for node in target_store.list_nodes(include_embedding=True)}
     second_edges = {edge.id: edge for edge in target_store.list_edges()}
 
     assert set(first_nodes) == set(second_nodes)
@@ -196,9 +196,9 @@ def test_load_raises_on_dangling_edge_and_leaves_partial_graph(populated, target
     to exercise that defensive path.
     """
     store = populated
-    ids = sorted(node.id for node in store.list_nodes() if node.embedding is None)
+    ids = sorted(node.id for node in store.list_nodes(include_embedding=True) if node.embedding is None)
     missing_id = ids[0]
-    survivors = [node.id for node in store.list_nodes() if node.id != missing_id]
+    survivors = [node.id for node in store.list_nodes(include_embedding=True) if node.id != missing_id]
     good_src, good_dst = survivors[0], survivors[1]
 
     # Ascending ids so edges.jsonl (spec: "ascending id") keeps the good edge

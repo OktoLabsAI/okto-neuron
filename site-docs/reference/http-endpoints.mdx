@@ -147,9 +147,11 @@ This table records which UI service module calls which route. It is not a contra
 | `/api/v1/vaults/reembed` | POST | `services/vault-api.ts:46` |
 | `/api/v1/vaults/reembed/status` | GET | `services/vault-api.ts:55` |
 | `/api/v1/detect-drift` | POST | `services/curation-api.ts:189` |
-| `/api/v1/review-queue` | GET | `services/curation-api.ts:222` |
-| `/api/v1/review-queue/batch` | POST | `services/curation-api.ts:242` |
-| `/api/v1/resolve-review` | POST | `services/curation-api.ts:227` |
+| `/api/v1/review-queue` | GET | `services/curation-api.ts:230` |
+| `/api/v1/review-queue/batch` | POST | `services/curation-api.ts:277` |
+| `/api/v1/resolve-review` | POST | `services/curation-api.ts:243` |
+| `/api/v1/review-actions` | GET | `services/curation-api.ts:261` |
+| `/api/v1/review-actions/{action_id}/cancel` | POST | `services/curation-api.ts:269` |
 
 Four `/config/defaults/...` rows share a caller with their vault-scoped twin. `llm-test-api.ts:23` and `embedding-api.ts:31` pick between the two paths on a `scope` argument: `application` sends the `/config/defaults/...` form, anything else sends the vault-scoped one. The same branch appears at `llm-test-api.ts:45` and `embedding-api.ts:52`, and at `config-api.ts:15` and `:26` for `/api/v1/config/defaults` against `/api/v1/config`.
 
@@ -195,7 +197,40 @@ Nothing in the server marks any route deprecated. There is no `Deprecation` or `
 
 Route order is load-bearing. The versioned routes are registered first, then the bare routes, then the single-page-app `StaticFiles` mount at `/` is appended last, because a catch-all at `/` would otherwise shadow everything above it. When no frontend build exists the mount is omitted entirely and the server runs API-only.
 
+## Review actions on a busy vault
+
+`POST /api/v1/resolve-review` and `POST /api/v1/review-queue/batch` do not fail when the vault is busy. When the writer lock or the semantic writer lease is not free within 5 s (an ingest item or an MCP `remember` holds both for the whole extraction), the action is stored in the vault's review queue database and the route answers `202`:
+
+```json
+{
+  "status": "queued",
+  "detail": "vault is busy; the action is queued and is applied in arrival order once the vault is free (held by mcp-remember - for 12 s; retry in about 15 s)",
+  "holder": {"kind": "mcp-remember", "id": "-", "since": 1790990000.0, "held_for_s": 12.4},
+  "retry_after_s": 15,
+  "actions_url": "/api/v1/review-actions",
+  "action": {"id": "ra_3f2a...", "candidate_id": "...", "action": "commit", "status": "queued",
+             "reason": null, "applying": false, "created_at": "...", "finished_at": null,
+             "batch_id": null, "outcome": null},
+  "queued_ahead": 0
+}
+```
+
+The batch route answers the same way with `resolved`, `skipped` and `errors` for what it already did, a `batch_id`, and `actions` (one row per queued id). An id that is not in the review queue is not queued: the single route answers `404 review_item_not_found`, the batch counts it as `skipped`. While earlier actions of the vault are queued, new ones queue behind them, so actions apply in arrival order.
+
+One applier per vault applies the queued actions oldest first under the same locks the direct path takes. It runs as soon as the locks are free, and again after a daemon restart. Each action ends in one of:
+
+- `applied`: the action ran; `outcome` is the companion outcome the direct route returns.
+- `superseded`: the candidate left the review queue (another action or a job resolved it) or was parked again with different content after the action was queued. `reason` says which. Nothing is changed.
+- `failed`: the action raised; `reason` holds the error.
+- `cancelled`: cancelled before it ran.
+
+`GET /api/v1/review-actions` lists the vault's actions, newest first, as `{items, queued}`. It takes `status` (comma-separated, among `queued`, `applied`, `superseded`, `failed`, `cancelled`) and `limit` (default 50, at most 500). `applying: true` marks the queued action the applier is working on.
+
+`POST /api/v1/review-actions/{action_id}/cancel` (loopback only, JSON content type, empty body `{}`) cancels a queued action that is not being applied and returns `{status: "ok", action}`. It answers `409 not_cancellable` with the current `action` for any other state and `404 review_action_not_found` for an unknown id.
+
 ## Loopback restriction is per handler
+
+`GET /api/v1/review-queue` (and `/review-queue`) takes an optional `limit` and `cursor`. Without `limit` it returns the whole queue and sends a `Deprecation: true` header. `limit=0` returns no items and just the `total`. A `limit` from 1 to 1000 returns that many items plus an opaque `next_cursor` (null on the last page); the body is `{status, items, next_cursor, total}`. A vault whose review queue has not been migrated yet is refused on its own: its routes answer 409 `review_queue_migration_required`, and `/api/v1/status` shows the vault under `vaults[].review_queue` with the `okto-neuron kg review-queue migrate --vault <name>` remedy, while the daemon keeps serving its other vaults.
 
 The loopback restriction is not a property of a block. It is a check inside individual handlers, so a bare route and a versioned route can both be restricted. `POST /add` refuses non-loopback callers with 403 because it materializes content into the vault. `/review-queue` refuses them with 403 through either of its two paths.
 
@@ -252,6 +287,20 @@ Three further asymmetries are worth knowing before you read a response:
 - The `types` query parameter is validated against the closed schema. The `relations` parameter is not: edge types are an open, pack-defined vocabulary and are filtered as given.
 - `degree` means different things on the two graph endpoints. On `/api/v1/graph` it is computed over the full filtered subgraph before the cap. On `/neighbors` it is computed only within the returned set.
 - On `/api/v1/graph/stats`, `total_nodes` counts visible nodes only, while `total_edges` counts every edge with no filtering. They do not describe one population.
+
+## Maintained projection reads
+
+`GET /api/v1/graph/stats` and `GET /api/v1/upkeep/predicates` never scan the graph themselves. They read one projection per vault that the daemon rebuilds in the background after writes, so they answer at once even on a large vault.
+
+| Situation | Response |
+| --- | --- |
+| No projection yet (first read after start, no usable sidecar) | `202` with `{"status": "building"}`; the first rebuild starts. Poll again. |
+| Projection current | `200` with the existing body plus `"stale": false, "rebuilding": false` (graph stats also carry `projection_age_s`). |
+| A write happened since it was built | `200` with the last projection and `"stale": true, "rebuilding": true` until the rebuild finishes. |
+
+Counts can therefore lag a write by one rebuild (at least `[server] projection_min_interval_s`, default 5 s, after the previous rebuild ended). A projection older than `[server] projection_max_age_s` (default 600 s) is stale even without a local write, which covers writes from another process.
+
+`POST /api/v1/upkeep/rebuild-stats` forces a rebuild now and answers `202` with `{"status": "rebuilding", "started": true|false}` (`false`: one was already running and will rescan once more). `okto-neuron upkeep rebuild-stats` calls it. The route is restricted to loopback callers like the other upkeep routes.
 
 ## Response bodies
 

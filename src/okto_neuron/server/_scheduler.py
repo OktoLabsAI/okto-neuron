@@ -35,6 +35,8 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from okto_neuron.server._store_io import store_io
+
 if TYPE_CHECKING:
     from okto_neuron.config import CurationSchedulerConfig
     from okto_neuron.server.state import ServerState
@@ -377,7 +379,9 @@ async def run_scheduler(state: "ServerState") -> None:
         while True:
             if not state.draining:
                 try:
-                    _tick(state, time.time())
+                    # A tick lists the vault registry and reads every vault's
+                    # config: store executor, never the event loop (issue #13).
+                    await store_io(_tick, state, time.time())
                 except Exception:  # noqa: BLE001 — a tick failure must not kill the loop
                     _LOG.exception("continuous curation tick failed")
             await asyncio.sleep(SCHED_TICK_S)

@@ -30,12 +30,12 @@ class _GraphStoreMissingAddEdge:
     included, D-49 — otherwise this would fail on "is_closed" too and no
     longer isolate the one member this fixture means to omit)."""
 
-    def add_node(self, node): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def add_node(self, node, clear_embedding=False): ...
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):
@@ -60,13 +60,13 @@ class _GraphStoreMissingAddEdge:
 class _GraphStoreIncompatibleAddEdge:
     """Has every GraphStore member, but add_edge takes an extra required arg."""
 
-    def add_node(self, node): ...
+    def add_node(self, node, clear_embedding=False): ...
     def add_edge(self, edge, extra_required_arg): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):
@@ -93,13 +93,13 @@ class _GraphStoreMissingIsClosed:
     (D-49) -- the fixture that pins the new member is actually enforced,
     not silently exempted from registration."""
 
-    def add_node(self, node): ...
+    def add_node(self, node, clear_embedding=False): ...
     def add_edge(self, edge): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):
@@ -124,13 +124,13 @@ class _GraphStoreIsClosedAsMethod:
     and a bound method is always truthy, so this must fail at registration
     rather than silently defeating that check at runtime."""
 
-    def add_node(self, node): ...
+    def add_node(self, node, clear_embedding=False): ...
     def add_edge(self, edge): ...
-    def get_node(self, node_id): ...
-    def get_nodes(self, node_ids):
+    def get_node(self, node_id, include_embedding=True): ...
+    def get_nodes(self, node_ids, include_embedding=False):
         return []
 
-    def list_nodes(self, type=None):
+    def list_nodes(self, type=None, include_embedding=False):
         return []
 
     def list_edges(self, src=None, dst=None, type=None):

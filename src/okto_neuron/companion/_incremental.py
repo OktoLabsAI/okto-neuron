@@ -50,7 +50,26 @@ from okto_neuron.semantic_surface import discovery_surface_key
 _LOG = logging.getLogger("okto_neuron.companion")
 
 if TYPE_CHECKING:
+    from okto_neuron.core.schema import Node
     from okto_neuron.store.protocol import GraphStore
+
+
+def _nodes_by_id(store: "GraphStore", node_ids) -> "dict[str, Node]":
+    """One batched ``get_nodes`` read keyed by id; a missing id is simply absent,
+    so ``.get(id)`` reproduces ``store.get_node(id)``'s ``None``."""
+    ids = [node_id for node_id in node_ids if node_id]
+    # include_embedding: the claims read here are written back (supersede/detach/revert);
+    # a vector-less read followed by add_node would erase the stored embedding.
+    return {node.id: node for node in store.get_nodes(ids, include_embedding=True)} if ids else {}
+
+
+def _claim_object_ids(claims) -> list[str]:
+    """``O_id`` of every fetched Claim, for one batched object-title read."""
+    return [
+        str((claim.facets or {}).get("O_id"))
+        for claim in claims
+        if claim.type == "Claim" and (claim.facets or {}).get("O_id")
+    ]
 
 
 _INCREMENTAL_ENV = "OKTO_NEURON_INCREMENTAL_INGEST"
@@ -130,8 +149,10 @@ def _llm_claims_for_block(store: "GraphStore", block_id: str) -> list[str]:
     no ``model_id``) are excluded — they are re-minted for free by ``vault.add``
     and must not, on their own, suppress LLM extraction of a Block."""
     out: list[str] = []
-    for edge in store.list_edges(dst=block_id, type="prov:wasDerivedFrom"):
-        claim = store.get_node(edge.src)
+    edges = list(store.list_edges(dst=block_id, type="prov:wasDerivedFrom"))
+    claims = _nodes_by_id(store, [edge.src for edge in edges])
+    for edge in edges:
+        claim = claims.get(edge.src)
         if claim is None or claim.type != "Claim":
             continue
         if is_infra(claim):
@@ -920,8 +941,9 @@ def build_orphan_diffs(
     daemon path (observed live: empty current content ⇒ survived=∅ ⇒ every
     sibling claim mass-detached and reverts never resurrected)."""
     diffs: dict[str, OrphanDiff] = {}
+    blocks = _nodes_by_id(store, orphan_block_ids)
     for bid in orphan_block_ids:
-        node = store.get_node(bid)
+        node = blocks.get(bid)
         lines = _normalized_lines(str(node.content or "")) if node is not None else frozenset()
         diffs[bid] = OrphanDiff(
             block_id=bid,
@@ -1029,19 +1051,28 @@ def detach_orphan_removals(
     if current_lines is None:
         # Fallback for direct callers: derive from current block nodes.
         acc: set[str] = set()
+        current_blocks = _nodes_by_id(store, current_block_ids)
         for bid in current_block_ids:
-            node = store.get_node(bid)
+            node = current_blocks.get(bid)
             if node is not None:
                 acc |= _normalized_lines(str(node.content or ""))
         current_lines = frozenset(acc)
     diffs = build_orphan_diffs(store, orphan_block_ids, current_lines)
     detached: list[str] = []
     seen: set[str] = set()
+    orphan_blocks = _nodes_by_id(store, orphan_block_ids)
     for block_id in orphan_block_ids:
-        block_node = store.get_node(block_id)
+        block_node = orphan_blocks.get(block_id)
         diff = diffs.get(block_id)
-        for edge in store.list_edges(dst=block_id, type="prov:wasDerivedFrom"):
-            claim = store.get_node(edge.src)
+        # One claim read and one object read per block (was one get_node per
+        # edge plus one per object). Claims written by ``_apply_detach`` in an
+        # earlier block are never re-judged (``seen``), and object nodes are only
+        # read for their title, which a detach stamp never changes.
+        edges = list(store.list_edges(dst=block_id, type="prov:wasDerivedFrom"))
+        claims = _nodes_by_id(store, [edge.src for edge in edges])
+        objects = _nodes_by_id(store, _claim_object_ids(claims.values()))
+        for edge in edges:
+            claim = claims.get(edge.src)
             if claim is None or claim.type != "Claim" or claim.id in seen:
                 continue
             seen.add(claim.id)
@@ -1068,7 +1099,7 @@ def detach_orphan_removals(
             anchored = _claim_anchored_lines(facets, block_node)
             if diff is None or not anchored:
                 continue  # nothing to judge against — keep (under-detach)
-            obj_node = store.get_node(str(facets.get("O_id") or "")) if facets.get("O_id") else None
+            obj_node = objects.get(str(facets.get("O_id") or "")) if facets.get("O_id") else None
             object_title = (obj_node.title or None) if obj_node is not None else None
             # Claim spans anchor at extraction-unit granularity (often the
             # WHOLE block), so a naive "any anchored line removed" rule nukes
@@ -1139,8 +1170,9 @@ def resurrect_reverted_claims(
     detach pass runs FIRST in ``_reconcile_removals``)."""
     out: list[dict] = []
     seen: set[str] = set()
+    current_blocks = _nodes_by_id(store, current_block_ids)
     for block_id in current_block_ids:
-        block_node = store.get_node(block_id)
+        block_node = current_blocks.get(block_id)
         # Presence is judged against the SOURCE FILE units (trust root) when
         # supplied — a freshly-upserted Block's content read mid-remember()
         # proved unreliable on the daemon path. NOTE: ``current_block_ids``
@@ -1155,8 +1187,13 @@ def resurrect_reverted_claims(
                 if block_node is not None
                 else frozenset()
             )
-        for edge in store.list_edges(dst=block_id, type="prov:wasDerivedFrom"):
-            claim = store.get_node(edge.src)
+        # Batched per block, as in ``detach_orphan_removals``: a claim resurrected
+        # (rewritten) in an earlier block is ``seen`` and never re-read here.
+        edges = list(store.list_edges(dst=block_id, type="prov:wasDerivedFrom"))
+        claims = _nodes_by_id(store, [edge.src for edge in edges])
+        objects = _nodes_by_id(store, _claim_object_ids(claims.values()))
+        for edge in edges:
+            claim = claims.get(edge.src)
             if claim is None or claim.type != "Claim" or claim.id in seen:
                 continue
             seen.add(claim.id)
@@ -1171,7 +1208,7 @@ def resurrect_reverted_claims(
             if stamp and asserted_at and asserted_at < stamp:
                 continue  # stale source — keep the correction in force
             anchored = _claim_anchored_lines(facets, block_node)
-            obj_node = store.get_node(str(facets.get("O_id") or "")) if facets.get("O_id") else None
+            obj_node = objects.get(str(facets.get("O_id") or "")) if facets.get("O_id") else None
             object_title = (obj_node.title or None) if obj_node is not None else None
             attributed = _attribute_claim_lines(facets, anchored, object_title=object_title)
             if not attributed or not (attributed <= block_lines):

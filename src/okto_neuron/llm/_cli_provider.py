@@ -159,6 +159,11 @@ def kill_active_cli_processes() -> int:
     return len(active)
 
 
+def _reset_for_tests() -> None:
+    """Test-only: clear the shutdown force-cancel flag. Never called in production."""
+    _FORCE_CANCEL_ALL.clear()
+
+
 class CliShellProvider(ABC):
     """Abstract base for LLM providers that shell out to a local CLI binary.
 

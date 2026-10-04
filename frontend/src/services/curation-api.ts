@@ -4,6 +4,9 @@
 // wheel and Vite's documented /api proxy behave identically. Bare server routes
 // remain only for CLI/backward compatibility.
 import { apiFetch, qs } from './http'
+import { fetchGraphStats } from './graph-stats'
+import { reviewQueueQuery } from '@/lib/review-queue'
+import type { QueuedReviewAction, ReviewActionStatus } from '@/lib/review-actions'
 
 // ── P1: health + dashboard ──────────────────────────────────────────────────--
 export interface HealthResponse {
@@ -25,7 +28,7 @@ export interface GraphStatsLite {
   total_edges: number
 }
 export function getGraphStats(): Promise<GraphStatsLite> {
-  return apiFetch<GraphStatsLite>('/graph/stats')
+  return fetchGraphStats()
 }
 
 // ── ADR 0040: explicit semantic-quality audit ───────────────────────────────
@@ -217,12 +220,26 @@ export interface CompanionReviewItem {
 export interface ReviewQueueResponse {
   status: string
   items: CompanionReviewItem[]
+  /** Opaque cursor for the next page; null on the last page. */
+  next_cursor: string | null
+  /** Size of the whole queue, independent of the page. */
+  total: number
 }
-export function getReviewQueue(): Promise<ReviewQueueResponse> {
-  return apiFetch<ReviewQueueResponse>('/review-queue')
+// Always paginated: a call without `limit` would make the server return the full list (deprecated).
+// Errors: 400 bad limit/cursor, 409 review_queue_migration_required (message carries the remedy).
+export function getReviewQueue(opts: {
+  limit: number
+  cursor?: string | null
+}): Promise<ReviewQueueResponse> {
+  return apiFetch<ReviewQueueResponse>(`/review-queue${reviewQueueQuery(opts)}`)
+}
+/** Queue size only (limit=0): what the attention badge uses. */
+export async function getReviewQueueTotal(): Promise<number> {
+  return (await getReviewQueue({ limit: 0 })).total
 }
 export type ReviewAction = 'commit' | 'discard' | 'merge'
 export type ReviewBatchAction = 'commit' | 'discard'
+// A busy vault answers 202 with status "queued" (see lib/review-actions.ts) instead of applying.
 export function resolveReview(candidateId: string, action: ReviewAction): Promise<unknown> {
   return apiFetch('/resolve-review', {
     method: 'POST',
@@ -230,10 +247,32 @@ export function resolveReview(candidateId: string, action: ReviewAction): Promis
   })
 }
 export interface ReviewBatchResponse {
+  /** "ok" when applied, "queued" when the vault was busy and `actions` were queued. */
   status: string
   resolved: number
   skipped: number
   errors: { id: string; error: string }[]
+  actions?: QueuedReviewAction[]
+}
+export interface ReviewActionsResponse {
+  items: QueuedReviewAction[]
+  queued: number
+}
+export function getReviewActions(
+  opts: { status?: ReviewActionStatus[]; limit?: number } = {},
+): Promise<ReviewActionsResponse> {
+  return apiFetch<ReviewActionsResponse>(
+    `/review-actions${qs({ status: opts.status?.join(','), limit: opts.limit })}`,
+    { timeoutMs: 15_000 },
+  )
+}
+export function cancelReviewAction(
+  actionId: string,
+): Promise<{ status: string; action: QueuedReviewAction }> {
+  return apiFetch(`/review-actions/${encodeURIComponent(actionId)}/cancel`, {
+    method: 'POST',
+    body: '{}',
+  })
 }
 export function resolveReviewBatch(
   candidateIds: string[],
@@ -347,6 +386,9 @@ export interface PredicateUpkeepSnapshot {
   last_propose: CurationJob | null
   last_apply: CurationJob | null
   worker_active: boolean
+  // Served from the daemon's maintained projection: the vocabulary size may lag a write.
+  stale?: boolean
+  rebuilding?: boolean
 }
 
 export function getPredicateUpkeep(): Promise<PredicateUpkeepSnapshot> {

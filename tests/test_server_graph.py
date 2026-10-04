@@ -19,6 +19,7 @@ from okto_neuron import Vault
 from okto_neuron.core.schema import Edge, Node
 from okto_neuron.server.http import build_rest_app
 from okto_neuron.server.state import init_state, reset_state_for_tests
+from tests._settled import get_settled
 from okto_neuron.store import vault as vault_module
 from okto_neuron.store.ladybug import VaultConnection
 
@@ -273,7 +274,7 @@ def test_neighbors_bad_hops_400(client: TestClient) -> None:
 
 
 def test_graph_stats_counts(client: TestClient) -> None:
-    r = client.get("/api/v1/graph/stats")
+    r = get_settled(client, "/api/v1/graph/stats")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "ok"

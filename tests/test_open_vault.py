@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from okto_neuron.config._vault import VaultConfig
+from okto_neuron.config._vault import CURRENT_YAML_VERSION, VaultConfig
 from okto_neuron.core.schema import Node
 from okto_neuron.errors import VaultPathNotADirectory
 from okto_neuron.store import vault as vault_module
@@ -45,8 +45,11 @@ def test_open_vault_writes_default_marginalia_yaml(tmp_path: Path) -> None:
     assert config_path.is_file()
     assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == (
         VaultConfig.default().model_dump(mode="json", exclude_none=True)
+        | {"marginalia_yaml_version": CURRENT_YAML_VERSION}
     )
-    assert VaultConfig.load(vault_path) == VaultConfig.default()
+    assert VaultConfig.load(vault_path) == VaultConfig.default().model_copy(
+        update={"marginalia_yaml_version": CURRENT_YAML_VERSION}
+    )
 
 
 def test_open_vault_is_idempotent_and_returns_live_handle(tmp_path: Path) -> None:

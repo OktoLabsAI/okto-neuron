@@ -14,22 +14,20 @@ lives here today.
 
 Deliberately does not import ``okto_neuron.cli.kg`` — ``store/`` is a lower
 layer than ``cli/``, and importing up out of it risks a circular import. This
-module instead reimplements ``cli.kg._require_offline_graph_swap``'s two
-checks (refuse while a server owns the vault, else acquire the cross-process
-handle lease) by importing the exact same primitives that function uses:
-``okto_neuron.server.lifecycle.active_server_pid`` and
-``okto_neuron.store.handle_lease.acquire_vault_handle_lease``. Behavior,
-ordering, and the raised ``VaultLockHeld`` (including its message text) are
-unchanged from today's CLI path.
+module is what ``cli.kg._require_offline_graph_swap`` delegates to: take the
+vault's writer lease first (refusing with exit code 5 while the daemon or another
+command holds it; see ``store/vault_writer.py``), then the cross-process handle
+lease. Lock order: writer lease, then handle lease.
 """
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import Protocol
 
-from okto_neuron.errors import VaultLockHeld
 from okto_neuron.store.handle_lease import VaultHandleLease, acquire_vault_handle_lease
+from okto_neuron.store.vault_writer import vault_writer
 
 
 class RebuildLockHandle(Protocol):
@@ -56,40 +54,39 @@ class _LadybugRebuildLockHandle:
 class _LadybugRebuildLock:
     """``RebuildLock`` around one ``VaultHandleLease`` acquired for a vault."""
 
-    def __init__(self, lease: VaultHandleLease) -> None:
+    def __init__(self, lease: VaultHandleLease, stack: contextlib.ExitStack) -> None:
         self._lease = lease
+        self._stack = stack
 
     def __enter__(self) -> RebuildLockHandle:
         return _LadybugRebuildLockHandle(self._lease)
 
     def __exit__(self, *exc: object) -> None:
-        self._lease.release()
+        try:
+            self._lease.release()
+        finally:
+            self._stack.close()
 
 
 def acquire_rebuild_lock(vault_path: Path, *, operation: str) -> RebuildLock:
     """Acquire exclusive cross-process ownership of one vault's graph swap.
 
-    Mirrors ``cli.kg._require_offline_graph_swap`` exactly: refuse with
-    ``VaultLockHeld`` naming the owning pid while a server owns this vault,
-    else take the non-blocking cross-process handle lease (whose own
-    ``VaultLockHeld`` propagates unchanged on contention). ``operation`` is
-    diagnostic text folded into both messages, same as today.
+    Takes the vault's writer lease (``WriterLeaseHeld``, exit code 5, naming the
+    holder pid and the remedy, while the daemon or another command holds it),
+    then the non-blocking cross-process handle lease (whose own ``VaultLockHeld``
+    propagates unchanged on contention). ``operation`` is diagnostic text folded
+    into both messages. Inside the daemon process the writer lease is already
+    held, so the in-process ``kg_reembed`` passes straight through.
     """
 
-    from okto_neuron.server.lifecycle import active_server_pid
-
-    owner_pid = active_server_pid(vault_path)
-    if owner_pid is not None:
-        raise VaultLockHeld(
-            vault_path,
-            holding_pid=owner_pid,
-            message=(
-                f"cannot {operation} while the Okto Neuron server is running for this vault "
-                f"(pid {owner_pid}); stop the server first"
-            ),
-        )
-    lease = acquire_vault_handle_lease(vault_path, operation=operation)
-    return _LadybugRebuildLock(lease)
+    stack = contextlib.ExitStack()
+    try:
+        stack.enter_context(vault_writer(vault_path, operation))
+        lease = acquire_vault_handle_lease(vault_path, operation=operation)
+    except BaseException:
+        stack.close()
+        raise
+    return _LadybugRebuildLock(lease, stack)
 
 
 __all__ = [

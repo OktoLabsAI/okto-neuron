@@ -143,7 +143,7 @@ okto-neuron kg reembed [VAULT]
 
 `VAULT` is optional and there are no flags. Reembed is vectors only. It replays the existing graph's stored text through the configured embedder and rebuilds the graph at the configured width. It performs no LLM re-extraction.
 
-The `embedding` block reembed reads is documented at [/config/embedding-model](/config/embedding-model). For when each lifecycle command applies, see [/vault/rebuilding](/vault/rebuilding).
+While a daemon holds the vault the command is refused and prints the route to use instead: `POST /api/v1/vaults/reembed` with `{"vault": "<vault name>"}` (loopback only), which also works when the vault cannot be opened because its stored width differs from the configured one. The `embedding` block reembed reads is documented at [/config/embedding-model](/config/embedding-model). For when each lifecycle command applies, see [/vault/rebuilding](/vault/rebuilding).
 
 ### Sequence
 
@@ -233,6 +233,24 @@ Once the store is open, any exception raised while comparing generations or rein
 | Index or store exception raised after the store is open | 1 |
 
 A failure before the store opens (closing live handles, reading the pinned backend, opening the backend) is not caught here and exits with that error's own code.
+
+## kg review-queue migrate
+
+```bash
+okto-neuron kg review-queue migrate --vault NAME [--dry-run | --rollback | --restore-backup] [--json]
+```
+
+A vault at `marginalia_yaml_version: 1` keeps its review queue in `.marginalia/review_queue.json` and is not served by the daemon until it is migrated to `.marginalia/review_queue.sqlite`. Run this command with the daemon stopped.
+
+| Flag | Effect |
+| --- | --- |
+| none | Migrate: verified backup `review_queue.json.bak-v1`, yaml set to 2, SQLite built and checked row by row, then the JSON is renamed to `review_queue.json.migrated`. Idempotent and resumable after a crash. |
+| `--dry-run` | Load and verify in a scratch directory. Writes nothing in the vault and takes no lease. |
+| `--rollback` | Regenerate `review_queue.json` from SQLite (every digest verified), move the SQLite file aside as `review_queue.sqlite.rolled-back-<timestamp>` (never deleted), then set the yaml back to 1. |
+| `--restore-backup` | Roll back by restoring the literal `.bak-v1` file. Changes made to the queue after the migration are lost. |
+| `--json` | Print the report as JSON on stdout. |
+
+The flags are mutually exclusive. Migrate and both rollbacks take the writer lease and exit 5 while a daemon or another command holds the vault. Any refusal (a malformed entry, a mismatched digest) exits non-zero and leaves the source file untouched.
 
 ## Related
 

@@ -20,6 +20,7 @@ from urllib.request import url2pathname
 
 import yaml
 
+from okto_neuron.config._vault import invalidate_config_cache
 from okto_neuron._compat import getenv as _compat_getenv
 from okto_neuron._compat import (
     JSONLD_VOCABULARY_IRI,
@@ -721,8 +722,10 @@ class Vault:
             import uuid
 
             storage["vault_id"] = uuid.uuid4().hex
+        from okto_neuron.config._vault import CURRENT_YAML_VERSION
+
         config = {
-            "marginalia_yaml_version": 1,
+            "marginalia_yaml_version": CURRENT_YAML_VERSION,
             "vault_id": root.name,
             "federation_opt_in": False,
             "packs": list(packs),
@@ -736,6 +739,7 @@ class Vault:
             config["compat_allow_external_sources"] = True
         config_path = vault_config_path(root)
         config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        invalidate_config_cache(config_path)
         os.chmod(config_path, 0o644)
 
     def _validate_source(self, source: str | PathLike[str]) -> tuple[Path | None, str | Path]:
@@ -1043,7 +1047,11 @@ class Vault:
         return hits
 
     def _scoped_nodes(self, scope: ExportScope) -> list[object]:
-        nodes = list(self.store.list_nodes())
+        nodes = list(
+            self.store.list_nodes(include_embedding=True)
+            if scope.include_embeddings
+            else self.store.list_nodes()
+        )
         if scope.node_types is not None:
             allowed_types = set(scope.node_types)
             nodes = [node for node in nodes if getattr(node, "type", None) in allowed_types]

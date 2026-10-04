@@ -14,11 +14,12 @@ Grafx is no longer gated behind `--accept-experimental` on any surface. Two
 disclosures still apply and are worth knowing even though they are no
 longer consent-gated:
 
-- **Pre-alpha on-disk format.** `okto-grafx` is pinned `>=0.0.4,<0.1`. The
+- **Pre-alpha on-disk format.** `okto-grafx` is pinned `>=0.0.7,<0.1`. The
   directory format (`graph.grafx/`) can change between patch releases inside
   that range. Do not treat a Grafx vault as a long-term archival format yet.
   (0.0.4 verified identical behavior to 0.0.3 on the contract suite and full
-  acceptance run — D-91.)
+  acceptance run — D-91. The floor is 0.0.7, the release the verification
+  and production daemon now run.)
 - **License.** Okto Grafx ships under the Elastic License 2.0 plus an Okto
   Labs Addendum. It is not OSI-approved. Okto Neuron itself remains under its
   own license; using Grafx as a storage backend is the permitted "application
@@ -113,6 +114,18 @@ other creation surface pins `grafx` explicitly.
   `backoff_cap_ms` (default 2000ms), bounded by `max_attempts` (default 8)
   and a wall-clock `total_cap_s` ceiling (default 30s), whichever is hit
   first. A losing writer re-reads the winning row rather than overwriting it.
+- **Buffer pool budget.** Grafx's own pool defaults to 64 MiB, which thrashes
+  on a graph near 180 MB. Okto Neuron passes `buffer_budget_bytes` to
+  `okto_grafx.connect` from `storage.buffer_budget` in the vault yaml (an
+  integer byte count or a string such as `256MiB`; accepted range 16 MiB to
+  8 GiB). A vault with `inherits_application_defaults: true` picks it up from
+  `defaults.yaml` (`storage: {backend: grafx, buffer_budget: 512MiB}`) when it
+  does not set its own. Unset, the budget is computed at open as
+  max(256 MiB, 1.5 x current graph size), capped at 1 GiB. The open logs the
+  vault name, graph size, chosen budget and its source (`default` or
+  `config`), and `GET /api/v1/status` reports `grafx_buffer_budget_bytes` in
+  each vault's block. Staged rebuild/heal/reembed copies read the same vault
+  yaml. Grafx stays in exclusive mode.
 - **Checkpoint.** `GrafxStore.checkpoint()` currently reports itself as a
   no-op in `BackendCapabilities` (`checkpoint_is_noop=True`). A direct probe
   against the underlying `okto_grafx.Database.checkpoint()` (bypassing that
@@ -121,6 +134,23 @@ other creation surface pins `grafx` explicitly.
   the M4 gate evidence (D-56) in the internal ADR 0041 plan for the full
   observation. Flipping the capability flag and wiring a real
   `checkpoint()` body is deliberately left for a later milestone.
+
+- **Integrity status and the write fence.** Only Ladybug enforces the
+  generation-scoped integrity fence on writes (`BackendCapabilities.write_fence`
+  is true for Ladybug only): its first write audits the graph generation and a
+  failed or incomplete audit blocks semantic writes. Grafx never audits or
+  blocks a write on its own, so a grafx vault that was never audited reports
+  `integrity.status: "unverified"` with `writer_fenced: false` and a reason
+  saying that no audit has run, that grafx does not fence writes and that an
+  audit is optional, instead of the Ladybug "integrity state is missing"
+  fence. The on-demand audit is real on grafx (`POST /api/v1/graph/integrity`,
+  `audit_supported` stays true) and records `verified` or a failure. A
+  recorded `failed` or `incomplete` audit keeps its `writer_fenced: true` and
+  its `integrity_fenced` degraded reason on grafx too, even though grafx does
+  not block writes on it. The `remember` outcome's `integrity` block says the
+  same thing in its own terms: status `not_applicable` (the write fence is not
+  enforced on this backend) with a `reason` that the backend does not fence
+  writes and that an audit is optional.
 
 ## Dialect gaps closed for Grafx
 

@@ -60,6 +60,40 @@ def _warn_missing_version_once(path: Path) -> None:
     )
 
 
+class ServerSettings(BaseModel):
+    """``[server]`` table: settings read once when ``okto-neuron serve`` starts."""
+
+    model_config = ConfigDict(extra="allow")
+
+    store_workers: int = Field(default=4, ge=1, le=64)
+    """Threads in the daemon's bounded store executor. Every graph read, vault
+    sidecar/JSON read and YAML load a request handler needs runs there instead
+    of on the event loop that also serves ``/health``, REST and MCP."""
+    job_workers: int = Field(default=2, ge=1, le=64)
+    """Threads in the daemon's bounded job executor: curation job runners,
+    ingest/remember extraction, answer synthesis and re-embed. Kept apart from
+    the store executor so long jobs never starve UI reads."""
+    projection_min_interval_s: float = Field(default=5.0, ge=0.0, le=3600.0)
+    """Minimum seconds between two rebuilds of a vault's maintained projection (predicate
+    stats + graph counts behind ``GET /api/v1/graph/stats`` and ``/api/v1/upkeep/predicates``),
+    measured from the end of the previous one. Writes inside the window collapse into one
+    follow-up rebuild."""
+    projection_max_age_s: float = Field(default=600.0, ge=1.0, le=86400.0)
+    """A projection older than this counts as stale even if no write went through this
+    process (covers writes from another process, which cannot move the in-process counter)."""
+    gc_tuning: object = True
+    """``false`` turns off the one-time ``gc.freeze()`` + threshold change at startup
+    (``OKTO_NEURON_GC_TUNING`` overrides). Untyped on purpose: an invalid value is
+    warned about and ignored by ``server._gc_tuning`` instead of failing the whole file."""
+    gc_thresholds: object = None
+    """Three positive integers ``[gen0, gen1, gen2]`` (default ``[50000, 20, 100]``;
+    ``OKTO_NEURON_GC_THRESHOLDS=a,b,c`` overrides). Validated like ``gc_tuning``."""
+    switch_interval: object = None
+    """GIL switch interval in seconds (default ``0.0002``, interpreter default is 0.005);
+    ``false``/``"off"`` leaves the interpreter default (``OKTO_NEURON_SWITCH_INTERVAL``
+    overrides). Validated like ``gc_tuning``: invalid or > 1.0 warns and uses the default."""
+
+
 class OktoNeuronConfig(BaseModel):
     """Typed global configuration loaded from okto-neuron.toml (or a pre-0.3.0 marginalia.toml)."""
 
@@ -70,6 +104,7 @@ class OktoNeuronConfig(BaseModel):
     default_vault: Path | None = None
     strict_acl: bool = False
     default_directory_mode: int = 0o755
+    server: ServerSettings = Field(default_factory=ServerSettings)
 
     @field_validator("vault_roots", mode="after")
     @classmethod
@@ -145,4 +180,4 @@ def _select_config_path(path: Path | str | None) -> Path | None:
     return None
 
 
-__all__ = ["OktoNeuronConfig", "default_app_home"]
+__all__ = ["OktoNeuronConfig", "ServerSettings", "default_app_home"]

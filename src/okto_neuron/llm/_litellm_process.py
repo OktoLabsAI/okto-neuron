@@ -84,6 +84,11 @@ def cancel_active_litellm_calls() -> int:
     return len(active)
 
 
+def _reset_force_cancel_for_tests() -> None:
+    """Test-only: clear the shutdown force-cancel flag. Never called in production."""
+    _FORCE_CANCEL.clear()
+
+
 def _response_from_payload(payload: dict) -> SimpleNamespace:
     """Rebuild the response shape ``LiteLLMProvider.complete`` reads.
 

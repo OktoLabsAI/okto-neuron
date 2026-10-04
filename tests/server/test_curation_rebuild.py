@@ -1337,13 +1337,14 @@ def test_run_reembed_grafx_recomputes_vectors(tmp_path: Path) -> None:
         state_mod._STATE = st
         try:
             _curation.register_runners()
-            # A placeholder (wrong-width) vector so the copy has something to
+            # A placeholder vector (right width, all zeros: grafx 0.0.7 rejects
+            # a wrong-width vector at write time) so the copy has something to
             # RECOMPUTE — ``copy_graph_reembedding`` copies an
             # ``embedding is None`` node verbatim (never fabricates a vector
             # for one that never had one), so an already-embedded node is
             # what actually exercises the recompute path.
-            st.vault.store.add_node(Node(id="n1", type="Concept", title="Alpha", embedding=[0.0] * 8))
-            st.vault.store.add_node(Node(id="n2", type="Concept", title="Beta", embedding=[0.0] * 8))
+            st.vault.store.add_node(Node(id="n1", type="Concept", title="Alpha", embedding=[0.0] * 384))
+            st.vault.store.add_node(Node(id="n2", type="Concept", title="Beta", embedding=[0.0] * 384))
 
             job = _jobs.submit(st, "reembed", label="reembed")
             await _await_job(job)
@@ -1355,9 +1356,10 @@ def test_run_reembed_grafx_recomputes_vectors(tmp_path: Path) -> None:
             assert not st.vault.store.is_closed
             ids = {n.id for n in st.vault.store.list_nodes()}
             assert {"n1", "n2"} <= ids
-            for node in st.vault.store.list_nodes():
+            for node in st.vault.store.list_nodes(include_embedding=True):
                 assert node.embedding is not None
                 assert len(node.embedding) == 384
+                assert any(node.embedding), "vector was not recomputed"
             assert (vault_path / "graph.grafx.bak").is_dir()
         finally:
             try:

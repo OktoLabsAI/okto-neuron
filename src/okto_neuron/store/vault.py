@@ -13,7 +13,12 @@ from pathlib import Path
 import yaml
 
 from okto_neuron._compat import vault_config_path
-from okto_neuron.config._vault import IndexConfig, VaultConfig
+from okto_neuron.config._vault import (
+    CURRENT_YAML_VERSION,
+    IndexConfig,
+    VaultConfig,
+    invalidate_config_cache,
+)
 from okto_neuron.errors import (
     OktoNeuronError,
     VaultNotFoundError,
@@ -25,6 +30,7 @@ from okto_neuron.store._bootstrap import (
     reset_bootstrap_cache_for_tests,
 )
 from okto_neuron.store.index import compute_graph_generation, reindex_all
+from okto_neuron.store.index.corpus import STAMP_PREFIX
 from okto_neuron.store.index.indexed import IndexedStore
 from okto_neuron.store.index.registry import resolve_index_backend
 from okto_neuron.store.ladybug import LadybugStore, VaultConnection
@@ -34,7 +40,19 @@ _LOG = logging.getLogger(__name__)
 
 _DIR_MODE = 0o755
 _STORE_CACHE: dict[Path, IndexedStore] = {}
-_CACHE_LOCK = threading.Lock()
+# One lock per vault path, held across the whole open, so opening vault B (a
+# full-graph digest can take many seconds) never delays opening or resetting
+# vault A. The guard only protects the two dicts and is never held across I/O.
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_CACHE_GUARD = threading.Lock()
+
+
+def _path_lock(vault_path: Path) -> threading.Lock:
+    with _CACHE_GUARD:
+        lock = _PATH_LOCKS.get(vault_path)
+        if lock is None:
+            lock = _PATH_LOCKS[vault_path] = threading.Lock()
+        return lock
 
 
 def _open_vault(path: Path | str) -> IndexedStore:
@@ -54,19 +72,21 @@ def _open_vault(path: Path | str) -> IndexedStore:
     if cached is not None and not cached.is_closed:
         return cached
 
-    with _CACHE_LOCK:
+    with _path_lock(vault_path):
         cached = _STORE_CACHE.get(vault_path)
         if cached is not None and not cached.is_closed:
             return cached
         if cached is not None:
-            _STORE_CACHE.pop(vault_path, None)
+            with _CACHE_GUARD:
+                _STORE_CACHE.pop(vault_path, None)
 
         _scaffold_vault(vault_path)
         _write_default_config_if_absent(vault_path)
         graph_backend, index_backend, storage_config = _read_pinned_backends(vault_path)
         store = _open_graph_store(vault_path, graph_backend, storage_config)
         indexed = IndexedStore(store, _open_index(vault_path, store, index_backend))
-        _STORE_CACHE[vault_path] = indexed
+        with _CACHE_GUARD:
+            _STORE_CACHE[vault_path] = indexed
         return indexed
 
 
@@ -108,7 +128,13 @@ def _open_index(vault_path: Path, store: object, backend_name: str) -> object:
     index_cls = resolve_index_backend(backend_name)
     index = _construct_backend(index_cls, vault_path, None)
     expected = compute_graph_generation(store)
-    if index.generation() != expected:
+    stored = index.generation()
+    if stored != expected:
+        if stored and not stored.startswith(STAMP_PREFIX):
+            _LOG.info(
+                "index stamp format upgraded, rebuilding %d docs",
+                sum(1 for _ in store.list_nodes()),
+            )
         started = time.perf_counter()
         reindex_all(store, index)
         _LOG.info(
@@ -184,7 +210,11 @@ def _write_default_config_if_absent(vault_path: Path) -> None:
     if config_path.exists():
         return
     config = VaultConfig.default().model_dump(mode="json", exclude_none=True)
+    # A new vault is born at the current layout (SQLite review queue): the v1
+    # baseline of ``default()`` would be refused by the daemon's own gate (#14).
+    config["marginalia_yaml_version"] = CURRENT_YAML_VERSION
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    invalidate_config_cache(config_path)
     os.chmod(config_path, 0o644)
 
 
@@ -225,8 +255,9 @@ def wipe_vault(vault_path: Path | str, *, keep_config: bool = True) -> None:
 
     # Release any live graph handles before deleting the on-disk files, so the
     # fresh open rebuilds from scratch. Mirrors the CLI's close sequence.
-    with _CACHE_LOCK:
-        cached = _STORE_CACHE.pop(resolved, None)
+    with _path_lock(resolved):
+        with _CACHE_GUARD:
+            cached = _STORE_CACHE.pop(resolved, None)
     if cached is not None:
         cached.close()
     VaultConnection.close_vault(resolved)

@@ -141,7 +141,7 @@ def test_gold_embeddings_non_null(embedded_store: InMemoryStore):
     """Guard: every embedding-dependent assertion is meaningless if fastembed
     silently fell back to a stub / empty vector. The real model must be live and
     every cosine-cell node must carry a full-width (384-dim) vector."""
-    nodes = list(embedded_store.list_nodes(type="Agent"))
+    nodes = list(embedded_store.list_nodes(type="Agent", include_embedding=True))
     assert len(nodes) == len(_GOLD_EMBEDDED)
     for n in nodes:
         assert n.embedding, f"{n.title!r} has no embedding — fastembed not live?"

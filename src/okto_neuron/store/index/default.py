@@ -6,6 +6,7 @@ external process; the corpus lives at ``<vault>/.marginalia/index/``.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -32,8 +33,11 @@ class DefaultIndexStore:
         self._corpus_store = JsonlCorpusStore(self.index_dir)
         self._records: dict[str, IndexRecord] = {}
         self._scorer: Optional[BM25Scorer] = None
+        self._corpus_store.discard_stale_tmp()
+        self._stamp: Optional[str] = None
         if self._corpus_store.exists():
-            self._records, _meta = self._corpus_store.load()
+            self._records, meta = self._corpus_store.load()
+            self._stamp = meta.get("graph_generation")
         self._dirty = not self._corpus_store.exists()
 
     def _invalidate(self) -> None:
@@ -46,7 +50,13 @@ class DefaultIndexStore:
         return self._scorer
 
     def upsert(self, node: Node) -> None:
-        self._records[node.id] = node_to_record(node)
+        record = node_to_record(node)
+        previous = self._records.get(node.id)
+        if record.embedding is None and previous is not None and previous.embedding is not None:
+            # Same contract as GraphStore.add_node: a node without a vector keeps the
+            # vector already indexed for that id (explicit clears delete first).
+            record = replace(record, embedding=previous.embedding)
+        self._records[node.id] = record
         self._invalidate()
         self._dirty = True
 
@@ -77,9 +87,20 @@ class DefaultIndexStore:
         """Unused in M1; see InMemoryIndexStore.invalidate_by_facet."""
         return sum(1 for record in self._records.values() if predicate({"P": record.facet_p}))
 
-    def generation(self) -> str:
+    def recompute_generation(self) -> str:
+        """Digest of the in-memory records: a full pass, kept off the open path."""
         ordered = sorted(self._records.values(), key=lambda record: record.id)
         return graph_generation(ordered)
+
+    def generation(self) -> str:
+        """The stamp stored with the corpus; recomputed only while unsaved changes exist.
+
+        Trusting the stored stamp is safe because ``JsonlCorpusStore.save`` writes
+        the records before the stamp. ``recompute_generation`` is the self-check.
+        """
+        if self._dirty or self._stamp is None:
+            return self.recompute_generation()
+        return self._stamp
 
     def stats(self) -> IndexStats:
         scorer = self._ensure_scorer()
@@ -97,8 +118,9 @@ class DefaultIndexStore:
         """Rewrite corpus.jsonl and meta.json in full."""
         if not self._dirty:
             return
-        stamp = self.generation()
+        stamp = self.recompute_generation()
         self._corpus_store.save(self._records, graph_generation_stamp=stamp)
+        self._stamp = stamp
         self._dirty = False
 
     def close(self) -> None:

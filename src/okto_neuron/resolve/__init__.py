@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, replace
-from typing import Callable, Protocol
+from typing import Callable, Protocol, Sequence
 
 from okto_neuron._internal.infra import is_infra
 from okto_neuron.companion import Correlation
@@ -153,7 +153,7 @@ def find_similar(
     embedder = embedder or get_provider()
     cand_vec = _candidate_vector(candidate, embedder)
     scored: list[tuple[float, Node]] = []
-    for node in store.list_nodes(type=candidate.type):
+    for node in store.list_nodes(type=candidate.type, include_embedding=True):
         if node.id == candidate.candidate_id or is_infra(node):
             continue
         score = _cosine(cand_vec, _node_vector(node, embedder))
@@ -174,9 +174,16 @@ def find_similar(
 def find_contradictions(
     candidate: NodeCandidate,
     store: GraphStore,
+    *,
+    claims: Sequence[Node] | None = None,
 ) -> tuple[Correlation, ...]:
     """Existing Claims that assert the same subject+predicate with a differing
-    object. Only meaningful for ``Claim`` candidates carrying S-P-O facets."""
+    object. Only meaningful for ``Claim`` candidates carrying S-P-O facets.
+
+    ``claims`` is an optional pre-read ``store.list_nodes(type="Claim")``
+    snapshot: a caller resolving a batch of candidates against an unchanging
+    store reads it once instead of once per candidate. ``None`` scans the store.
+    """
     if candidate.type != "Claim":
         return ()
     cand_spo = _claim_spo(candidate.facets)
@@ -184,7 +191,7 @@ def find_contradictions(
         return ()
     subject, predicate, obj = cand_spo
     out: list[Correlation] = []
-    for node in store.list_nodes(type="Claim"):
+    for node in store.list_nodes(type="Claim") if claims is None else claims:
         existing = _claim_spo(node.facets)
         if existing is None:
             continue
@@ -208,6 +215,7 @@ def resolve(
     *,
     embedder: EmbeddingProvider | None = None,
     similar_threshold: float = SIMILAR_THRESHOLD,
+    claims: Sequence[Node] | None = None,
 ) -> ResolveOutcome:
     """Assemble the full talk-back and derive a gate-ready confidence.
 
@@ -218,7 +226,7 @@ def resolve(
     """
     embedder = embedder or get_provider()
     similar = find_similar(candidate, store, embedder=embedder, threshold=similar_threshold)
-    contradictions = find_contradictions(candidate, store)
+    contradictions = find_contradictions(candidate, store, claims=claims)
     correlations = (*similar, *contradictions)
 
     confidence = _BASE_CONFIDENCE

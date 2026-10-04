@@ -39,13 +39,18 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from okto_neuron.server import _integrity as graph_integrity
+from okto_neuron.server._lock_holder import held_lock
+from okto_neuron.server._persist_coalesce import PersistCoalescer
+from okto_neuron.server._store_io import acquire_off_loop, call_soon_on_loop, job_io, store_io
 
 if TYPE_CHECKING:
     from okto_neuron.server.state import ServerState
@@ -86,6 +91,15 @@ _INTEGRITY_RECOVERY_KINDS = frozenset({"rebuild", "rollback"})
 # Retrying one implicitly after a process restart can repeat expensive model work
 # or operate on a retained partial generation. Recovery is therefore explicit.
 _NON_RESUMABLE_ON_RESTART_KINDS = frozenset({"rebuild", "rollback", "heal", "reembed"})
+# Scheduler sweeps (equal to ``_scheduler.SWEEP_KINDS``; defined here because the
+# scheduler imports this module lazily and a test pins the two sets together).
+# They are read-only and the scheduler regenerates them, so a persisted queued or
+# running one is not resumed at boot: resuming contends for the GIL with the
+# startup vault opens (measured 113 s opens vs 9-13 s without the resumed sweep).
+_SWEEP_KINDS_NOT_RESUMED = frozenset({"reconcile-propose", "predicate-propose", "detect-drift"})
+_SWEEP_NOT_RESUMED_REASON = (
+    "interrupted by process restart; not auto-resumed (scheduler regenerates sweeps)"
+)
 
 
 def register_runner(
@@ -135,6 +149,27 @@ class CurationJob:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    # Watchdog state (issue #24). ``last_progress_at`` is stamped at start and on
+    # every ``progress()`` call; ``stall_after_s`` is the no-progress limit in
+    # force when the job started (``None`` = watchdog off).
+    last_progress_at: float | None = None
+    stall_after_s: float | None = None
+
+    @property
+    def elapsed_s(self) -> float | None:
+        if self.started_at is None:
+            return None
+        return round((self.finished_at or time.time()) - self.started_at, 1)
+
+    def stalled_for_s(self, now: float | None = None) -> float | None:
+        """Seconds without progress for a running job past its limit, else ``None``."""
+        if self.status != "running" or self.stall_after_s is None:
+            return None
+        reference = self.last_progress_at or self.started_at
+        if reference is None:
+            return None
+        idle = (now if now is not None else time.time()) - reference
+        return idle if idle > self.stall_after_s else None
 
     def to_public(self) -> dict:
         """The poll shape the UI sees."""
@@ -150,6 +185,8 @@ class CurationJob:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "elapsed_s": self.elapsed_s,
+            "last_progress_at": self.last_progress_at,
         }
 
 
@@ -176,12 +213,55 @@ def _persist_payload(jobs: list[CurationJob]) -> dict:
     return {"version": JOBS_VERSION, "jobs": [asdict(j) for j in kept]}
 
 
+_PERSIST_LOCK = threading.Lock()
+
+
 def persist(state: "ServerState") -> None:
     """Atomically write the job list to the sidecar (temp + os.replace).
 
     Best-effort: a persistence failure never aborts an in-flight job (the queue
     stays correct in memory). Snapshots the list first because the worker runs in
-    a thread and may mutate concurrently."""
+    a thread and may mutate concurrently. Writers are serialized and each one
+    snapshots INSIDE the lock, so the last write to land always carries the
+    newest queue even when store-executor threads persist concurrently."""
+    _coalescer(state).flushed()  # this write covers everything marked dirty so far
+    with _PERSIST_LOCK:
+        _persist_locked(state)
+
+
+_COALESCER_LOCK = threading.Lock()
+
+
+def _coalescer(state: "ServerState") -> PersistCoalescer:
+    """The job list's coalescer (one per state/runtime), created on first use."""
+    coalescer = getattr(state, "_jobs_persist_coalescer", None)
+    if coalescer is None:
+        with _COALESCER_LOCK:
+            coalescer = getattr(state, "_jobs_persist_coalescer", None)
+            if coalescer is None:
+                coalescer = PersistCoalescer(lambda: persist(state), name="curation-jobs")
+                try:
+                    state._jobs_persist_coalescer = coalescer  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+    return coalescer
+
+
+def request_persist(state: "ServerState") -> None:
+    """Mark the job list dirty; ONE background flush writes it within a couple of seconds.
+
+    For runner progress ticks only. Submit, every worker status transition and the linked
+    terminal outcome still call :func:`persist` directly, so a crash loses at most the
+    flush interval of progress text, never a state transition."""
+    _coalescer(state).mark_dirty()
+
+
+def shutdown_flush(state: "ServerState") -> bool:
+    """Stop the background flush and write once more if anything is pending."""
+    return _coalescer(state).close()
+
+
+def _persist_locked(state: "ServerState") -> None:
     path = jobs_path(state)
     payload = _persist_payload(list(state.curation_jobs))
     try:
@@ -221,6 +301,7 @@ def rehydrate_jobs(state: "ServerState") -> None:
     known = {f.name for f in fields(CurationJob)}
     restored: list[CurationJob] = []
     changed = False
+    swept: list[CurationJob] = []
     for entry in data.get("jobs", []) if isinstance(data, dict) else []:
         if not isinstance(entry, dict):
             continue
@@ -231,7 +312,14 @@ def rehydrate_jobs(state: "ServerState") -> None:
             job = CurationJob(**kwargs)
         except TypeError:
             continue
-        if job.status == "running":
+        if job.status in ("running", "queued") and job.kind in _SWEEP_KINDS_NOT_RESUMED:
+            changed = True
+            job.status = "error"
+            job.progress = "error"
+            job.error = _SWEEP_NOT_RESUMED_REASON
+            job.finished_at = time.time()
+            swept.append(job)
+        elif job.status == "running":
             changed = True
             if job.kind in _NON_RESUMABLE_ON_RESTART_KINDS:
                 recovery_note: str | None = None
@@ -258,6 +346,44 @@ def rehydrate_jobs(state: "ServerState") -> None:
     state.curation_jobs = restored
     if changed:
         persist(state)
+    if swept:
+        _fail_linked_sweep_outcomes(state, swept)
+        _LOG.info(
+            "%d sweep jobs not resumed after restart for %s",
+            len(swept),
+            Path(state.vault_path).name,
+        )
+
+
+def _fail_linked_sweep_outcomes(state: "ServerState", swept: list[CurationJob]) -> None:
+    """Mark the ingest items waiting on a swept D8 job's outcome as failed.
+
+    The ingest queue is rehydrated before the jobs, so the items are in memory;
+    the sidecar is written once at the end (``persist_now=False`` per job)."""
+    from okto_neuron.server import _ingest_queue
+    from okto_neuron.server._curation import _publish_linked_reconcile_outcome
+
+    changed = False
+    for job in swept:
+        if job.kind != "reconcile-propose":
+            continue
+        outcome = {
+            "state": "failed",
+            "stage": "propose",
+            "job_id": job.id,
+            "trigger": str(job.params.get("trigger") or "manual"),
+            "error_category": "InterruptedByRestart",
+            "error": _SWEEP_NOT_RESUMED_REASON,
+        }
+        changed |= _publish_linked_reconcile_outcome(
+            state,
+            job.params.get("ingest_item_ids"),
+            outcome,
+            expected_job_id=job.id,
+            persist_now=False,
+        )
+    if changed:
+        _ingest_queue.persist(state)
 
 
 # ── enqueue / lookup / snapshot ──────────────────────────────────────────────--
@@ -309,22 +435,39 @@ def latest_of_kind(state: "ServerState", kind: str) -> CurationJob | None:
     return matches[-1] if matches else None
 
 
-def snapshot(state: "ServerState", *, kind: str | None = None) -> dict:
-    jobs = [j for j in state.curation_jobs if kind is None or j.kind == kind]
-    summary = {
-        "total": len(jobs),
-        "queued": sum(1 for j in jobs if j.status == "queued"),
-        "running": sum(1 for j in jobs if j.status == "running"),
-        "done": sum(1 for j in jobs if j.status == "done"),
-        "error": sum(1 for j in jobs if j.status == "error"),
+def summary(state: "ServerState", *, kind: str | None = None) -> dict:
+    """Job summary counts only: one pass, no ``to_public`` payloads (status hot path)."""
+    counts: Counter[str] = Counter()
+    for j in state.curation_jobs:
+        if kind is None or j.kind == kind:
+            counts[j.status] += 1
+    return {
+        "total": sum(counts.values()),
+        "queued": counts["queued"],
+        "running": counts["running"],
+        "done": counts["done"],
+        "error": counts["error"],
         "active": state.curation_worker_active,
     }
-    return {"status": "ok", "summary": summary, "jobs": [j.to_public() for j in jobs]}
+
+
+def snapshot(state: "ServerState", *, kind: str | None = None) -> dict:
+    jobs = [j for j in state.curation_jobs if kind is None or j.kind == kind]
+    return {
+        "status": "ok",
+        "summary": summary(state, kind=kind),
+        "jobs": [j.to_public() for j in jobs],
+    }
 
 
 # ── worker ─────────────────────────────────────────────────────────────────────
 def ensure_worker(state: "ServerState") -> None:
-    """Start and retain the drain worker if one is not already running."""
+    """Start and retain the drain worker if one is not already running.
+
+    Safe to call from a store-executor thread: the start is handed back to the
+    event loop that dispatched that work."""
+    if call_soon_on_loop(ensure_worker, state):
+        return
     existing = getattr(state, "curation_worker_task", None)
     if state.curation_worker_active or (existing is not None and not existing.done()):
         return
@@ -336,10 +479,74 @@ def ensure_worker(state: "ServerState") -> None:
 
 def _set_progress(state: "ServerState", job: CurationJob, stage: str) -> None:
     """Progress callback handed to runners. Mutates the live job (so a poll sees
-    it immediately) and persists. Runs in the to_thread worker; persist only
-    writes a file, so it is safe there."""
+    it immediately) and marks the list dirty; the coalesced flush writes it. Runs in
+    the to_thread worker; marking is cheap and thread-safe."""
     job.progress = stage
-    persist(state)
+    job.last_progress_at = time.time()
+    request_persist(state)
+
+
+class JobStalledError(RuntimeError):
+    """A read-only job reported no progress for longer than its watchdog limit."""
+
+
+def _job_stall_timeout(state: "ServerState") -> float | None:
+    from okto_neuron.server._scheduler import _load_scheduler_config
+
+    return _load_scheduler_config(state).job_stall_timeout_s
+
+
+def stalled_jobs(state: "ServerState", now: float | None = None) -> list[CurationJob]:
+    """Running jobs past their no-progress limit (for the status payload)."""
+    return [job for job in state.curation_jobs if job.stalled_for_s(now) is not None]
+
+
+async def _run_watched(
+    job: CurationJob,
+    run: Callable[[], dict],
+    *,
+    abandon_ok: bool,
+    orphans: list["asyncio.Future[dict]"],
+) -> dict:
+    """Run a job's runner on the job pool under the no-progress watchdog.
+
+    A runner that goes ``job.stall_after_s`` seconds without calling
+    ``progress()`` is presumed stuck (a model server that accepted the
+    connection and never answered). A read-only job is then failed and
+    *abandoned*: its worker thread cannot be interrupted, so it is handed to
+    ``orphans`` and the caller releases the writer lock. A job that writes is
+    never abandoned (a thread still writing while another writer starts would
+    corrupt state); it is left running and stays visible as
+    ``curation_job_stalled`` until its own deadlines end it.
+    """
+    task = asyncio.ensure_future(job_io(run))
+    stall_s = job.stall_after_s
+    if stall_s is None:
+        return await task
+    poll = min(5.0, max(0.02, stall_s / 4))
+    warned = False
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=poll)
+        if done:
+            return task.result()
+        idle = job.stalled_for_s()
+        if idle is None:
+            continue
+        if abandon_ok:
+            orphans.append(task)
+            task.add_done_callback(lambda fut: fut.cancelled() or fut.exception())
+            raise JobStalledError(
+                f"job made no progress for {idle:.0f}s (limit {stall_s:.0f}s) and was abandoned"
+            )
+        if not warned:
+            warned = True
+            _LOG.error(
+                "curation job %s (%s) has made no progress for %.0fs; it writes, so it is "
+                "not abandoned",
+                job.id,
+                job.kind,
+                idle,
+            )
 
 
 def _waits_for_ingest_quiet(state: "ServerState", job: CurationJob) -> bool:
@@ -362,21 +569,27 @@ def _reconcile_failure_outcome(job: CurationJob, exc: Exception) -> dict[str, ob
     }
 
 
-def _publish_linked_terminal_outcome(state: "ServerState", job: CurationJob) -> None:
-    """Publish after ``to_thread`` returns, while queue ownership is on-loop."""
+async def _publish_linked_terminal_outcome(state: "ServerState", job: CurationJob) -> None:
+    """Publish after ``to_thread`` returns, while queue ownership is on-loop.
+
+    The ingest items are updated here on the loop; only the sidecar write goes
+    to the store executor."""
     if job.kind != "reconcile-propose" or not isinstance(job.result, dict):
         return
     outcome = job.result.get("outcome")
     if not isinstance(outcome, dict):
         return
+    from okto_neuron.server import _ingest_queue
     from okto_neuron.server._curation import _publish_linked_reconcile_outcome
 
-    _publish_linked_reconcile_outcome(
+    if _publish_linked_reconcile_outcome(
         state,
         job.params.get("ingest_item_ids"),
         outcome,
         expected_job_id=job.id,
-    )
+        persist_now=False,
+    ):
+        await store_io(_ingest_queue.persist, state)
 
 
 async def _drain(state: "ServerState") -> None:
@@ -402,7 +615,7 @@ async def _drain(state: "ServerState") -> None:
                 job = candidate
                 break
             if parked_changed:
-                persist(state)
+                await store_io(persist, state)
             if job is None:
                 break
             entry = _REGISTRY.get(job.kind)
@@ -413,20 +626,28 @@ async def _drain(state: "ServerState") -> None:
                 if job.kind == "reconcile-propose":
                     job.result = {"outcome": _reconcile_failure_outcome(job, exc)}
                 job.finished_at = time.time()
-                _publish_linked_terminal_outcome(state, job)
-                persist(state)
+                await _publish_linked_terminal_outcome(state, job)
+                await store_io(persist, state)
                 continue
             runner, writes = entry
             verified_snapshot = job.kind in _VERIFIED_SNAPSHOT_KINDS
             job.status = "running"
             job.started_at = time.time()
+            job.last_progress_at = job.started_at
             job.progress = "starting"
-            persist(state)
+            try:
+                job.stall_after_s = await store_io(_job_stall_timeout, state)
+            except Exception:  # noqa: BLE001 - a config read must not fail the job
+                job.stall_after_s = None
+            await store_io(persist, state)
 
             try:
                 lease_factory = getattr(state, "lease_vault", None)
+                # Leasing may open the vault under the pool lock; never on the loop.
                 lease_context = (
-                    lease_factory() if callable(lease_factory) else contextlib.nullcontext()
+                    await acquire_off_loop(lease_factory)
+                    if callable(lease_factory)
+                    else contextlib.nullcontext()
                 )
 
                 def _run() -> dict:
@@ -438,19 +659,37 @@ async def _drain(state: "ServerState") -> None:
 
                 # The job's immutable VaultRuntime owns both its sidecar and its
                 # graph lease. Selection changes in a browser cannot retarget it.
-                with lease_context as leased_vault:
+                orphans: list[asyncio.Future[dict]] = []
+                stack = contextlib.ExitStack()
+                leased_vault = stack.enter_context(lease_context)
+                try:
                     if writes or verified_snapshot:
-                        async with state.writer_lock:
+                        async with held_lock(
+                            state.writer_lock,
+                            "rebuild-job" if job.kind in _NON_RESUMABLE_ON_RESTART_KINDS else "curation-job",
+                            job.id,
+                        ):
                             vault = leased_vault or getattr(state, "vault", None)
                             if vault is not None and job.kind not in _INTEGRITY_RECOVERY_KINDS:
-                                await asyncio.to_thread(
+                                await store_io(
                                     graph_integrity.require_write_allowed,
                                     state,
                                     vault,
                                 )
-                            result = await asyncio.to_thread(_run)
+                            result = await _run_watched(
+                                job, _run, abandon_ok=not writes, orphans=orphans
+                            )
                     else:
-                        result = await asyncio.to_thread(_run)
+                        result = await _run_watched(
+                            job, _run, abandon_ok=not writes, orphans=orphans
+                        )
+                finally:
+                    if orphans:
+                        # The abandoned worker thread may still be reading the
+                        # graph: keep its lease until it actually returns.
+                        orphans[0].add_done_callback(lambda _fut: stack.close())
+                    else:
+                        stack.close()
                 job.result = result if isinstance(result, dict) else {"result": result}
                 job.status = "done"
                 job.progress = "done"
@@ -472,8 +711,8 @@ async def _drain(state: "ServerState") -> None:
                 if job.kind == "reconcile-propose":
                     job.result = {"outcome": _reconcile_failure_outcome(job, exc)}
             job.finished_at = time.time()
-            _publish_linked_terminal_outcome(state, job)
-            persist(state)
+            await _publish_linked_terminal_outcome(state, job)
+            await store_io(persist, state)
             await asyncio.sleep(0)  # yield so polls stay responsive
     finally:
         state.curation_worker_active = False
@@ -529,6 +768,8 @@ __all__ = [
     "CurationJob",
     "InterruptedJobRecovery",
     "JobRunner",
+    "JobStalledError",
+    "stalled_jobs",
     "JOBS_FILENAME",
     "JOBS_VERSION",
     "RETENTION_CAP",

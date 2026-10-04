@@ -557,7 +557,7 @@ def test_consolidation_superseded_audit_defaults_are_non_blocking() -> None:
 
     assert cfg.audit_superseded_nodes_with_llm is False
     assert cfg.audit_superseded_relations_with_llm is False
-    assert cfg.curation_call_timeout_s is None
+    assert cfg.curation_call_timeout_s == 600.0  # finite by default (issue #24)
 
 
 def test_vault_config_unknown_version_raises_typed_error(tmp_path: Path) -> None:
@@ -571,7 +571,7 @@ def test_vault_config_unknown_version_raises_typed_error(tmp_path: Path) -> None
 
     assert raised.value.file_path == config_path.resolve()
     assert raised.value.found_version == 99
-    assert raised.value.supported_versions == (1,)
+    assert raised.value.supported_versions == (1, 2)
 
 
 def test_vault_config_missing_file_raises_config_not_found(tmp_path: Path) -> None:

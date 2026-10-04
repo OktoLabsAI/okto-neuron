@@ -267,7 +267,7 @@ def _vector_seeds(
     The recall floor is the untruncated ``IndexStore.scan_vectors``.
     """
     pairs = list(index.scan_vectors(type=type))
-    nodes = store.get_nodes([node_id for node_id, _ in pairs])
+    nodes = store.get_nodes([node_id for node_id, _ in pairs], include_embedding=True)
     scored: list[tuple[Node, float]] = []
     for node in nodes:
         score = _cosine(query_embedding, node.embedding) * node_quality_weight(node)

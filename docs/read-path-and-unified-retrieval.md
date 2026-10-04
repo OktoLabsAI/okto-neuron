@@ -223,3 +223,45 @@ Two related gaps remain open:
   mapped at the store boundary.
 - `get_nodes` was the only `IN $list` site in `store/grafx.py`, but the other
   backends (`ladybug`, `neo4j`) have not been swept for the same shape.
+
+## Addendum — 2026-09-30: set-based store reads (#11)
+
+Several library loops read the graph one node at a time: a `get_node` per edge
+endpoint, per Claim argument or per candidate id. On Grafx every `get_node` is
+its own read transaction, so the cost grows with the graph, not with the
+answer. The predicate vocabulary scan was the worst case: it resolved both
+endpoints of every edge and the arguments of every Claim just to return a
+`Counter` of predicate names.
+
+The rule now is to read sets, not ids: collect the ids first, then make one
+`GraphStore.get_nodes` call (Grafx splits it into `_ID_QUERY_BATCH` chunks) and
+look nodes up in a dict. A missing id is simply absent, which keeps the old
+`get_node(...) is None` handling. Where a scan was repeated per item, it is
+read once before the loop.
+
+- `predicates.collect_predicate_vocabulary` makes two reads, one `list_edges()`
+  and one `list_nodes("Claim")`, with no node lookups. `shared_argument_evidence`
+  makes the same two. `generate_predicate_candidates` adds a single `get_nodes`
+  over every endpoint, Claim argument and sample Block id. The outputs match the
+  old per-node scan byte for byte, including dict and `Counter` insertion order.
+  `tests/predicates/test_candidates_batch_reads.py` checks this against a copy
+  of the old scan on the in-memory, Grafx and Ladybug backends.
+- The sub-chunk detach and revert passes in `companion/_incremental.py` read
+  their blocks in one call. Each block's derived Claims and their object nodes
+  also come back in one call per block.
+- `subgraph` reads bridging and sibling Claims in one call. The bridge scan cap
+  still bounds how many ids get read.
+- `migrate.bridge_edges.ensure_source_mentions` reads the committed nodes and
+  their Documents in two calls.
+- `reconcile.propose.adjudicate_cluster` reads cluster members in one call.
+- `resolve.find_contradictions` and `resolve.resolve` take an optional
+  `claims=` snapshot, and the two resolve loops in `Companion.remember` read
+  the Claim list once per loop, not once per Claim candidate.
+- The server's `companion-triage` job (`server/_curation.py`) reads the Claim
+  list once and passes it as `claims=` to every `resolve()` call in its
+  candidate loop. That loop only reads the store, so the snapshot is exact.
+
+On a synthetic Grafx store (4,000 nodes, 13,000 edges, 2,500 Claims, local
+laptop), `collect_predicate_vocabulary` went from a 53.6 s median to 0.39 s,
+and the full candidate scan from 50.0 s to 0.70 s, with identical outputs.
+These are synthetic numbers, not a measurement of any real vault.

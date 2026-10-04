@@ -16,7 +16,7 @@ TOL = 1e-9
 
 def _vector_leg(index, store, query_embedding, node_type):
     pairs = list(index.scan_vectors(type=node_type))
-    nodes = store.get_nodes([node_id for node_id, _ in pairs])
+    nodes = store.get_nodes([node_id for node_id, _ in pairs], include_embedding=True)
     scored = []
     for node in nodes:
         score = _cosine(query_embedding, node.embedding) * node_quality_weight(node)
@@ -77,3 +77,41 @@ def test_type_filter_uses_global_statistics(populated_index, expected):
     scores_all = dict(populated_index.search_text(case_all["query"], k=60))
     for node_id, score in populated_index.search_text(case_claim["query"], k=60, type="Claim"):
         assert abs(scores_all[node_id] - score) < TOL
+
+
+def test_checkpoint_writes_records_before_the_stamp(tmp_path, monkeypatch):
+    import json
+
+    import pytest
+
+    from okto_neuron.core.schema import Node
+    from okto_neuron.store.index import DefaultIndexStore
+    from okto_neuron.store.index import corpus
+
+    index = DefaultIndexStore(tmp_path / "vault")
+    index.upsert(Node(id="a1", type="Concept", title="first"))
+    index.checkpoint()
+    old_stamp = index.generation()
+
+    replaced: list[str] = []
+    real_replace = corpus.os.replace
+
+    def replace(src, dst):
+        replaced.append(dst.name)
+        if dst.name == "meta.json":
+            raise OSError("crash before the stamp lands")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(corpus.os, "replace", replace)
+    index.upsert(Node(id="a2", type="Concept", title="second"))
+    with pytest.raises(OSError):
+        index.checkpoint()
+    assert replaced == ["corpus.jsonl", "meta.json"]
+
+    # The records landed, the stamp still names the previous corpus: a reopen sees
+    # a stamp that cannot claim records which are not on disk.
+    meta = json.loads((index.index_dir / "meta.json").read_text())
+    assert meta["graph_generation"] == old_stamp
+    reopened = DefaultIndexStore(tmp_path / "vault")
+    assert reopened.generation() == old_stamp
+    assert reopened.recompute_generation() != old_stamp

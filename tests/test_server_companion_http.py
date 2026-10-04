@@ -8,7 +8,6 @@ status, not exact LLM-derived counts.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -144,17 +143,20 @@ def test_ask_without_llm_is_degraded_and_never_calls_a_provider(
 
 @pytest.fixture
 def offload_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every function offloaded via ``asyncio.to_thread`` so tests can
-    prove a handler runs its blocking work off the event loop rather than inline.
-    Delegates to the real implementation so behaviour is unchanged."""
+    """Record every function offloaded to the server's bounded executors (the
+    store and job pools that replaced ``asyncio.to_thread``, issue #13) so tests
+    can prove a handler runs its blocking work off the event loop rather than
+    inline. Delegates to the real implementation so behaviour is unchanged."""
+    from okto_neuron.server._store_io import BoundedExecutor
+
     seen: list[str] = []
-    real = asyncio.to_thread
+    real = BoundedExecutor.run
 
-    async def _spy(func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+    async def _spy(self, func, /, *args, **kwargs):  # type: ignore[no-untyped-def]
         seen.append(getattr(func, "__name__", repr(func)))
-        return await real(func, *args, **kwargs)
+        return await real(self, func, *args, **kwargs)
 
-    monkeypatch.setattr(asyncio, "to_thread", _spy)
+    monkeypatch.setattr(BoundedExecutor, "run", _spy)
     return seen
 
 

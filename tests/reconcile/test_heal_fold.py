@@ -633,7 +633,12 @@ def test_heal_via_copy_refuses_real_cross_process_pool_handle(tmp_path):
     try:
         assert child.stdout is not None
         assert child.stdout.readline().strip() == "READY"
-        with pytest.raises(VaultLockHeld, match="owns a live graph handle") as exc_info:
+        # Since #21 the pool holds the per-vault writer lease for its whole lifetime, so the
+        # cross-process holder is refused by the writer lease first ("being written by
+        # daemon pid N"); the graph-handle lease message remains as defence in depth.
+        with pytest.raises(
+            VaultLockHeld, match="being written by|owns a live graph handle"
+        ) as exc_info:
             heal_via_copy(vault_path)
         assert exc_info.value.holding_pid == child.pid
         assert not (vault_path / "graph.heal.lbug").exists()

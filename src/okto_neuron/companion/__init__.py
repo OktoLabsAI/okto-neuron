@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from functools import wraps
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -1037,6 +1037,20 @@ def _semantic_relation_replay_index(
             signatures.pop(key, None)
             ambiguous.add(key)
     return indexed
+
+
+def _claims_for_contradiction_scan(
+    store: "GraphStore", candidates: "list[NodeCandidate]"
+) -> "list[Node] | None":
+    """One ``list_nodes("Claim")`` shared by a batch of ``resolve()`` calls.
+
+    ``find_contradictions`` otherwise re-reads every Claim once per Claim
+    candidate. The two resolve loops in ``remember`` only read the store, so one
+    snapshot taken right before a loop is what each call would have seen. ``None``
+    when the batch holds no Claim candidate (nothing would scan)."""
+    if not any(candidate.type == "Claim" for candidate in candidates):
+        return None
+    return list(store.list_nodes(type="Claim"))
 
 
 def _verdict_telemetry(verdict: object) -> dict[str, object]:
@@ -2334,6 +2348,31 @@ def _source_is_ingestable_path(
     return any(_is_within_root(str(resolved), root) for root in roots)
 
 
+def _source_outside_roots_message(
+    source: "str | PathLike[str]",
+    vault_root: "str | PathLike[str]",
+    watch_roots: "list[str]",
+) -> str:
+    """The refusal for a path-shaped ``remember`` source outside every allowed root.
+
+    Names the roots the guard actually checked and the three ways forward, so the caller does not
+    have to read the server log or the source. ``remember`` is a loopback-only write surface (the
+    MCP tool and REST ``/remember`` both refuse non-loopback callers before reaching this), so
+    showing the absolute roots discloses nothing to a remote client. The wording keeps the historical prefix
+    that clients and docs match on.
+    """
+    roots = (
+        ", ".join(repr(str(root)) for root in watch_roots) if watch_roots else "none configured"
+    )
+    return (
+        f"refusing to remember source outside the vault and watch roots: {str(source)!r}. "
+        f"Allowed roots: the vault {str(vault_root)!r}; folder-watch roots: {roots}. "
+        "Either copy the file under one of those roots, add its folder to the vault config "
+        "`folder_watch.roots`, or pass the file's text as raw text (raw text is saved under the "
+        "vault's .marginalia/sources/ and ingested from that copy)."
+    )
+
+
 def _is_local_provider(provider: "LLMProvider") -> bool:
     """A provider is local if it has no hosted ``api_base`` (StubLLM) or its
     ``api_base`` host is loopback. Pure attribute check — never touches the wire."""
@@ -2404,8 +2443,17 @@ def _guard_live_graph_write(method):  # type: ignore[no-untyped-def]
 def _current_integrity_outcome(vault: Any) -> dict[str, Any]:
     handle = getattr(vault.store, "_graph_handle", None)
     if handle is None:
+        from okto_neuron.vault_registry import resolve_vault_backend
+
+        # "not_applicable" answers "is the write fence enforced?": it is not on this backend. The reason is
+        # the same explanation the server status gives for a never-audited vault of this kind.
+        backend = resolve_vault_backend(vault.path)
         return {
             "status": "not_applicable",
+            "reason": (
+                f"the {backend} backend does not fence writes; an audit is optional "
+                "(POST /api/v1/graph/integrity runs one)"
+            ),
             "audit_id": None,
             "graph_generation": None,
         }
@@ -2818,7 +2866,7 @@ class Companion:
         watch_roots = list(self._vault_config().folder_watch.roots)
         if not _source_is_ingestable_path(source, self._vault.path, watch_roots):
             raise SourceOutsideVaultError(
-                f"refusing to remember source outside the vault and watch roots: {source!r}"
+                _source_outside_roots_message(source, self._vault.path, watch_roots)
             )
 
         _emit("parsing", 0, 0)
@@ -5244,8 +5292,11 @@ class Companion:
         # it too — the keep-alive is worthless if the phase's first silent
         # stretch already outlasts the client's idle timer.
         pairs = []
+        claim_snapshot = _claims_for_contradiction_scan(store, node_candidates)
         for candidate in node_candidates:
-            pairs.append((candidate, resolve(candidate, store, embedder=embedder)))
+            pairs.append(
+                (candidate, resolve(candidate, store, embedder=embedder, claims=claim_snapshot))
+            )
             _emit_substage("committing")
         for candidate, outcome in pairs:
             if outcome.correlations:
@@ -5620,10 +5671,14 @@ class Companion:
                 {"merged_into": post_curator_node_merges},
             )
         curator_audit_counts = {"commit": 0, "queue": 0, "abstain": 0}
+        claim_snapshot = _claims_for_contradiction_scan(
+            store,
+            [c for c in raw_node_candidates if c.candidate_id not in curated_node_ids],
+        )
         for candidate in raw_node_candidates:
             if candidate.candidate_id in curated_node_ids:
                 continue
-            outcome = resolve(candidate, store, embedder=embedder)
+            outcome = resolve(candidate, store, embedder=embedder, claims=claim_snapshot)
             target_ref = node_merge_targets.get(candidate.candidate_id)
             audit_reason = (
                 "candidate remapped to an existing/surviving node before the final node gate"
@@ -8789,14 +8844,29 @@ class Companion:
         queue = self._review_queue()
         return [*queue.list(), *queue.list_relations()]
 
-    def resolve_review(self, candidate_id: str, action: ReviewAction) -> CandidateOutcome:
+    def review_queue_page(
+        self, limit: int, cursor: str | None = None
+    ) -> tuple[list[ReviewItem | "RelationReviewItem"], str | None, int]:
+        """One page of node then relation reviews: ``(items, next_cursor, total)``."""
+
+        return self._review_queue().page(limit, cursor)
+
+    def resolve_review(
+        self,
+        candidate_id: str,
+        action: ReviewAction,
+        *,
+        lease_timeout: float | None = None,
+    ) -> CandidateOutcome:
         """Act on a parked node candidate (commit / discard / merge).
 
-        Raises :class:`ReviewItemNotFoundError` for an unknown id.
+        Raises :class:`ReviewItemNotFoundError` for an unknown id. ``lease_timeout`` bounds the wait
+        for the cross-process semantic writer lease (``LeaseBusyError`` when it runs out); ``None``
+        waits forever.
         """
         for attempt in range(2):
             try:
-                return self._resolve_review_once(candidate_id, action)
+                return self._resolve_review_once(candidate_id, action, lease_timeout=lease_timeout)
             except _ManualReviewScopeChangedError:
                 if attempt:
                     raise
@@ -8806,6 +8876,8 @@ class Companion:
         self,
         candidate_id: str,
         action: ReviewAction,
+        *,
+        lease_timeout: float | None = None,
     ) -> CandidateOutcome:
         """Apply one sealed manual plan, abandoning a stale untouched scope."""
         if action not in {"commit", "discard", "merge"}:
@@ -8820,7 +8892,7 @@ class Companion:
         guard_factory = getattr(self._vault, "_integrity_write_guard", None)
         guard = guard_factory() if writes_graph and callable(guard_factory) else nullcontext()
         ledger = self._candidate_ledger()
-        with scan_guard, ledger.semantic_writer_lease():
+        with scan_guard, ledger.semantic_writer_lease(timeout=lease_timeout):
             # ReviewQueue is an in-memory snapshot of its durable file. Load it
             # only after the writer lease so a waiting resolver cannot replay a
             # candidate that the preceding transaction already acknowledged.
@@ -8904,10 +8976,7 @@ class Companion:
                         "relation review items are read/acknowledge only; "
                         "graph resolution belongs to the orchestrator"
                     )
-                candidate = next(
-                    (value for value in queue.candidates() if value.candidate_id == candidate_id),
-                    None,
-                )
+                candidate = queue.get_candidate(candidate_id)
                 if candidate is None:
                     raise ValueError("manual review queue lost its full candidate")
                 fingerprints = self._semantic_fingerprints()
@@ -9455,7 +9524,13 @@ class _PlanningGraphOverlay:
     def planned_edges(self) -> tuple[Any, ...]:
         return tuple(self._edges[edge_id] for edge_id in sorted(self._edges))
 
-    def add_node(self, node: Any) -> None:
+    def add_node(self, node: Any, clear_embedding: bool = False) -> None:
+        if getattr(node, "embedding", None) is None and not clear_embedding:
+            # Same upsert contract as the store: no vector on the node keeps the one
+            # the planned-or-stored node already has.
+            current = self.get_node(str(node.id))
+            if current is not None and getattr(current, "embedding", None) is not None:
+                node = node.model_copy(update={"embedding": current.embedding})
         self._nodes[str(node.id)] = node
 
     def add_edge(self, edge: Any) -> None:
@@ -9463,11 +9538,29 @@ class _PlanningGraphOverlay:
             raise ValueError("planned edge has a missing endpoint")
         self._edges[str(edge.id)] = edge
 
-    def get_node(self, node_id: str) -> Any:
-        return self._nodes.get(node_id) or self._base.get_node(node_id)
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Any:
+        return self._nodes.get(node_id) or self._base.get_node(
+            node_id, include_embedding=include_embedding
+        )
 
-    def list_nodes(self, type: str | None = None) -> list[Any]:
-        nodes = {str(node.id): node for node in self._base.list_nodes(type=type)}
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Any]:
+        """``get_node`` per id, with the base reads batched into one call: input
+        order, duplicates collapsed, missing ids skipped (the protocol contract)."""
+        ids = list(dict.fromkeys(node_ids))
+        base = {
+            str(node.id): node
+            for node in self._base.get_nodes(
+                [i for i in ids if i not in self._nodes], include_embedding=include_embedding
+            )
+        }
+        found = (self._nodes.get(node_id) or base.get(node_id) for node_id in ids)
+        return [node for node in found if node is not None]
+
+    def list_nodes(self, type: str | None = None, include_embedding: bool = False) -> list[Any]:
+        nodes = {
+            str(node.id): node
+            for node in self._base.list_nodes(type=type, include_embedding=include_embedding)
+        }
         for node in self._nodes.values():
             if type is None or node.type == type:
                 nodes[str(node.id)] = node

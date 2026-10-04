@@ -6,7 +6,9 @@ import ipaddress
 import os
 import re
 import socket
+import threading
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Self
 from urllib.parse import urlparse
@@ -29,7 +31,11 @@ from okto_neuron.config._capacity import DEFAULT_PARALLEL_CAPABLE_MODELS
 from okto_neuron.config._app_config import default_app_home
 from okto_neuron.errors import ConfigNotFound, ConfigParseError, ConfigVersionUnsupported
 
-SUPPORTED_YAML_VERSIONS = (1,)
+# Version 2 marks a vault whose review queue lives in SQLite (#14). An older
+# binary (supported: 1) refuses such a vault loudly instead of silently
+# ignoring the SQLite queue and writing a stale review_queue.json beside it.
+SUPPORTED_YAML_VERSIONS = (1, 2)
+CURRENT_YAML_VERSION = 2
 _WARNED_MISSING_VERSION: set[Path] = set()
 
 
@@ -42,6 +48,160 @@ def _config_file_for(path: Path | str) -> Path:
     if is_vault_config_filename(candidate.name):
         return candidate
     return vault_config_path(candidate)
+
+
+def _safe_load(stream: Any) -> Any:
+    """``yaml.safe_load`` for every config read in this module (one seam to swap/spy).
+
+    Uses libyaml's ``CSafeLoader`` when PyYAML was built with it (several times
+    faster than the pure-Python ``SafeLoader``, same safe constructors and the same
+    ``YAMLError`` family); falls back to ``SafeLoader`` otherwise.
+    """
+
+    return yaml.load(stream, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+
+
+# ── process-wide read caches ────────────────────────────────────────────────
+# ``GET /api/v1/status`` and the scheduler tick re-read every vault's yaml on each
+# call (#14). Entries are keyed by the file's stat tuple, so any rewrite misses.
+# ``st_ctime_ns`` is part of the tuple because mtime+size can repeat across two
+# writes inside one filesystem timestamp tick (``os.utime`` can even restore
+# mtime), whereas ctime cannot be set from userspace. Only successful reads are
+# stored; a parse/validation/version error re-raises on every call. Writers in
+# this process also invalidate explicitly (a same-tick, same-size rewrite on a
+# coarse-granularity filesystem could still share a ctime).
+_CONFIG_CACHE_MAX = 64
+_CONFIG_CACHE_LOCK = threading.Lock()
+_LOAD_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, bool]] = OrderedDict()
+_VERSION_CACHE: OrderedDict[tuple[Any, ...], int | None] = OrderedDict()
+
+
+def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+
+
+def _provider_registry_stat() -> tuple[str, tuple[int, int, int, int] | None]:
+    """Stat key of the one file ``provider_ref`` validation reads, without loading it.
+
+    ``ProviderRegistry.load`` consults only ``providers.yaml`` under the app home
+    (no legacy-home fallback, no includes; credential secrets are never read, only
+    their env names). Included for every vault, whether or not it names a
+    ``provider_ref``, exactly like ``defaults.yaml``.
+    """
+    from okto_neuron.providers import ProviderRegistry
+
+    path = ProviderRegistry.path_for_user()
+    return str(path), _stat_key(path)
+
+
+def _cache_get(cache: OrderedDict[tuple[Any, ...], Any], key: tuple[Any, ...]) -> Any:
+    with _CONFIG_CACHE_LOCK:
+        if key not in cache:
+            return _MISSING
+        cache.move_to_end(key)
+        return cache[key]
+
+
+def _cache_put(cache: OrderedDict[tuple[Any, ...], Any], key: tuple[Any, ...], value: Any) -> None:
+    with _CONFIG_CACHE_LOCK:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > _CONFIG_CACHE_MAX:
+            cache.popitem(last=False)
+
+
+_MISSING: Any = object()
+
+
+def clear_config_cache() -> None:
+    """Drop every cached vault config and yaml version (tests, defaults writes)."""
+
+    with _CONFIG_CACHE_LOCK:
+        _LOAD_CACHE.clear()
+        _VERSION_CACHE.clear()
+
+
+def invalidate_config_cache(vault_path: Path | str) -> None:
+    """Drop the cached entries of one vault; call after writing its yaml."""
+
+    config_path = _config_file_for(vault_path)
+    with _CONFIG_CACHE_LOCK:
+        for cache in (_LOAD_CACHE, _VERSION_CACHE):
+            for key in [k for k in cache if k[1] == config_path]:
+                del cache[key]
+
+
+_YAML_VERSION_LINE = re.compile(r"^marginalia_yaml_version:[ \t]*[0-9]*[ \t]*(#.*)?$", re.MULTILINE)
+
+
+def vault_yaml_version(vault_path: Path | str) -> int | None:
+    """Return the vault's ``marginalia_yaml_version`` without validating the file.
+
+    ``None`` when the vault has no config file at all; a config without the key
+    is version 1 (the loader's own rule). Raises nothing for a malformed file
+    body beyond what ``yaml`` raises, so callers can gate cheaply.
+    """
+
+    config_path = _config_file_for(vault_path)
+    stat_key = _stat_key(config_path)
+    key = ("version", config_path, stat_key)
+    if stat_key is not None:
+        cached = _cache_get(_VERSION_CACHE, key)
+        if cached is not _MISSING:
+            return cached
+    if not config_path.is_file():
+        return None
+    data = _safe_load(config_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        result = None
+    else:
+        found = data.get("marginalia_yaml_version", 1)
+        result = found if isinstance(found, int) and not isinstance(found, bool) else None
+    if stat_key is not None:
+        _cache_put(_VERSION_CACHE, key, result)
+    return result
+
+
+def set_vault_yaml_version(vault_path: Path | str, version: int) -> None:
+    """Rewrite only the ``marginalia_yaml_version`` line, atomically.
+
+    Every other byte of the file (comments, key order) is preserved; the key is
+    prepended when absent. Temp file + fsync + ``os.replace`` + directory fsync.
+    """
+
+    config_path = _config_file_for(vault_path)
+    text = config_path.read_text(encoding="utf-8")
+    line = f"marginalia_yaml_version: {version}"
+    if _YAML_VERSION_LINE.search(text):
+        updated = _YAML_VERSION_LINE.sub(line, text, count=1)
+    else:
+        updated = f"{line}\n{text}"
+    temp = config_path.with_name(f".{config_path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, config_path)
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
+    directory_fd = os.open(config_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    invalidate_config_cache(config_path)
+    if vault_yaml_version(vault_path) != version:
+        raise ConfigParseError(
+            config_path,
+            cause=ValueError(f"marginalia_yaml_version did not persist as {version}"),
+        )
 
 
 def _yaml_error_line(error: yaml.YAMLError) -> int | None:
@@ -118,6 +278,14 @@ def _check_embedding_provider(value: str | None) -> str | None:
         )
     return value
 
+
+DEFAULT_LLM_REQUEST_TIMEOUT_S = 300.0
+"""Wall/read deadline for one LiteLLM completion when neither the provider
+connection nor ``OKTO_NEURON_LLM_REQUEST_TIMEOUT`` sets one (issue #24)."""
+DEFAULT_CURATION_CALL_TIMEOUT_S = 600.0
+"""Wall-clock deadline for one curation/judge call, enclosing its one retry."""
+DEFAULT_JOB_STALL_TIMEOUT_S = 900.0
+"""No-progress watchdog for a running curation job."""
 
 class EmbeddingConfig(BaseModel):
     """Embedding provider settings for a vault.
@@ -218,6 +386,36 @@ class RetryConfig(BaseModel):
     total_cap_s: float = Field(default=30, ge=0)
 
 
+_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1000, "mb": 1000**2, "gb": 1000**3,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3,
+}
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
+
+#: Bounds for an explicit ``storage.buffer_budget`` (grafx buffer pool).
+BUFFER_BUDGET_MIN_BYTES = 16 * 1024**2
+BUFFER_BUDGET_MAX_BYTES = 8 * 1024**3
+
+
+def parse_byte_size(value: object) -> int:
+    """Parse ``268435456`` or ``"256MiB"`` / ``"1.5GiB"`` / ``"512MB"`` into bytes."""
+    if isinstance(value, bool):
+        raise ValueError("a size must be bytes (int) or a string like '256MiB'")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        match = _SIZE_RE.match(value)
+        if match is not None:
+            unit = _SIZE_UNITS.get((match.group(2) or "b").lower())
+            if unit is not None:
+                return int(float(match.group(1)) * unit)
+    raise ValueError(
+        f"invalid size {value!r}: use bytes or a string like '256MiB' "
+        "(units: B, KB, MB, GB, KiB, MiB, GiB)"
+    )
+
+
 class GrafxStorageConfig(BaseModel):
     """Storage backend metadata for the (not-yet-shipped) Grafx backend."""
 
@@ -226,6 +424,23 @@ class GrafxStorageConfig(BaseModel):
     backend: Literal["grafx"]
     reason: str | None = None
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    buffer_budget: int | None = None
+    """Grafx buffer-pool size (``buffer_budget_bytes`` on ``okto_grafx.connect``).
+    Bytes or a string such as ``256MiB``; 16 MiB to 8 GiB. ``None`` (default)
+    means computed: max(256 MiB, 1.5 x graph size), capped at 1 GiB."""
+
+    @field_validator("buffer_budget", mode="before")
+    @classmethod
+    def _v_buffer_budget(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        size = parse_byte_size(value)
+        if not BUFFER_BUDGET_MIN_BYTES <= size <= BUFFER_BUDGET_MAX_BYTES:
+            raise ValueError(
+                f"buffer_budget must be between {BUFFER_BUDGET_MIN_BYTES} (16MiB) and "
+                f"{BUFFER_BUDGET_MAX_BYTES} (8GiB) bytes, got {size}"
+            )
+        return size
 
 
 class Neo4jStorageConfig(BaseModel):
@@ -991,8 +1206,7 @@ class ResolvedLLM(BaseModel):
     model: str
     api_key_env: str | None
     # Transport policy inherited from a named provider connection. ``None``
-    # means Okto Neuron adds no completion deadline and leaves the adapter/
-    # provider policy intact.
+    # means the bounded default ``DEFAULT_LLM_REQUEST_TIMEOUT_S`` applies.
     request_timeout_s: float | None = Field(default=None, gt=0.0)
     # Deprecated typed fields stay at this boundary so existing YAML and call
     # sites remain readable.
@@ -1452,10 +1666,11 @@ class ConsolidationConfig(BaseModel):
     # sequential behavior (default). Raising it only pays when the LLM endpoint
     # accepts concurrent requests (llama.cpp needs --parallel N > 1).
     curation_max_concurrent: int = Field(default=1, ge=1, le=32)
-    # Optional scheduler wait deadline. ``None`` is intentionally unbounded:
-    # provider request policy belongs to the provider connection, while Stop /
-    # shutdown use the explicit cancellable-call boundary.
-    curation_call_timeout_s: float | None = Field(default=None, gt=0.0)
+    # Wall-clock deadline for one curation/judge call (issue #24). Any finite
+    # value routes the call through the killable helper process, so a server that
+    # accepts the connection and never answers cannot hold a writer lock forever.
+    # ``None`` opts out (unbounded), which is only safe for a trusted local model.
+    curation_call_timeout_s: float | None = Field(default=DEFAULT_CURATION_CALL_TIMEOUT_S, gt=0.0)
     # ADR 0015 D4 — block-keyed batched curation. 1 = off (today's per-candidate
     # calls, default). >1 evaluates up to K same-block candidates per LLM call
     # with schema-constrained output and per-candidate single-call fallback.
@@ -1491,6 +1706,12 @@ class CurationSchedulerConfig(BaseModel):
     enabled: bool = True
     quiet_debounce_s: int = Field(default=60, ge=0)
     min_interval_s: int = Field(default=3600, gt=0)
+    # Watchdog (issue #24): a running curation job that reports no progress for
+    # this many seconds is failed (read-only jobs) and surfaced as
+    # ``curation_job_stalled`` on /api/v1/status. ``None`` disables it. Keep it
+    # above ``consolidation.curation_call_timeout_s`` so the call deadline fires
+    # first and the watchdog is only the backstop.
+    job_stall_timeout_s: float | None = Field(default=DEFAULT_JOB_STALL_TIMEOUT_S, gt=0.0)
 
 
 class UpkeepConfig(BaseModel):
@@ -1671,7 +1892,7 @@ class VaultConfig(BaseModel):
         path = cls.application_defaults_path()
         try:
             with path.open("r", encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
+                data = _safe_load(handle) or {}
         except FileNotFoundError:
             return cls.default()
         except yaml.YAMLError as error:
@@ -1687,11 +1908,48 @@ class VaultConfig(BaseModel):
         *,
         application_defaults: Self | None = None,
     ) -> Self:
-        """Load a vault config, extending application defaults only when opted in."""
+        """Load a vault config, extending application defaults only when opted in.
+
+        Successful loads are cached process-wide, keyed by the stat tuple of the
+        vault yaml, of the application ``defaults.yaml`` it may inherit, and of
+        ``providers.yaml`` (``provider_ref`` validation reads it); a missing
+        file is its own key. Every call returns a deep copy, so
+        a caller mutating its model never reaches the cache. An explicit
+        ``application_defaults`` argument bypasses the cache.
+        """
         config_path = _config_file_for(vault_path)
+        if application_defaults is not None:
+            return cls._load_uncached(config_path, application_defaults)[0]
+        vault_stat = _stat_key(config_path)
+        if vault_stat is None:
+            return cls._load_uncached(config_path, None)[0]
+        defaults_path = cls.application_defaults_path()
+        key = (
+            "load",
+            config_path,
+            cls,
+            vault_stat,
+            str(defaults_path),
+            _stat_key(defaults_path),
+            *_provider_registry_stat(),
+        )
+        cached = _cache_get(_LOAD_CACHE, key)
+        if cached is not _MISSING:
+            model, missing_version = cached
+            if missing_version:
+                _warn_missing_version_once(config_path)
+            return model.model_copy(deep=True)
+        model, missing_version = cls._load_uncached(config_path, None)
+        _cache_put(_LOAD_CACHE, key, (model, missing_version))
+        return model.model_copy(deep=True)
+
+    @classmethod
+    def _load_uncached(
+        cls, config_path: Path, application_defaults: Self | None
+    ) -> tuple[Self, bool]:
         try:
             with config_path.open("r", encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
+                data = _safe_load(handle) or {}
         except FileNotFoundError as error:
             raise ConfigNotFound(config_path, cause=error) from error
         except yaml.YAMLError as error:
@@ -1704,8 +1962,9 @@ class VaultConfig(BaseModel):
             raise ConfigParseError(config_path, cause=error) from error
 
         if not isinstance(data, dict):
-            return cls._validate_data(data, config_path)
-        if "marginalia_yaml_version" not in data:
+            return cls._validate_data(data, config_path), False
+        missing_version = "marginalia_yaml_version" not in data
+        if missing_version:
             _warn_missing_version_once(config_path)
         if data.get("inherits_application_defaults") is True:
             baseline = application_defaults or cls.load_application_defaults()
@@ -1715,7 +1974,7 @@ class VaultConfig(BaseModel):
             baseline.model_dump(mode="json", exclude_none=True),
             data,
         )
-        return cls._validate_data(merged, config_path)
+        return cls._validate_data(merged, config_path), missing_version
 
     # ── writable surface (web-UI config-write) ──────────────────────────────
     WRITABLE_BLOCKS: ClassVar[tuple[str, ...]] = (
@@ -1755,7 +2014,7 @@ class VaultConfig(BaseModel):
         config_path = _config_file_for(vault_path)
         try:
             with config_path.open("r", encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
+                data = _safe_load(handle) or {}
         except FileNotFoundError:
             return {}
         except yaml.YAMLError as error:
@@ -1775,10 +2034,12 @@ class VaultConfig(BaseModel):
 
         raw = cls.load_raw(vault_path)
         compact = {key: value for key, value in raw.items() if key not in cls.WRITABLE_BLOCKS}
-        compact["marginalia_yaml_version"] = 1
+        # Preserve the vault's own version: it decides the review-queue layout.
+        compact["marginalia_yaml_version"] = raw.get("marginalia_yaml_version", 1)
         compact["inherits_application_defaults"] = True
         config_path = _config_file_for(vault_path)
         config_path.write_text(yaml.safe_dump(compact, sort_keys=False), encoding="utf-8")
+        invalidate_config_cache(config_path)
         return cls.load(vault_path)
 
     @classmethod
@@ -1823,6 +2084,7 @@ class VaultConfig(BaseModel):
         os.chmod(path.parent, 0o700)
         path.write_text(yaml.safe_dump(persisted, sort_keys=False), encoding="utf-8")
         os.chmod(path, 0o600)
+        clear_config_cache()
         return validated, _changed_paths(before, validated)
 
     @classmethod
@@ -1867,6 +2129,7 @@ class VaultConfig(BaseModel):
 
         config_path = _config_file_for(vault_path)
         config_path.write_text(yaml.safe_dump(persisted, sort_keys=False), encoding="utf-8")
+        invalidate_config_cache(config_path)
 
         changed = _changed_paths(before, validated)
         return validated, changed
@@ -1920,7 +2183,81 @@ def _changed_paths(before: VaultConfig, after: VaultConfig) -> list[str]:
     return changed
 
 
+_NEW_VAULT_EMBEDDING_KEYS = frozenset(
+    {"provider", "model", "dimension", "api_base", "api_key_env", "allow_remote"}
+)
+
+
+def validate_new_vault_embedding_spec(spec: object) -> dict[str, Any]:
+    """Validate the optional embedding spec a NEW vault is created with.
+
+    The graph is created at the configured width on its first open, and the vector column
+    is fixed-width afterwards (a later change needs a re-embed). Creating a vault with
+    its embedding spec makes the width right from the start; this returns the sparse
+    ``embedding`` patch to write into the vault config BEFORE that first open.
+
+    Unknown keys, wrong types and everything :class:`EmbeddingConfig` refuses (provider
+    name, loopback-or-``allow_remote`` ``api_base``, ``api_key_env`` namespace, a
+    non-positive ``dimension``) raise ``ValueError``. One more rule: a width other than the
+    default must name the provider/model that produces it; "dimension 4096" alone, or
+    with the default local model, would create a graph no embedder can feed.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("embedding must be an object")
+    unknown = sorted(set(spec) - _NEW_VAULT_EMBEDDING_KEYS)
+    if unknown:
+        raise ValueError(
+            f"unknown embedding field(s) {unknown}; allowed: {sorted(_NEW_VAULT_EMBEDDING_KEYS)}"
+        )
+    patch: dict[str, Any] = {}
+    for key in ("provider", "model", "api_base", "api_key_env"):
+        if key in spec and spec[key] is not None:
+            value = spec[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"embedding.{key} must be a non-empty string")
+            patch[key] = value.strip()
+    if "dimension" in spec and spec["dimension"] is not None:
+        dimension = spec["dimension"]
+        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
+            raise ValueError("embedding.dimension must be a positive integer")
+        patch["dimension"] = dimension
+    if "allow_remote" in spec and spec["allow_remote"] is not None:
+        if not isinstance(spec["allow_remote"], bool):
+            raise ValueError("embedding.allow_remote must be a boolean")
+        patch["allow_remote"] = spec["allow_remote"]
+    try:
+        checked = EmbeddingConfig(**patch)
+    except ValueError as exc:  # pydantic.ValidationError is a ValueError
+        details = getattr(exc, "errors", None)
+        if callable(details):
+            reasons = "; ".join(
+                f"{'.'.join(['embedding', *(str(part) for part in item['loc'])])}: "
+                f"{str(item['msg']).removeprefix('Value error, ')}"
+                for item in details()
+            )
+            raise ValueError(f"invalid embedding spec: {reasons}") from exc
+        raise ValueError(f"invalid embedding spec: {exc}") from exc
+    if "provider" in patch:
+        patch["provider"] = checked.provider  # canonical name (aliases resolved)
+    default = EmbeddingConfig()
+    if checked.dimension != default.dimension:
+        names_source = "provider" in patch and patch["provider"] != default.provider
+        if not (names_source or "model" in patch):
+            raise ValueError(
+                f"embedding.dimension {checked.dimension} differs from the default width "
+                f"{default.dimension}: name the embedding provider/model that produces it"
+            )
+        if checked.provider == default.provider and checked.model == default.model:
+            raise ValueError(
+                f"embedding.dimension {checked.dimension} does not match the default local "
+                f"model ({default.model}, width {default.dimension}); name the model that "
+                "produces that width"
+            )
+    return patch
+
+
 __all__ = [
+    "validate_new_vault_embedding_spec",
     "ConsolidationConfig",
     "CurationSchedulerConfig",
     "CustomStorageConfig",

@@ -56,7 +56,7 @@ from neo4j.exceptions import ClientError, DriverError, Neo4jError, ServiceUnavai
 
 from okto_neuron._compat import secret_env as _secret_env
 from okto_neuron._compat import vault_config_path
-from okto_neuron.config._vault import RetryConfig
+from okto_neuron.config._vault import RetryConfig, invalidate_config_cache
 from okto_neuron.core.schema import Edge, Node, Provenance
 from okto_neuron.errors import (
     EmbeddingDimMismatch,
@@ -194,6 +194,7 @@ def _persist_legacy_vault_id(vault_path: Path, vault_id: str) -> None:
             yaml.safe_dump(raw, fh, sort_keys=False)
         os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, config_path)
+        invalidate_config_cache(config_path)
     except OSError:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
@@ -267,6 +268,12 @@ SET n.type = $type,
     n.schema_version = $schema_version,
     n.embedding = $embedding
 """
+
+# Upsert that leaves the stored vector alone (a node written with embedding=None).
+_NODE_MERGE_CYPHER_KEEP_VECTOR = _NODE_MERGE_CYPHER.replace(
+    ",\n    n.embedding = $embedding", ""
+)
+assert _NODE_MERGE_CYPHER_KEEP_VECTOR != _NODE_MERGE_CYPHER
 
 _EDGE_CREATE_CYPHER = """
 MATCH (s:Node {id: $src, vault_id: $vault_id, _generation: $generation})
@@ -426,17 +433,27 @@ class Neo4jStore(GenerationScopedBackendMixin):
     def is_closed(self) -> bool:
         return self._closed
 
-    def add_node(self, node: Node) -> None:
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
         self._ensure_open()
         require_writable_node_type(node.type)
+        keep_vector = node.embedding is None and not clear_embedding
 
         def attempt() -> None:
             existing = self.get_node(node.id)
-            if existing is not None and _same_node_payload(existing, node):
+            effective = (
+                node.model_copy(update={"embedding": existing.embedding})
+                if keep_vector and existing is not None
+                else node
+            )
+            if existing is not None and _same_node_payload(existing, effective):
                 return
             created_at = existing.created_at if existing is not None else node.created_at
             params = self._node_write_params(node, created_at=created_at)
-            self._execute_write(_NODE_MERGE_CYPHER, params)
+            if keep_vector:
+                params.pop("embedding")
+                self._execute_write(_NODE_MERGE_CYPHER_KEEP_VECTOR, params)
+            else:
+                self._execute_write(_NODE_MERGE_CYPHER, params)
 
         self._run_with_retry(attempt)
 
@@ -730,7 +747,7 @@ class Neo4jStore(GenerationScopedBackendMixin):
         SET n.type = row.type, n.title = row.title, n.content = row.content,
             n.tags = row.tags, n.facets = row.facets, n.provenance = row.provenance,
             n.created_at = row.created_at, n.schema_version = row.schema_version,
-            n.embedding = row.embedding
+            n.embedding = coalesce(row.embedding, n.embedding)
         """
 
         def attempt() -> None:

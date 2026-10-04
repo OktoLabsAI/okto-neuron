@@ -299,8 +299,9 @@ class ProviderProfile(BaseModel):
     credential_id: str | None = None
     parameter_mode: ParameterMode = "safe"
     # Optional Okto Neuron-owned wall/read deadline for one LiteLLM completion.
-    # ``None`` deliberately delegates timeout policy to LiteLLM/the provider;
-    # ingest cancellation remains available through the owned helper process.
+    # ``None`` means the bounded default (``DEFAULT_LLM_REQUEST_TIMEOUT_S``,
+    # 300 s), never "no deadline"; ingest cancellation remains available
+    # through the owned helper process.
     request_timeout_s: float | None = Field(default=None, gt=0.0)
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)

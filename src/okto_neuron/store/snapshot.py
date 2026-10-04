@@ -224,7 +224,7 @@ def dump(
     snapshot_cm = store.snapshot() if hasattr(store, "snapshot") else nullcontext(None)
     with snapshot_cm as pinned_generation:
         nodes = sorted(
-            (node for node in store.list_nodes() if node.id != SCHEMA_METADATA_NODE_ID),
+            (node for node in store.list_nodes(include_embedding=True) if node.id != SCHEMA_METADATA_NODE_ID),
             key=lambda node: node.id,
         )
         embedded_count = 0

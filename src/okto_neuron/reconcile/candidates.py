@@ -432,7 +432,7 @@ def generate_candidate_clusters(
     # Collect candidate entity nodes, scoped to one type at a time so a cross-type
     # accident (Agent vs Concept sharing a word) never pairs.
     nodes_by_type: dict[str, list] = {}
-    for node in store.list_nodes(type=type):
+    for node in store.list_nodes(type=type, include_embedding=True):
         if is_infra(node):
             continue
         # Reconciliation targets the 5 entity primitives ONLY. Support types

@@ -122,7 +122,7 @@ def test_each_committed_relationship_mints_a_claim(tmp_path: Path) -> None:
         companion = _companion(vault, _RelExtractor())
         companion.remember(path)
 
-        claims = [n for n in vault.store.list_nodes(type="Claim")]
+        claims = [n for n in vault.store.list_nodes(type="Claim", include_embedding=True)]
         # One ~12k window holds both paragraphs; two relationships => two Claims
         # (minting tracks committed relationships, not block count).
         assert len(claims) == 2

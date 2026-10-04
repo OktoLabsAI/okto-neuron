@@ -25,6 +25,7 @@ import yaml
 
 from okto_neuron._compat import secret_env as _secret_env
 from okto_neuron._compat import vault_config_path
+from okto_neuron.config._vault import invalidate_config_cache
 from okto_neuron import __version__
 from okto_neuron.curation import orchestrate
 from okto_neuron.errors import (
@@ -34,6 +35,7 @@ from okto_neuron.errors import (
     RebuildInterrupted,
     RebuildSwapFailed,
     VaultLockHeld,
+    VaultNotFoundError,
     VaultPathNotADirectory,
 )
 from okto_neuron.store import _open_vault, schema, snapshot
@@ -43,10 +45,6 @@ from okto_neuron.store._bootstrap import (
     _graph_file_identity,
     _resolve_configured_dim,
     reset_bootstrap_cache_for_tests,
-)
-from okto_neuron.store.handle_lease import (
-    VaultHandleLease,
-    acquire_vault_handle_lease,
 )
 from okto_neuron.store.integrity import (
     AuditStatus,
@@ -62,6 +60,7 @@ from okto_neuron.store.integrity_state import (
 )
 from okto_neuron.store.ladybug import LadybugStore, VaultConnection, verify_ladybug_db_health
 from okto_neuron.store.rebuild_lock import RebuildLockHandle, acquire_rebuild_lock
+from okto_neuron.store.vault_writer import vault_writer
 
 # M2b (spec §2.1/§3): _active_graph_sidecars/_copy_closed_graph_checkpoint have
 # no remaining bare-name caller in this module (their only prior callers were
@@ -146,27 +145,29 @@ def kg_init(
     ``kg init`` into ``DEFAULT_NEW_VAULT_BACKEND``.
     """
     vault_path = Path(vault)
-    if backend is not None:
-        from okto_neuron.cli import _resolve_and_pin_backend
+    # An existing vault is refused while the daemon writes it; a new path is taken.
+    with vault_writer(vault_path, "kg init"):
+        if backend is not None:
+            from okto_neuron.cli import _resolve_and_pin_backend
 
-        _resolve_and_pin_backend(vault_path, backend)
-        if not (vault_config_path(vault_path)).exists():
-            _write_kg_init_vault_config(
-                vault_path,
-                backend,
-                storage_uri=storage_uri,
-                storage_credential_env=storage_credential_env,
-                storage_database=storage_database,
-                storage_allow_remote=storage_allow_remote,
-            )
-    store = _open_vault(vault_path)
-    try:
-        click.echo(_format_scaffold_layout(vault_path))
-    finally:
-        close = getattr(store, "close", None)
-        if callable(close):
-            close()
-    return 0
+            _resolve_and_pin_backend(vault_path, backend)
+            if not (vault_config_path(vault_path)).exists():
+                _write_kg_init_vault_config(
+                    vault_path,
+                    backend,
+                    storage_uri=storage_uri,
+                    storage_credential_env=storage_credential_env,
+                    storage_database=storage_database,
+                    storage_allow_remote=storage_allow_remote,
+                )
+        store = _open_vault(vault_path)
+        try:
+            click.echo(_format_scaffold_layout(vault_path))
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        return 0
 
 
 def _write_kg_init_vault_config(
@@ -191,7 +192,11 @@ def _write_kg_init_vault_config(
     """
     from okto_neuron.config import VaultConfig
 
+    from okto_neuron.config._vault import CURRENT_YAML_VERSION
+
     config = VaultConfig.default().model_dump(mode="json", exclude_none=True)
+    # Born at the current layout; default()'s v1 would be refused by the daemon (#14).
+    config["marginalia_yaml_version"] = CURRENT_YAML_VERSION
     storage: dict[str, object] = {"backend": backend}
     if backend in ("ladybug", "grafx"):
         storage["reason"] = None
@@ -214,6 +219,7 @@ def _write_kg_init_vault_config(
         raise VaultPathNotADirectory(vault_path, cause=exc) from exc
     config_path = vault_config_path(vault_path)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    invalidate_config_cache(config_path)
     os.chmod(config_path, 0o644)
 
 
@@ -428,28 +434,6 @@ def _ensure_live_graph_exists(
     close = getattr(store, "close", None)
     if callable(close):
         close()
-
-
-def _require_offline_graph_swap(
-    vault_path: Path,
-    *,
-    operation: str,
-) -> VaultHandleLease:
-    """Refuse standalone graph swaps while the vault daemon owns live handles."""
-
-    from okto_neuron.server.lifecycle import active_server_pid
-
-    owner_pid = active_server_pid(vault_path)
-    if owner_pid is not None:
-        raise VaultLockHeld(
-            vault_path,
-            holding_pid=owner_pid,
-            message=(
-                f"cannot {operation} while the Okto Neuron server is running for this vault "
-                f"(pid {owner_pid}); stop the server first"
-            ),
-        )
-    return acquire_vault_handle_lease(vault_path, operation=operation)
 
 
 def kg_rebuild(
@@ -1580,13 +1564,7 @@ def kg_reindex(vault: Path | None = None, *, force: bool = False) -> int:
 
     vault_path = _resolve_rebuild_vault(vault)
     _ensure_vault_directory(vault_path)
-    try:
-        ownership = _require_offline_graph_swap(vault_path, operation="reindex")
-    except VaultLockHeld:
-        click.echo("vault is open by another process; stop serve first", err=True)
-        return 1
-
-    with ownership:
+    with acquire_rebuild_lock(vault_path, operation="reindex"):
         _close_live_graph_handles(vault_path)
         # M4 spec §2 item 3 (registry-driven open): a plain
         # ``LadybugStore(vault_path)`` degrades to exactly
@@ -1727,7 +1705,7 @@ def _kg_reembed_owned(vault_path: Path, ownership: RebuildLockHandle) -> int:
                 vault_path, backend_name, _load_storage_config(vault_path)
             )
             try:
-                nodes = list(live_store.list_nodes())
+                nodes = list(live_store.list_nodes(include_embedding=True))
                 edges = list(live_store.list_edges())
             finally:
                 live_store.close()
@@ -2850,17 +2828,27 @@ def _close_result(result: object) -> None:
 
 
 # ── retroactive entity reconciliation (v0.0.5, ADR 0008) ──────────────────────--
-def _open_reconcile_context(vault_path: Path):
-    """Open the vault read-only and build the conservative judge + embedder + the
-    two off-graph side-stores. Mirrors the companion's judge/embedder construction
-    (CRITICAL: the embedder must be the SAME provider the read side uses)."""
+def _open_reconcile_context(vault_path: Path, *, open_vault: bool = True):
+    """Open the vault and build the conservative judge + embedder + the two
+    off-graph side-stores. Mirrors the companion's judge/embedder construction
+    (CRITICAL: the embedder must be the SAME provider the read side uses).
+
+    ``open_vault=False`` (``review list``, a pure reader) never opens the graph
+    store: it returns ``None`` for the vault and touches only the two JSON
+    side-stores, so it needs no writer lease.
+    """
     from okto_neuron.config import VaultConfig
     from okto_neuron.reconcile.authority import AUTHORITY_DIRNAME, AuthorityIndex
     from okto_neuron.reconcile.queue import RECONCILE_DIRNAME, ReconcileQueue
     from okto_neuron.resolve import LLMMergeJudge
     from okto_neuron.vault import Vault
 
-    vault = Vault.open(vault_path)
+    if open_vault:
+        vault = Vault.open(vault_path)
+    else:
+        if not vault_path.exists():
+            raise VaultNotFoundError(vault_path)
+        vault = None
     try:
         cfg = VaultConfig.load(vault_path)
     except Exception:  # noqa: BLE001 — missing/partial config → defaults
@@ -2900,56 +2888,57 @@ def kg_reconcile_propose(
     from okto_neuron.reconcile.propose import adjudicate_cluster
 
     vault_path = _resolve_rebuild_vault(vault)
-    vault, build_judge, authority, _queue, _model = _open_reconcile_context(vault_path)
-    try:
-        from okto_neuron.reconcile.decisions import IdentityDecisionIndex
+    with vault_writer(vault_path, "reconcile propose"):
+        vault, build_judge, authority, _queue, _model = _open_reconcile_context(vault_path)
+        try:
+            from okto_neuron.reconcile.decisions import IdentityDecisionIndex
 
-        decisions = IdentityDecisionIndex(authority.dir)
-        judge = build_judge()
-        clusters = generate_candidate_clusters(vault.store, embedder=vault.embedder, type=type)
-        rows = []
-        for cluster in clusters:
-            verdict = adjudicate_cluster(
-                cluster,
-                vault.store,
-                judge=judge,
-                embedder=vault.embedder,
-                use_cluster_judge=use_cluster_judge,
-                merge_blocked=decisions.is_distinct,
+            decisions = IdentityDecisionIndex(authority.dir)
+            judge = build_judge()
+            clusters = generate_candidate_clusters(vault.store, embedder=vault.embedder, type=type)
+            rows = []
+            for cluster in clusters:
+                verdict = adjudicate_cluster(
+                    cluster,
+                    vault.store,
+                    judge=judge,
+                    embedder=vault.embedder,
+                    use_cluster_judge=use_cluster_judge,
+                    merge_blocked=decisions.is_distinct,
+                )
+                rows.append((cluster, verdict))
+        finally:
+            vault.close()
+
+        if as_json:
+            payload = [
+                {
+                    "cluster_id": c.cluster_id,
+                    "type": c.type,
+                    "member_ids": list(c.member_ids),
+                    "lanes": sorted(c.lane_evidence.keys()),
+                    "same": v.same,
+                    "confidence": v.confidence,
+                    "canonical_id": v.canonical_id,
+                    "corroboration": v.corroboration,
+                    "reason": v.reason,
+                }
+                for c, v in rows
+            ]
+            click.echo(json.dumps(payload, indent=2))
+            return 0
+
+        if not rows:
+            click.echo("(no candidate clusters)")
+            return 0
+        for cluster, verdict in rows:
+            mark = "SAME" if verdict.same else "distinct"
+            click.echo(
+                f"{cluster.cluster_id} [{cluster.type}] {mark} "
+                f"conf={verdict.confidence:.2f} corr={verdict.corroboration} "
+                f"members={len(cluster.member_ids)} lanes={','.join(sorted(cluster.lane_evidence))}"
             )
-            rows.append((cluster, verdict))
-    finally:
-        vault.close()
-
-    if as_json:
-        payload = [
-            {
-                "cluster_id": c.cluster_id,
-                "type": c.type,
-                "member_ids": list(c.member_ids),
-                "lanes": sorted(c.lane_evidence.keys()),
-                "same": v.same,
-                "confidence": v.confidence,
-                "canonical_id": v.canonical_id,
-                "corroboration": v.corroboration,
-                "reason": v.reason,
-            }
-            for c, v in rows
-        ]
-        click.echo(json.dumps(payload, indent=2))
         return 0
-
-    if not rows:
-        click.echo("(no candidate clusters)")
-        return 0
-    for cluster, verdict in rows:
-        mark = "SAME" if verdict.same else "distinct"
-        click.echo(
-            f"{cluster.cluster_id} [{cluster.type}] {mark} "
-            f"conf={verdict.confidence:.2f} corr={verdict.corroboration} "
-            f"members={len(cluster.member_ids)} lanes={','.join(sorted(cluster.lane_evidence))}"
-        )
-    return 0
 
 
 def kg_reconcile_apply(
@@ -2964,53 +2953,54 @@ def kg_reconcile_apply(
     from okto_neuron.reconcile.apply import apply_reconciliation
 
     vault_path = _resolve_rebuild_vault(vault)
-    vault, build_judge, authority, queue, judge_model = _open_reconcile_context(vault_path)
-    try:
-        from okto_neuron.reconcile.decisions import IdentityDecisionIndex
+    with vault_writer(vault_path, "reconcile apply"):
+        vault, build_judge, authority, queue, judge_model = _open_reconcile_context(vault_path)
+        try:
+            from okto_neuron.reconcile.decisions import IdentityDecisionIndex
 
-        decisions = IdentityDecisionIndex(authority.dir)
-        judge = build_judge()
-        report = apply_reconciliation(
-            vault.store,
-            embedder=vault.embedder,
-            judge=judge,
-            authority=authority,
-            queue=queue,
-            type=type,
-            use_cluster_judge=use_cluster_judge,
-            judge_model=judge_model,
-            merge_blocked=decisions.is_distinct,
-        )
-    finally:
-        vault.close()
-
-    if as_json:
-        click.echo(
-            json.dumps(
-                {
-                    "auto_merged": report.auto_merged,
-                    "queued": report.queued,
-                    "skipped": report.skipped,
-                },
-                indent=2,
+            decisions = IdentityDecisionIndex(authority.dir)
+            judge = build_judge()
+            report = apply_reconciliation(
+                vault.store,
+                embedder=vault.embedder,
+                judge=judge,
+                authority=authority,
+                queue=queue,
+                type=type,
+                use_cluster_judge=use_cluster_judge,
+                judge_model=judge_model,
+                merge_blocked=decisions.is_distinct,
             )
+        finally:
+            vault.close()
+
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "auto_merged": report.auto_merged,
+                        "queued": report.queued,
+                        "skipped": report.skipped,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        click.echo(
+            f"reconcile apply: {len(report.auto_merged)} auto-merged (off-graph), "
+            f"{len(report.queued)} queued, {len(report.skipped)} skipped"
         )
         return 0
-    click.echo(
-        f"reconcile apply: {len(report.auto_merged)} auto-merged (off-graph), "
-        f"{len(report.queued)} queued, {len(report.skipped)} skipped"
-    )
-    return 0
 
 
 def kg_reconcile_review_list(vault: Path | None, *, as_json: bool = False) -> int:
     """List queued clusters awaiting confirmation."""
+    # Pure reader: no graph store opened, no writer lease taken.
     vault_path = _resolve_rebuild_vault(vault)
-    vault, _build_judge, _authority, queue, _model = _open_reconcile_context(vault_path)
-    try:
-        entries = queue.list()
-    finally:
-        vault.close()
+    _vault, _build_judge, _authority, queue, _model = _open_reconcile_context(
+        vault_path, open_vault=False
+    )
+    entries = queue.list()
     if as_json:
         click.echo(
             json.dumps(
@@ -3043,29 +3033,31 @@ def kg_reconcile_review_list(vault: Path | None, *, as_json: bool = False) -> in
 def kg_reconcile_review_confirm(cluster_id: str, vault: Path | None) -> int:
     """Confirm a queued cluster → off-graph AuthorityIndex; dequeue."""
     vault_path = _resolve_rebuild_vault(vault)
-    vault, _build_judge, _authority, queue, judge_model = _open_reconcile_context(vault_path)
-    try:
+    with vault_writer(vault_path, "reconcile review confirm"):
+        vault, _build_judge, _authority, queue, judge_model = _open_reconcile_context(vault_path)
         try:
-            rec = queue.confirm(cluster_id, judge_model=judge_model)
-        except KeyError:
-            click.echo(f"no queued cluster {cluster_id!r}", err=True)
-            return 1
-    finally:
-        vault.close()
-    click.echo(f"confirmed {rec.cluster_id} → canonical {rec.canonical_name!r} (off-graph)")
-    return 0
+            try:
+                rec = queue.confirm(cluster_id, judge_model=judge_model)
+            except KeyError:
+                click.echo(f"no queued cluster {cluster_id!r}", err=True)
+                return 1
+        finally:
+            vault.close()
+        click.echo(f"confirmed {rec.cluster_id} → canonical {rec.canonical_name!r} (off-graph)")
+        return 0
 
 
 def kg_reconcile_review_reject(cluster_id: str, vault: Path | None) -> int:
     """Reject (drop) a queued cluster."""
     vault_path = _resolve_rebuild_vault(vault)
-    vault, _build_judge, _authority, queue, _model = _open_reconcile_context(vault_path)
-    try:
-        queue.reject(cluster_id)
-    finally:
-        vault.close()
-    click.echo(f"rejected {cluster_id}")
-    return 0
+    with vault_writer(vault_path, "reconcile review reject"):
+        vault, _build_judge, _authority, queue, _model = _open_reconcile_context(vault_path)
+        try:
+            queue.reject(cluster_id)
+        finally:
+            vault.close()
+        click.echo(f"rejected {cluster_id}")
+        return 0
 
 
 def kg_reconcile_heal(vault: Path | None) -> int:
@@ -3084,8 +3076,8 @@ def kg_snapshot_dump(vault: Path | None, dest: Path) -> int:
     """Dump VAULT's graph into a fresh logical snapshot directory at DEST.
 
     Runs offline under the same single-writer lease guard as ``kg reindex``
-    (D-30): a held lease or a running server exits 1 with the same fixed
-    message. Reads the raw graph (bootstrapping it exactly as ``kg reindex``
+    (D-30): a held lease (the daemon's or another command's) exits 5 with the
+    holder's pid and what to do instead. Reads the raw graph (bootstrapping it exactly as ``kg reindex``
     does), the graph identity, and ``okto-neuron.yaml``'s embedding/packs — the
     manifest never records the vault's absolute path (see
     ``store/snapshot.py``'s module docstring and ``ORIGIN_SOURCES_PREFIX``).
@@ -3094,13 +3086,7 @@ def kg_snapshot_dump(vault: Path | None, dest: Path) -> int:
 
     vault_path = _resolve_rebuild_vault(vault)
     _ensure_vault_directory(vault_path)
-    try:
-        ownership = _require_offline_graph_swap(vault_path, operation="snapshot dump")
-    except VaultLockHeld:
-        click.echo("vault is open by another process; stop serve first", err=True)
-        return 1
-
-    with ownership:
+    with acquire_rebuild_lock(vault_path, operation="snapshot dump"):
         _close_live_graph_handles(vault_path)
         # M4 spec §2 item 3 (registry-driven open, supersedes M3's OQ7
         # note): a plain ``LadybugStore(vault_path)`` degrades to exactly
@@ -3222,8 +3208,10 @@ def _write_snapshot_vault_config(
         import uuid
 
         storage["vault_id"] = uuid.uuid4().hex
+    from okto_neuron.config._vault import CURRENT_YAML_VERSION
+
     config = {
-        "marginalia_yaml_version": 1,
+        "marginalia_yaml_version": CURRENT_YAML_VERSION,
         "vault_id": vault_path.name,
         "federation_opt_in": False,
         "packs": list(manifest.packs),
@@ -3236,6 +3224,7 @@ def _write_snapshot_vault_config(
     }
     config_path = vault_config_path(vault_path)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    invalidate_config_cache(config_path)
     os.chmod(config_path, 0o644)
 
 
@@ -3283,48 +3272,105 @@ def kg_snapshot_load(
     else:
         created_vault = True
 
-    try:
-        vault_path.mkdir(parents=True, exist_ok=True)
-        _write_snapshot_vault_config(
-            vault_path,
-            manifest,
-            storage_uri=storage_uri,
-            storage_credential_env=storage_credential_env,
-            storage_database=storage_database,
-            storage_allow_remote=storage_allow_remote,
-        )
-        store = _open_vault(vault_path)
+    # A new path: nobody else holds it, so this takes the lease instead of refusing.
+    with vault_writer(vault_path, "snapshot load"):
         try:
-            load_report = snapshot.load(
-                store,
-                src_path,
-                skip_embeddings=skip_embeddings,
-                sources_dest=vault_path / _MARGINALIA_DIR / "sources",
+            vault_path.mkdir(parents=True, exist_ok=True)
+            _write_snapshot_vault_config(
+                vault_path,
+                manifest,
+                storage_uri=storage_uri,
+                storage_credential_env=storage_credential_env,
+                storage_database=storage_database,
+                storage_allow_remote=storage_allow_remote,
             )
-            from okto_neuron.store.index import compute_graph_generation
+            store = _open_vault(vault_path)
+            try:
+                load_report = snapshot.load(
+                    store,
+                    src_path,
+                    skip_embeddings=skip_embeddings,
+                    sources_dest=vault_path / _MARGINALIA_DIR / "sources",
+                )
+                from okto_neuron.store.index import compute_graph_generation
 
-            generation = compute_graph_generation(store.graph)
-            in_sync = store.index.generation() == generation
-        finally:
-            store.close()
-            VaultConnection.close_vault(vault_path)
-    except Exception as exc:  # noqa: BLE001 — surfaced to the caller as a store error
-        click.echo(f"error: {exc}", err=True)
-        if created_vault:
-            shutil.rmtree(vault_path, ignore_errors=True)
-        return 1
+                generation = compute_graph_generation(store.graph)
+                in_sync = store.index.generation() == generation
+            finally:
+                store.close()
+                VaultConnection.close_vault(vault_path)
+        except Exception as exc:  # noqa: BLE001 — surfaced to the caller as a store error
+            click.echo(f"error: {exc}", err=True)
+            if created_vault:
+                shutil.rmtree(vault_path, ignore_errors=True)
+            return 1
 
-    click.echo(
-        f"nodes={load_report.nodes_written} edges={load_report.edges_written} "
-        f"embeddings={load_report.embeddings_applied} sources={load_report.sources_copied} "
-        f"skipped_embeddings={load_report.skipped_embeddings}"
-    )
-    stamp = generation[:12]
-    click.echo(
-        f"index up to date (generation {stamp})"
-        if in_sync
-        else f"index generation mismatch (generation {stamp})"
-    )
+        click.echo(
+            f"nodes={load_report.nodes_written} edges={load_report.edges_written} "
+            f"embeddings={load_report.embeddings_applied} sources={load_report.sources_copied} "
+            f"skipped_embeddings={load_report.skipped_embeddings}"
+        )
+        stamp = generation[:12]
+        click.echo(
+            f"index up to date (generation {stamp})"
+            if in_sync
+            else f"index generation mismatch (generation {stamp})"
+        )
+        return 0
+
+
+def kg_review_queue_migrate(
+    vault: Path | None,
+    *,
+    dry_run: bool = False,
+    rollback: bool = False,
+    restore_backup: bool = False,
+    as_json: bool = False,
+) -> int:
+    """Move a vault's review queue between ``review_queue.json`` and SQLite (#14).
+
+    ``--dry-run`` reads and verifies only and writes nothing in the vault, so it
+    takes no lease. Migrate and both rollback modes hold the vault's writer lease
+    (exit 5 while a daemon or another command holds it).
+    """
+    from okto_neuron.consolidate import review_queue_migration as migration
+
+    chosen = [name for name, on in (("--dry-run", dry_run), ("--rollback", rollback), ("--restore-backup", restore_backup)) if on]
+    if len(chosen) > 1:
+        raise click.UsageError(f"{' and '.join(chosen)} are mutually exclusive")
+    vault_path = _resolve_rebuild_vault(vault)
+    if not vault_path.is_dir():
+        raise migration.ReviewQueueMigrationError(f"vault not found: {vault_path}", vault_path=vault_path)
+
+    def run() -> "migration.MigrationReport":
+        if rollback or restore_backup:
+            return migration.rollback(vault_path, restore_backup=restore_backup)
+        return migration.migrate(vault_path, dry_run=dry_run)
+
+    if dry_run:
+        report = run()
+    else:
+        operation = "review-queue rollback" if rollback or restore_backup else "review-queue migrate"
+        with vault_writer(vault_path, operation):
+            report = run()
+
+    if as_json:
+        click.echo(json.dumps(report.as_dict(), indent=2))
+        return 0
+    click.echo(f"review-queue {report.action}: {report.outcome} ({report.seconds}s)")
+    if report.source_count or report.migrated_count:
+        click.echo(
+            f"  entries: source={report.source_count} sqlite={report.migrated_count} "
+            f"(nodes={report.nodes}, relations={report.relations}) hash-equal={report.hash_equal}"
+        )
+    if report.source_bytes or report.sqlite_bytes:
+        click.echo(f"  bytes: json={report.source_bytes} sqlite={report.sqlite_bytes}")
+    if report.backup:
+        click.echo(f"  backup: {report.backup}")
+    for note in report.notes:
+        click.echo(f"  {note}")
+    if report.dry_run:
+        click.echo("  dry run: nothing was written")
     return 0
 
 
@@ -3337,6 +3383,7 @@ __all__ = [
     "kg_reconcile_review_list",
     "kg_reconcile_review_confirm",
     "kg_reconcile_review_reject",
+    "kg_review_queue_migrate",
     "kg_reconcile_heal",
     "kg_snapshot_dump",
     "kg_snapshot_verify",

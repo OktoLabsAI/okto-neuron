@@ -348,7 +348,10 @@ def adjudicate_cluster(
     """Decide a cluster. Reduce to canonical, judge the rest against it; survivors
     are the members the judge calls 'same' at ≥ ``merge_confidence``. Cluster is
     'same' iff ≥1 survives; confidence = min surviving member confidence."""
-    members = [n for n in (store.get_node(mid) for mid in cluster.member_ids) if n]
+    # One batched read (was one get_node per member); member order, duplicate
+    # ids and missing-id skips are preserved.
+    fetched = {n.id: n for n in store.get_nodes(cluster.member_ids, include_embedding=True)}
+    members = [fetched[mid] for mid in cluster.member_ids if mid in fetched]
     if len(members) < 2:
         return ClusterVerdict(
             cluster.cluster_id, False, 0.0, "", cluster.member_ids, "none", "thin"

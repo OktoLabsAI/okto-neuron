@@ -23,6 +23,10 @@ The source comment on that map names `grafx` the default, non-experimental graph
 
 `resolve_graph_backend(name)` checks `_OFFICIAL` first, then the `marginalia.graph_backends` entry-point group. It fails closed: a name in neither source, or a resolved class that does not structurally satisfy the `GraphStore` protocol (a missing method or property, or a method whose signature cannot accept the protocol's call shape), raises `NoSuchBackendError` at registration time rather than on first write.
 
+The protocol's node reads take `include_embedding`: `get_node(node_id, include_embedding=True)`, `get_nodes(node_ids, include_embedding=False)` and `list_nodes(type=None, include_embedding=False)`. A backend whose methods lack that keyword is rejected at registration. When it is false the backend must not select the vector column and the returned nodes carry `embedding=None`.
+
+Writes keep the vector too: `add_node(node, clear_embedding=False)` preserves the stored vector when `node.embedding` is `None`, and only `clear_embedding=True` erases it. A backend must implement both the keyword and the preserve semantics, or a node read without its vector and written back would lose it.
+
 `list_graph_backends()` returns the three official names in declaration order, then appends any additional name registered under the `marginalia.graph_backends` entry-point group, deduplicated. It enumerates names only. It does not import or validate any class, so a name it lists is not by itself proof that the backend is usable in this process.
 
 `neptune` is not in `_OFFICIAL`. There is a `NeptuneStorageConfig` model in the config module, described in its own docstring as not-yet-shipped, but the name does not resolve through the registry, so asking for it raises `NoSuchBackendError`.

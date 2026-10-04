@@ -116,6 +116,41 @@ like any other. The node already exists, so `commit` receipts it as a re-mention
 *define* `add_node` / `add_edge` rather than call them. The closed-schema guard is
 enforced inside the two store implementations, so it covers every site above.
 
+## Review routes and a busy writer
+
+A `remember` or an ingest item holds the vault `writer_lock` and, inside the companion, the
+cross-process semantic writer lease (`.marginalia/.semantic-writer.lock`) for the whole item,
+which can take minutes. Review approve/reject (`POST /api/v1/resolve-review` and
+`POST /api/v1/review-queue/batch`, plus the bare aliases) never wait behind it and never fail
+because of it: a busy vault queues the action.
+
+- Both routes wait up to 5 s for `writer_lock`, then up to 5 s for the lease (a non-blocking
+  acquire loop; a timeout leaves nothing held). Callers that pass no timeout (for example
+  `remember` and the curation jobs) still block as before.
+- When either wait runs out, the route stores the action in the vault's
+  `.marginalia/review_queue.sqlite` (table `review_actions`: `id`, `candidate_id`, `action`,
+  `payload`, `expected_sha256`, `created_at`, `status`, `reason`, `claimed_at`, `finished_at`,
+  `outcome`) and answers `202` with `status: "queued"`, the action, `queued_ahead`, and the
+  `holder` and `retry_after_s` of the lock it found busy. `expected_sha256` is the queue entry
+  digest of the candidate at that moment (the state the user acted on). An id that is not in
+  the review queue still answers `404` (single) or counts as `skipped` (batch); nothing is
+  queued for it.
+- While earlier actions of the vault are still queued, a new action queues behind them even if
+  the lock is free, so actions apply in arrival order.
+- One applier task per vault (`server/_review_actions.py`) applies queued actions oldest first,
+  under `writer_lock` (holder kind `review-queue`) and the semantic lease, the same locks the
+  direct path takes. It starts when an action is queued, at daemon startup for every vault with
+  queued rows (so actions survive a restart), and when `GET /api/v1/review-actions` sees queued
+  rows. A busy lease releases `writer_lock` and retries after 2 s.
+- Before applying, the applier reads the candidate's current digest. Missing (resolved by
+  another action or a job, or removed) or different (parked again with other content) marks the
+  action `superseded` with the reason; it is never applied blindly. An error marks it `failed`
+  with the error text. Otherwise it is `applied` with the companion outcome.
+- A batch that is stopped by a busy lease keeps what it already resolved (`resolved`,
+  `skipped`, `errors` in the `202` body) and queues the rest under one `batch_id`.
+- `503 busy` is no longer an answer of these two routes. The other fail-fast routes
+  (reconcile, predicate upkeep, authority unmerge) still answer `503 busy` with the holder.
+
 ## Adding a writer
 
 1. Decide the class honestly. If a write depends on a model's judgement and is not

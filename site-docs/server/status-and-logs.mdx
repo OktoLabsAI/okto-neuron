@@ -86,13 +86,17 @@ The payload has exactly these keys.
 <ResponseField name="vaults" type="array">Per-vault summaries. Each entry carries `path`, `backend`, `draining`, `ingest`, `curation`, `maintenance` and `integrity`.</ResponseField>
 <ResponseField name="uptime_s" type="number">Daemon uptime in seconds.</ResponseField>
 <ResponseField name="queue_error_count" type="integer">Ingest items that failed or degraded. Defaults to `0`.</ResponseField>
-<ResponseField name="ingest" type="object">The ingest summary the text line is rendered from. Defaults to `{}`.</ResponseField>
+<ResponseField name="ingest" type="object">The ingest summary the text line is rendered from. Defaults to `{}`. Besides the queue counts it carries `inline` (`processing`, `done`, `error`), which counts MCP `remember` calls; those run inline and are not queue items, so they are not in `total`.</ResponseField>
 <ResponseField name="degraded_reasons" type="array">Reason strings. The server includes this key only when there is at least one reason; the CLI defaults it to an empty list.</ResponseField>
 <ResponseField name="marginalia_version" type="string">From `/version`; `unknown` when absent.</ResponseField>
 <ResponseField name="api_version" type="string">From `/version`; `unknown` when absent.</ResponseField>
 
 The server's `/api/v1/status` response carries more fields than the CLI forwards, among them
-`recovered_from_corruption`, `folder_watch_running` and `integrity`. If you need those, read the
+`recovered_from_corruption`, `folder_watch_running`, `integrity` and `gc` (collector thresholds,
+frozen-object count, collections per generation, and pause counters: `max_pause_ms`,
+`total_pause_ms`, `slow_pauses` over 50 ms, `last_slow_pause_at`, plus `switch_interval_s`, the
+current GIL switch interval in seconds, and `switch_interval_tuned`, whether `serve` changed
+it). If you need those, read the
 endpoint directly.
 
 ## Degraded reasons
@@ -134,10 +138,10 @@ esac
 
 ## The daemon log
 
-By default a daemonized server writes to `~/.okto-neuron/logs/okto-neuron-serve.log`. Structured
+By default every server, foreground or daemonized, writes to `~/.okto-neuron/logs/okto-neuron-serve.log`. Structured
 records are JSON, one per line. The daemon's raw stdout and stderr are redirected to the same file,
 so uncaught tracebacks and third-party output also appear there and are not JSON. Parse
-defensively. The file is size-rotated at 10 MiB with 3 backups kept. If the path already exists and is not
+defensively. The file is size-rotated at 10 MiB with 3 backups kept (`.1`, `.2`, `.3`); the active file keeps its name, and the daemon's stdout and stderr follow it after a rotation. If the path already exists and is not
 a regular file (a character device such as `/dev/null`), it is written without rotation.
 
 When a start fails, read the tail of that file. The installer does the same thing: on a failed

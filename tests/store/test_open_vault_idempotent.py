@@ -9,7 +9,7 @@ import ladybug
 import pytest
 import yaml
 
-from okto_neuron.config._vault import VaultConfig
+from okto_neuron.config._vault import CURRENT_YAML_VERSION, VaultConfig
 from okto_neuron.store import vault as vault_module
 from okto_neuron.store._bootstrap import _bootstrap_cache
 from okto_neuron.store.ladybug import VaultConnection
@@ -89,6 +89,7 @@ def _assert_scaffold_exists(vault_path: Path) -> None:
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o644
     assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == (
         VaultConfig.default().model_dump(mode="json", exclude_none=True)
+        | {"marginalia_yaml_version": CURRENT_YAML_VERSION}
     )
 
 

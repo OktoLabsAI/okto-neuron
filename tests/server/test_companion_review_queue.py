@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,3 +192,81 @@ def test_companion_triage_runner_maps_commit_discard_keep(
     assert [item.candidate_id for item in remaining] == [keep.candidate_id]
     assert store.get_node(commit.candidate_id) is not None
     assert store.get_node(discard.candidate_id) is None
+
+
+def test_companion_triage_reads_claims_once_for_all_candidates(tmp_path: Path, monkeypatch) -> None:
+    """N Claim candidates -> one shared Claim snapshot for contradiction scans, same outcomes as unbatched."""
+    from okto_neuron import resolve as resolve_mod
+
+    vault = _vault(tmp_path)
+    store = vault.store
+    store.add_node(Node(id="block:1", type="Block", title="Block", content="Source text"))
+    store.add_node(
+        Node(
+            id="claim:existing",
+            type="Claim",
+            title="Sky is blue",
+            content="The sky is blue.",
+            facets={"subject": "sky", "predicate": "color", "object": "blue"},
+        )
+    )
+    queue = ReviewQueue(Path(vault.path) / ".marginalia", store)
+    for i in range(4):
+        queue.enqueue(
+            NodeCandidate(
+                type="Claim",
+                title=f"Claim {i}",
+                content=f"The sky is not blue {i}.",
+                facets={
+                    "block_id": "block:1",
+                    "subject": "sky",
+                    "predicate": "color",
+                    "object": f"red{i}",
+                },
+                embedding=(1.0, float(i), 0.0),
+            ),
+            "low_confidence",
+        )
+
+    cfg = VaultConfig()
+    monkeypatch.setattr(_curation, "_load_config", lambda _state: cfg)
+    monkeypatch.setattr(
+        _curation,
+        "_build_companion_triage_provider",
+        lambda _s, _r: _TriageProvider({c.candidate_id: ("keep", 0.9) for c in queue.candidates()}),
+    )
+
+    seen: list[tuple] = []
+    real_resolve = resolve_mod.resolve
+
+    def spy(candidate, st, **kw):
+        outcome = real_resolve(candidate, st, **kw)
+        seen.append((outcome.contradicted, outcome.confidence, repr(outcome.correlations)))
+        return outcome
+
+    calls: list[object] = []
+    real_list = store.list_nodes
+
+    def counting(*a, **kw):
+        caller = sys._getframe(1).f_code.co_name
+        is_claim = kw.get("type") == "Claim" or (a and a[0] == "Claim")
+        # Only the contradiction scan's reads: find_similar / prompt context read
+        # their own same-type lists per candidate and are not part of this change.
+        if is_claim and caller in {"find_contradictions", "_claims_for_contradiction_scan"}:
+            calls.append(1)
+        return real_list(*a, **kw)
+
+    monkeypatch.setattr(resolve_mod, "resolve", spy)
+    monkeypatch.setattr(store, "list_nodes", counting)
+    state = SimpleNamespace(vault=vault, vault_path=vault.path)
+    _curation.run_companion_triage(state, _Job())
+    batched = list(seen)
+    assert len(calls) == 1
+
+    seen.clear()
+    calls.clear()
+    for candidate in queue.candidates():
+        spy(candidate, store, embedder=vault.embedder)
+    assert all(entry[0] for entry in batched)  # contradictions were really found
+    assert len(calls) == 4  # unbatched: one contradiction-scan read per candidate
+    assert seen == batched

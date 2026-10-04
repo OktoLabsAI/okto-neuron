@@ -453,17 +453,39 @@ def test_kg_rebuild_lock_contention_raises_vault_lock_held(tmp_path: Path) -> No
 @pytest.mark.parametrize("operation", [kg_rebuild, kg_reembed])
 def test_standalone_graph_swap_refuses_live_vault_daemon(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     operation: object,
 ) -> None:
+    """The daemon's per-vault writer lease (#21) replaces the old pid check."""
     vault_path = tmp_path / "vault"
     vault_path.mkdir()
-    monkeypatch.setattr("okto_neuron.server.lifecycle.active_server_pid", lambda _vault: 4242)
-
-    with pytest.raises(VaultLockHeld, match="stop the server first") as exc_info:
-        operation(vault_path)  # type: ignore[operator]
-
-    assert exc_info.value.holding_pid == 4242
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from okto_neuron.store.writer_lease import acquire_writer_lease as a; "
+            "a(sys.argv[1], role='daemon', operation='serve'); print('READY', flush=True); "
+            "sys.stdin.readline()",
+            str(vault_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "READY"
+        with pytest.raises(VaultLockHeld, match="daemon pid") as exc_info:
+            operation(vault_path)  # type: ignore[operator]
+        assert exc_info.value.EXIT_CODE == 5
+        assert exc_info.value.holding_pid == child.pid
+        assert "okto-neuron stop" in exc_info.value.user_message()
+    finally:
+        assert child.stdin is not None
+        child.stdin.write("\n")
+        child.stdin.flush()
+        child.wait(timeout=10)
+        child.stdout.close()
+        child.stdin.close()
 
 
 @pytest.mark.parametrize("operation", [kg_rebuild, kg_reembed])
@@ -495,7 +517,7 @@ def test_standalone_graph_swap_refuses_real_cross_process_pool_handle(
     try:
         assert child.stdout is not None
         assert child.stdout.readline().strip() == "READY"
-        with pytest.raises(VaultLockHeld, match="owns a live graph handle") as exc_info:
+        with pytest.raises(VaultLockHeld, match="daemon pid") as exc_info:
             operation(vault_path)  # type: ignore[operator]
         assert exc_info.value.holding_pid == child.pid
         assert not (vault_path / ".marginalia" / "rebuild.state.json").exists()

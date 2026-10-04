@@ -36,7 +36,7 @@ def test_vault_config_load_unknown_yaml_version_raises_unsupported(
     assert error.EXIT_CODE == 4
     assert error.file_path == config_path.resolve()
     assert error.found_version == 99
-    assert error.supported_versions == (1,)
+    assert error.supported_versions == (1, 2)
 
 
 def test_vault_config_load_explicit_yaml_version_one_succeeds_without_warning(

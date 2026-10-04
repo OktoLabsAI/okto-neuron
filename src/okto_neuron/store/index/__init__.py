@@ -37,11 +37,11 @@ def default_index_store(vault_path: Path | str) -> DefaultIndexStore:
 def reindex_all(store: "GraphStore", index: IndexStore) -> None:
     """Rebuild the index from scratch off the graph's current nodes."""
     index.clear()
-    for node in store.list_nodes():
+    for node in store.list_nodes(include_embedding=True):
         index.upsert(node)
     index.checkpoint()
 
 
 def compute_graph_generation(store: "GraphStore") -> str:
     """The generation stamp a consistent index for this store must equal."""
-    return graph_generation(store.list_nodes())
+    return graph_generation(store.list_nodes(include_embedding=True))

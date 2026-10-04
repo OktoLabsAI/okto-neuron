@@ -1,0 +1,3002 @@
+{
+ "after": {
+  "decision_runs": [
+   "e075f9f575974189bf6ff6cc9e5d9f26"
+  ],
+  "open_runs": {
+   "ad3cb48c242c4005b9cdf6c0800b957e": "doc-b"
+  },
+  "progress": {
+   "4d448f2d067541319f3ad6891f76b05f": {
+    "active_candidate_kinds": {},
+    "audit_modes": {
+     "llm_skipped": 1
+    },
+    "candidate_kinds": {},
+    "comparison_methods": {
+     "curator": 1
+    },
+    "comparison_verdicts": {
+     "queue": 1
+    },
+    "counts": {
+     "candidate_rows": 0,
+     "candidates": 0,
+     "commit_plans": 1,
+     "commit_records": 0,
+     "comparisons": 1
+    },
+    "llm_timing": {},
+    "pending_commit_preview": {
+     "nodes": {
+      "accepted_for_write": 0,
+      "queued_or_abstained": 0,
+      "sample_candidates_by_verdict": {},
+      "sample_titles_by_verdict": {},
+      "types_by_verdict": {}
+     },
+     "relations": {
+      "accepted_for_write": 0,
+      "accepted_predicates": {},
+      "canonicalized_originals": 0,
+      "endpoint_dead_letters": 0,
+      "queued_or_abstained": 0,
+      "queued_predicates": {},
+      "sample_relations_by_verdict": {},
+      "terminals_by_verdict": {}
+     }
+    },
+    "progress": {
+     "node_curator": {
+      "done": 1,
+      "fraction": null,
+      "population": "node_candidates",
+      "progress_integrity_error": {
+       "code": "progress_done_exceeds_total",
+       "done": 1,
+       "overflow": 1,
+       "population": "node_candidates",
+       "total": 0
+      },
+      "remaining": -1,
+      "total": 0
+     },
+     "relation_curator": {
+      "done": 0,
+      "fraction": null,
+      "population": "edge_candidates",
+      "remaining": 0,
+      "total": 0
+     }
+    },
+    "run": {
+     "blocks_total": 1,
+     "completed_at": "2026-09-30T20:01:49.864938+00:00",
+     "counts": {
+      "candidates": 0,
+      "commit_plans": 1,
+      "commit_records": 0,
+      "comparisons": 1
+     },
+     "document_id": "doc-c",
+     "model": "m2",
+     "name": "c.md",
+     "post_semantic_policy_fingerprint": null,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "source": "/x/c.md",
+     "started_at": "2026-09-30T20:01:49.860158+00:00",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     }
+    }
+   },
+   "ad3cb48c242c4005b9cdf6c0800b957e": {
+    "active_candidate_kinds": {
+     "node": 1
+    },
+    "audit_modes": {},
+    "candidate_kinds": {
+     "node": 1
+    },
+    "comparison_methods": {},
+    "comparison_verdicts": {},
+    "counts": {
+     "candidate_rows": 1,
+     "candidates": 1,
+     "commit_plans": 2,
+     "commit_records": 0,
+     "comparisons": 0
+    },
+    "llm_timing": {},
+    "pending_commit_preview": {
+     "nodes": {
+      "accepted_for_write": 0,
+      "queued_or_abstained": 0,
+      "sample_candidates_by_verdict": {},
+      "sample_titles_by_verdict": {},
+      "types_by_verdict": {}
+     },
+     "relations": {
+      "accepted_for_write": 0,
+      "accepted_predicates": {},
+      "canonicalized_originals": 0,
+      "endpoint_dead_letters": 0,
+      "queued_or_abstained": 0,
+      "queued_predicates": {},
+      "sample_relations_by_verdict": {},
+      "terminals_by_verdict": {}
+     }
+    },
+    "progress": {
+     "node_curator": {
+      "done": 0,
+      "fraction": 0.0,
+      "population": "node_candidates",
+      "remaining": 1,
+      "total": 1
+     },
+     "relation_curator": {
+      "done": 0,
+      "fraction": null,
+      "population": "edge_candidates",
+      "remaining": 0,
+      "total": 0
+     }
+    },
+    "run": {
+     "blocks_total": 1,
+     "completed_at": null,
+     "counts": {
+      "candidates": 1,
+      "commit_plans": 2,
+      "commit_records": 0,
+      "comparisons": 0
+     },
+     "document_id": "doc-b",
+     "model": "m1",
+     "name": "b.md",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "source": "/x/b.md",
+     "started_at": "2026-09-30T20:01:49.859953+00:00",
+     "state": "started",
+     "summary": {}
+    }
+   },
+   "e075f9f575974189bf6ff6cc9e5d9f26": {
+    "active_candidate_kinds": {
+     "edge": 4,
+     "node": 3
+    },
+    "audit_modes": {},
+    "candidate_kinds": {
+     "edge": 1,
+     "node": 2
+    },
+    "comparison_methods": {
+     "curator": 1,
+     "relation_curator": 1
+    },
+    "comparison_verdicts": {
+     "commit": 2
+    },
+    "counts": {
+     "candidate_rows": 3,
+     "candidates": 3,
+     "commit_plans": 1,
+     "commit_records": 1,
+     "comparisons": 2
+    },
+    "llm_timing": {
+     "curator": {
+      "calls": 1,
+      "max_s": 1.5,
+      "p50_s": 1.5,
+      "p90_s": 1.5,
+      "tokens": {
+       "prompt_tokens": 10
+      },
+      "total_s": 1.5
+     }
+    },
+    "pending_commit_preview": {
+     "nodes": {
+      "accepted_for_write": 1,
+      "queued_or_abstained": 0,
+      "sample_candidates_by_verdict": {
+       "commit": [
+        {
+         "candidate_id": "n-1",
+         "title": "Alpha",
+         "type": "Agent"
+        }
+       ]
+      },
+      "sample_titles_by_verdict": {
+       "commit": [
+        "Alpha"
+       ]
+      },
+      "types_by_verdict": {
+       "commit": {
+        "Agent": 1
+       }
+      }
+     },
+     "relations": {
+      "accepted_for_write": 1,
+      "accepted_predicates": {
+       "mentions": 1
+      },
+      "canonicalized_originals": 0,
+      "endpoint_dead_letters": 0,
+      "queued_or_abstained": 0,
+      "queued_predicates": {},
+      "sample_relations_by_verdict": {
+       "commit": [
+        {
+         "candidate_id": "e-1",
+         "object": {
+          "ref": "n-2",
+          "title": "n-2",
+          "type": ""
+         },
+         "predicate": "mentions",
+         "raw_predicate": "mentions",
+         "relation_kind": "",
+         "subject": {
+          "ref": "n-1",
+          "title": "Alpha",
+          "type": "Agent"
+         },
+         "terminal_action": "create_edge_or_claim"
+        }
+       ]
+      },
+      "terminals_by_verdict": {
+       "commit": {
+        "create_edge_or_claim": 1
+       }
+      }
+     }
+    },
+    "progress": {
+     "node_curator": {
+      "done": 1,
+      "fraction": 0.3333333333333333,
+      "population": "node_candidates",
+      "population_revision": {
+       "previous_total": 2,
+       "reason": "active_population_recomputed",
+       "source": "curator",
+       "total": 3
+      },
+      "remaining": 2,
+      "total": 3
+     },
+     "relation_curator": {
+      "done": 1,
+      "fraction": 0.25,
+      "population": "edge_candidates",
+      "population_revision": {
+       "previous_total": 1,
+       "reason": "active_population_recomputed",
+       "source": "curator",
+       "total": 4
+      },
+      "remaining": 3,
+      "total": 4
+     }
+    },
+    "run": {
+     "blocks_total": 2,
+     "completed_at": "2026-09-30T20:01:49.866158+00:00",
+     "counts": {
+      "candidates": 3,
+      "commit_plans": 1,
+      "commit_records": 1,
+      "comparisons": 2
+     },
+     "document_id": "doc-a",
+     "integrity": {
+      "status": "verified"
+     },
+     "model": "m1",
+     "name": "a.md",
+     "post_semantic_policy_fingerprint": "sp1",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "source": "/x/a.md",
+     "started_at": "2026-09-30T20:01:49.858634+00:00",
+     "state": "completed",
+     "summary": {
+      "outcome": {
+       "integrity": {
+        "status": "verified"
+       },
+       "quality": "complete",
+       "receipts_complete": true
+      }
+     }
+    }
+   },
+   "latest": {
+    "active_candidate_kinds": {},
+    "audit_modes": {
+     "llm_skipped": 1
+    },
+    "candidate_kinds": {},
+    "comparison_methods": {
+     "curator": 1
+    },
+    "comparison_verdicts": {
+     "queue": 1
+    },
+    "counts": {
+     "candidate_rows": 0,
+     "candidates": 0,
+     "commit_plans": 1,
+     "commit_records": 0,
+     "comparisons": 1
+    },
+    "llm_timing": {},
+    "pending_commit_preview": {
+     "nodes": {
+      "accepted_for_write": 0,
+      "queued_or_abstained": 0,
+      "sample_candidates_by_verdict": {},
+      "sample_titles_by_verdict": {},
+      "types_by_verdict": {}
+     },
+     "relations": {
+      "accepted_for_write": 0,
+      "accepted_predicates": {},
+      "canonicalized_originals": 0,
+      "endpoint_dead_letters": 0,
+      "queued_or_abstained": 0,
+      "queued_predicates": {},
+      "sample_relations_by_verdict": {},
+      "terminals_by_verdict": {}
+     }
+    },
+    "progress": {
+     "node_curator": {
+      "done": 1,
+      "fraction": null,
+      "population": "node_candidates",
+      "progress_integrity_error": {
+       "code": "progress_done_exceeds_total",
+       "done": 1,
+       "overflow": 1,
+       "population": "node_candidates",
+       "total": 0
+      },
+      "remaining": -1,
+      "total": 0
+     },
+     "relation_curator": {
+      "done": 0,
+      "fraction": null,
+      "population": "edge_candidates",
+      "remaining": 0,
+      "total": 0
+     }
+    },
+    "run": {
+     "blocks_total": 1,
+     "completed_at": "2026-09-30T20:01:49.864938+00:00",
+     "counts": {
+      "candidates": 0,
+      "commit_plans": 1,
+      "commit_records": 0,
+      "comparisons": 1
+     },
+     "document_id": "doc-c",
+     "model": "m2",
+     "name": "c.md",
+     "post_semantic_policy_fingerprint": null,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "source": "/x/c.md",
+     "started_at": "2026-09-30T20:01:49.860158+00:00",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     }
+    }
+   },
+   "missing": null
+  },
+  "receipts": {
+   "2b19d01ef5f74069abedb4af84fd48e7": {
+    "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84": {
+     "kind": "operation_receipt",
+     "ledger_version": 2,
+     "operation": "dead_letter",
+     "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+     "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+     "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+     "result": {
+      "candidate_id": "e-5"
+     },
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "status": "dead_lettered",
+     "ts": "2026-09-30T20:01:49.865914+00:00"
+    }
+   },
+   "f508ba8282974aa1b8865d2af7ad8bd7": {}
+  },
+  "records": [
+   {
+    "blocks_total": 2,
+    "config_fingerprint": "cf1",
+    "document_id": "doc-a",
+    "extraction_fingerprint": "ef1",
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "materialization_scope": "fresh_rebuild.v1",
+    "model": "m1",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "semantic_policy_fingerprint": "sp1",
+    "source": "/x/a.md",
+    "state": "started",
+    "ts": "2026-09-30T20:01:49.858634+00:00"
+   },
+   {
+    "candidate_id": "n-1",
+    "candidate_kind": "node",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "embedding_dim": 2,
+     "title": "Alpha",
+     "type": "Agent"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.859153+00:00"
+   },
+   {
+    "candidate_id": "e-1",
+    "candidate_kind": "edge",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "dst_ref": "n-2",
+     "src_ref": "n-1",
+     "type": "mentions"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.859374+00:00"
+   },
+   {
+    "candidate_id": "n-1",
+    "kind": "comparison",
+    "ledger_version": 2,
+    "method": "curator",
+    "payload": {
+     "after": {
+      "edges": 4,
+      "nodes": 3
+     },
+     "duration_s": 1.5,
+     "usage": {
+      "prompt_tokens": 10
+     }
+    },
+    "reason": "",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "score": 0.9,
+    "target_ref": null,
+    "ts": "2026-09-30T20:01:49.859564+00:00",
+    "verdict": "commit"
+   },
+   {
+    "candidate_id": "e-1",
+    "kind": "comparison",
+    "ledger_version": 2,
+    "method": "relation_curator",
+    "payload": {
+     "dst_ref": "n-2",
+     "proposed_terminal_action": "create_edge_or_claim",
+     "src_ref": "n-1",
+     "type": "mentions"
+    },
+    "reason": "",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "score": null,
+    "target_ref": null,
+    "ts": "2026-09-30T20:01:49.859759+00:00",
+    "verdict": "commit"
+   },
+   {
+    "blocks_total": 1,
+    "config_fingerprint": "cf1",
+    "document_id": "doc-b",
+    "extraction_fingerprint": "ef1",
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "materialization_scope": "fresh_rebuild.v1",
+    "model": "m1",
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "semantic_policy_fingerprint": "sp1",
+    "source": "/x/b.md",
+    "state": "started",
+    "ts": "2026-09-30T20:01:49.859953+00:00"
+   },
+   {
+    "blocks_total": 1,
+    "config_fingerprint": "cf1",
+    "document_id": "doc-c",
+    "extraction_fingerprint": "ef1",
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "materialization_scope": "fresh_rebuild.v1",
+    "model": "m2",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "semantic_policy_fingerprint": "sp1",
+    "source": "/x/c.md",
+    "state": "started",
+    "ts": "2026-09-30T20:01:49.860158+00:00"
+   },
+   {
+    "context": {
+     "document_id": "doc-a"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-1",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+      "reason": "fixture"
+     },
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-2",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "ts": "2026-09-30T20:01:49.860409+00:00"
+   },
+   {
+    "kind": "operation_receipt",
+    "ledger_version": 2,
+    "operation": "dead_letter",
+    "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "result": {
+     "candidate_id": "e-1"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "status": "dead_lettered",
+    "ts": "2026-09-30T20:01:49.861245+00:00"
+   },
+   {
+    "kind": "operation_receipt",
+    "ledger_version": 2,
+    "operation": "dead_letter",
+    "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "result": {
+     "candidate_id": "e-2"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "status": "dead_lettered",
+    "ts": "2026-09-30T20:01:49.861549+00:00"
+   },
+   {
+    "kind": "commit_record",
+    "ledger_version": 2,
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "result": {
+     "ok": true,
+     "operation_receipts": 2,
+     "operation_receipts_complete": true
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "ts": "2026-09-30T20:01:49.862409+00:00"
+   },
+   {
+    "candidate_id": "n-9",
+    "candidate_kind": "node",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "title": "Nine",
+     "type": "Agent"
+    },
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.862660+00:00"
+   },
+   {
+    "candidate_id": "n-3",
+    "kind": "comparison",
+    "ledger_version": 2,
+    "method": "curator",
+    "payload": {
+     "audit_only": true,
+     "llm_skipped": true
+    },
+    "reason": "",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "score": null,
+    "target_ref": null,
+    "ts": "2026-09-30T20:01:49.862844+00:00",
+    "verdict": "queue"
+   },
+   {
+    "context": {
+     "document_id": "doc-b"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-3",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+    "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "ts": "2026-09-30T20:01:49.863054+00:00"
+   },
+   {
+    "context": {
+     "document_id": "doc-c"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-4",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:4b01e2a2115136a3561188abe77192e856bdf3aab644d37f6ac664abec803cf5",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+    "plan_id": "fde1e26dfc544172b823068632611619",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "ts": "2026-09-30T20:01:49.863392+00:00"
+   },
+   {
+    "evidence": {
+     "k": "v"
+    },
+    "kind": "plan_abandoned",
+    "ledger_version": 2,
+    "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+    "plan_id": "fde1e26dfc544172b823068632611619",
+    "reason": "source_changed",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "ts": "2026-09-30T20:01:49.864683+00:00"
+   },
+   {
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "state": "failed",
+    "summary": {
+     "reason": "x"
+    },
+    "ts": "2026-09-30T20:01:49.864938+00:00"
+   },
+   {
+    "context": {
+     "document_id": "doc-b"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-5",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+      "reason": "fixture"
+     },
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-6",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+    "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "ts": "2026-09-30T20:01:49.865229+00:00"
+   },
+   {
+    "kind": "operation_receipt",
+    "ledger_version": 2,
+    "operation": "dead_letter",
+    "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+    "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+    "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+    "result": {
+     "candidate_id": "e-5"
+    },
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "status": "dead_lettered",
+    "ts": "2026-09-30T20:01:49.865914+00:00"
+   },
+   {
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "post_semantic_policy_fingerprint": "sp1",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "completed",
+    "summary": {
+     "outcome": {
+      "quality": "complete",
+      "receipts_complete": true
+     }
+    },
+    "ts": "2026-09-30T20:01:49.866158+00:00"
+   },
+   {
+    "document_id": "doc-a",
+    "integrity": {
+     "status": "verified"
+    },
+    "kind": "integrity_outcome",
+    "ledger_version": 2,
+    "quality": "complete",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "ts": "2026-09-30T20:01:49.866400+00:00"
+   },
+   {
+    "candidate_id": "n-2",
+    "candidate_kind": "node",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "title": "Beta",
+     "type": "Agent"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.866665+00:00"
+   }
+  ],
+  "run_detail": {
+   "4d448f2d067541319f3ad6891f76b05f": {
+    "candidates": [],
+    "commit_plans": [
+     {
+      "context": {
+       "document_id": "doc-c"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-4",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:4b01e2a2115136a3561188abe77192e856bdf3aab644d37f6ac664abec803cf5",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+      "plan_id": "fde1e26dfc544172b823068632611619",
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "ts": "2026-09-30T20:01:49.863392+00:00"
+     }
+    ],
+    "commit_records": [],
+    "comparisons": [
+     {
+      "candidate_id": "n-3",
+      "kind": "comparison",
+      "ledger_version": 2,
+      "method": "curator",
+      "payload": {
+       "audit_only": true,
+       "llm_skipped": true
+      },
+      "reason": "",
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "score": null,
+      "target_ref": null,
+      "ts": "2026-09-30T20:01:49.862844+00:00",
+      "verdict": "queue"
+     }
+    ],
+    "integrity_outcomes": [],
+    "records": [
+     {
+      "blocks_total": 1,
+      "config_fingerprint": "cf1",
+      "document_id": "doc-c",
+      "extraction_fingerprint": "ef1",
+      "kind": "ingest_run",
+      "ledger_version": 2,
+      "materialization_scope": "fresh_rebuild.v1",
+      "model": "m2",
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "semantic_policy_fingerprint": "sp1",
+      "source": "/x/c.md",
+      "state": "started",
+      "ts": "2026-09-30T20:01:49.860158+00:00"
+     },
+     {
+      "candidate_id": "n-3",
+      "kind": "comparison",
+      "ledger_version": 2,
+      "method": "curator",
+      "payload": {
+       "audit_only": true,
+       "llm_skipped": true
+      },
+      "reason": "",
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "score": null,
+      "target_ref": null,
+      "ts": "2026-09-30T20:01:49.862844+00:00",
+      "verdict": "queue"
+     },
+     {
+      "context": {
+       "document_id": "doc-c"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-4",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:4b01e2a2115136a3561188abe77192e856bdf3aab644d37f6ac664abec803cf5",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+      "plan_id": "fde1e26dfc544172b823068632611619",
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "ts": "2026-09-30T20:01:49.863392+00:00"
+     },
+     {
+      "evidence": {
+       "k": "v"
+      },
+      "kind": "plan_abandoned",
+      "ledger_version": 2,
+      "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+      "plan_id": "fde1e26dfc544172b823068632611619",
+      "reason": "source_changed",
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "ts": "2026-09-30T20:01:49.864683+00:00"
+     },
+     {
+      "kind": "ingest_run",
+      "ledger_version": 2,
+      "run_id": "4d448f2d067541319f3ad6891f76b05f",
+      "state": "failed",
+      "summary": {
+       "reason": "x"
+      },
+      "ts": "2026-09-30T20:01:49.864938+00:00"
+     }
+    ],
+    "run": {
+     "blocks_total": 1,
+     "completed_at": "2026-09-30T20:01:49.864938+00:00",
+     "counts": {
+      "candidates": 0,
+      "commit_plans": 1,
+      "commit_records": 0,
+      "comparisons": 1
+     },
+     "document_id": "doc-c",
+     "model": "m2",
+     "name": "c.md",
+     "post_semantic_policy_fingerprint": null,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "source": "/x/c.md",
+     "started_at": "2026-09-30T20:01:49.860158+00:00",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     }
+    }
+   },
+   "ad3cb48c242c4005b9cdf6c0800b957e": {
+    "candidates": [
+     {
+      "block_id": null,
+      "candidate_id": "n-9",
+      "candidate_kind": "node",
+      "confidence": null,
+      "source_path": null,
+      "state": "proposed",
+      "title": "Nine",
+      "type": "Agent"
+     }
+    ],
+    "commit_plans": [
+     {
+      "context": {
+       "document_id": "doc-b"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-3",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+      "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "ts": "2026-09-30T20:01:49.863054+00:00"
+     },
+     {
+      "context": {
+       "document_id": "doc-b"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-5",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+        "reason": "fixture"
+       },
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-6",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+      "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "ts": "2026-09-30T20:01:49.865229+00:00"
+     }
+    ],
+    "commit_records": [],
+    "comparisons": [],
+    "integrity_outcomes": [],
+    "records": [
+     {
+      "blocks_total": 1,
+      "config_fingerprint": "cf1",
+      "document_id": "doc-b",
+      "extraction_fingerprint": "ef1",
+      "kind": "ingest_run",
+      "ledger_version": 2,
+      "materialization_scope": "fresh_rebuild.v1",
+      "model": "m1",
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "semantic_policy_fingerprint": "sp1",
+      "source": "/x/b.md",
+      "state": "started",
+      "ts": "2026-09-30T20:01:49.859953+00:00"
+     },
+     {
+      "candidate_id": "n-9",
+      "candidate_kind": "node",
+      "kind": "candidate",
+      "ledger_version": 2,
+      "payload": {
+       "title": "Nine",
+       "type": "Agent"
+      },
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "state": "proposed",
+      "ts": "2026-09-30T20:01:49.862660+00:00"
+     },
+     {
+      "context": {
+       "document_id": "doc-b"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-3",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+      "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "ts": "2026-09-30T20:01:49.863054+00:00"
+     },
+     {
+      "context": {
+       "document_id": "doc-b"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-5",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+        "reason": "fixture"
+       },
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-6",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+      "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "ts": "2026-09-30T20:01:49.865229+00:00"
+     },
+     {
+      "kind": "operation_receipt",
+      "ledger_version": 2,
+      "operation": "dead_letter",
+      "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+      "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+      "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+      "result": {
+       "candidate_id": "e-5"
+      },
+      "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+      "status": "dead_lettered",
+      "ts": "2026-09-30T20:01:49.865914+00:00"
+     }
+    ],
+    "run": {
+     "blocks_total": 1,
+     "completed_at": null,
+     "counts": {
+      "candidates": 1,
+      "commit_plans": 2,
+      "commit_records": 0,
+      "comparisons": 0
+     },
+     "document_id": "doc-b",
+     "model": "m1",
+     "name": "b.md",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "source": "/x/b.md",
+     "started_at": "2026-09-30T20:01:49.859953+00:00",
+     "state": "started",
+     "summary": {}
+    }
+   },
+   "e075f9f575974189bf6ff6cc9e5d9f26": {
+    "candidates": [
+     {
+      "block_id": null,
+      "candidate_id": "n-1",
+      "candidate_kind": "node",
+      "confidence": null,
+      "source_path": null,
+      "state": "proposed",
+      "title": "Alpha",
+      "type": "Agent"
+     },
+     {
+      "block_id": null,
+      "candidate_id": "e-1",
+      "candidate_kind": "edge",
+      "confidence": null,
+      "source_path": null,
+      "state": "proposed",
+      "title": "",
+      "type": "mentions"
+     },
+     {
+      "block_id": null,
+      "candidate_id": "n-2",
+      "candidate_kind": "node",
+      "confidence": null,
+      "source_path": null,
+      "state": "proposed",
+      "title": "Beta",
+      "type": "Agent"
+     }
+    ],
+    "commit_plans": [
+     {
+      "context": {
+       "document_id": "doc-a"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-1",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+        "reason": "fixture"
+       },
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-2",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+      "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "ts": "2026-09-30T20:01:49.860409+00:00"
+     }
+    ],
+    "commit_records": [
+     {
+      "kind": "commit_record",
+      "ledger_version": 2,
+      "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+      "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+      "result": {
+       "ok": true,
+       "operation_receipts": 2,
+       "operation_receipts_complete": true
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "ts": "2026-09-30T20:01:49.862409+00:00"
+     }
+    ],
+    "comparisons": [
+     {
+      "candidate_id": "n-1",
+      "kind": "comparison",
+      "ledger_version": 2,
+      "method": "curator",
+      "payload": {
+       "after": {
+        "edges": 4,
+        "nodes": 3
+       },
+       "duration_s": 1.5,
+       "usage": {
+        "prompt_tokens": 10
+       }
+      },
+      "reason": "",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "score": 0.9,
+      "target_ref": null,
+      "ts": "2026-09-30T20:01:49.859564+00:00",
+      "verdict": "commit"
+     },
+     {
+      "candidate_id": "e-1",
+      "kind": "comparison",
+      "ledger_version": 2,
+      "method": "relation_curator",
+      "payload": {
+       "dst_ref": "n-2",
+       "proposed_terminal_action": "create_edge_or_claim",
+       "src_ref": "n-1",
+       "type": "mentions"
+      },
+      "reason": "",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "score": null,
+      "target_ref": null,
+      "ts": "2026-09-30T20:01:49.859759+00:00",
+      "verdict": "commit"
+     }
+    ],
+    "integrity_outcomes": [
+     {
+      "document_id": "doc-a",
+      "integrity": {
+       "status": "verified"
+      },
+      "kind": "integrity_outcome",
+      "ledger_version": 2,
+      "quality": "complete",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "ts": "2026-09-30T20:01:49.866400+00:00"
+     }
+    ],
+    "records": [
+     {
+      "blocks_total": 2,
+      "config_fingerprint": "cf1",
+      "document_id": "doc-a",
+      "extraction_fingerprint": "ef1",
+      "kind": "ingest_run",
+      "ledger_version": 2,
+      "materialization_scope": "fresh_rebuild.v1",
+      "model": "m1",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "semantic_policy_fingerprint": "sp1",
+      "source": "/x/a.md",
+      "state": "started",
+      "ts": "2026-09-30T20:01:49.858634+00:00"
+     },
+     {
+      "candidate_id": "n-1",
+      "candidate_kind": "node",
+      "kind": "candidate",
+      "ledger_version": 2,
+      "payload": {
+       "embedding_dim": 2,
+       "title": "Alpha",
+       "type": "Agent"
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "state": "proposed",
+      "ts": "2026-09-30T20:01:49.859153+00:00"
+     },
+     {
+      "candidate_id": "e-1",
+      "candidate_kind": "edge",
+      "kind": "candidate",
+      "ledger_version": 2,
+      "payload": {
+       "dst_ref": "n-2",
+       "src_ref": "n-1",
+       "type": "mentions"
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "state": "proposed",
+      "ts": "2026-09-30T20:01:49.859374+00:00"
+     },
+     {
+      "candidate_id": "n-1",
+      "kind": "comparison",
+      "ledger_version": 2,
+      "method": "curator",
+      "payload": {
+       "after": {
+        "edges": 4,
+        "nodes": 3
+       },
+       "duration_s": 1.5,
+       "usage": {
+        "prompt_tokens": 10
+       }
+      },
+      "reason": "",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "score": 0.9,
+      "target_ref": null,
+      "ts": "2026-09-30T20:01:49.859564+00:00",
+      "verdict": "commit"
+     },
+     {
+      "candidate_id": "e-1",
+      "kind": "comparison",
+      "ledger_version": 2,
+      "method": "relation_curator",
+      "payload": {
+       "dst_ref": "n-2",
+       "proposed_terminal_action": "create_edge_or_claim",
+       "src_ref": "n-1",
+       "type": "mentions"
+      },
+      "reason": "",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "score": null,
+      "target_ref": null,
+      "ts": "2026-09-30T20:01:49.859759+00:00",
+      "verdict": "commit"
+     },
+     {
+      "context": {
+       "document_id": "doc-a"
+      },
+      "kind": "commit_plan",
+      "ledger_version": 2,
+      "operations": [
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-1",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+        "reason": "fixture"
+       },
+       {
+        "candidate": {
+         "dst_ref": "n2",
+         "src_ref": "n1",
+         "type": "mentions"
+        },
+        "candidate_id": "e-2",
+        "candidate_kind": "edge",
+        "operation": "dead_letter",
+        "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+        "reason": "fixture"
+       }
+      ],
+      "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+      "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "ts": "2026-09-30T20:01:49.860409+00:00"
+     },
+     {
+      "kind": "operation_receipt",
+      "ledger_version": 2,
+      "operation": "dead_letter",
+      "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+      "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+      "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+      "result": {
+       "candidate_id": "e-1"
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "status": "dead_lettered",
+      "ts": "2026-09-30T20:01:49.861245+00:00"
+     },
+     {
+      "kind": "operation_receipt",
+      "ledger_version": 2,
+      "operation": "dead_letter",
+      "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+      "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+      "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+      "result": {
+       "candidate_id": "e-2"
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "status": "dead_lettered",
+      "ts": "2026-09-30T20:01:49.861549+00:00"
+     },
+     {
+      "kind": "commit_record",
+      "ledger_version": 2,
+      "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+      "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+      "result": {
+       "ok": true,
+       "operation_receipts": 2,
+       "operation_receipts_complete": true
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "ts": "2026-09-30T20:01:49.862409+00:00"
+     },
+     {
+      "kind": "ingest_run",
+      "ledger_version": 2,
+      "post_semantic_policy_fingerprint": "sp1",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "state": "completed",
+      "summary": {
+       "outcome": {
+        "quality": "complete",
+        "receipts_complete": true
+       }
+      },
+      "ts": "2026-09-30T20:01:49.866158+00:00"
+     },
+     {
+      "document_id": "doc-a",
+      "integrity": {
+       "status": "verified"
+      },
+      "kind": "integrity_outcome",
+      "ledger_version": 2,
+      "quality": "complete",
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "ts": "2026-09-30T20:01:49.866400+00:00"
+     },
+     {
+      "candidate_id": "n-2",
+      "candidate_kind": "node",
+      "kind": "candidate",
+      "ledger_version": 2,
+      "payload": {
+       "title": "Beta",
+       "type": "Agent"
+      },
+      "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+      "state": "proposed",
+      "ts": "2026-09-30T20:01:49.866665+00:00"
+     }
+    ],
+    "run": {
+     "blocks_total": 2,
+     "completed_at": "2026-09-30T20:01:49.866158+00:00",
+     "counts": {
+      "candidates": 3,
+      "commit_plans": 1,
+      "commit_records": 1,
+      "comparisons": 2
+     },
+     "document_id": "doc-a",
+     "integrity": {
+      "status": "verified"
+     },
+     "model": "m1",
+     "name": "a.md",
+     "post_semantic_policy_fingerprint": "sp1",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "source": "/x/a.md",
+     "started_at": "2026-09-30T20:01:49.858634+00:00",
+     "state": "completed",
+     "summary": {
+      "outcome": {
+       "integrity": {
+        "status": "verified"
+       },
+       "quality": "complete",
+       "receipts_complete": true
+      }
+     }
+    }
+   },
+   "missing": null
+  },
+  "run_summaries": {
+   "1": [
+    {
+     "blocks_total": 1,
+     "completed_at": "2026-09-30T20:01:49.864938+00:00",
+     "counts": {
+      "candidates": 0,
+      "commit_plans": 1,
+      "commit_records": 0,
+      "comparisons": 1
+     },
+     "document_id": "doc-c",
+     "model": "m2",
+     "name": "c.md",
+     "post_semantic_policy_fingerprint": null,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "source": "/x/c.md",
+     "started_at": "2026-09-30T20:01:49.860158+00:00",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     }
+    }
+   ],
+   "2": [
+    {
+     "blocks_total": 1,
+     "completed_at": "2026-09-30T20:01:49.864938+00:00",
+     "counts": {
+      "candidates": 0,
+      "commit_plans": 1,
+      "commit_records": 0,
+      "comparisons": 1
+     },
+     "document_id": "doc-c",
+     "model": "m2",
+     "name": "c.md",
+     "post_semantic_policy_fingerprint": null,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "source": "/x/c.md",
+     "started_at": "2026-09-30T20:01:49.860158+00:00",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     }
+    },
+    {
+     "blocks_total": 1,
+     "completed_at": null,
+     "counts": {
+      "candidates": 1,
+      "commit_plans": 2,
+      "commit_records": 0,
+      "comparisons": 0
+     },
+     "document_id": "doc-b",
+     "model": "m1",
+     "name": "b.md",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "source": "/x/b.md",
+     "started_at": "2026-09-30T20:01:49.859953+00:00",
+     "state": "started",
+     "summary": {}
+    }
+   ],
+   "500": [
+    {
+     "blocks_total": 1,
+     "completed_at": "2026-09-30T20:01:49.864938+00:00",
+     "counts": {
+      "candidates": 0,
+      "commit_plans": 1,
+      "commit_records": 0,
+      "comparisons": 1
+     },
+     "document_id": "doc-c",
+     "model": "m2",
+     "name": "c.md",
+     "post_semantic_policy_fingerprint": null,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "source": "/x/c.md",
+     "started_at": "2026-09-30T20:01:49.860158+00:00",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     }
+    },
+    {
+     "blocks_total": 1,
+     "completed_at": null,
+     "counts": {
+      "candidates": 1,
+      "commit_plans": 2,
+      "commit_records": 0,
+      "comparisons": 0
+     },
+     "document_id": "doc-b",
+     "model": "m1",
+     "name": "b.md",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "source": "/x/b.md",
+     "started_at": "2026-09-30T20:01:49.859953+00:00",
+     "state": "started",
+     "summary": {}
+    },
+    {
+     "blocks_total": 2,
+     "completed_at": "2026-09-30T20:01:49.866158+00:00",
+     "counts": {
+      "candidates": 3,
+      "commit_plans": 1,
+      "commit_records": 1,
+      "comparisons": 2
+     },
+     "document_id": "doc-a",
+     "integrity": {
+      "status": "verified"
+     },
+     "model": "m1",
+     "name": "a.md",
+     "post_semantic_policy_fingerprint": "sp1",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "source": "/x/a.md",
+     "started_at": "2026-09-30T20:01:49.858634+00:00",
+     "state": "completed",
+     "summary": {
+      "outcome": {
+       "integrity": {
+        "status": "verified"
+       },
+       "quality": "complete",
+       "receipts_complete": true
+      }
+     }
+    }
+   ]
+  },
+  "scan": {
+   "completeness_reason": "malformed_ledger_lines+trailing_partial_record",
+   "completeness_status": "incomplete",
+   "file_sha256": "a0906c300b876b772d40744363fb02bf539503d9b5ca18a08a6a37fd6a3f2a94",
+   "file_size_bytes": 8302,
+   "ledger_versions": [
+    2
+   ],
+   "malformed_line_count": 1,
+   "malformed_lines": [
+    {
+     "line_number": 23,
+     "reason": "invalid_json",
+     "sample": "{\\\"kind\\\":\\\"candidate\\\",\\\"run_id\\\":\\\"e075f9f575974189bf6ff6cc9e5d9f26\\\",\\\"candidate_id\\\":\\\"n-7\\\",\\\"pay",
+     "sample_truncated": false
+    }
+   ],
+   "malformed_samples_truncated": false,
+   "nonempty_lines": 23,
+   "parsed_records": [
+    {
+     "blocks_total": 2,
+     "config_fingerprint": "cf1",
+     "document_id": "doc-a",
+     "extraction_fingerprint": "ef1",
+     "kind": "ingest_run",
+     "ledger_version": 2,
+     "materialization_scope": "fresh_rebuild.v1",
+     "model": "m1",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "semantic_policy_fingerprint": "sp1",
+     "source": "/x/a.md",
+     "state": "started",
+     "ts": "2026-09-30T20:01:49.858634+00:00"
+    },
+    {
+     "candidate_id": "n-1",
+     "candidate_kind": "node",
+     "kind": "candidate",
+     "ledger_version": 2,
+     "payload": {
+      "embedding_dim": 2,
+      "title": "Alpha",
+      "type": "Agent"
+     },
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "state": "proposed",
+     "ts": "2026-09-30T20:01:49.859153+00:00"
+    },
+    {
+     "candidate_id": "e-1",
+     "candidate_kind": "edge",
+     "kind": "candidate",
+     "ledger_version": 2,
+     "payload": {
+      "dst_ref": "n-2",
+      "src_ref": "n-1",
+      "type": "mentions"
+     },
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "state": "proposed",
+     "ts": "2026-09-30T20:01:49.859374+00:00"
+    },
+    {
+     "candidate_id": "n-1",
+     "kind": "comparison",
+     "ledger_version": 2,
+     "method": "curator",
+     "payload": {
+      "after": {
+       "edges": 4,
+       "nodes": 3
+      },
+      "duration_s": 1.5,
+      "usage": {
+       "prompt_tokens": 10
+      }
+     },
+     "reason": "",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "score": 0.9,
+     "target_ref": null,
+     "ts": "2026-09-30T20:01:49.859564+00:00",
+     "verdict": "commit"
+    },
+    {
+     "candidate_id": "e-1",
+     "kind": "comparison",
+     "ledger_version": 2,
+     "method": "relation_curator",
+     "payload": {
+      "dst_ref": "n-2",
+      "proposed_terminal_action": "create_edge_or_claim",
+      "src_ref": "n-1",
+      "type": "mentions"
+     },
+     "reason": "",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "score": null,
+     "target_ref": null,
+     "ts": "2026-09-30T20:01:49.859759+00:00",
+     "verdict": "commit"
+    },
+    {
+     "blocks_total": 1,
+     "config_fingerprint": "cf1",
+     "document_id": "doc-b",
+     "extraction_fingerprint": "ef1",
+     "kind": "ingest_run",
+     "ledger_version": 2,
+     "materialization_scope": "fresh_rebuild.v1",
+     "model": "m1",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "semantic_policy_fingerprint": "sp1",
+     "source": "/x/b.md",
+     "state": "started",
+     "ts": "2026-09-30T20:01:49.859953+00:00"
+    },
+    {
+     "blocks_total": 1,
+     "config_fingerprint": "cf1",
+     "document_id": "doc-c",
+     "extraction_fingerprint": "ef1",
+     "kind": "ingest_run",
+     "ledger_version": 2,
+     "materialization_scope": "fresh_rebuild.v1",
+     "model": "m2",
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "semantic_policy_fingerprint": "sp1",
+     "source": "/x/c.md",
+     "state": "started",
+     "ts": "2026-09-30T20:01:49.860158+00:00"
+    },
+    {
+     "context": {
+      "document_id": "doc-a"
+     },
+     "kind": "commit_plan",
+     "ledger_version": 2,
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-1",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+       "reason": "fixture"
+      },
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-2",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+     "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "ts": "2026-09-30T20:01:49.860409+00:00"
+    },
+    {
+     "kind": "operation_receipt",
+     "ledger_version": 2,
+     "operation": "dead_letter",
+     "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+     "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+     "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+     "result": {
+      "candidate_id": "e-1"
+     },
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "status": "dead_lettered",
+     "ts": "2026-09-30T20:01:49.861245+00:00"
+    },
+    {
+     "kind": "operation_receipt",
+     "ledger_version": 2,
+     "operation": "dead_letter",
+     "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+     "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+     "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+     "result": {
+      "candidate_id": "e-2"
+     },
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "status": "dead_lettered",
+     "ts": "2026-09-30T20:01:49.861549+00:00"
+    },
+    {
+     "kind": "commit_record",
+     "ledger_version": 2,
+     "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+     "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+     "result": {
+      "ok": true,
+      "operation_receipts": 2,
+      "operation_receipts_complete": true
+     },
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "ts": "2026-09-30T20:01:49.862409+00:00"
+    },
+    {
+     "candidate_id": "n-9",
+     "candidate_kind": "node",
+     "kind": "candidate",
+     "ledger_version": 2,
+     "payload": {
+      "title": "Nine",
+      "type": "Agent"
+     },
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "state": "proposed",
+     "ts": "2026-09-30T20:01:49.862660+00:00"
+    },
+    {
+     "candidate_id": "n-3",
+     "kind": "comparison",
+     "ledger_version": 2,
+     "method": "curator",
+     "payload": {
+      "audit_only": true,
+      "llm_skipped": true
+     },
+     "reason": "",
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "score": null,
+     "target_ref": null,
+     "ts": "2026-09-30T20:01:49.862844+00:00",
+     "verdict": "queue"
+    },
+    {
+     "context": {
+      "document_id": "doc-b"
+     },
+     "kind": "commit_plan",
+     "ledger_version": 2,
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-3",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+     "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "ts": "2026-09-30T20:01:49.863054+00:00"
+    },
+    {
+     "context": {
+      "document_id": "doc-c"
+     },
+     "kind": "commit_plan",
+     "ledger_version": 2,
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-4",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:4b01e2a2115136a3561188abe77192e856bdf3aab644d37f6ac664abec803cf5",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+     "plan_id": "fde1e26dfc544172b823068632611619",
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "ts": "2026-09-30T20:01:49.863392+00:00"
+    },
+    {
+     "evidence": {
+      "k": "v"
+     },
+     "kind": "plan_abandoned",
+     "ledger_version": 2,
+     "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+     "plan_id": "fde1e26dfc544172b823068632611619",
+     "reason": "source_changed",
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "ts": "2026-09-30T20:01:49.864683+00:00"
+    },
+    {
+     "kind": "ingest_run",
+     "ledger_version": 2,
+     "run_id": "4d448f2d067541319f3ad6891f76b05f",
+     "state": "failed",
+     "summary": {
+      "reason": "x"
+     },
+     "ts": "2026-09-30T20:01:49.864938+00:00"
+    },
+    {
+     "context": {
+      "document_id": "doc-b"
+     },
+     "kind": "commit_plan",
+     "ledger_version": 2,
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-5",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+       "reason": "fixture"
+      },
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-6",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+     "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "ts": "2026-09-30T20:01:49.865229+00:00"
+    },
+    {
+     "kind": "operation_receipt",
+     "ledger_version": 2,
+     "operation": "dead_letter",
+     "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+     "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+     "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+     "result": {
+      "candidate_id": "e-5"
+     },
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+     "status": "dead_lettered",
+     "ts": "2026-09-30T20:01:49.865914+00:00"
+    },
+    {
+     "kind": "ingest_run",
+     "ledger_version": 2,
+     "post_semantic_policy_fingerprint": "sp1",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "state": "completed",
+     "summary": {
+      "outcome": {
+       "quality": "complete",
+       "receipts_complete": true
+      }
+     },
+     "ts": "2026-09-30T20:01:49.866158+00:00"
+    },
+    {
+     "document_id": "doc-a",
+     "integrity": {
+      "status": "verified"
+     },
+     "kind": "integrity_outcome",
+     "ledger_version": 2,
+     "quality": "complete",
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "ts": "2026-09-30T20:01:49.866400+00:00"
+    },
+    {
+     "candidate_id": "n-2",
+     "candidate_kind": "node",
+     "kind": "candidate",
+     "ledger_version": 2,
+     "payload": {
+      "title": "Beta",
+      "type": "Agent"
+     },
+     "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+     "state": "proposed",
+     "ts": "2026-09-30T20:01:49.866665+00:00"
+    }
+   ],
+   "path": "<path>",
+   "total_lines": 23,
+   "trailing_partial": true,
+   "trailing_partial_line_number": 23,
+   "unrecognized_version_record_count": 0,
+   "unterminated_final_line": true
+  },
+  "size_after": 8213,
+  "unreceipted": {
+   "all": [
+    {
+     "context": {
+      "document_id": "doc-b"
+     },
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-3",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+     "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e"
+    },
+    {
+     "context": {
+      "document_id": "doc-b"
+     },
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-5",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+       "reason": "fixture"
+      },
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-6",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+     "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e"
+    }
+   ],
+   "doc-a": [],
+   "doc-b": [
+    {
+     "context": {
+      "document_id": "doc-b"
+     },
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-3",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+     "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e"
+    },
+    {
+     "context": {
+      "document_id": "doc-b"
+     },
+     "operations": [
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-5",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+       "reason": "fixture"
+      },
+      {
+       "candidate": {
+        "dst_ref": "n2",
+        "src_ref": "n1",
+        "type": "mentions"
+       },
+       "candidate_id": "e-6",
+       "candidate_kind": "edge",
+       "operation": "dead_letter",
+       "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+       "reason": "fixture"
+      }
+     ],
+     "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+     "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+     "run_id": "ad3cb48c242c4005b9cdf6c0800b957e"
+    }
+   ]
+  }
+ },
+ "records_before_repair": [
+  {
+   "blocks_total": 2,
+   "config_fingerprint": "cf1",
+   "document_id": "doc-a",
+   "extraction_fingerprint": "ef1",
+   "kind": "ingest_run",
+   "ledger_version": 2,
+   "materialization_scope": "fresh_rebuild.v1",
+   "model": "m1",
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "semantic_policy_fingerprint": "sp1",
+   "source": "/x/a.md",
+   "state": "started",
+   "ts": "2026-09-30T20:01:49.858634+00:00"
+  },
+  {
+   "candidate_id": "n-1",
+   "candidate_kind": "node",
+   "kind": "candidate",
+   "ledger_version": 2,
+   "payload": {
+    "embedding_dim": 2,
+    "title": "Alpha",
+    "type": "Agent"
+   },
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "state": "proposed",
+   "ts": "2026-09-30T20:01:49.859153+00:00"
+  },
+  {
+   "candidate_id": "e-1",
+   "candidate_kind": "edge",
+   "kind": "candidate",
+   "ledger_version": 2,
+   "payload": {
+    "dst_ref": "n-2",
+    "src_ref": "n-1",
+    "type": "mentions"
+   },
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "state": "proposed",
+   "ts": "2026-09-30T20:01:49.859374+00:00"
+  },
+  {
+   "candidate_id": "n-1",
+   "kind": "comparison",
+   "ledger_version": 2,
+   "method": "curator",
+   "payload": {
+    "after": {
+     "edges": 4,
+     "nodes": 3
+    },
+    "duration_s": 1.5,
+    "usage": {
+     "prompt_tokens": 10
+    }
+   },
+   "reason": "",
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "score": 0.9,
+   "target_ref": null,
+   "ts": "2026-09-30T20:01:49.859564+00:00",
+   "verdict": "commit"
+  },
+  {
+   "candidate_id": "e-1",
+   "kind": "comparison",
+   "ledger_version": 2,
+   "method": "relation_curator",
+   "payload": {
+    "dst_ref": "n-2",
+    "proposed_terminal_action": "create_edge_or_claim",
+    "src_ref": "n-1",
+    "type": "mentions"
+   },
+   "reason": "",
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "score": null,
+   "target_ref": null,
+   "ts": "2026-09-30T20:01:49.859759+00:00",
+   "verdict": "commit"
+  },
+  {
+   "blocks_total": 1,
+   "config_fingerprint": "cf1",
+   "document_id": "doc-b",
+   "extraction_fingerprint": "ef1",
+   "kind": "ingest_run",
+   "ledger_version": 2,
+   "materialization_scope": "fresh_rebuild.v1",
+   "model": "m1",
+   "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+   "semantic_policy_fingerprint": "sp1",
+   "source": "/x/b.md",
+   "state": "started",
+   "ts": "2026-09-30T20:01:49.859953+00:00"
+  },
+  {
+   "blocks_total": 1,
+   "config_fingerprint": "cf1",
+   "document_id": "doc-c",
+   "extraction_fingerprint": "ef1",
+   "kind": "ingest_run",
+   "ledger_version": 2,
+   "materialization_scope": "fresh_rebuild.v1",
+   "model": "m2",
+   "run_id": "4d448f2d067541319f3ad6891f76b05f",
+   "semantic_policy_fingerprint": "sp1",
+   "source": "/x/c.md",
+   "state": "started",
+   "ts": "2026-09-30T20:01:49.860158+00:00"
+  },
+  {
+   "context": {
+    "document_id": "doc-a"
+   },
+   "kind": "commit_plan",
+   "ledger_version": 2,
+   "operations": [
+    {
+     "candidate": {
+      "dst_ref": "n2",
+      "src_ref": "n1",
+      "type": "mentions"
+     },
+     "candidate_id": "e-1",
+     "candidate_kind": "edge",
+     "operation": "dead_letter",
+     "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+     "reason": "fixture"
+    },
+    {
+     "candidate": {
+      "dst_ref": "n2",
+      "src_ref": "n1",
+      "type": "mentions"
+     },
+     "candidate_id": "e-2",
+     "candidate_kind": "edge",
+     "operation": "dead_letter",
+     "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+     "reason": "fixture"
+    }
+   ],
+   "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+   "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "ts": "2026-09-30T20:01:49.860409+00:00"
+  },
+  {
+   "kind": "operation_receipt",
+   "ledger_version": 2,
+   "operation": "dead_letter",
+   "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+   "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+   "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+   "result": {
+    "candidate_id": "e-1"
+   },
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "status": "dead_lettered",
+   "ts": "2026-09-30T20:01:49.861245+00:00"
+  },
+  {
+   "kind": "operation_receipt",
+   "ledger_version": 2,
+   "operation": "dead_letter",
+   "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+   "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+   "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+   "result": {
+    "candidate_id": "e-2"
+   },
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "status": "dead_lettered",
+   "ts": "2026-09-30T20:01:49.861549+00:00"
+  },
+  {
+   "kind": "commit_record",
+   "ledger_version": 2,
+   "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+   "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+   "result": {
+    "ok": true,
+    "operation_receipts": 2,
+    "operation_receipts_complete": true
+   },
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "ts": "2026-09-30T20:01:49.862409+00:00"
+  },
+  {
+   "candidate_id": "n-9",
+   "candidate_kind": "node",
+   "kind": "candidate",
+   "ledger_version": 2,
+   "payload": {
+    "title": "Nine",
+    "type": "Agent"
+   },
+   "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+   "state": "proposed",
+   "ts": "2026-09-30T20:01:49.862660+00:00"
+  },
+  {
+   "candidate_id": "n-3",
+   "kind": "comparison",
+   "ledger_version": 2,
+   "method": "curator",
+   "payload": {
+    "audit_only": true,
+    "llm_skipped": true
+   },
+   "reason": "",
+   "run_id": "4d448f2d067541319f3ad6891f76b05f",
+   "score": null,
+   "target_ref": null,
+   "ts": "2026-09-30T20:01:49.862844+00:00",
+   "verdict": "queue"
+  },
+  {
+   "context": {
+    "document_id": "doc-b"
+   },
+   "kind": "commit_plan",
+   "ledger_version": 2,
+   "operations": [
+    {
+     "candidate": {
+      "dst_ref": "n2",
+      "src_ref": "n1",
+      "type": "mentions"
+     },
+     "candidate_id": "e-3",
+     "candidate_kind": "edge",
+     "operation": "dead_letter",
+     "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+     "reason": "fixture"
+    }
+   ],
+   "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+   "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+   "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+   "ts": "2026-09-30T20:01:49.863054+00:00"
+  },
+  {
+   "context": {
+    "document_id": "doc-c"
+   },
+   "kind": "commit_plan",
+   "ledger_version": 2,
+   "operations": [
+    {
+     "candidate": {
+      "dst_ref": "n2",
+      "src_ref": "n1",
+      "type": "mentions"
+     },
+     "candidate_id": "e-4",
+     "candidate_kind": "edge",
+     "operation": "dead_letter",
+     "operation_id": "sha256:4b01e2a2115136a3561188abe77192e856bdf3aab644d37f6ac664abec803cf5",
+     "reason": "fixture"
+    }
+   ],
+   "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+   "plan_id": "fde1e26dfc544172b823068632611619",
+   "run_id": "4d448f2d067541319f3ad6891f76b05f",
+   "ts": "2026-09-30T20:01:49.863392+00:00"
+  },
+  {
+   "evidence": {
+    "k": "v"
+   },
+   "kind": "plan_abandoned",
+   "ledger_version": 2,
+   "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+   "plan_id": "fde1e26dfc544172b823068632611619",
+   "reason": "source_changed",
+   "run_id": "4d448f2d067541319f3ad6891f76b05f",
+   "ts": "2026-09-30T20:01:49.864683+00:00"
+  },
+  {
+   "kind": "ingest_run",
+   "ledger_version": 2,
+   "run_id": "4d448f2d067541319f3ad6891f76b05f",
+   "state": "failed",
+   "summary": {
+    "reason": "x"
+   },
+   "ts": "2026-09-30T20:01:49.864938+00:00"
+  },
+  {
+   "context": {
+    "document_id": "doc-b"
+   },
+   "kind": "commit_plan",
+   "ledger_version": 2,
+   "operations": [
+    {
+     "candidate": {
+      "dst_ref": "n2",
+      "src_ref": "n1",
+      "type": "mentions"
+     },
+     "candidate_id": "e-5",
+     "candidate_kind": "edge",
+     "operation": "dead_letter",
+     "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+     "reason": "fixture"
+    },
+    {
+     "candidate": {
+      "dst_ref": "n2",
+      "src_ref": "n1",
+      "type": "mentions"
+     },
+     "candidate_id": "e-6",
+     "candidate_kind": "edge",
+     "operation": "dead_letter",
+     "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+     "reason": "fixture"
+    }
+   ],
+   "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+   "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+   "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+   "ts": "2026-09-30T20:01:49.865229+00:00"
+  },
+  {
+   "kind": "operation_receipt",
+   "ledger_version": 2,
+   "operation": "dead_letter",
+   "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+   "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+   "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+   "result": {
+    "candidate_id": "e-5"
+   },
+   "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+   "status": "dead_lettered",
+   "ts": "2026-09-30T20:01:49.865914+00:00"
+  },
+  {
+   "kind": "ingest_run",
+   "ledger_version": 2,
+   "post_semantic_policy_fingerprint": "sp1",
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "state": "completed",
+   "summary": {
+    "outcome": {
+     "quality": "complete",
+     "receipts_complete": true
+    }
+   },
+   "ts": "2026-09-30T20:01:49.866158+00:00"
+  },
+  {
+   "document_id": "doc-a",
+   "integrity": {
+    "status": "verified"
+   },
+   "kind": "integrity_outcome",
+   "ledger_version": 2,
+   "quality": "complete",
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "ts": "2026-09-30T20:01:49.866400+00:00"
+  },
+  {
+   "candidate_id": "n-2",
+   "candidate_kind": "node",
+   "kind": "candidate",
+   "ledger_version": 2,
+   "payload": {
+    "title": "Beta",
+    "type": "Agent"
+   },
+   "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+   "state": "proposed",
+   "ts": "2026-09-30T20:01:49.866665+00:00"
+  }
+ ],
+ "scan_before_repair": {
+  "completeness_reason": "malformed_ledger_lines+trailing_partial_record",
+  "completeness_status": "incomplete",
+  "file_sha256": "a0906c300b876b772d40744363fb02bf539503d9b5ca18a08a6a37fd6a3f2a94",
+  "file_size_bytes": 8302,
+  "ledger_versions": [
+   2
+  ],
+  "malformed_line_count": 1,
+  "malformed_lines": [
+   {
+    "line_number": 23,
+    "reason": "invalid_json",
+    "sample": "{\\\"kind\\\":\\\"candidate\\\",\\\"run_id\\\":\\\"e075f9f575974189bf6ff6cc9e5d9f26\\\",\\\"candidate_id\\\":\\\"n-7\\\",\\\"pay",
+    "sample_truncated": false
+   }
+  ],
+  "malformed_samples_truncated": false,
+  "nonempty_lines": 23,
+  "parsed_records": [
+   {
+    "blocks_total": 2,
+    "config_fingerprint": "cf1",
+    "document_id": "doc-a",
+    "extraction_fingerprint": "ef1",
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "materialization_scope": "fresh_rebuild.v1",
+    "model": "m1",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "semantic_policy_fingerprint": "sp1",
+    "source": "/x/a.md",
+    "state": "started",
+    "ts": "2026-09-30T20:01:49.858634+00:00"
+   },
+   {
+    "candidate_id": "n-1",
+    "candidate_kind": "node",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "embedding_dim": 2,
+     "title": "Alpha",
+     "type": "Agent"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.859153+00:00"
+   },
+   {
+    "candidate_id": "e-1",
+    "candidate_kind": "edge",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "dst_ref": "n-2",
+     "src_ref": "n-1",
+     "type": "mentions"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.859374+00:00"
+   },
+   {
+    "candidate_id": "n-1",
+    "kind": "comparison",
+    "ledger_version": 2,
+    "method": "curator",
+    "payload": {
+     "after": {
+      "edges": 4,
+      "nodes": 3
+     },
+     "duration_s": 1.5,
+     "usage": {
+      "prompt_tokens": 10
+     }
+    },
+    "reason": "",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "score": 0.9,
+    "target_ref": null,
+    "ts": "2026-09-30T20:01:49.859564+00:00",
+    "verdict": "commit"
+   },
+   {
+    "candidate_id": "e-1",
+    "kind": "comparison",
+    "ledger_version": 2,
+    "method": "relation_curator",
+    "payload": {
+     "dst_ref": "n-2",
+     "proposed_terminal_action": "create_edge_or_claim",
+     "src_ref": "n-1",
+     "type": "mentions"
+    },
+    "reason": "",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "score": null,
+    "target_ref": null,
+    "ts": "2026-09-30T20:01:49.859759+00:00",
+    "verdict": "commit"
+   },
+   {
+    "blocks_total": 1,
+    "config_fingerprint": "cf1",
+    "document_id": "doc-b",
+    "extraction_fingerprint": "ef1",
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "materialization_scope": "fresh_rebuild.v1",
+    "model": "m1",
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "semantic_policy_fingerprint": "sp1",
+    "source": "/x/b.md",
+    "state": "started",
+    "ts": "2026-09-30T20:01:49.859953+00:00"
+   },
+   {
+    "blocks_total": 1,
+    "config_fingerprint": "cf1",
+    "document_id": "doc-c",
+    "extraction_fingerprint": "ef1",
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "materialization_scope": "fresh_rebuild.v1",
+    "model": "m2",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "semantic_policy_fingerprint": "sp1",
+    "source": "/x/c.md",
+    "state": "started",
+    "ts": "2026-09-30T20:01:49.860158+00:00"
+   },
+   {
+    "context": {
+     "document_id": "doc-a"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-1",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+      "reason": "fixture"
+     },
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-2",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "ts": "2026-09-30T20:01:49.860409+00:00"
+   },
+   {
+    "kind": "operation_receipt",
+    "ledger_version": 2,
+    "operation": "dead_letter",
+    "operation_id": "sha256:380551e0df4c3fd0b3d20469b71b6455ee52325fbc1967921acd255a42185f60",
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "result": {
+     "candidate_id": "e-1"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "status": "dead_lettered",
+    "ts": "2026-09-30T20:01:49.861245+00:00"
+   },
+   {
+    "kind": "operation_receipt",
+    "ledger_version": 2,
+    "operation": "dead_letter",
+    "operation_id": "sha256:a07f546c337db2e2c4ea150095ba094a45fe7cff0283b367ff8a92f713a2245f",
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "result": {
+     "candidate_id": "e-2"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "status": "dead_lettered",
+    "ts": "2026-09-30T20:01:49.861549+00:00"
+   },
+   {
+    "kind": "commit_record",
+    "ledger_version": 2,
+    "plan_hash": "sha256:5b735233473c9664a2ef9b913f6795648016dc795d9011df0ab660e583272a83",
+    "plan_id": "259b6997b7c74559a137eadcea5f7ad3",
+    "result": {
+     "ok": true,
+     "operation_receipts": 2,
+     "operation_receipts_complete": true
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "ts": "2026-09-30T20:01:49.862409+00:00"
+   },
+   {
+    "candidate_id": "n-9",
+    "candidate_kind": "node",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "title": "Nine",
+     "type": "Agent"
+    },
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.862660+00:00"
+   },
+   {
+    "candidate_id": "n-3",
+    "kind": "comparison",
+    "ledger_version": 2,
+    "method": "curator",
+    "payload": {
+     "audit_only": true,
+     "llm_skipped": true
+    },
+    "reason": "",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "score": null,
+    "target_ref": null,
+    "ts": "2026-09-30T20:01:49.862844+00:00",
+    "verdict": "queue"
+   },
+   {
+    "context": {
+     "document_id": "doc-b"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-3",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:b764216fb1b45910e6e543ff3d83f0fcaf71d5cea8d38934229b124acc9d3bf7",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:080be1516e5f01a526e12872b688773334dae48c164498d44a709647b38c6fa6",
+    "plan_id": "f508ba8282974aa1b8865d2af7ad8bd7",
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "ts": "2026-09-30T20:01:49.863054+00:00"
+   },
+   {
+    "context": {
+     "document_id": "doc-c"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-4",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:4b01e2a2115136a3561188abe77192e856bdf3aab644d37f6ac664abec803cf5",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+    "plan_id": "fde1e26dfc544172b823068632611619",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "ts": "2026-09-30T20:01:49.863392+00:00"
+   },
+   {
+    "evidence": {
+     "k": "v"
+    },
+    "kind": "plan_abandoned",
+    "ledger_version": 2,
+    "plan_hash": "sha256:eb03b3e68cff1200b42317edff3a9c12373301af920966facb93e15860c9bbdf",
+    "plan_id": "fde1e26dfc544172b823068632611619",
+    "reason": "source_changed",
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "ts": "2026-09-30T20:01:49.864683+00:00"
+   },
+   {
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "run_id": "4d448f2d067541319f3ad6891f76b05f",
+    "state": "failed",
+    "summary": {
+     "reason": "x"
+    },
+    "ts": "2026-09-30T20:01:49.864938+00:00"
+   },
+   {
+    "context": {
+     "document_id": "doc-b"
+    },
+    "kind": "commit_plan",
+    "ledger_version": 2,
+    "operations": [
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-5",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+      "reason": "fixture"
+     },
+     {
+      "candidate": {
+       "dst_ref": "n2",
+       "src_ref": "n1",
+       "type": "mentions"
+      },
+      "candidate_id": "e-6",
+      "candidate_kind": "edge",
+      "operation": "dead_letter",
+      "operation_id": "sha256:1bc41fe09d6e81457a1a6bc74bd4dd8aa3ad22cb6f8bc3a90040025f605f28e1",
+      "reason": "fixture"
+     }
+    ],
+    "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+    "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "ts": "2026-09-30T20:01:49.865229+00:00"
+   },
+   {
+    "kind": "operation_receipt",
+    "ledger_version": 2,
+    "operation": "dead_letter",
+    "operation_id": "sha256:91dbb208c6a48f0cd64820e696b3289e5ccbf8b75feb98cefa39573c87dc9a84",
+    "plan_hash": "sha256:b338969c275dbedc0e58520a6ea03675a746dfb4d60577ec7770982ea815b202",
+    "plan_id": "2b19d01ef5f74069abedb4af84fd48e7",
+    "result": {
+     "candidate_id": "e-5"
+    },
+    "run_id": "ad3cb48c242c4005b9cdf6c0800b957e",
+    "status": "dead_lettered",
+    "ts": "2026-09-30T20:01:49.865914+00:00"
+   },
+   {
+    "kind": "ingest_run",
+    "ledger_version": 2,
+    "post_semantic_policy_fingerprint": "sp1",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "completed",
+    "summary": {
+     "outcome": {
+      "quality": "complete",
+      "receipts_complete": true
+     }
+    },
+    "ts": "2026-09-30T20:01:49.866158+00:00"
+   },
+   {
+    "document_id": "doc-a",
+    "integrity": {
+     "status": "verified"
+    },
+    "kind": "integrity_outcome",
+    "ledger_version": 2,
+    "quality": "complete",
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "ts": "2026-09-30T20:01:49.866400+00:00"
+   },
+   {
+    "candidate_id": "n-2",
+    "candidate_kind": "node",
+    "kind": "candidate",
+    "ledger_version": 2,
+    "payload": {
+     "title": "Beta",
+     "type": "Agent"
+    },
+    "run_id": "e075f9f575974189bf6ff6cc9e5d9f26",
+    "state": "proposed",
+    "ts": "2026-09-30T20:01:49.866665+00:00"
+   }
+  ],
+  "path": "<path>",
+  "total_lines": 23,
+  "trailing_partial": true,
+  "trailing_partial_line_number": 23,
+  "unrecognized_version_record_count": 0,
+  "unterminated_final_line": true
+ }
+}

@@ -58,6 +58,14 @@ PID_RELATIVE = Path(".marginalia") / "server.pid"
 SIGNAL_RELATIVE = Path(".marginalia") / "server.signal"
 """Instance-targeted stop request consumed by the PID-file owner."""
 
+SHUTDOWN_OUTCOME_CAPABILITY = "shutdown_outcome"
+"""Advertised in the PID record by a daemon that writes ``server.outcome`` on every clean
+stop. ``stop`` reads it from the record (still on disk after the daemon exited), so a
+0.3.1 daemon, which never writes the file, is told apart from a new one that crashed."""
+
+OUTCOME_RELATIVE = Path(".marginalia") / "server.outcome"
+"""Final status a daemon leaves when its store close was skipped (read once by ``stop``)."""
+
 PID_RECORD_VERSION = 1
 _PID_FILE_LIMIT = 16 * 1024
 _PID_LOCK_OFFSET = _PID_FILE_LIMIT
@@ -105,22 +113,98 @@ def signal_file_path(root: Path) -> Path:
     return Path(root) / SIGNAL_RELATIVE
 
 
+def outcome_file_path(root: Path) -> Path:
+    """Return the shutdown-outcome file path for a lifecycle ``root``."""
+    return Path(root) / OUTCOME_RELATIVE
+
+
+_OUTCOME_ROOT: Path | None = None
+
+
+def write_shutdown_outcome(outcome: str, calls_in_flight: dict[str, int] | None = None) -> None:
+    """Record how this daemon's shutdown ended (``closed`` right after the store
+    close completed, ``close_skipped`` just before the hard exit).
+
+    Best effort (the exit path must not raise): ``stop`` reads and removes the
+    file and exits 0 only for ``closed``.
+    """
+    root = _OUTCOME_ROOT
+    if root is None:
+        return
+    calls_in_flight = calls_in_flight or {}
+    payload = {
+        "outcome": outcome,
+        "pid": os.getpid(),
+        "calls_in_flight": sum(calls_in_flight.values()),
+        "vaults": sorted(name for name, count in calls_in_flight.items() if count),
+    }
+    try:
+        path = outcome_file_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        _LOG.warning("could not write the shutdown outcome file", exc_info=True)
+
+
+def write_close_skipped_outcome(calls_in_flight: dict[str, int]) -> None:
+    write_shutdown_outcome("close_skipped", calls_in_flight)
+
+
+def pid_record_capabilities(root: Path) -> frozenset[str]:
+    """Capabilities the daemon advertised in its PID record (empty for a legacy one)."""
+    record, _legacy = _read_pid_payload(pid_file_path(root))
+    return frozenset(record.capabilities) if record is not None else frozenset()
+
+
+def consume_stop_outcome(root: Path, pid: int) -> dict[str, Any] | None:
+    """Read and remove the outcome file left by daemon ``pid``.
+
+    Returns the payload only when it is well-formed, says ``closed`` or
+    ``close_skipped`` and belongs to ``pid``. A missing, corrupt or stale (other pid) file yields
+    ``None``; any file found is removed so it cannot leak into a later stop.
+    """
+    path = outcome_file_path(root)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    _remove_path(path, what="shutdown-outcome file")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("outcome") not in ("closed", "close_skipped")
+        or payload.get("pid") != pid
+        or not isinstance(payload.get("calls_in_flight"), int)
+    ):
+        return None
+    return payload
+
+
 @dataclass(frozen=True)
 class _PidRecord:
     pid: int
     start_token: str
     owner_id: str
     version: int = PID_RECORD_VERSION
+    capabilities: tuple[str, ...] = ()
 
     def to_json(self) -> str:
+        payload: dict[str, Any] = {
+            "version": self.version,
+            "pid": self.pid,
+            "start_token": self.start_token,
+            "owner_id": self.owner_id,
+        }
+        if self.capabilities:
+            payload["capabilities"] = list(self.capabilities)
         return (
             json.dumps(
-                {
-                    "version": self.version,
-                    "pid": self.pid,
-                    "start_token": self.start_token,
-                    "owner_id": self.owner_id,
-                },
+                payload,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -145,12 +229,17 @@ def _parse_pid_record(raw: str) -> tuple[_PidRecord | None, int | None]:
             owner_id = str(payload.get("owner_id") or "")
         except (TypeError, ValueError):
             return None, None
+        raw_caps = payload.get("capabilities")
+        capabilities = (
+            tuple(str(item) for item in raw_caps) if isinstance(raw_caps, list) else ()
+        )
         if version == PID_RECORD_VERSION and pid > 0 and start_token and owner_id:
             return _PidRecord(
                 pid=pid,
                 start_token=start_token,
                 owner_id=owner_id,
                 version=version,
+                capabilities=capabilities,
             ), None
         return None, None
     try:
@@ -335,6 +424,28 @@ def _unlock_pid_fd(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+# Public names for the cross-process OS-lock primitives, shared with the
+# per-vault writer lease (``okto_neuron.store.writer_lease``). POSIX uses
+# ``flock(LOCK_EX | LOCK_NB)``; Windows locks one byte past the bounded record so
+# the record itself stays readable while the lock is held.
+LOCK_RECORD_LIMIT = _PID_FILE_LIMIT
+
+
+def try_lock_fd(fd: int) -> bool:
+    """Take the exclusive, non-blocking OS lock on ``fd``; False on contention."""
+    return _try_lock_pid_fd(fd)
+
+
+def unlock_fd(fd: int) -> None:
+    """Release the lock taken by :func:`try_lock_fd` (idempotent, never raises)."""
+    _unlock_pid_fd(fd)
+
+
+def process_start_token(pid: int) -> str | None:
+    """Birth fingerprint of ``pid`` (retrying transient reads); ``None`` when unknown."""
+    return _process_start_token_with_retry(pid)
+
+
 def _read_pid_fd(fd: int) -> str:
     os.lseek(fd, 0, os.SEEK_SET)
     return os.read(fd, _PID_FILE_LIMIT).decode("utf-8", errors="replace")
@@ -470,6 +581,27 @@ def read_pid(vault: Path) -> int | None:
     return record.pid if record is not None else legacy_pid
 
 
+@dataclass(frozen=True)
+class StopRequest:
+    """What the last owner-bound stop request asked for (``stop --timeout/--force``)."""
+
+    force: bool = False
+    drain_timeout: float | None = None
+
+
+_LAST_STOP_REQUEST: StopRequest | None = None
+
+
+def last_stop_request() -> StopRequest | None:
+    """The stop request the watcher most recently turned into a signal, if any.
+
+    The signal handler reads this to size the drain budget for ``stop --timeout``
+    and to tell ``stop --force`` from the first, graceful request. A plain
+    SIGTERM/SIGINT (no request file) leaves it ``None``.
+    """
+    return _LAST_STOP_REQUEST
+
+
 class PidFile:
     """Context manager that owns ``<vault>/.marginalia/server.pid``.
 
@@ -557,13 +689,19 @@ class PidFile:
                 pid=self._pid,
                 start_token=start_token,
                 owner_id=secrets.token_hex(16),
+                capabilities=(
+                    (SHUTDOWN_OUTCOME_CAPABILITY,) if self._pid == os.getpid() else ()
+                ),
             )
             _write_pid_fd(fd, record)
             _remove_path(signal_file_path(self.vault), what="stop-request file")
+            _remove_path(outcome_file_path(self.vault), what="shutdown-outcome file")
             self._fd = fd
             self._record = record
             self._owned = True
             if self._pid == os.getpid():
+                global _OUTCOME_ROOT
+                _OUTCOME_ROOT = self.vault
                 self._start_signal_watcher()
             return
         raise LifecycleError(f"could not atomically acquire daemon lock at {self.path}")
@@ -583,6 +721,7 @@ class PidFile:
             return
         path = signal_file_path(self.vault)
         last_request_id: str | None = None
+        delivered_first = False
         while not self._watch_stop.wait(_SIGNAL_POLL_SECONDS):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -607,6 +746,25 @@ class PidFile:
             # ever sends a signal to a numeric PID, eliminating PID-reuse kills.
             if os.getpid() != record.pid or _process_start_token(record.pid) != record.start_token:
                 return
+            force = payload.get("force") is True
+            # Only the first request and explicit ``--force`` requests become
+            # signals. A repeat graceful request must never be read by the
+            # daemon as the operator's second signal (#22); a real second
+            # SIGTERM/Ctrl-C still forces through the signal handler.
+            if delivered_first and not force:
+                last_request_id = request_id
+                continue
+            drain_timeout: float | None
+            try:
+                raw_timeout = payload.get("drain_timeout")
+                drain_timeout = float(raw_timeout) if raw_timeout is not None else None
+            except (TypeError, ValueError):
+                drain_timeout = None
+            if drain_timeout is not None and not (0.0 <= drain_timeout < 86400.0):
+                drain_timeout = None
+            global _LAST_STOP_REQUEST
+            _LAST_STOP_REQUEST = StopRequest(force=force, drain_timeout=drain_timeout)
+            delivered_first = True
             last_request_id = request_id
             # ``raise_signal`` targets this process directly (and invokes the
             # Python handler on Windows, where ``os.kill(SIGTERM)`` would call
@@ -721,6 +879,51 @@ def default_daemon_log_path() -> Path:
     return default_app_home() / "logs" / "okto-neuron-serve.log"
 
 
+def stream_is_file(stream: Any, path: Path) -> bool:
+    """True when ``stream`` is an open handle on the same file as ``path`` (same device and inode).
+
+    The detached daemon child has its stdout redirected to the log file by the parent; a second file
+    handler on that file would write every record twice and rotate it away from the raw stdout fd.
+    """
+    try:
+        a = os.fstat(stream.fileno())
+        b = os.stat(Path(path).expanduser())
+    except (OSError, ValueError, AttributeError):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+class _FdFollowingRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotating handler for a log file that the process's stdout/stderr (fd 1 and 2) also point at.
+
+    The detached daemon child inherits fd 1/2 on the log file (uvicorn and tracebacks write there
+    directly). A plain rotation renames the file and leaves those fds on the renamed backup, so after
+    the first rollover the active file would only get this handler's records. After each rollover the
+    fds that were on the old file are re-pointed at the new active file.
+    """
+
+    def doRollover(self) -> None:
+        followers: list[int] = []
+        if self.stream is not None:
+            try:
+                ident = os.fstat(self.stream.fileno())
+                for fd in (1, 2):
+                    st = os.fstat(fd)
+                    if (st.st_dev, st.st_ino) == (ident.st_dev, ident.st_ino):
+                        followers.append(fd)
+            except OSError:
+                followers = []
+        super().doRollover()
+        if followers and self.stream is None:  # delay=True leaves the new file unopened until the next emit
+            self.stream = self._open()
+        if self.stream is not None:
+            for fd in followers:
+                try:
+                    os.dup2(self.stream.fileno(), fd)
+                except OSError:
+                    pass
+
+
 def configure_logging(
     vault: Path | None,
     *,
@@ -730,12 +933,19 @@ def configure_logging(
     rotate_max_bytes: int = DEFAULT_LOG_ROTATE_BYTES,
     rotate_backups: int = DEFAULT_LOG_ROTATE_BACKUPS,
     logger_name: str = "okto_neuron",
+    also_stream: Any = None,
+    follow_std_fds: bool = False,
 ) -> logging.Logger:
     """Install :class:`JsonLogFormatter` on ``logger_name``.
 
     Writes to ``stream`` (default stdout), or — when ``log_file`` is given —
     to a size-rotated file instead (``/dev/null`` and other character devices
-    are written without rotation).
+    are written without rotation). ``also_stream`` additionally tees every
+    record to that stream (the console) when a file is used.
+
+    A log file that cannot be opened (missing permission, read-only volume) never
+    stops the server: one warning goes to stderr and the logger falls back to the
+    stream handler.
 
     Idempotent: removes pre-existing handlers we previously installed so that
     repeated invocations (tests, daemonization re-init) do not duplicate
@@ -753,25 +963,44 @@ def configure_logging(
     for handler in list(logger.handlers):
         if getattr(handler, "_okto_neuron_json", False):
             logger.removeHandler(handler)
-    handler: logging.Handler
+    formatter = JsonLogFormatter(vault=str(vault) if vault is not None else None)
+    handlers: list[logging.Handler] = []
     if log_file is not None:
         log_file = log_file.expanduser()
-        if log_file.exists() and not log_file.is_file():
-            # Character devices (/dev/null) cannot be size-rotated.
-            handler = logging.FileHandler(log_file, delay=True)
-        else:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            handler = logging.handlers.RotatingFileHandler(
-                log_file,
-                maxBytes=rotate_max_bytes,
-                backupCount=rotate_backups,
-                delay=True,
+        try:
+            if log_file.exists() and not log_file.is_file():
+                # Character devices (/dev/null) cannot be size-rotated.
+                file_handler: logging.Handler = logging.FileHandler(log_file, delay=True)
+            else:
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_file, "ab"):  # fail now, not on the first record
+                    pass
+                rotating_cls = (
+                    _FdFollowingRotatingFileHandler if follow_std_fds else logging.handlers.RotatingFileHandler
+                )
+                file_handler = rotating_cls(
+                    log_file,
+                    maxBytes=rotate_max_bytes,
+                    backupCount=rotate_backups,
+                    delay=True,
+                )
+            handlers.append(file_handler)
+        except OSError as exc:
+            print(
+                f"okto-neuron: cannot write the log file {log_file} ({type(exc).__name__}: "
+                f"{exc.strerror or exc}); logging to the console only",
+                file=sys.stderr,
+            )
+        if also_stream is not None or not handlers:
+            handlers.append(
+                logging.StreamHandler(also_stream if also_stream is not None else stream or sys.stdout)
             )
     else:
-        handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
-    handler.setFormatter(JsonLogFormatter(vault=str(vault) if vault is not None else None))
-    handler._okto_neuron_json = True  # type: ignore[attr-defined]
-    logger.addHandler(handler)
+        handlers.append(logging.StreamHandler(stream if stream is not None else sys.stdout))
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        handler._okto_neuron_json = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
     return logger
 
 
@@ -922,6 +1151,17 @@ class _IdentityUnverifiable(LifecycleError):
     """
 
 
+class _IdentityMismatch(_IdentityUnverifiable):
+    """The owner's birth token read differently from the one captured at stop time.
+
+    While the lifecycle lock is still held by the recorded owner this is not a
+    different process (only the lock holder can write that record): it is the
+    same daemon whose process-table entry reads differently while it tears down.
+    Like :class:`_IdentityUnverifiable` it fails closed for callers deciding
+    whether to signal, and a caller that is only polling keeps polling.
+    """
+
+
 @dataclass(frozen=True)
 class _LegacyTarget:
     pid: int
@@ -998,7 +1238,7 @@ def _active_pid_record(
                         "unrelated or unverifiable process"
                     )
                 if current_start != expected_start_token:
-                    raise LifecycleError(
+                    raise _IdentityMismatch(
                         f"PID identity mismatch for {record.pid}; refusing to signal an "
                         "unrelated or unverifiable process"
                     )
@@ -1007,6 +1247,7 @@ def _active_pid_record(
                     start_token=current_start,
                     owner_id=record.owner_id,
                     version=record.version,
+                    capabilities=record.capabilities,
                 )
             if current_start == record.start_token:
                 return record
@@ -1030,6 +1271,7 @@ def _active_pid_record(
                     start_token=current_start,
                     owner_id=record.owner_id,
                     version=record.version,
+                    capabilities=record.capabilities,
                 )
             raise LifecycleError(
                 f"PID identity mismatch for {record.pid}; refusing to signal an "
@@ -1236,7 +1478,14 @@ def _signal_legacy_target(vault: Path, target: _LegacyTarget, sig: int) -> None:
         raise _OwnerGone from exc
 
 
-def _write_signal_request(vault: Path, record: _PidRecord, sig: int) -> None:
+def _write_signal_request(
+    vault: Path,
+    record: _PidRecord,
+    sig: int,
+    *,
+    force: bool = False,
+    drain_timeout: float | None = None,
+) -> None:
     if sig not in {signal.SIGTERM, signal.SIGINT}:
         raise LifecycleError(f"unsupported daemon stop signal: {sig}")
     path = signal_file_path(vault)
@@ -1251,6 +1500,8 @@ def _write_signal_request(vault: Path, record: _PidRecord, sig: int) -> None:
                 "start_token": record.start_token,
                 "signal": int(sig),
                 "request_id": request_id,
+                "force": bool(force),
+                "drain_timeout": drain_timeout,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1291,6 +1542,8 @@ def _request_stop(
     expected_owner_id: str | None = None,
     expected_pid: int | None = None,
     expected_start_token: str | None = None,
+    force: bool = False,
+    drain_timeout: float | None = None,
 ) -> _PidRecord:
     record = _active_pid_record(
         vault,
@@ -1299,7 +1552,7 @@ def _request_stop(
     )
     if expected_pid is not None and record.pid != expected_pid:
         raise _OwnerChanged
-    _write_signal_request(vault, record, sig)
+    _write_signal_request(vault, record, sig, force=force, drain_timeout=drain_timeout)
     return record
 
 
@@ -1309,6 +1562,8 @@ def _request_stop_target(
     sig: int,
     expected: _PidRecord | _LegacyTarget | None = None,
     expected_pid: int | None = None,
+    force: bool = False,
+    drain_timeout: float | None = None,
 ) -> _PidRecord | _LegacyTarget:
     if isinstance(expected, _PidRecord):
         return _request_stop(
@@ -1317,18 +1572,31 @@ def _request_stop_target(
             expected_owner_id=expected.owner_id,
             expected_pid=expected.pid,
             expected_start_token=expected.start_token,
+            force=force,
+            drain_timeout=drain_timeout,
         )
     if isinstance(expected, _LegacyTarget):
-        _signal_legacy_target(vault, expected, sig)
+        _signal_legacy_target(vault, expected, _legacy_signal(sig, force))
         return expected
     try:
-        return _request_stop(vault, sig=sig, expected_pid=expected_pid)
+        return _request_stop(
+            vault,
+            sig=sig,
+            expected_pid=expected_pid,
+            force=force,
+            drain_timeout=drain_timeout,
+        )
     except _LegacyOwner as legacy:
         target = _validate_legacy_target(vault, legacy.pid)
         if expected_pid is not None and target.pid != expected_pid:
             raise _OwnerChanged
-        _signal_legacy_target(vault, target, sig)
+        _signal_legacy_target(vault, target, _legacy_signal(sig, force))
         return target
+
+
+def _legacy_signal(sig: int, force: bool) -> int:
+    """A pre-lock daemon has no force request: ``--force`` is SIGKILL for it."""
+    return signal.SIGKILL if force and os.name == "posix" else sig
 
 
 def send_stop(
@@ -1369,32 +1637,53 @@ def active_server_pid(vault: Path) -> int | None:
         return None
 
 
+def close_budget(drain_timeout: float) -> float:
+    """Seconds reserved after the drain budget for the store close (#22).
+
+    ``max(5 s, 25 %)`` of the drain budget: the drain may use all of
+    ``drain_timeout``, and the close then still has this long before the hard
+    deadline (``drain_timeout + close_budget``).
+    """
+    return max(_MIN_CLOSE_BUDGET_SECONDS, _CLOSE_BUDGET_FRACTION * max(0.0, drain_timeout))
+
+
+_MIN_CLOSE_BUDGET_SECONDS = 5.0
+_CLOSE_BUDGET_FRACTION = 0.25
+_STOP_EXIT_GRACE_SECONDS = 5.0
+
+
 def stop_server(
     vault: Path,
     *,
     sig: int = signal.SIGTERM,
     timeout: float = 30.0,
     poll_interval: float = 0.1,
+    force: bool = False,
 ) -> int:
-    """Signal the server and wait for the PID file to be removed.
+    """Ask the server to stop once and wait for it to exit.
 
-    A server that has not stopped after ten seconds receives the same signal a
-    second time. The runtime treats that repeat as an explicit force request;
-    this makes ``okto-neuron stop`` deterministic without requiring the operator
-    to discover the PID and send another signal manually.
+    Exactly ONE request is sent: ``stop`` never escalates on its own (#22). The
+    request carries ``timeout`` as the daemon's drain budget; the daemon then
+    has a further :func:`close_budget` to close its stores, so this waits up to
+    ``timeout`` plus that budget plus a small exit grace. Success is the owner
+    releasing its lifecycle lock (or the PID being gone). An identity read that
+    is unavailable or differs while the lock is still held is not an exit and
+    not an error: keep polling.
+
+    ``force=True`` sends the force request instead (the daemon skips the
+    drain; a legacy daemon gets SIGKILL).
 
     Returns the PID that was signalled. Raises :class:`LifecycleError` on
     timeout.
     """
     try:
-        target = _request_stop_target(vault, sig=sig)
+        target = _request_stop_target(vault, sig=sig, force=force, drain_timeout=timeout)
     except _OwnerGone as exc:
         raise LifecycleError(str(exc)) from exc
     pid = target.pid
     started = time.monotonic()
-    deadline = started + timeout
-    escalation_at = started + min(10.0, max(0.1, timeout / 2.0))
-    escalated = False
+    wait = timeout + close_budget(timeout) + _STOP_EXIT_GRACE_SECONDS
+    deadline = started + wait
     while time.monotonic() < deadline:
         if isinstance(target, _PidRecord):
             try:
@@ -1406,49 +1695,19 @@ def stop_server(
             except (_OwnerGone, _OwnerChanged):
                 return pid
             except _IdentityUnverifiable:
-                # ``_active_pid_record`` fails closed (refuses to vouch for the
-                # owner) whenever a single process-birth read is transiently
-                # unavailable, e.g. a ``ps`` call timing out under system load
-                # -- see test_expected_locked_owner_with_unavailable_identity_
-                # remains_fail_closed. That is correct when deciding whether to
-                # *signal* a process, but here we are only polling whether the
-                # target we already signalled is still there. An inconclusive
-                # read is not proof the owner exited, so keep waiting rather
-                # than aborting the whole stop attempt; only a confirmed
-                # _OwnerGone/_OwnerChanged above, or the deadline below, ends
-                # the wait. A genuine, provable identity mismatch (or a
-                # corrupt/missing record) still raises the base
-                # ``LifecycleError`` and is not caught here.
+                # Covers a transiently unreadable process-birth identity and a
+                # birth token that reads differently while the owner still
+                # holds the lock. Neither is proof the owner exited, and
+                # neither is an error: we only poll a target we already
+                # signalled. Only a confirmed exit above, or the deadline
+                # below, ends the wait. A corrupt or missing PID record still
+                # raises the base ``LifecycleError``.
                 pass
         elif not _legacy_target_still_same(vault, target):
             return pid
-        if not escalated and time.monotonic() >= escalation_at:
-            try:
-                escalation_signal = (
-                    signal.SIGKILL
-                    if isinstance(target, _LegacyTarget) and os.name == "posix"
-                    else sig
-                )
-                _request_stop_target(
-                    vault,
-                    sig=escalation_signal,
-                    expected=target,
-                )
-            except (_OwnerGone, _OwnerChanged):
-                return pid
-            except _IdentityUnverifiable:
-                # Same transient-read race as above, but here it happened
-                # while trying to deliver the escalation signal itself: no
-                # signal was written (the identity check runs before
-                # ``_write_signal_request``), so leave ``escalated`` False
-                # and retry escalation on a later iteration instead of
-                # silently dropping the second signal.
-                pass
-            else:
-                escalated = True
         time.sleep(poll_interval)
     path = pid_file_path(vault)
-    raise LifecycleError(f"server did not exit within {timeout:.1f}s (pid={pid}, pid_file={path})")
+    raise LifecycleError(f"server did not exit within {wait:.1f}s (pid={pid}, pid_file={path})")
 
 
 # ---------------------------------------------------------------------------
@@ -1458,6 +1717,87 @@ def stop_server(
 
 _DEFAULT_DRAIN_TIMEOUT = 30.0
 """Seconds we wait for in-flight requests to finish on SIGTERM/SIGINT."""
+
+
+_SHUTDOWN_LOG = logging.getLogger("okto_neuron.server.shutdown")
+_SHUTDOWN_HARD_DEADLINE: float | None = None
+
+
+def set_shutdown_hard_deadline(deadline: float | None) -> None:
+    """Record the absolute (monotonic) hard deadline ``shutdown.phase`` reports against."""
+    global _SHUTDOWN_HARD_DEADLINE
+    _SHUTDOWN_HARD_DEADLINE = deadline
+
+
+def flush_before_exit(timeout_s: float = 5.0) -> dict[str, int]:
+    """Flush what ``os._exit`` would drop: telemetry, logs, stdout/stderr.
+
+    ``os._exit`` skips ``atexit`` and thread joins, so the pending MLflow span
+    queue, buffered log handlers and stdio are flushed explicitly, in that
+    order, with telemetry bounded to ``timeout_s``. Spans still queued after
+    the bound are given up on and their count is logged, then logging is shut
+    down (flushing every handler) and stdio flushed. Returns
+    ``{"telemetry_dropped": n}``.
+    """
+    dropped = 0
+    try:
+        from okto_neuron.llm import _telemetry
+
+        pending = _telemetry._QUEUE
+        if pending is not None and not _telemetry.flush(timeout_s):
+            dropped = int(pending.unfinished_tasks)
+    except Exception:  # noqa: BLE001 - the exit path must not raise
+        _SHUTDOWN_LOG.warning("telemetry flush failed before exit", exc_info=True)
+    mlflow = sys.modules.get("mlflow")
+    flush_async = getattr(mlflow, "flush_trace_async_logging", None)
+    if callable(flush_async):
+        try:
+            flush_async()
+        except Exception:  # noqa: BLE001
+            _SHUTDOWN_LOG.warning("mlflow trace flush failed before exit", exc_info=True)
+    if dropped:
+        _SHUTDOWN_LOG.warning(
+            "shutdown.telemetry_dropped count=%d (export queue not drained in %.1fs)",
+            dropped,
+            timeout_s,
+        )
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    return {"telemetry_dropped": dropped}
+
+
+@contextlib.contextmanager
+def shutdown_phase(name: str, **fields: Any) -> Iterator[dict[str, Any]]:
+    """Log one ``shutdown.phase`` line (name, duration_ms, remaining_s, status).
+
+    The yielded dict lets a phase attach extra ``key=value`` detail (for example
+    ``result``) that is included in the line. An exception is logged with
+    ``status=error`` and re-raised.
+    """
+    started = time.monotonic()
+    detail: dict[str, Any] = dict(fields)
+    status = "ok"
+    try:
+        yield detail
+    except BaseException:
+        status = "error"
+        raise
+    finally:
+        now = time.monotonic()
+        hard = _SHUTDOWN_HARD_DEADLINE
+        remaining = max(0.0, hard - now) if hard is not None else -1.0
+        extra = "".join(f" {key}={value}" for key, value in detail.items())
+        _SHUTDOWN_LOG.info(
+            "shutdown.phase name=%s duration_ms=%d remaining_s=%.1f status=%s%s",
+            name,
+            int((now - started) * 1000),
+            remaining,
+            status,
+            extra,
+            extra={"component": "server", "event": "shutdown.phase", "phase": name},
+        )
 
 
 class GracefulShutdown:
@@ -1492,7 +1832,14 @@ class GracefulShutdown:
         self._shutdown_event = threading.Event()
         self._force_event = threading.Event()
         self._deadline: float | None = None
+        self._drain_timeout: float | None = None
         self._closed = False
+
+    @property
+    def drain_timeout(self) -> float | None:
+        """The first shutdown request's drain budget in seconds, if set."""
+        with self._lock:
+            return self._drain_timeout
 
     @property
     def shutdown_event(self) -> threading.Event:
@@ -1529,6 +1876,7 @@ class GracefulShutdown:
             with self._lock:
                 if self._deadline is None:
                     self._deadline = candidate
+                    self._drain_timeout = max(0.0, timeout)
         self._shutdown_event.set()
 
     def request_force_shutdown(self) -> None:

@@ -80,9 +80,13 @@ def ensure_source_mentions(store: object, node_ids: Iterable[str] | None = None)
     if node_ids is None:
         nodes: Iterable[object] = store.list_nodes()
     else:
-        nodes = (node for node in (store.get_node(nid) for nid in node_ids) if node is not None)
+        # One batched read (was one get_node per id); input order and duplicate
+        # ids are kept, missing ids are skipped, exactly as before.
+        wanted = list(node_ids)
+        by_id = {node.id: node for node in store.get_nodes(wanted)}
+        nodes = [by_id[nid] for nid in wanted if nid in by_id]
 
-    minted = 0
+    candidates: list[tuple[object, str]] = []
     for node in nodes:
         if getattr(node, "type", None) not in _PRIMITIVE_ENTITY_TYPES:
             continue
@@ -91,10 +95,19 @@ def ensure_source_mentions(store: object, node_ids: Iterable[str] | None = None)
         document_id = _document_id_for_path(source_path)
         if not document_id:
             continue
-        entity_id = str(node.id)
-        if entity_id == document_id:
+        if str(node.id) == document_id:
             continue  # a node mentioning itself adds no information
-        if store.get_node(document_id) is None:
+        candidates.append((node, document_id))
+    # Minting adds edges only, never nodes, so Document existence can be read once
+    # for the whole set up front.
+    existing_documents = {
+        node.id for node in store.get_nodes([doc_id for _node, doc_id in candidates])
+    }
+
+    minted = 0
+    for node, document_id in candidates:
+        entity_id = str(node.id)
+        if document_id not in existing_documents:
             continue  # D7: a source_path that resolves to no Document is left alone
         edge_id = sha256_hex("edge", document_id, _SCHEMA_MENTIONS, entity_id)
         if edge_id in existing_edge_ids:

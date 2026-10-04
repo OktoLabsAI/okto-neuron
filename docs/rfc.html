@@ -415,6 +415,203 @@ immutable runtime per registered vault. Browser tabs, CLI calls, and MCP request
 runtime explicitly; each runtime owns its queues, jobs, locks, and sidecars, while <code>VaultPool</code>
 leases the matching Ladybug handle for the operation. This is request routing, not cross-vault
 query fanout. No <code>MultiVault</code>, authority-overlay, or catalog-federation API has shipped.</p>
+<p>REST, MCP and <code>/health</code> share one asyncio event loop, so no handler may do store, sidecar or
+YAML I/O on it, and nothing in <code>okto_neuron.server</code> uses the default executor. Every blocking
+call goes to one of two bounded pools in <code>server/_store_io.py</code>, sized in <code>okto-neuron.toml</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Pool</th>
+<th>Key (default)</th>
+<th>Entry point</th>
+<th>Work</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>StoreExecutor</td>
+<td><code>[server] store_workers</code> (4)</td>
+<td><code>store_io</code>, <code>single_flight</code></td>
+<td>short store, sidecar and YAML I/O for requests and background loops, recall's query embedding</td>
+</tr>
+<tr>
+<td>JobExecutor</td>
+<td><code>[server] job_workers</code> (2)</td>
+<td><code>job_io</code></td>
+<td>curation job runners, ingest and remember extraction, answer synthesis, re-embed, provider/model test probes</td>
+</tr>
+</tbody>
+</table>
+<p>Large responses (review queue, graph and node reads, ledger, predicate snapshot, queue and
+authority lists, drift and quality reports) are JSON-encoded on the worker, in pieces so the
+GIL is released between elements (a single <code>json.dumps</code> of a multi-megabyte payload would hold
+it for the whole call), and returned as pre-encoded bytes identical to <code>JSONResponse</code>.
+Single-flight caches those bytes. <code>single_flight</code> collapses concurrent identical full scans (integrity summary, ledger
+runs/summary) into one execution; the upkeep-predicates and graph-stats reads no longer scan at all (next paragraph). Long jobs never occupy a store
+worker, so they cannot starve UI reads; the JobExecutor is also where a separate worker
+process will plug in. On shutdown both pools finish calls already executing (bounded by the
+drain deadline) before vault handles close, then cancel anything still queued. Two deliberate
+exceptions remain: the graph swap at the end of rebuild/heal/reembed jobs runs on the loop as
+one no-await block (reads see a short latency blip, never a half-swapped graph), and the
+companion-triage LLM fan-out uses its own thread pool inside a job runner.</p>
+<p><code>GET /api/v1/upkeep/predicates</code> and <code>GET /api/v1/graph/stats</code> read one maintained projection per vault
+(<code>server/_projection.py</code>): the predicate stats (<code>PredicateStats</code>) and the node/edge census for both
+<code>include_structural</code> variants, built together from set-based scans that read no vectors. It is current
+while <code>(store.generation(), instance_token, write_seq)</code> is unchanged (see <code>IndexedStore</code>). A read never
+waits for a rebuild: it returns the last projection with <code>stale</code> and <code>rebuilding</code> flags (response fields
+added, none removed), and a vault with no projection yet answers HTTP 202 <code>{&quot;status&quot;: &quot;building&quot;}</code> and
+starts the first build. At most one rebuild per vault runs, on the JobExecutor, plus one pending: a
+rebuild that finishes with the key moved runs once more, at least <code>[server] projection_min_interval_s</code>
+(default 5 s) after the previous one ended; a projection older than <code>[server] projection_max_age_s</code>
+(default 600 s) counts as stale even without a local write, which covers writes from another process.
+<code>POST /api/v1/upkeep/rebuild-stats</code> (and <code>okto-neuron upkeep rebuild-stats</code>) forces a rescan now and
+answers 202. The projection is persisted to <code>.marginalia/vault-projection.json</code> (version 1) through the
+store executor; one restored from an earlier process is served as stale until the first rebuild, and a
+missing, corrupt or old-version file just means a cold start. A predicate-propose job takes its stats from
+the same projection, joining a build in flight, instead of scanning the graph twice. The old 60 s
+vocabulary cache is gone.
+Model calls are bounded so a wedged endpoint cannot hold a vault's writer lock: a completion
+defaults to a 300 s deadline with SDK retries off (retry policy is ours: one retry, backing off
+2 s after a timeout), <code>llm.curation_call_timeout_s</code> defaults to 600 s and puts every judge call
+in the killable helper process, and a curation job watchdog (<code>curation.job_stall_timeout_s</code>,
+default 900 s) fails a read-only job that reports no progress and shows <code>curation_job_stalled</code>,
+with <code>elapsed_s</code> and <code>last_progress_at</code> per job, on <code>/api/v1/status</code>. Reconcile-propose keeps
+its writer lock across model calls: the lock is what pins one verified graph generation for the
+whole pass, and the pass only checks that generation at its start.
+<code>tests/server/test_event_loop_guard.py</code> fails any route or MCP tool that blocks the loop for
+more than 50 ms against a deliberately slow store, and <code>test_no_default_executor.py</code> fails on
+any new default-executor offload.
+Graph reads on grafx retry a transient driver error inside the store adapter: when another
+process publishes a commit between grafx's view snapshot and its exact read, the driver raises a
+retryable error (<code>index_view_changed</code>), and <code>GrafxStore</code> retries the read (at most 6 attempts,
+jittered backoff from 10 ms to 200 ms, 2 s total) so <code>get_node</code>, <code>get_nodes</code> and <code>list_*</code> never
+surface it as a 500. A failure the driver does not flag retryable surfaces at once, and an
+exhausted budget reaches the caller as <code>GraphBackendError</code> with <code>retryable=True</code>.</p>
+<p>Node reads take <code>include_embedding</code>. <code>list_nodes</code> and <code>get_nodes</code> default to <code>False</code>: the vector column is
+not selected at all (grafx and ladybug drop <code>n.embedding</code> from the <code>RETURN</code>, the neo4j mixin returns a map
+projection without it), so a scan of a 4096-dimension vault no longer drags every vector through the engine
+and starves the writer. <code>get_node</code> defaults to <code>True</code> because it is the read-modify-write read and a single
+vector is cheap. Callers that use vectors or write a node back pass <code>True</code>: vector ranking, reembed, rebuild
+and heal copies, snapshot dump, index rebuild and generation stamps, reconcile clustering, resolve similarity,
+and the companion's supersede/detach/revert helper. Edges carry no vector. A backend registered through the
+<code>marginalia.graph_backends</code> entry point must accept the new keyword.</p>
+<p>Writes are the other half of that contract. <code>add_node</code> on a node whose <code>embedding</code> is <code>None</code> PRESERVES
+the vector already stored for that id (grafx, ladybug and neo4j use an upsert statement without the
+<code>embedding</code> SET; the in-memory store, <code>IndexedStore</code>'s index and the companion planning overlay keep the
+existing vector), so a node read without its vector and written back can no longer erase it. Erasing is
+explicit: <code>add_node(node, clear_embedding=True)</code>. A new node with no vector simply has none, and the
+graph generation digest does not change when a vector is preserved. No in-tree caller clears a vector
+today: the copy paths (reembed, rebuild, heal, snapshot load) write into fresh stores. A backend
+registered through the entry point must honour the same semantics and accept <code>clear_embedding</code>.</p>
+<p>Every store the daemon serves is an <code>IndexedStore</code>, which carries a change counter for derived
+projections: <code>instance_token</code> (a uuid minted per store object, so a reopen or swap is a new one) and
+<code>write_seq</code>, bumped once after each completed mutation (<code>add_node</code>, <code>add_edge</code>, and the backend bulk
+writers <code>add_nodes</code>, <code>add_edges</code>, <code>wipe</code> reached through delegation; a write that raised also counts,
+because it may have applied partially). A projection built at <code>(generation, instance_token, write_seq)</code>
+is current exactly while all three still match. <code>tests/store/test_write_seq.py</code> enumerates the
+<code>GraphStore</code> protocol and fails when a member is not classified as read-only or mutating. Predicate
+vocabulary, shared-argument pairs, argument signatures and samples are one <code>PredicateStats</code> value
+(<code>predicates.build_predicate_stats</code>), which candidate generation accepts through <code>stats=</code> instead of
+rescanning the graph.</p>
+<p>The companion review queue lives in <code>.marginalia/review_queue.sqlite</code> (stdlib <code>sqlite3</code>, WAL,
+<code>synchronous=FULL</code>), not in <code>review_queue.json</code>. The JSON file was rewritten whole on every enqueue and
+acknowledge and re-parsed whole on every <code>ReviewQueue</code> construction (137 MB for about 2,000 items, 97% of it
+embeddings). Tables: <code>entries(seq, candidate_id UNIQUE, kind, reason, created_at, payload, entry_sha256)</code> with the
+payload stored WITHOUT the embedding, and <code>embeddings(candidate_id, dim, vec)</code> holding the vector as
+little-endian float64, so the round trip is bit-exact. <code>entry_sha256</code> (what <code>resolution_scope</code> hands a sealed
+plan) is still the sha256 of the full entry record with the embedding restored, byte-for-byte the JSON-era
+value, and every path that materialises the embedding re-checks it. Each enqueue or acknowledge is one
+<code>BEGIN IMMEDIATE</code> transaction on its own connection (about 0.6 ms); <code>ReviewQueue</code> construction reads nothing.
+A vault at <code>marginalia_yaml_version: 1</code> keeps <code>review_queue.json</code> and its queue is refused
+(<code>ReviewQueueMigrationRequired</code>) until the explicit migration runs; nothing migrates implicitly. The migration
+(<code>consolidate/review_queue_migration.py</code>) loads the source with the old validating loader (any refusal aborts,
+nothing is skipped or rewritten), writes a verified <code>review_queue.json.bak-v1</code> that is never overwritten or
+deleted, bumps the yaml to version 2, builds and verifies a temp SQLite file (counts equal, and every row's
+<code>entry_sha256</code> recomputed from the SQLite row equals the source entry's), replaces it atomically and only then
+renames the source to <code>review_queue.json.migrated</code>. Version 2 is the forward-compat guard: 0.3.1 supports
+<code>(1,)</code> and exits 4 (<code>ConfigVersionUnsupported</code>) on a migrated vault, verified in the tests against the real
+released 0.3.1 wheel; the bump comes before the data work so a crash can never leave 0.3.1 able to open a
+half-migrated vault. Rollback regenerates the JSON from SQLite (or restores the literal backup), moves the
+SQLite file aside and lowers the yaml to 1 last; yaml 1 always means the JSON is the truth. New vaults are
+created at version 2 (every scaffold path: <code>Vault.init</code>/<code>scaffold</code>, <code>init</code>, <code>vault create</code>, <code>onboard</code>,
+<code>kg init</code>, <code>kg snapshot load</code>, the daemon's <code>POST /api/v1/vaults</code>, and the default config <code>_open_vault</code> writes
+for a yaml-less directory; a test opens each one through the daemon's own runtime path).</p>
+<p><code>GET /api/v1/review-queue</code> (and the bare <code>/review-queue</code>) pages the queue: with no <code>limit</code> it returns the full
+list as before and carries a <code>Deprecation: true</code> header; <code>limit=0</code> returns <code>items: []</code> and the <code>total</code>
+without any evidence fetch; <code>limit</code> 1..1000 returns that many items (nodes by insertion order, then relations)
+with an opaque <code>next_cursor</code>. The body is <code>{status, items, next_cursor, total}</code> and only the page's evidence
+blocks go to <code>get_nodes</code>. The daemon refuses a version-1 vault alone: <code>ServerState.runtime_for</code> checks the yaml
+(read-only) BEFORE it takes the writer lease, so nothing in the vault changes (no lease file, no yaml, no
+SQLite); other vaults keep serving. <code>/api/v1/status</code> lists the vault under <code>vaults[].review_queue</code> with
+<code>state: migration_required</code> and the remedy (<code>okto-neuron kg review-queue migrate --vault &lt;name&gt;</code>), adds a
+<code>review_queue_migration_required</code> degraded reason, the log carries one WARNING per vault, and requests scoped to
+it answer 409 <code>review_queue_migration_required</code>.</p>
+<p>Grafx's buffer pool defaults to 64 MiB, which thrashes once a full scan's working set (about 165 MiB
+on a 179 MB production graph) exceeds it. <code>GrafxStore</code> therefore passes <code>buffer_budget_bytes</code> to
+<code>okto_grafx.connect</code>: <code>storage.buffer_budget</code> in the vault yaml (bytes or a string such as <code>256MiB</code>,
+16 MiB to 8 GiB; <code>defaults.yaml</code> supplies it when the vault inherits application defaults), else
+max(256 MiB, 1.5 x the graph size) capped at 1 GiB. The open is logged at INFO with the graph size,
+the chosen budget and its source, and <code>/api/v1/status</code> reports it per vault as
+<code>grafx_buffer_budget_bytes</code>. Neuron stays on grafx exclusive mode; no sharing option is involved.</p>
+<p>One process at a time writes a vault. The daemon takes a per-vault writer lease
+(<code>&lt;vault&gt;/.okto-neuron-writer.lock</code>, an OS file lock that dies with its holder, never deleted;
+one JSON line records pid, process start token, role, operation, endpoint and time) for every
+vault it serves and keeps it for the life of the process, idle eviction included. A CLI command
+that writes (<code>watch</code>, <code>pilot</code>, <code>init --wipe</code>, <code>kg init</code> on an existing vault, <code>kg rebuild</code>,
+<code>reembed</code>, <code>reindex</code>, <code>reconcile propose/apply/review confirm/review reject/heal</code>,
+<code>snapshot dump</code>, <code>onboard</code>, which takes it before the backend-pin check or any default-vault or config write) takes the lease or refuses with exit 5 while the daemon holds it,
+naming the daemon pid and the API call that does the same thing, or telling you to stop the
+daemon first; it never proxies. <code>init</code> on a new path, <code>vault create</code> and <code>snapshot load</code> take
+the lease themselves. Readers (<code>review list</code>, <code>quality *</code>, <code>snapshot verify</code>) take no lease. A
+live OS lock is always honoured: a record whose pid or start token does not check out is reported
+as an unverifiable holder, and a record left by a dead process never blocks (the lock is free, so
+the lease is reclaimed and <code>writer_lease.stale_reclaimed</code> is logged). Inside the daemon the lease
+is re-entrant, so its own jobs never contend with it. On a filesystem without working file locks
+(some NFS or SMB mounts) the lease degrades: <code>/api/v1/status</code> reports <code>writer_lease_degraded</code>
+for that vault and the daemon logs a startup warning naming it, because nothing then stops a
+second writer. Lock order is writer lease, then <code>.graph-handle.lock</code>, then engine locks.</p>
+<p>On the CLI side, every writer goes through one helper (<code>store/vault_writer.py::vault_writer</code>)
+that takes the lease before the command opens the vault and releases it on exit. A refusal prints
+<code>cannot &lt;operation&gt;: this vault is being written by daemon pid &lt;pid&gt; (serve)</code>, then either the
+API call on the running daemon (<code>POST /api/v1/reset</code>, <code>/api/v1/curation/rebuild</code>, <code>reembed</code>,
+<code>heal</code>, <code>/api/v1/reconcile/propose|apply|review/confirm|review/reject</code>, <code>PATCH /api/v1/config</code>)
+or <code>stop the daemon first (okto-neuron stop)</code>; a CLI holder gets &quot;wait for it to finish&quot;. The
+per-vault pid check in <code>kg rebuild</code>/<code>reembed</code>/<code>reindex</code>/<code>snapshot dump</code> and the <code>init --wipe</code>
+pid probe are gone: the lease is the only gate. <code>kg reconcile review list</code> reads the review queue
+and the authority index straight from their JSON files and never opens the graph store, so it
+runs while the daemon holds the lease. The <code>.graph-handle.lock</code>, <code>.marginalia/.bootstrap.lock</code>
+and <code>reembed.state.json</code> left behind by a failed 0.3.1 <code>kg reembed</code> are ignored by the guard.</p>
+<p>The daemon takes the lease before it registers a runtime, opens a startup vault or opens a pooled
+handle. If a CLI command holds it, the request gets a 409 <code>vault_busy</code> naming the holder's pid
+and operation, and vault discovery skips that vault (logged once) and retries on its next pass,
+so one busy vault never hides the others. The lease is released only at shutdown, after the
+stores are closed and before the pid file is removed, and on managed delete just before the
+directory is removed (re-acquired if the delete rolls back).</p>
+<p><code>okto-neuron stop</code> sends one request and never escalates. The request carries <code>--timeout</code> as the
+daemon's drain budget (default 30 s); the daemon reserves a further close budget of <code>max(5 s, 25% of the drain budget)</code>, and <code>stop</code> waits for both plus a short exit grace. <code>stop --force</code> sends the
+force request instead. The watcher delivers only the first request and forced ones, so a second
+<code>stop</code> is not read as the operator's second signal, while a real second SIGTERM or Ctrl-C still
+forces. An identity read that is unavailable or differs while the lock is still held is polled
+through, never reported as an error. Inside the daemon, when the drain budget runs out the workers
+and queued executor calls are cancelled and the stores STILL close inside the close budget, from a
+dedicated thread so a wedged executor cannot block it. Every grafx statement, transaction and
+health probe runs under an in-flight counter (<code>store/_inflight.py</code>), and the close refuses new
+calls and waits for running ones. A thread parked in an LLM or network wait holds no grafx call,
+so the close goes ahead around it. If a grafx call is still running at the hard deadline (drain
+plus close budget), the daemon does not close under it: it logs <code>store close skipped: N grafx calls in flight, relying on WAL recovery</code>, flushes telemetry and logs, and exits; the next open
+recovers from the WAL. The order is store close, then writer-lease release, then the pid file.
+The daemon leaves its verdict in <code>.marginalia/server.outcome</code> (<code>outcome=closed</code> right after the store
+close completed, <code>outcome=close_skipped</code> with the calls in flight and vault names just before the hard
+exit; both carry its pid, written atomically). <code>okto-neuron stop</code> reads and removes it and exits 0 only
+for <code>closed</code>. <code>close_skipped</code> prints <code>stopped, but the store close was skipped (N grafx calls in flight); the next start recovers from the WAL</code> and exits 3. When the daemon is gone and left no outcome (killed
+mid-stop, crashed, or <code>--force</code>), a daemon that advertises the <code>shutdown_outcome</code> capability in its pid
+record gets <code>stopped, but the daemon left no shutdown outcome (crash or forced exit); the next start recovers from the WAL</code> and exit 3. A 0.3.1 daemon never writes the file and does not advertise the
+capability (read from the pid record before the stop, since it is gone after), so <code>stop</code> keeps exit 0 for
+it. An outcome from another pid, a corrupt one, or an unknown value counts as no outcome.
+Every phase logs <code>shutdown.phase name=... duration_ms=... remaining_s=...</code> (each vault's close
+included) and a final <code>shutdown.summary</code> line. The ladybug and neo4j adapters do not count their
+native calls yet, so they need <code>store/_inflight.py</code> before the daemon's clean-close path can
+serve them.</p>
 <p>Right-to-erasure is available in the application for idle vaults that Marginalia created and
 marked as managed. Deletion requires exact-name confirmation, revalidates root membership and
 symlink/path safety, fences new leases, drains existing work, releases the owned handle, and

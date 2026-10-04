@@ -12,6 +12,7 @@ from okto_neuron.store.integrity_state import (
     guarded_store_write,
     initialize_integrity_state,
     integrity_state_path,
+    is_unrecorded_state,
     load_integrity_state,
     require_store_write_allowed,
     write_integrity_state,
@@ -286,3 +287,56 @@ def test_fence_error_propagates_out_of_a_contextmanager() -> None:
 
     assert excinfo.value.state is fenced
     assert excinfo.value.args == (fenced,)
+
+
+def test_is_unrecorded_state_matches_only_the_synthesized_no_record_verdicts(tmp_path: Path) -> None:
+    vault_path = tmp_path / "vault"
+    missing = load_integrity_state(vault_path, expected_graph_generation="generation-a")
+    assert is_unrecorded_state(missing)
+
+    path = integrity_state_path(vault_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("not json", encoding="utf-8")
+    assert is_unrecorded_state(
+        load_integrity_state(vault_path, expected_graph_generation="generation-a")
+    )
+
+    write_integrity_state(
+        vault_path,
+        GraphIntegrityState(
+            status=AuditStatus.VERIFIED,
+            graph_generation="generation-a",
+            writer_fenced=False,
+            audit_id="audit-a",
+        ),
+    )
+    stale = load_integrity_state(vault_path, expected_graph_generation="generation-b")
+    assert is_unrecorded_state(stale)
+
+    # Recorded verdicts are never "unrecorded": a verifying marker (audit id), a failed audit and
+    # a drift/recovery fence (unverified with another reason and no audit id).
+    verifying = GraphIntegrityState(
+        status=AuditStatus.VERIFYING,
+        graph_generation="g",
+        writer_fenced=True,
+        reason="graph integrity audit is running",
+        audit_id="audit-b",
+    )
+    failed = GraphIntegrityState(
+        status=AuditStatus.FAILED, graph_generation="g", writer_fenced=True, reason="1 issue(s)"
+    )
+    recovery = GraphIntegrityState(
+        status=AuditStatus.UNVERIFIED,
+        graph_generation="g",
+        writer_fenced=True,
+        reason="graph recovered from a corrupt WAL/checkpoint; the recovered generation has not been re-audited",
+    )
+    unaudited_with_id = GraphIntegrityState(
+        status=AuditStatus.UNVERIFIED,
+        graph_generation="g",
+        writer_fenced=True,
+        reason="integrity state is missing",
+        audit_id="audit-c",
+    )
+    for state in (verifying, failed, recovery, unaudited_with_id):
+        assert not is_unrecorded_state(state)

@@ -47,6 +47,10 @@ from your documents that reaches a prompt can land in the log
 | `OKTO_NEURON_PI_CLI_TIMEOUT` | Per-call timeout for the pi CLI provider. Default `300.0`. |
 | `OKTO_NEURON_PACK_PATH` | Extra search paths for type packs, separated by the platform path separator. |
 | `OKTO_NEURON_OLLAMA_BACKEND` | Forces the Ollama backend choice instead of auto-detection. |
+| `OKTO_NEURON_GC_TUNING` | `off`, `false`, `0` or `no` skips the one-time garbage-collector tuning `serve` applies at startup (`gc.freeze()` plus raised thresholds). Overrides `[server] gc_tuning`. |
+| `OKTO_NEURON_GC_THRESHOLDS` | The three collector thresholds as `gen0,gen1,gen2`, for example `50000,20,100` (the default). Overrides `[server] gc_thresholds`. An invalid value is logged and ignored. |
+| `OKTO_NEURON_SWITCH_INTERVAL` | GIL switch interval in seconds that `serve` sets once at startup, for example `0.0002` (the default; the interpreter default is `0.005`). `off` leaves the interpreter default. A non-numeric value, 0, a negative value or a value above `1.0` is logged and replaced by the default. Overrides `[server] switch_interval`. The current value appears as `switch_interval_s` under `gc` in `/api/v1/status`. |
+| `OKTO_NEURON_GC_WATCH` | `off` stops `serve` from installing the hook that counts collections and logs a WARNING for any pause over 50 ms. The counters appear under `gc` in `/api/v1/status`. |
 
 ### Config and vault selection
 

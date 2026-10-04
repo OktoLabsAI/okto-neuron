@@ -7,6 +7,7 @@ need an index without a vault on disk.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable, Iterable, Optional
 
 from okto_neuron.core.schema import Node
@@ -37,7 +38,13 @@ class InMemoryIndexStore:
         return self._scorer
 
     def upsert(self, node: Node) -> None:
-        self._records[node.id] = node_to_record(node)
+        record = node_to_record(node)
+        previous = self._records.get(node.id)
+        if record.embedding is None and previous is not None and previous.embedding is not None:
+            # Same contract as GraphStore.add_node: a node without a vector keeps the
+            # vector already indexed for that id (explicit clears delete first).
+            record = replace(record, embedding=previous.embedding)
+        self._records[node.id] = record
         self._invalidate()
 
     def delete(self, node_id: str) -> None:

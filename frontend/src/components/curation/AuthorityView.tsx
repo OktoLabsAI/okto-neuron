@@ -5,6 +5,9 @@
 import { useEffect, useState } from 'react'
 import { RefreshCw, Undo2, ExternalLink } from 'lucide-react'
 import { Spinner, ErrorBox, Badge } from '@/components/ui'
+import { BusyRetryNotice } from './BusyRetryNotice'
+import { useBusyRetry } from '@/hooks/useBusyRetry'
+import { isBusyRetryStopped } from '@/lib/busy-retry'
 import { useApp } from '@/store/app'
 import {
   getAuthority,
@@ -17,6 +20,7 @@ export function AuthorityView() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
+  const { run: runBusy, wait: busyWait, stop: stopBusy } = useBusyRetry()
   const setView = useApp((s) => s.setView)
   const selectNode = useApp((s) => s.selectNode)
 
@@ -41,10 +45,10 @@ export function AuthorityView() {
     setBusy(id)
     setError(null)
     try {
-      await authorityUnmerge(id)
+      await runBusy(() => authorityUnmerge(id))
       await refresh()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (!isBusyRetryStopped(e)) setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(null)
     }
@@ -74,6 +78,7 @@ export function AuthorityView() {
         </button>
       </div>
 
+      <BusyRetryNotice wait={busyWait} onStop={stopBusy} />
       {error && <ErrorBox message={error} />}
       {loading && records.length === 0 && <Spinner label="Loading records…" />}
       {!loading && records.length === 0 && !error && (

@@ -286,35 +286,24 @@ def test_item_detail_includes_events(tmp_path: Path) -> None:
     assert payload["events"][0]["payload"]["chunks"][0]["text"] == "body"
 
 
-def test_make_on_event_batches_chatty_llm_event_persistence(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def test_on_event_only_appends_and_marks_dirty(tmp_path: Path, monkeypatch) -> None:
+    """The sidecar write is not on the event path (it runs under the companion's event lock)."""
     state = _state(tmp_path / "vault")
     item = IngestItem(id="1", name="a.md", path="/x/a.md")
     state.ingest_queue = [item]
-    persist_lengths: list[int] = []
-
-    def fake_persist(_state) -> None:  # type: ignore[no-untyped-def]
-        persist_lengths.append(len(item.events))
-
-    monkeypatch.setattr(iq, "persist", fake_persist)
+    persists: list[int] = []
+    marks: list[int] = []
+    monkeypatch.setattr(iq, "persist", lambda _state: persists.append(len(item.events)))
+    monkeypatch.setattr(iq, "request_persist", lambda _state: marks.append(len(item.events)))
     on_event = iq._make_on_event(state, item)
 
-    for idx in range(iq.PERSIST_EVERY_CHATTY_EVENTS - 1):
+    for idx in range(30):
         on_event({"kind": "llm_request", "summary": f"request {idx}", "payload": {}})
-
-    assert len(item.events) == iq.PERSIST_EVERY_CHATTY_EVENTS - 1
-    assert persist_lengths == []
-
-    on_event({"kind": "llm_response", "summary": "response", "payload": {}})
-
-    assert len(item.events) == iq.PERSIST_EVERY_CHATTY_EVENTS
-    assert persist_lengths == [iq.PERSIST_EVERY_CHATTY_EVENTS]
-
     on_event({"kind": "chunks", "summary": "Parsed chunks", "payload": {}})
 
-    assert persist_lengths == [iq.PERSIST_EVERY_CHATTY_EVENTS, iq.PERSIST_EVERY_CHATTY_EVENTS + 1]
+    assert len(item.events) == 31
+    assert persists == [], "on_event must never write the sidecar itself"
+    assert marks == list(range(1, 32)), "every event marks the queue dirty"
 
 
 def test_cancel_marks_queued_terminal_and_requests_processing_stop(

@@ -6,20 +6,19 @@ import { GitMerge, RefreshCw, Search } from 'lucide-react'
 import { Spinner, ErrorBox, Badge } from '@/components/ui'
 import {
   getHealth,
-  getGraphStats,
   getCurationJobs,
   getScheduler,
   getJob,
-  getPredicateUpkeep,
   predicateUpkeepApply,
   predicateUpkeepPropose,
   type HealthResponse,
-  type GraphStatsLite,
   type JobsSnapshot,
   type SchedulerStatus,
   type CurationJob,
   type PredicateUpkeepSnapshot,
 } from '@/services/curation-api'
+import { useGraphStats } from '@/services/graph-stats'
+import { refreshPredicateSnapshot, usePredicateSnapshot } from '@/services/predicate-snapshot'
 
 function Stat({ label, value }: { label: string; value: string | number }) {
   return (
@@ -249,10 +248,12 @@ export function CurationDashboard({
   onNavigate?: (tab: string) => void
 }) {
   const [health, setHealth] = useState<HealthResponse | null>(null)
-  const [stats, setStats] = useState<GraphStatsLite | null>(null)
+  // Shared graph-stats query (same poll as the Overview), not a per-component request.
+  const { stats } = useGraphStats()
   const [jobs, setJobs] = useState<JobsSnapshot | null>(null)
   const [sched, setSched] = useState<SchedulerStatus | null>(null)
-  const [predicate, setPredicate] = useState<PredicateUpkeepSnapshot | null>(null)
+  // Shared predicate query: one timer for every panel, paused while the tab is hidden.
+  const { snapshot: predicate } = usePredicateSnapshot()
   const [activePredicateJobId, setActivePredicateJobId] = useState<string | null>(null)
   const [activePredicateJob, setActivePredicateJob] = useState<CurationJob | null>(null)
   const [predicateBusy, setPredicateBusy] = useState(false)
@@ -264,18 +265,14 @@ export function CurationDashboard({
     setLoading(true)
     setError(null)
     try {
-      const [h, s, j, sc, p] = await Promise.all([
+      const [h, j, sc] = await Promise.all([
         getHealth(),
-        getGraphStats(),
         getCurationJobs(),
         getScheduler(),
-        getPredicateUpkeep(),
       ])
       setHealth(h)
-      setStats(s)
       setJobs(j)
       setSched(sc)
-      setPredicate(p)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -285,7 +282,9 @@ export function CurationDashboard({
 
   useEffect(() => {
     refresh()
-    const t = setInterval(refresh, 5000)
+    const t = setInterval(() => {
+      if (document.visibilityState !== 'hidden') refresh()
+    }, 5000)
     return () => clearInterval(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -300,6 +299,7 @@ export function CurationDashboard({
         setActivePredicateJob(job)
         if (job.status === 'done' || job.status === 'error') {
           setActivePredicateJobId(null)
+          void refreshPredicateSnapshot()
           refresh()
           return
         }
@@ -342,7 +342,10 @@ export function CurationDashboard({
       <div className="flex items-center justify-between">
         <h2 className="text-base font-medium text-surface-200">Overview</h2>
         <button
-          onClick={refresh}
+          onClick={() => {
+            void refreshPredicateSnapshot()
+            refresh()
+          }}
           className="flex items-center gap-2 rounded-lg border border-surface-700 px-3 py-1.5 text-sm text-surface-300 hover:bg-surface-800"
         >
           <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />

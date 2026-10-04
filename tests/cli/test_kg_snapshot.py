@@ -72,7 +72,7 @@ def test_kg_snapshot_dump_verify_load_round_trip(tmp_path: Path) -> None:
         restored.close()
 
 
-def test_kg_snapshot_dump_onto_served_vault_exits_with_lock_message(tmp_path: Path) -> None:
+def test_kg_snapshot_dump_onto_live_handle_exits_5_with_lock_message(tmp_path: Path) -> None:
     vault_path = tmp_path / "vault"
     _populated_vault(vault_path)
 
@@ -82,5 +82,5 @@ def test_kg_snapshot_dump_onto_served_vault_exits_with_lock_message(tmp_path: Pa
     with acquire_vault_handle_lease(vault_path, operation="test"):
         result = runner.invoke(app, ["kg", "snapshot", "dump", str(vault_path), str(dest)])
 
-    assert result.exit_code == 1
-    assert "vault is open by another process; stop serve first" in result.output
+    assert result.exit_code == 5
+    assert "another process owns a live graph handle" in result.output

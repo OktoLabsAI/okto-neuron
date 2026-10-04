@@ -88,6 +88,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -100,12 +102,22 @@ from okto_neuron.config._vault import RetryConfig
 from okto_neuron.core.schema import Edge, Node, Provenance
 from okto_neuron.errors import EmbeddingDimMismatch, GraphBackendError, GraphWriteExhausted
 from okto_neuron.store import schema
+from okto_neuron.store._inflight import InflightGate
 from okto_neuron.store._retry import retry_with_backoff
 from okto_neuron.store.closed_set import require_same_edge_identity, require_writable_node_type
 from okto_neuron.store.integrity import EdgeAdjacencyObservation
 from okto_neuron.store.protocol import BackendHealth, DriftReport, RecoveryStatus
 
 _T = TypeVar("_T")
+
+#: Bounded retry policy for READS that hit a retryable grafx error (for example
+#: ``index_view_changed`` when another process publishes a commit between the
+#: view snapshot and the exact read). Deliberately small: a view change heals on
+#: the next attempt, so this adds at most ~2 s to a pathological read and
+#: nothing to a healthy one. Writes keep the D-10 policy in ``_retry_policy``.
+_READ_RETRY_POLICY = RetryConfig(
+    max_attempts=6, backoff_base_ms=10, backoff_cap_ms=200, total_cap_s=2.0
+)
 
 
 class _IdentityRow(TypedDict):
@@ -129,6 +141,11 @@ _EMBED_SPACE_NAME = "node_embed"
 _EMBED_STORAGE_DTYPE = "float64"
 
 
+def _read_retry_sleep(seconds: float) -> None:
+    """Indirection so tests can observe/skip the read-retry backoff."""
+    time.sleep(seconds)
+
+
 class GrafxWriteExhausted(GraphWriteExhausted):
     """A Grafx write did not land after exhausting the D-10 retry budget.
 
@@ -140,6 +157,58 @@ class GrafxWriteExhausted(GraphWriteExhausted):
     """
 
     default_message = "graph write failed: retry budget exhausted under sustained write conflict"
+
+
+_LOG = logging.getLogger("okto_neuron.store.grafx")
+
+#: Default grafx buffer pool: max(256 MiB, 1.5 x graph size), capped at 1 GiB.
+#: grafx's own default is 64 MiB, which thrashes on a ~180 MB graph.
+BUFFER_BUDGET_FLOOR_BYTES = 256 * 1024**2
+BUFFER_BUDGET_CAP_BYTES = 1024**3
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for entry in path.rglob("*"):
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def default_buffer_budget(graph_size_bytes: int) -> int:
+    """max(256 MiB, 1.5 x ``graph_size_bytes``), capped at 1 GiB."""
+    return min(
+        BUFFER_BUDGET_CAP_BYTES,
+        max(BUFFER_BUDGET_FLOOR_BYTES, int(graph_size_bytes * 1.5)),
+    )
+
+
+def _resolve_buffer_budget(config: Any, vault_path: Path, graph_path: Path) -> tuple[int, int, str]:
+    """Return ``(budget_bytes, graph_size_bytes, source)``.
+
+    ``source`` is ``"config"`` when ``storage.buffer_budget`` is set (directly
+    on ``config``, or, for a staged/rebuild open that carries no config, in the
+    vault's own yaml, which already folds in ``defaults.yaml`` inheritance),
+    else ``"default"``.
+    """
+    size = _dir_size_bytes(graph_path) if graph_path.exists() else 0
+    configured = getattr(config, "buffer_budget", None)
+    if configured is None and config is None:
+        try:
+            from okto_neuron.config import VaultConfig
+
+            configured = getattr(VaultConfig.load(vault_path).storage, "buffer_budget", None)
+        except Exception:
+            configured = None
+    if configured is not None:
+        return int(configured), size, "config"
+    return default_buffer_budget(size), size, "default"
 
 
 def _resolve_retry_policy(config: Any) -> RetryConfig:
@@ -298,11 +367,22 @@ SET n.type = $type,
     n.embedding = $embedding
 """
 
-_NODE_READ_COLUMNS = (
+# Upsert that leaves the stored vector alone (a node written with embedding=None).
+_NODE_MERGE_SQL_KEEP_VECTOR = _NODE_MERGE_SQL.replace(",\n    n.embedding = $embedding", "")
+assert _NODE_MERGE_SQL_KEEP_VECTOR != _NODE_MERGE_SQL
+
+_NODE_READ_COLUMNS_NO_VECTOR = (
     "n.id AS id, n.type AS type, n.title AS title, n.content AS content, "
     "n.tags AS tags, n.facets AS facets, n.provenance AS provenance, "
-    "n.created_at AS created_at, n.embedding AS embedding"
+    "n.created_at AS created_at"
 )
+_NODE_READ_COLUMNS = _NODE_READ_COLUMNS_NO_VECTOR + ", n.embedding AS embedding"
+
+
+def _node_columns(include_embedding: bool) -> str:
+    """The projection itself changes: a default read never selects the vector column."""
+    return _NODE_READ_COLUMNS if include_embedding else _NODE_READ_COLUMNS_NO_VECTOR
+
 
 _EDGE_READ_COLUMNS = (
     "e.id AS id, e.type AS type, e.src AS src, e.dst AS dst, "
@@ -400,8 +480,32 @@ class GrafxStore:
             self.vault_path = given
             self.graph_path = given / _GRAPH_DIR_NAME
         self._closed = False
+        # In-flight grafx calls (#22): every statement/transaction this store
+        # issues, and every ``health`` probe, runs under ``_gate.call``; ``close``
+        # goes through the gate so the database is never closed under one.
+        self._gate = InflightGate(
+            lambda: GraphBackendError(
+                "graph store is closed", backend="grafx", vault_path=self.vault_path
+            )
+        )
         self._retry_policy = _resolve_retry_policy(config)
-        self._db = grafx.connect(self.graph_path, descriptor_revalidation="strict")
+        budget, graph_size, source = _resolve_buffer_budget(
+            config, self.vault_path, self.graph_path
+        )
+        self.buffer_budget_bytes = budget
+        self.buffer_budget_source = source
+        _LOG.info(
+            "grafx open: vault=%s graph_bytes=%d buffer_budget_bytes=%d source=%s",
+            self.vault_path.name,
+            graph_size,
+            budget,
+            source,
+        )
+        self._db = grafx.connect(
+            self.graph_path,
+            descriptor_revalidation="strict",
+            buffer_budget_bytes=budget,
+        )
 
         fresh = not self._db.catalog.catalog.table_definitions
         configured_dim = _resolve_configured_dim(self.vault_path)
@@ -463,17 +567,27 @@ class GrafxStore:
     def is_closed(self) -> bool:
         return self._closed
 
-    def add_node(self, node: Node) -> None:
+    def add_node(self, node: Node, clear_embedding: bool = False) -> None:
         self._ensure_open()
         require_writable_node_type(node.type)
+        keep_vector = node.embedding is None and not clear_embedding
 
         def attempt() -> None:
             existing = self.get_node(node.id)
-            if existing is not None and _same_node_payload(existing, node):
+            effective = (
+                node.model_copy(update={"embedding": existing.embedding})
+                if keep_vector and existing is not None
+                else node
+            )
+            if existing is not None and _same_node_payload(existing, effective):
                 return
             created_at = existing.created_at if existing is not None else node.created_at
             params = self._node_write_params(node, created_at=created_at)
-            self._execute_write(_NODE_MERGE_SQL, params)
+            if keep_vector:
+                params.pop("embedding")
+                self._execute_write(_NODE_MERGE_SQL_KEEP_VECTOR, params)
+            else:
+                self._execute_write(_NODE_MERGE_SQL, params)
 
         self._run_with_retry(attempt)
 
@@ -494,17 +608,17 @@ class GrafxStore:
 
         self._run_with_retry(attempt)
 
-    def get_node(self, node_id: str) -> Optional[Node]:
+    def get_node(self, node_id: str, include_embedding: bool = True) -> Optional[Node]:
         self._ensure_open()
         rows = self._query(
-            f"MATCH (n:Node {{id: $id}}) RETURN {_NODE_READ_COLUMNS}",
+            f"MATCH (n:Node {{id: $id}}) RETURN {_node_columns(include_embedding)}",
             {"id": node_id},
         )
         if not rows:
             return None
         return self._node_from_row(rows[0])
 
-    def get_nodes(self, node_ids: Iterable[str]) -> list[Node]:
+    def get_nodes(self, node_ids: Iterable[str], include_embedding: bool = False) -> list[Node]:
         self._ensure_open()
         ids = list(dict.fromkeys(node_ids))
         if not ids:
@@ -513,24 +627,27 @@ class GrafxStore:
         for start in range(0, len(ids), _ID_QUERY_BATCH):
             batch = ids[start : start + _ID_QUERY_BATCH]
             rows = self._query(
-                f"MATCH (n:Node) WHERE n.id IN $ids RETURN {_NODE_READ_COLUMNS}",
+                f"MATCH (n:Node) WHERE n.id IN $ids RETURN {_node_columns(include_embedding)}",
                 {"ids": batch},
             )
             by_id.update({row["id"]: self._node_from_row(row) for row in rows})
         return [by_id[i] for i in ids if i in by_id]
 
-    def list_nodes(self, type: Optional[str] = None) -> Iterable[Node]:
+    def list_nodes(
+        self, type: Optional[str] = None, include_embedding: bool = False
+    ) -> Iterable[Node]:
         self._ensure_open()
+        columns = _node_columns(include_embedding)
         if type is None:
             rows = self._query(
                 f"MATCH (n:Node) WHERE n.id <> $metadata_id "
-                f"RETURN {_NODE_READ_COLUMNS} ORDER BY n.id",
+                f"RETURN {columns} ORDER BY n.id",
                 {"metadata_id": schema.SCHEMA_METADATA_NODE_ID},
             )
         else:
             rows = self._query(
                 f"MATCH (n:Node) WHERE n.id <> $metadata_id AND n.type = $type "
-                f"RETURN {_NODE_READ_COLUMNS} ORDER BY n.id",
+                f"RETURN {columns} ORDER BY n.id",
                 {"metadata_id": schema.SCHEMA_METADATA_NODE_ID, "type": type},
             )
         return (self._node_from_row(row) for row in rows)
@@ -604,9 +721,22 @@ class GrafxStore:
         """
         self._ensure_open()
 
+    @property
+    def calls_in_flight(self) -> int:
+        """Grafx statements/transactions executing right now (#22)."""
+        return self._gate.count
+
     def close(self) -> None:
-        if self._closed:
-            return
+        """Close the database once no grafx call is executing.
+
+        Blocks until every in-flight call has finished (new calls are refused
+        from the moment close starts). Shutdown polls :attr:`calls_in_flight`
+        first and skips the close, relying on WAL recovery, when a call is still
+        running at the hard deadline.
+        """
+        self._gate.close(self._close_database)
+
+    def _close_database(self) -> None:
         self._closed = True
         if not self._db.closed:
             self._db.close()
@@ -640,14 +770,17 @@ class GrafxStore:
         succeeds, so that is what this probe uses too.
         """
         try:
-            probe = grafx.connect(self.graph_path, descriptor_revalidation="strict")
-            try:
-                probe.execute(
-                    "MATCH (m:Node {id: $id}) RETURN m.id AS id",
-                    {"id": schema.SCHEMA_METADATA_NODE_ID},
-                )
-            finally:
-                probe.close()
+            # Its own connection, so it is allowed after close, but it is still
+            # counted: a close that starts while a probe runs waits for it.
+            with self._gate.call(allow_closed=True):
+                probe = grafx.connect(self.graph_path, descriptor_revalidation="strict")
+                try:
+                    probe.execute(
+                        "MATCH (m:Node {id: $id}) RETURN m.id AS id",
+                        {"id": schema.SCHEMA_METADATA_NODE_ID},
+                    )
+                finally:
+                    probe.close()
         except Exception as exc:  # noqa: BLE001 - health check reports, never raises
             return BackendHealth(healthy=False, detail=f"{type(exc).__name__}: {exc}")
         return BackendHealth(healthy=True, detail="ok")
@@ -679,15 +812,16 @@ class GrafxStore:
     # ------------------------------------------------------------------
 
     def _create_schema(self, dim: int) -> None:
-        txn = self._db.begin("write")
-        try:
-            for statement in _ddl_statements(dim):
-                txn.execute(statement)
-            txn.commit()
-        except Exception:
-            if txn.active:
-                txn.rollback()
-            raise
+        with self._gate.call():
+            txn = self._db.begin("write")
+            try:
+                for statement in _ddl_statements(dim):
+                    txn.execute(statement)
+                txn.commit()
+            except Exception:
+                if txn.active:
+                    txn.rollback()
+                raise
 
     def _read_metadata_row(self) -> _IdentityRow | None:
         rows = self._query(
@@ -778,26 +912,43 @@ class GrafxStore:
         translating before the retry loop would make every write look
         non-retryable. Writes are translated after retry gives up instead.
         """
+        def read() -> list[dict[str, Any]]:
+            with self._gate.call():
+                if params is None:
+                    # list_edge_adjacency passes no parameters; _db.execute
+                    # treats them as optional and so must this wrapper.
+                    return self._db.execute(statement).dictionaries()
+                return self._db.execute(statement, params).dictionaries()
+
         try:
-            if params is None:
-                # list_edge_adjacency passes no parameters; _db.execute treats
-                # them as optional and so must this wrapper.
-                return self._db.execute(statement).dictionaries()
-            return self._db.execute(statement, params).dictionaries()
+            # Reads are idempotent, so a driver-flagged retryable failure is
+            # retried here with jittered backoff; callers never see a transient
+            # view change. Anything not flagged retryable surfaces immediately.
+            return retry_with_backoff(
+                read,
+                policy=_READ_RETRY_POLICY,
+                is_retryable=lambda exc: bool(getattr(exc, "retryable", False)),
+                sleep=_read_retry_sleep,
+            )
         except grafx_errors.GrafxError as exc:
             raise GraphBackendError(
-                str(exc), backend="grafx", vault_path=self.vault_path, cause=exc
+                str(exc),
+                backend="grafx",
+                vault_path=self.vault_path,
+                cause=exc,
+                retryable=bool(getattr(exc, "retryable", False)),
             ) from exc
 
     def _execute_write(self, statement: str, params: Mapping[str, object]) -> None:
-        txn = self._db.begin("write")
-        try:
-            txn.execute(statement, params)
-            txn.commit()
-        except Exception:
-            if txn.active:
-                txn.rollback()
-            raise
+        with self._gate.call():
+            txn = self._db.begin("write")
+            try:
+                txn.execute(statement, params)
+                txn.commit()
+            except Exception:
+                if txn.active:
+                    txn.rollback()
+                raise
 
     def _run_with_retry(self, attempt: Callable[[], _T]) -> _T:
         """D-10's default policy via the shared `store/_retry.py` helper —
@@ -864,7 +1015,7 @@ class GrafxStore:
         }
 
     def _node_from_row(self, row: Mapping[str, object]) -> Node:
-        embedding_value = row.get("embedding")
+        embedding_value = row.get("embedding")  # absent when the projection omitted it
         embedding = list(embedding_value.values) if embedding_value is not None else None  # type: ignore[union-attr]
         tags_raw = row.get("tags")
         tags = _json_load(tags_raw) if tags_raw else []

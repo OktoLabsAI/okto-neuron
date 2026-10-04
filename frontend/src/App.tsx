@@ -25,6 +25,7 @@ import { IngestView } from '@/components/ingest/IngestView'
 import { IngestLogsView } from '@/components/logs/IngestLogsView'
 import { CurationView } from '@/components/curation/CurationView'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
+import { MigrationRequiredBanner } from '@/components/MigrationRequiredBanner'
 import {
   createVault,
   deleteVault,
@@ -430,6 +431,7 @@ export default function App() {
             </button>
           )}
         </div>
+        <MigrationRequiredBanner />
         {connectionStatus === 'offline' && (
           <div
             role="alert"
