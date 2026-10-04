@@ -52,8 +52,15 @@ _APP_HOME_DIRNAMES = (".marginalia", ".okto-neuron")
 
 def _real_home() -> Path:
     import os
-    import pwd
 
+    try:
+        import pwd
+    except ImportError:
+        # Windows has no pwd module; USERPROFILE is the account's real home
+        # (expanduser("~") reads it, possibly via HOMEDRIVE/HOMEPATH fallbacks).
+        return Path(
+            os.path.realpath(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
+        )
     return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
 
 

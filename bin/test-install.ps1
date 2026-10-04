@@ -1150,8 +1150,14 @@ def hold() -> None:
 
 def validate(record_path: Path, expected_pid: int) -> None:
     payload = json.loads(record_path.read_text(encoding="utf-8"))
-    if set(payload) != {"version", "pid", "start_token", "owner_id"}:
+    _required_keys = {"version", "pid", "start_token", "owner_id"}
+    if not _required_keys <= set(payload) <= _required_keys | {"capabilities"}:
         raise SystemExit("PID record fields are not canonical")
+    if "capabilities" in payload and (
+        not isinstance(payload["capabilities"], list)
+        or not all(isinstance(item, str) for item in payload["capabilities"])
+    ):
+        raise SystemExit("PID record capabilities are not a list of strings")
     if payload["version"] != lifecycle.PID_RECORD_VERSION:
         raise SystemExit("PID record version is not canonical")
     if payload["pid"] != expected_pid:
