@@ -326,6 +326,7 @@ class _TracingLLMProvider:
         presence_penalty: float | None = None,
         enable_thinking: bool | None = None,
         response_format: "ResponseFormat | None" = None,
+        on_token: "Callable[[str], None] | None" = None,
     ) -> str:
         if self._should_cancel is not None and self._should_cancel():
             raise RememberCancelled()
@@ -407,8 +408,7 @@ class _TracingLLMProvider:
         previous_cancel = _set_call_cancel_predicate(self._should_cancel)
         try:
             try:
-                response = self._provider.complete(
-                    messages,  # type: ignore[arg-type]
+                complete_kwargs = dict(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=top_p,
@@ -417,6 +417,12 @@ class _TracingLLMProvider:
                     presence_penalty=presence_penalty,
                     enable_thinking=enable_thinking,
                     response_format=response_format,
+                )
+                if on_token is not None:
+                    complete_kwargs["on_token"] = on_token
+                response = self._provider.complete(
+                    messages,  # type: ignore[arg-type]
+                    **complete_kwargs,
                 )
             except LLMCallCancelled as exc:
                 _emit_request(None)
@@ -498,6 +504,7 @@ class _StepLabelledProvider:
         presence_penalty: float | None = None,
         enable_thinking: bool | None = None,
         response_format: "ResponseFormat | None" = None,
+        on_token: "Callable[[str], None] | None" = None,
     ) -> str:
         # Defect I fix: save/restore the PREVIOUS step label around the
         # delegated call instead of just setting it. Without a restore, the
@@ -513,8 +520,7 @@ class _StepLabelledProvider:
         prev_step = getattr(_call_step, "value", None)
         set_call_step(self._step)
         try:
-            response = self._provider.complete(
-                messages,  # type: ignore[arg-type]
+            complete_kwargs = dict(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 top_p=top_p,
@@ -523,6 +529,12 @@ class _StepLabelledProvider:
                 presence_penalty=presence_penalty,
                 enable_thinking=enable_thinking,
                 response_format=response_format,
+            )
+            if on_token is not None:
+                complete_kwargs["on_token"] = on_token
+            response = self._provider.complete(
+                messages,  # type: ignore[arg-type]
+                **complete_kwargs,
             )
             if self._on_completion is not None:
                 from okto_neuron.llm import last_call_stats

@@ -114,6 +114,9 @@ async def test_ask_emits_stage_and_token_progress_notifications(
     assert 2 <= len(token_notes) <= 15, (len(token_notes), messages)
     for note in token_notes:
         assert note.count("tokens") == 1
+    # MCP progress must be STRICTLY MONOTONIC per request.
+    values = [n["progress"] for n in notifications]
+    assert all(b > a for a, b in zip(values, values[1:])), (values, messages)
     # NEVER the text itself: only the three stage names and token COUNTS.
     allowed = {"retrieving", "synthesizing", "done"}
     for note in messages:

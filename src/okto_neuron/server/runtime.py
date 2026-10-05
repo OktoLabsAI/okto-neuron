@@ -1393,6 +1393,11 @@ def _mcp_ask_progress_bridge():
 
     tokens = {"count": 0}
     last_sent = {"at": 0.0}
+    # MCP progress must be MONOTONIC per request: every notification reports
+    # strictly greater than the previous one. Stages bump a step counter
+    # (retrieving=1, synthesizing=2); token updates report 2+tokens_so_far
+    # (already increasing); "done" reports one past whatever was last sent.
+    last_progress = {"value": 0.0}
     lock = threading.Lock()
 
     async def _send(progress: float | None, message: str) -> None:
@@ -1403,8 +1408,16 @@ def _mcp_ask_progress_bridge():
         except Exception:  # noqa: BLE001
             _LOG.debug("mcp ask progress notification failed", exc_info=True)
 
-    def _report(message: str, progress: float | None) -> None:
-        """Hand one notification to the loop from the worker thread."""
+    def _report(message: str, progress: float) -> None:
+        """Hand one notification to the loop from the worker thread.
+
+        ``progress`` is clamped to strictly-greater-than the last value sent,
+        so the MCP monotonicity contract holds no matter how stages and token
+        counts interleave."""
+        with lock:
+            if progress <= last_progress["value"]:
+                progress = last_progress["value"] + 1.0
+            last_progress["value"] = progress
         try:
             asyncio.run_coroutine_threadsafe(_send(progress, message), loop)
         except RuntimeError:
@@ -1412,10 +1425,9 @@ def _mcp_ask_progress_bridge():
 
     def on_stage(stage: str) -> None:
         # A numeric progress is required for an MCP progress notification to
-        # reach clients: stages report the ordinal position (retrieving=0,
-        # synthesising=0.5, done=1) so the message carries the NAME and the
-        # number carries a monotonic sense of where the call is.
-        _report(stage, {"retrieving": 0.0, "synthesizing": 0.5, "done": 1.0}.get(stage, 0.0))
+        # reach clients; the message carries the stage NAME, the number the
+        # monotonic step (see last_progress above).
+        _report(stage, last_progress["value"] + 1.0)
 
     def on_token(_delta: str) -> None:
         with lock:
@@ -1425,7 +1437,7 @@ def _mcp_ask_progress_bridge():
                 return
             last_sent["at"] = now
             count = tokens["count"]
-        _report(f"synthesizing: {count} tokens", float(count))
+        _report(f"synthesizing: {count} tokens", 2.0 + count)
 
     return on_stage, on_token
 
