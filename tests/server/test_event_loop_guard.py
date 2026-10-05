@@ -405,6 +405,12 @@ async def test_rest_route_never_blocks_event_loop(guarded, method: str, path: st
 _MCP_TOOL_ARGS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
     "ask": ({"question": "what is this?", "k": 3},) * 2,
     "explore": ({"topic": "knowledge graph", "k": 3},) * 2,
+    "ingest_status": (
+        # P1 async remember: a cheap, non-blocking status poll (the job id is
+        # looked up in the vault's queue; a miss exercises the not_found path).
+        {"job_id": "0-nonexistent"},
+        {"job_id": "0-nonexistent"},
+    ),
     "remember": (
         {"source": "a pasted note\nabout the loop guard"},
         {"source": "a second pasted note\nabout the loop guard"},
@@ -428,6 +434,23 @@ async def test_every_mcp_tool_never_blocks_event_loop(
     async with Client(server) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         assert tools == sorted(_MCP_TOOL_ARGS), "add the new MCP tool to _MCP_TOOL_ARGS"
+        # P1: ingest_status needs a REAL job id (a miss is a tool error, which
+        # this guard must not see); enqueue one now and use its id.
+        queued = await client.call_tool(
+            "remember", {"source": "loop-guard job\nfor ingest_status"}
+        )
+        queued_payload = (
+            queued.structured_content
+            if hasattr(queued, "structured_content")
+            else queued.data
+        )
+        if isinstance(queued_payload, dict) and set(queued_payload) == {"result"}:
+            queued_payload = queued_payload["result"]
+        args = _MCP_TOOL_ARGS["ingest_status"]
+        _MCP_TOOL_ARGS["ingest_status"] = (
+            {"job_id": queued_payload["job_id"]},
+            {"job_id": queued_payload["job_id"]},
+        )
         for name in tools:
             warm_args, args = _MCP_TOOL_ARGS[name]
             # Warm-up for first-call imports, then the measured call.

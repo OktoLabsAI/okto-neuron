@@ -2010,8 +2010,13 @@ def _build_mcp_server(state: ServerState):
                 )
                 from okto_neuron.config import VaultConfig
 
+                # The config read is YAML I/O: off-loop (event-loop guard).
                 watch_roots = list(
-                    VaultConfig.load(Path(selected_vault.path)).folder_watch.roots
+                    await store_io(
+                        lambda: VaultConfig.load(
+                            Path(selected_vault.path)
+                        ).folder_watch.roots
+                    )
                 )
                 if not _source_is_ingestable_path(
                     ingest_source, selected_vault.path, watch_roots
@@ -2050,10 +2055,11 @@ def _build_mcp_server(state: ServerState):
             raise RuntimeError(
                 f"ladybug_write_failed: ladybug write failed: {exc}"
             ) from exc
+        vault_name = await store_io(_serving_vault_name, runtime)
         return {
             "job_id": item.id,
             "status": "queued",
-            "vault": _serving_vault_name(runtime),
+            "vault": vault_name,
             "source_name": item.name,
             "poll": "ingest_status",
         }
@@ -2082,6 +2088,9 @@ def _build_mcp_server(state: ServerState):
         runtime, lease = await acquire_off_loop(_lease, vault, release=_release_pair)
         with lease:
             detail = await iq.item_detail_async(runtime, job_id)
+            # The registry scan in _serving_vault_name reads YAML: off-loop
+            # (the event-loop guard pins this tool to never block the loop).
+            vault_name = await store_io(_serving_vault_name, runtime)
         if detail is None:
             raise RuntimeError(
                 f"not_found: no ingest job {job_id!r} on this vault; "
@@ -2116,7 +2125,7 @@ def _build_mcp_server(state: ServerState):
             "llm_disabled": bool(queued_item.get("llm_disabled") or False),
             "error": queued_item.get("error"),
             "provider_error": queued_item.get("provider_error"),
-            "vault": _serving_vault_name(runtime),
+            "vault": vault_name,
             "source_name": queued_item.get("name"),
         }
 
