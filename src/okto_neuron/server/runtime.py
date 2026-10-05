@@ -1317,6 +1317,119 @@ _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
 _BARE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
 
 
+_MCP_HEARTBEAT_INTERVAL_S = 15.0
+_MCP_TOKEN_PROGRESS_MIN_INTERVAL_S = 0.25
+
+
+@contextlib.asynccontextmanager
+async def _mcp_heartbeat(label: str = "ask"):
+    """Send an MCP progress notification every interval while the body runs.
+
+    Started with the tool call and cancelled in ``finally`` (no notification
+    after completion). It never raises into the tool: no MCP context yields a
+    no-op, and ``report_progress`` itself no-ops without a ``progressToken``.
+    Progress is elapsed seconds; ``total`` is None (duration is unknown).
+    """
+    try:
+        from fastmcp.server.dependencies import get_context  # type: ignore
+
+        ctx = get_context()
+    except (RuntimeError, ImportError):
+        ctx = None
+    if ctx is None:
+        yield
+        return
+    started = time.monotonic()
+
+    async def _beat() -> None:
+        while True:
+            await asyncio.sleep(_MCP_HEARTBEAT_INTERVAL_S)
+            elapsed = time.monotonic() - started
+            try:
+                await ctx.report_progress(elapsed, None, f"{label} in progress ({elapsed:.0f}s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - telemetry must never break the call
+                _LOG.debug("mcp heartbeat notification failed", exc_info=True)
+
+    task = asyncio.create_task(_beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+def _mcp_ask_progress_bridge():
+    """Thread→loop bridge for ask's on_stage/on_token callbacks.
+
+    ``companion.ask`` runs under ``job_io`` on a worker thread; the MCP
+    ``Context.report_progress`` coroutine must run on the event loop. The loop
+    and context are captured HERE (on the loop) because ``get_context()``
+    reads context-local state a worker thread does not have. Returns
+    ``(on_stage, on_token)``; both are None outside an MCP request (direct
+    in-process callers), and a delivery failure is swallowed at debug — the
+    answer is the product, the notifications are telemetry.
+
+    ``on_token`` NEVER forwards text: it counts tokens and reports
+    ``"synthesizing: N tokens"`` throttled to >=250 ms so a fast stream cannot
+    flood the notification channel.
+    """
+    try:
+        from fastmcp.server.dependencies import get_context  # type: ignore
+
+        ctx = get_context()
+    except (RuntimeError, ImportError):
+        ctx = None
+    if ctx is None:
+        return None, None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None, None
+
+    import threading
+
+    tokens = {"count": 0}
+    last_sent = {"at": 0.0}
+    lock = threading.Lock()
+
+    async def _send(progress: float | None, message: str) -> None:
+        try:
+            await ctx.report_progress(progress, None, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOG.debug("mcp ask progress notification failed", exc_info=True)
+
+    def _report(message: str, progress: float | None) -> None:
+        """Hand one notification to the loop from the worker thread."""
+        try:
+            asyncio.run_coroutine_threadsafe(_send(progress, message), loop)
+        except RuntimeError:
+            _LOG.debug("mcp ask progress loop is closed", exc_info=True)
+
+    def on_stage(stage: str) -> None:
+        # A numeric progress is required for an MCP progress notification to
+        # reach clients: stages report the ordinal position (retrieving=0,
+        # synthesising=0.5, done=1) so the message carries the NAME and the
+        # number carries a monotonic sense of where the call is.
+        _report(stage, {"retrieving": 0.0, "synthesizing": 0.5, "done": 1.0}.get(stage, 0.0))
+
+    def on_token(_delta: str) -> None:
+        with lock:
+            tokens["count"] += 1
+            now = time.monotonic()
+            if now - last_sent["at"] < _MCP_TOKEN_PROGRESS_MIN_INTERVAL_S:
+                return
+            last_sent["at"] = now
+            count = tokens["count"]
+        _report(f"synthesizing: {count} tokens", float(count))
+
+    return on_stage, on_token
+
+
 def _raw_text_preview(source: str, limit: int = 80) -> str:
     """One-line, ``limit``-char preview of a RAW-TEXT remember source.
 
@@ -1677,37 +1790,45 @@ def _build_mcp_server(state: ServerState):
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
+        # P2: heartbeat + stage/token progress. Captured HERE, on the event
+        # loop, before the job-executor thread runs the answer (the bridge's
+        # own docstring explains why). No MCP context => both None => the
+        # companion call is exactly today's.
+        on_stage, on_token = _mcp_ask_progress_bridge()
         # Resolving reads the registry and leasing may open the vault: take the
         # lease off-loop first, so a call waiting on another vault's open never
         # occupies a job worker. The answer itself is seconds to minutes: job executor.
         ignored: list[str] = []
         runtime, lease = await acquire_off_loop(_lease, vault, ignored, release=_release_pair)
-        return await _run_leased(
-            job_io,
-            lease,
-            functools.partial(
-                _ask_impl,
-                runtime=runtime,
-                lease=lease,
-                ignored=ignored,
-                question=question,
-                k=k,
-                hops=hops,
-                enable_subgraph=enable_subgraph,
-                source_block_policy=source_block_policy,
-                seed_k=seed_k,
-                max_degree_per_seed=max_degree_per_seed,
-                neighbour_budget_tokens=neighbour_budget_tokens,
-                source_block_budget_tokens=source_block_budget_tokens,
-                coverage_threshold=coverage_threshold,
-                min_claim_confidence=min_claim_confidence,
-                max_nodes=max_nodes,
-                max_relationships=max_relationships,
-                max_claims=max_claims,
-                relationship_types=relationship_types,
-                include_sources=include_sources,
+        async with _mcp_heartbeat("ask"):
+            return await _run_leased(
+                job_io,
+                lease,
+                functools.partial(
+                    _ask_impl,
+                    runtime=runtime,
+                    lease=lease,
+                    ignored=ignored,
+                    question=question,
+                    k=k,
+                    hops=hops,
+                    enable_subgraph=enable_subgraph,
+                    source_block_policy=source_block_policy,
+                    seed_k=seed_k,
+                    max_degree_per_seed=max_degree_per_seed,
+                    neighbour_budget_tokens=neighbour_budget_tokens,
+                    source_block_budget_tokens=source_block_budget_tokens,
+                    coverage_threshold=coverage_threshold,
+                    min_claim_confidence=min_claim_confidence,
+                    max_nodes=max_nodes,
+                    max_relationships=max_relationships,
+                    max_claims=max_claims,
+                    relationship_types=relationship_types,
+                    include_sources=include_sources,
+                    on_stage=on_stage,
+                    on_token=on_token,
+                ),
             )
-        )
 
     def _ask_impl(
         runtime: VaultRuntime,
@@ -1729,6 +1850,8 @@ def _build_mcp_server(state: ServerState):
         max_claims: int | None = None,
         relationship_types: list[str] | None = None,
         include_sources: bool = False,
+        on_stage=None,
+        on_token=None,
     ) -> dict[str, object]:
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
@@ -1767,8 +1890,15 @@ def _build_mcp_server(state: ServerState):
                 raise RuntimeError(
                     f"invalid retrieval policy: {loc}: {first.get('msg', 'invalid value')}"
                 ) from exc
+            # Only pass the hooks when they exist so injected test companions
+            # (and any older Companion) keep their exact signatures honored.
+            ask_kwargs: dict[str, object] = {"retrieval_policy": policy}
+            if on_stage is not None:
+                ask_kwargs["on_stage"] = on_stage
+            if on_token is not None:
+                ask_kwargs["on_token"] = on_token
             answer = companion_for(selected_vault).ask(
-                question, k=min(int(k), MAX_QUERY_K), retrieval_policy=policy
+                question, k=min(int(k), MAX_QUERY_K), **ask_kwargs
             )
             sources: list[dict[str, object]] = []
             if include_sources:

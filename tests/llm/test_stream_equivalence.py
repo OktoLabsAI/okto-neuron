@@ -63,12 +63,13 @@ SCRIPTS: dict[str, _Script] = {
         finish_reason="length",
         usage={"prompt_tokens": 9, "completion_tokens": 12},
     ),
-    # A native finish reason litellm does NOT map: it must survive as
-    # native_finish_reason with finish_reason_unmapped, stream or not.
-    "weird-native": _Script(
+    # A NON-"stop" finish reason the provider can send (OpenAI's
+    # content_filter): the abnormal-stop classification must be identical in
+    # the stream and non-stream lanes.
+    "content-filter": _Script(
         text="halted mid thought",
         chunks=["halted ", "mid ", "thought"],
-        finish_reason="stop",  # what the stub SENDS; litellm records the raw
+        finish_reason="content_filter",
         usage={"prompt_tokens": 5, "completion_tokens": 3},
     ),
 }
@@ -242,6 +243,36 @@ def test_length_truncation_is_flagged_identically_when_streaming(
 
     assert plain.get("finish_reason") == "length"
     assert streamed.get("finish_reason") == "length"
+
+
+def test_non_stop_native_finish_reason_classified_identically(
+    stub: _StubServer,
+) -> None:
+    """A provider finish_reason of "content_filter" (an abnormal stop) must
+    reach the recorded stats the same way streamed and not: the reason itself,
+    and any native/unmapped classification around it."""
+    provider = _provider(stub, "content-filter")
+    messages = [Message("user", "say the thing")]
+
+    _set_last_call_stats(None)
+    provider.complete(messages)
+    plain = _stats()
+
+    _set_last_call_stats(None)
+    provider.complete(messages, on_token=lambda _t: None)
+    streamed = _stats()
+
+    assert plain.get("finish_reason") == "content_filter"
+    assert streamed.get("finish_reason") == plain.get("finish_reason")
+    # The classification flags must match lane-for-lane, whatever litellm
+    # records for this reason (native, unmapped, or neither).
+    for key in (
+        "native_finish_reason",
+        "finish_reason_unmapped",
+        "prompt_tokens",
+        "completion_tokens",
+    ):
+        assert streamed.get(key) == plain.get(key), key
 
 
 def test_no_callback_leaves_the_request_non_streaming(stub: _StubServer) -> None:

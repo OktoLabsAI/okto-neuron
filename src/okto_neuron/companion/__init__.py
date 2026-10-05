@@ -2383,6 +2383,14 @@ def _source_outside_roots_message(
     )
 
 
+def _fire_stage(on_stage, stage: str) -> None:
+    """Report one ask stage to a caller hook; telemetry never breaks the call."""
+    try:
+        on_stage(stage)
+    except Exception:  # noqa: BLE001 — progress is telemetry, never fatal
+        _LOG.debug("ask on_stage callback failed", exc_info=True)
+
+
 def _is_local_provider(provider: "LLMProvider") -> bool:
     """A provider is local if it has no hosted ``api_base`` (StubLLM) or its
     ``api_base`` host is loopback, a private RFC1918 address (10/8, 172.16/12,
@@ -7947,6 +7955,8 @@ class Companion:
         *,
         k: int = 20,
         retrieval_policy: AskRetrievalPolicy | None = None,
+        on_stage=None,
+        on_token=None,
     ) -> Answer:
         """Answer ``question`` grounded in retrieved nodes, as ONE trace.
 
@@ -7970,7 +7980,13 @@ class Companion:
             # what the trace list filters on.
             tags={"marginalia.step": "ask"},
         ) as span:
-            answer = self._ask_answer(question, k=k, retrieval_policy=retrieval_policy)
+            answer = self._ask_answer(
+                question,
+                k=k,
+                retrieval_policy=retrieval_policy,
+                on_stage=on_stage,
+                on_token=on_token,
+            )
             status = answer.retrieval.get("synthesis_status")
             span.set_attribute("marginalia.synthesis_status", status)
             # Each retried attempt is also its own failed child call span; this
@@ -7996,6 +8012,8 @@ class Companion:
         *,
         k: int = 20,
         retrieval_policy: AskRetrievalPolicy | None = None,
+        on_stage=None,
+        on_token=None,
     ) -> Answer:
         """Answer ``question`` grounded in retrieved nodes.
 
@@ -8054,6 +8072,8 @@ class Companion:
         # Retrieval never passes the provider seam, so without this the trace
         # shows only the completion and an answer's time looks like it was all
         # generation.
+        if on_stage is not None:
+            _fire_stage(on_stage, "retrieving")
         with trace_child(
             "retrieval",
             span_type="RETRIEVER",
@@ -8078,6 +8098,8 @@ class Companion:
             "source_blocks_used": False,
             "seed_diversity": seed_diversity,
         }
+        if on_stage is not None:
+            _fire_stage(on_stage, "synthesizing")
         no_llm_reason = self._ask_no_llm_reason(cfg)
         if no_llm_reason is not None:
             # No usable LLM: never dial the provider (it would only fail, and
@@ -8096,6 +8118,7 @@ class Companion:
                     k=seed_k,
                     policy=retrieval_policy,
                     source_policy=source_policy,
+                    on_token=on_token,
                 )
             else:
                 _source_reads: list[int] = []
@@ -8138,7 +8161,9 @@ class Companion:
                     }
                 )
                 try:
-                    text = self._complete_ask(question, context, cfg, trace=trace)
+                    text = self._complete_ask(
+                        question, context, cfg, trace=trace, on_token=on_token
+                    )
                     _mark_finish_reason(trace, _completion_finish_state())
                 except LLMProviderError as exc:
                     # Graceful degradation STAYS (text=""), but it is no longer
@@ -8156,6 +8181,8 @@ class Companion:
         # forget to check. Paths that already classified themselves (every
         # provider-error handler) win; everything else is judged on the text.
         trace.setdefault("synthesis_status", "ok" if text.strip() else "empty")
+        if on_stage is not None:
+            _fire_stage(on_stage, "done")
         return Answer(
             text=text,
             citations=citations,
@@ -8339,6 +8366,7 @@ class Companion:
         *,
         system_prompt_override: str | None = None,
         trace: dict[str, Any] | None = None,
+        on_token=None,
     ) -> str:
         """One grounded ask completion over ``context``. Shared by the default
         block-dump path and both Tier-1/Tier-2 subgraph passes so the prompt
@@ -8400,6 +8428,7 @@ class Companion:
                 min_p=ask_resolved.min_p,
                 presence_penalty=ask_resolved.presence_penalty,
                 enable_thinking=ask_resolved.enable_thinking,
+                **({"on_token": on_token} if on_token is not None else {}),
             ).strip()
         finally:
             # Recorded on success AND on the exhausted retry's re-raise, so a
@@ -8416,6 +8445,7 @@ class Companion:
         k: int,
         policy: AskRetrievalPolicy | None,
         source_policy: SourceBlockPolicy,
+        on_token=None,
     ) -> tuple[str, dict[str, Any]]:
         """Efficient-hybrid subgraph answer path (task-12 fix A, owner reframe).
 
@@ -8530,7 +8560,9 @@ class Companion:
                 # Nothing to fall back to — return empty, let caller handle.
                 return "", trace
             try:
-                t2_text = self._complete_ask(question, t2_context, cfg, trace=trace)
+                t2_text = self._complete_ask(
+                    question, t2_context, cfg, trace=trace, on_token=on_token
+                )
                 _mark_finish_reason(trace, _completion_finish_state())
                 return t2_text, trace
             except LLMProviderError as exc:
