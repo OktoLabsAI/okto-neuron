@@ -19166,6 +19166,28 @@ the abandon row records the receipts that stay applied).</li>
 <li>The blocking <code>IngestError</code> itself names the plan's run id and the exact resume/abandon commands,
 so the wedge is self-describing at the point of failure.</li>
 </ul>
+<h2 id="docs__web-ui--addendum--2026-10-05--async-mcp-remember--ingest_status-queue-honors-sensitivity-lan-llms-are-local">Addendum · 2026-10-05 — async MCP <code>remember</code> + <code>ingest_status</code>; queue honors sensitivity; LAN LLMs are local</h2>
+<p><strong>Async remember.</strong> MCP <code>remember</code> no longer blocks for the whole ingest: it validates
+(loopback write gate, vault resolution, maintenance/draining, integrity fence, raw-text
+materialization — including the out-of-tree refusal and a loud <code>bad_path</code> for a missing
+path), then <strong>enqueues</strong> the durable source into the vault's ingest queue and returns
+immediately with <code>{job_id, status:&quot;queued&quot;, vault (name only), source_name, poll:&quot;ingest_status&quot;}</code>. The queue's drain worker performs the remember under the writer
+lock; the inline progress-notification bridge and the idle-call heartbeat are gone with
+the inline call — progress is queue telemetry now.</p>
+<p><strong><code>ingest_status(job_id, vault=None)</code>.</strong> Polls a job: <code>status</code>
+(queued|processing|done|error|cancelled), an explicit <code>ok</code> (true only when done AND not
+zero-yield/failed-quality), <code>stage</code> + <code>blocks_done</code>/<code>blocks_total</code>, <code>committed</code>/<code>queued</code>
+counts, <code>document_id</code>, <code>error</code>/<code>provider_error</code>, and the serving vault NAME. Unknown
+ids fail loudly as <code>not_found</code>.</p>
+<p><strong>Sensitivity survives the queue.</strong> <code>sensitivity</code> travels with the queue item (persisted
+and rehydrated) into the worker's <code>companion.remember</code> — <code>local_only</code> now actually
+reaches the ingest instead of being dropped. A <code>local_only</code> source may only run on a
+local LLM: loopback/<code>localhost</code>, RFC1918 (10/8, 172.16/12, 192.168/16), IPv6 ULA
+fc00::/7, or link-local — the operator's LAN ollama/litellm box qualifies; hostnames do
+not (a DNS name can point anywhere).</p>
+<p><strong>Raw-text previews.</strong> Queue items enqueued from raw text carry a one-line ~80-char
+<code>preview</code> of the note; the Logs view shows it instead of the bare <code>note-&lt;hash&gt;.md</code>
+filename (path still on hover).</p>
 </div></div></div><div class="doc" id="frontend__README"><div class="doc-head" onclick="toggleDoc(this.parentNode)"><span class="chev">▶</span><div class="meta"><div class="dt">Web UI developer guide</div><div class="ds">The concise frontend layout, seven-view map, development workflow, and explicit mock-mode contract.</div></div><a class="src" href="../../frontend/README.md" onclick="event.stopPropagation()">frontend/README.md</a></div><div class="doc-body"><div class="md"><h1 id="frontend__README--okto-neuron-web-ui">Okto Neuron Web UI</h1>
 <p>Built SPA (React 18 + Vite + TS + Tailwind 3 + Zustand 5, graph viz via <code>@xyflow/react</code>),
 served by Okto Neuron's Starlette server. Talks to the backend strictly via the

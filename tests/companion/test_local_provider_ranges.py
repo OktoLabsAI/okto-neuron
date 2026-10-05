@@ -2,7 +2,7 @@
 
 ``_is_local_provider`` gates ``sensitivity=local_only``: a source may only
 stay on the machine (or the operator's own network). Loopback alone was too
-narrow — a LAN ollama/litellm box (e.g. http://192.168.31.222/v1) is just as
+narrow — a LAN ollama/litellm box (e.g. http://192.168.50.10/v1) is just as
 local for this purpose. Local means: no ``api_base`` at all (stub), or its
 host is ``localhost``/loopback, a private RFC1918 address (10/8, 172.16/12,
 192.168/16), an IPv6 unique-local (fc00::/7), or link-local (169.254/16,
@@ -35,7 +35,7 @@ def _provider(api_base: str | None) -> object:
         ("http://10.255.255.255:8080/v1", "RFC1918 10/8 upper edge"),
         ("http://172.16.0.1:8080/v1", "RFC1918 172.16/12 lower edge"),
         ("http://172.31.255.254:8080/v1", "RFC1918 172.16/12 upper edge"),
-        ("http://192.168.31.222/v1", "RFC1918 192.168/16 (the LAN box)"),
+        ("http://192.168.50.10/v1", "RFC1918 192.168/16 (the LAN box)"),
         ("http://[fd12:3456:789a::1]:8080/v1", "IPv6 ULA fc00::/7"),
         ("http://[fe80::1]:8080/v1", "IPv6 link-local"),
         ("http://169.254.8.8:8080/v1", "IPv4 link-local"),
@@ -75,7 +75,7 @@ def test_real_litellm_provider_with_lan_base_is_local() -> None:
     provider = LiteLLMProvider(
         ResolvedLLM(
             provider="openai",
-            api_base="http://192.168.31.222/v1",
+            api_base="http://192.168.50.10/v1",
             model="qwen3",
             api_key_env=None,
         )
@@ -102,11 +102,11 @@ def test_lan_llm_vault_accepts_local_only_through_the_queue(tmp_path, monkeypatc
     lan_provider = LiteLLMProvider(
         ResolvedLLM(
             provider="openai",
-            api_base="http://192.168.31.222/v1",
+            api_base="http://192.168.50.10/v1",
             model="qwen3",
             api_key_env=None,
         )
-    ) if _litellm_available() else SimpleNamespace(api_base="http://192.168.31.222/v1")
+    ) if _litellm_available() else SimpleNamespace(api_base="http://192.168.50.10/v1")
 
     class _GateCheckingCompanion:
         """Runs the production local_only gate verbatim, then succeeds."""

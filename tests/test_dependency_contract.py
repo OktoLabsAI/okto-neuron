@@ -1053,7 +1053,14 @@ from fastmcp import Client
 async def main():
     async with Client(sys.argv[1], auth=os.environ["OKTO_NEURON_AUTH_TOKEN"]) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
-        assert tools == ["ask", "explore", "init_vault", "list_vaults", "remember"], tools
+        assert tools == [
+            "ask",
+            "explore",
+            "ingest_status",
+            "init_vault",
+            "list_vaults",
+            "remember",
+        ], tools
         print(",".join(tools))
 
 asyncio.run(main())
@@ -1066,7 +1073,10 @@ asyncio.run(main())
             capture_output=True,
             text=True,
         )
-        assert mcp_result.stdout.strip() == "ask,explore,init_vault,list_vaults,remember"
+        assert (
+            mcp_result.stdout.strip()
+            == "ask,explore,ingest_status,init_vault,list_vaults,remember"
+        )
     finally:
         if process.poll() is None:
             process.terminate()
