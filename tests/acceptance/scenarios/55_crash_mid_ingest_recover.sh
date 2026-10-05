@@ -109,7 +109,22 @@ TOKEN=os.environ["OKTO_NEURON_AUTH_TOKEN"]
 async def main():
   async with Client(URL, auth=TOKEN) as c:
     try:
-      await c.call_tool("remember", {"source": f"{VAULT}/notes/c11.md"})
+      q = await c.call_tool("remember", {"source": f"{VAULT}/notes/c11.md"})
+      qp = q.structured_content if hasattr(q,"structured_content") else q.data
+      if isinstance(qp, dict) and "result" in qp: qp = qp["result"]
+      # P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud).
+      st = {}
+      for _ in range(600):
+        s = await c.call_tool("ingest_status", {"job_id": qp.get("job_id")})
+        sp = s.structured_content if hasattr(s,"structured_content") else s.data
+        if isinstance(sp, dict) and "result" in sp: sp = sp["result"]
+        st = sp if isinstance(sp, dict) else {}
+        if st.get("status") in {"done", "error", "cancelled"}: break
+        await asyncio.sleep(0.1)
+      else:
+        raise SystemExit(f"ingest_status timeout: {st}")
+      if st.get("status") != "done" or st.get("ok") is not True:
+        raise SystemExit(f"ingest not ok after crash recovery: {st}")
       print("retry_remember=ok")
     except Exception as e:
       print(f"retry_remember_err={type(e).__name__}:{e}")
