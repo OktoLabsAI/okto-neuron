@@ -42,7 +42,8 @@ for path in sorted(root.rglob("*.py")):
     if name not in sys.modules:
         missing.append(name)
 print(n)
-print("\\n".join(missing))
+if missing:
+    print("\\n".join(missing))
 """
 
 
@@ -54,7 +55,7 @@ def test_preload_puts_every_module_in_sys_modules() -> None:
     proc = subprocess.run(
         [sys.executable, "-c", _FRESH], capture_output=True, text=True, timeout=120, check=True
     )
-    count, *missing = proc.stdout.splitlines()
+    count, *missing = [line for line in proc.stdout.splitlines() if line]
     assert int(count) > 100
     # Only modules that need an optional third-party extra that is not installed may be absent.
     for name in missing:
