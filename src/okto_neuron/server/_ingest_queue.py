@@ -107,6 +107,10 @@ class IngestItem:
     # P1: the ingested document's id once the worker's remember returns it
     # (persisted; empty while queued/processing or on failure).
     document_id: str = ""
+    # P1: one-line, ~80-char preview of RAW-TEXT sources (MCP remember) so the
+    # queue UI can show what the note-<hash>.md durable copy actually contains.
+    # Path-sourced items leave it empty; the filename already identifies them.
+    preview: str = ""
     committed: int = 0
     queued: int = 0
     error: str | None = None
@@ -915,6 +919,7 @@ def enqueue_materialized(
     *,
     sensitivity: str = "default",
     name: str | None = None,
+    preview: str = "",
 ) -> IngestItem:
     """Register an ALREADY-DURABLE source as a queue item — no second copy.
 
@@ -940,6 +945,7 @@ def enqueue_materialized(
         name=name or Path(abs_path).name,
         path=abs_path,
         sensitivity=sensitivity,
+        preview=preview,
     )
     state.ingest_queue.append(item)
     return item

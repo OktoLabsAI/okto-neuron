@@ -13,6 +13,7 @@ See ``docs/autonomous-architecture-plan.md`` for the phased plan.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import math
 import re
@@ -1698,6 +1699,15 @@ class RememberCancelled(BaseException):
 # ── locality policy ───────────────────────────────────────────────────────────
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", ""})
 
+# P1 (user decision): a private-network LLM endpoint is "local" for
+# sensitivity=local_only. Exactly RFC1918 for IPv4 plus IPv6 ULA fc00::/7;
+# deliberately NOT ipaddress's blanket ``is_private`` (which also counts
+# TEST-NET and other special registries as private).
+_PRIVATE_V4_NETWORKS = tuple(
+    ipaddress.ip_network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
+_UNIQUE_LOCAL_V6_NETWORK = ipaddress.ip_network("fc00::/7")
+
 
 _ASK_SYSTEM = "You answer grounded in the provided notes. Be concise."
 """Default system prompt for the ask path. Overridden by ``llm.ask.system_prompt``
@@ -2375,12 +2385,27 @@ def _source_outside_roots_message(
 
 def _is_local_provider(provider: "LLMProvider") -> bool:
     """A provider is local if it has no hosted ``api_base`` (StubLLM) or its
-    ``api_base`` host is loopback. Pure attribute check — never touches the wire."""
+    ``api_base`` host is loopback, a private RFC1918 address (10/8, 172.16/12,
+    192.168/16), an IPv6 unique-local address (fc00::/7), or a link-local
+    address (169.254/16, fe80::/10). A hostname that is not an IP literal is
+    NOT local — a DNS name can point anywhere; only the literal
+    ``localhost`` is. Pure attribute check: never touches the wire, never
+    resolves DNS."""
     api_base = getattr(provider, "api_base", None)
     if not api_base:
         return True
     host = urlparse(str(api_base)).hostname or ""
-    return host in _LOCAL_HOSTS
+    if host in _LOCAL_HOSTS:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # not an IP literal — only "localhost" (above) is local
+    if address.is_loopback or address.is_link_local:
+        return True
+    if address.version == 4:
+        return any(address in network for network in _PRIVATE_V4_NETWORKS)
+    return address in _UNIQUE_LOCAL_V6_NETWORK
 
 
 # ── the companion ───────────────────────────────────────────────────────────--

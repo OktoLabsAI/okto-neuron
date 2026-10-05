@@ -1317,6 +1317,36 @@ _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
 _BARE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
 
 
+def _raw_text_preview(source: str, limit: int = 80) -> str:
+    """One-line, ``limit``-char preview of a RAW-TEXT remember source.
+
+    Empty for path-shaped sources (the queue already shows their filename);
+    for raw text, the first line flattened to a single line and truncated on
+    a character boundary. Pure string work — no filesystem access."""
+    if "\n" not in source:
+        try:
+            exists = Path(source).expanduser().exists()
+        except (OSError, ValueError, RuntimeError):
+            exists = False
+        has_space = " " in source
+        suffix = Path(source).suffix
+        is_path_shaped = (
+            exists
+            or "/" in source
+            or "\\" in source
+            or _DRIVE_LETTER_RE.match(source) is not None
+            or (source.startswith("~") and not has_space)
+            or (not has_space and "/" not in source and _BARE_SUFFIX_RE.match(suffix) is not None)
+        )
+        if is_path_shaped:
+            return ""
+    first_line = source.lstrip().splitlines()[0] if source.strip() else ""
+    first_line = " ".join(first_line.split())
+    if len(first_line) <= limit:
+        return first_line
+    return first_line[: limit - 1].rstrip() + "\u2026"
+
+
 def _materialize_raw_text_source(vault: Vault, source: str) -> str:
     """Detect a raw-text MCP ``remember`` source and durably materialize it.
 
@@ -1924,8 +1954,12 @@ def _build_mcp_server(state: ServerState):
         /api/v1/ingest) and THAT copy is enqueued, so the vault keeps its own
         text. ``sensitivity`` must be exactly ``local_only`` or ``default``
         (enforced by the tool schema); it travels with the queue item and the
-        worker honors it — ``local_only`` keeps the source off any remote LLM
-        path.
+        worker honors it: ``local_only`` keeps the source off any remote LLM
+        path — the ingest FAILS unless the vault's LLM is local, meaning its
+        api_base has no host (stub), or its host is ``localhost``/loopback, a
+        private RFC1918 address (10/8, 172.16/12, 192.168/16), an IPv6
+        unique-local (fc00::/7) or link-local address. Hostnames are NOT
+        local (a DNS name can point anywhere).
 
         ``vault`` optionally names the registered vault to write to (a NAME
         from ``list_vaults`` — never a path); omit it to use this connection's
@@ -1988,7 +2022,10 @@ def _build_mcp_server(state: ServerState):
                         )
                     )
                 item = iq.enqueue_materialized(
-                    runtime, ingest_source, sensitivity=sens
+                    runtime,
+                    ingest_source,
+                    sensitivity=sens,
+                    preview=_raw_text_preview(source),
                 )
                 iq.ensure_worker(runtime, _queue_companion)
                 await store_io(iq.persist, runtime)
@@ -2031,7 +2068,9 @@ def _build_mcp_server(state: ServerState):
         curation counts, ``document_id`` the ingested document once known.
         ``vault`` is the serving vault's NAME (never a path). A ``job_id``
         that never existed (or belongs to another vault) fails loudly as
-        ``not_found``.
+        ``not_found``. A ``local_only`` sensitivity job can only succeed on a
+        vault whose LLM is local (loopback, RFC1918, IPv6 ULA fc00::/7, or
+        link-local api_base host — see ``remember``).
         """
         runtime, lease = await acquire_off_loop(_lease, vault, release=_release_pair)
         with lease:
