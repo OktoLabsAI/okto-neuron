@@ -1,8 +1,9 @@
-"""A failed ``remember`` leaves the same server-log record on REST and MCP.
+"""A failed ``remember`` leaves the same classified record on REST and MCP.
 
-An MCP client only sees the tool error and a REST client only sees the JSON
-body, so the daemon log is the operator's only record of why a write failed.
-Both surfaces classify the failure through ``http.log_remember_failure``:
+A REST client only sees the JSON body and an MCP client only sees the queued
+job, so the daemon log (REST) and the job sidecar (MCP) are the operator's
+records of why a write failed. REST classifies the failure through
+``http.log_remember_failure``:
 
 - a caller's mistake (a source path that is missing or outside the vault) is a
   WARNING naming the mistake, without a traceback;
@@ -12,7 +13,13 @@ Both surfaces classify the failure through ``http.log_remember_failure``:
 - any other exception is an ERROR ``unexpected remember failure`` with its
   traceback.
 
-Each case runs through both surfaces and asserts the same record.
+MCP (async, P1) classifies the SAME failure as the job's terminal state: the
+queue worker runs the extraction, the item ends ``status=error`` and
+``ingest_status`` reports ``ok=false`` with the exception text in
+``error``. (Missing-path sources are a separate, call-time contract: MCP
+``remember`` now refuses them loudly as ``bad_path`` before enqueueing.)
+
+Each case runs through both surfaces and asserts the matching record.
 """
 
 from __future__ import annotations
@@ -199,17 +206,32 @@ def _close_stores() -> None:
     VaultConnection.close_all()
 
 
-def _mcp_remember(state: ServerState, source: str) -> None:
+def _mcp_remember_enqueued(state: ServerState, source: str) -> dict[str, object]:
+    """Call async MCP ``remember`` with an EXISTING source (so it enqueues),
+    drain the queue worker inside the client loop, and return the terminal
+    ``ingest_status`` detail for the job."""
     from fastmcp import Client
 
     server = runtime._build_mcp_server(state)
 
-    async def exercise() -> None:
+    async def exercise() -> dict[str, object]:
         async with Client(server) as client:
-            with pytest.raises(Exception):
-                await client.call_tool("remember", {"source": source})
+            result = await client.call_tool("remember", {"source": source})
+            queued = result.structured_content or {}
+            assert queued.get("status") == "queued", queued
+            assert queued.get("poll") == "ingest_status"
+            job_id = queued["job_id"]
+            # Let the drain worker finish INSIDE this loop (bounded).
+            for _ in range(500):
+                item = next((i for i in state.ingest_queue if i.id == job_id), None)
+                if item is not None and item.status in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            return (
+                await client.call_tool("ingest_status", {"job_id": job_id})
+            ).structured_content or {}
 
-    asyncio.run(exercise())
+    return asyncio.run(exercise())
 
 
 @pytest.fixture
@@ -224,23 +246,32 @@ def rest_client(tmp_path: Path) -> Iterator[tuple[TestClient, Vault]]:
 
 
 @pytest.mark.parametrize("kind", sorted(CASES))
-def test_mcp_remember_logs_failure_by_the_shared_rule(
+def test_mcp_remember_records_failure_on_the_job_by_the_shared_rule(
     kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Async contract (P1): the companion failure happens in the queue
+    worker, not at call time, so the operator's MCP-side record is the
+    terminal job (``ingest_status``: status=error, ok=false, the exception
+    text in ``error``) — the same failure the REST surface logs."""
     case = CASES[kind]
     vault = Vault.init(tmp_path / "mcp", packs=["core"])
     vault_path = Path(vault.path).resolve()
-    source = str(vault_path / "notes" / "missing.md")
+    # An EXISTING in-vault file: remember enqueues it and the worker is what
+    # raises the case's exception.
+    (vault_path / "notes").mkdir(parents=True, exist_ok=True)
+    source_path = vault_path / "notes" / "real.md"
+    source_path.write_text(f"# {kind}\n", encoding="utf-8")
+    source = str(source_path)
     exc = case.make(source, vault_path)
     monkeypatch.setattr(http_mod, "companion_for", lambda _vault: _fake_companion(exc))
     state = ServerState(vault=vault, vault_path=vault_path, multi_vault_runtime_enabled=True)
     try:
-        with caplog.at_level("WARNING"):
-            _mcp_remember(state, source)
-        _assert_record(_records(caplog), case, exc)
+        detail = _mcp_remember_enqueued(state, source)
+        assert detail.get("status") == "error", detail
+        assert detail.get("ok") is False, detail
+        assert detail.get("error") == str(exc), detail
     finally:
         state.close()
 
@@ -270,19 +301,34 @@ def test_rest_remember_logs_failure_by_the_shared_rule(
 # classification must hold for the exception the ingest path actually raises.
 
 
-def test_mcp_remember_real_missing_source_is_a_caller_warning(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_mcp_remember_real_missing_source_fails_loudly_at_call_time(
+    tmp_path: Path,
 ) -> None:
+    """Async contract (P1): a path-shaped source that does not exist is a
+    caller's mistake that MCP ``remember`` refuses LOUDLY AT CALL TIME as a
+    ``bad_path`` error — no job is enqueued (there is nothing for the worker
+    to fail on later), and no source is materialized."""
+    from fastmcp import Client
+
     vault = Vault.init(tmp_path / "mcp-real", packs=["core"])
     vault_path = Path(vault.path).resolve()
     state = ServerState(vault=vault, vault_path=vault_path, multi_vault_runtime_enabled=True)
+    server = runtime._build_mcp_server(state)
+
+    async def exercise() -> None:
+        async with Client(server) as client:
+            with pytest.raises(Exception) as excinfo:
+                await client.call_tool(
+                    "remember", {"source": str(vault_path / "notes" / "does-not-exist.md")}
+                )
+        assert "bad_path" in str(excinfo.value)
+        assert "does not exist" in str(excinfo.value)
+
     try:
-        with caplog.at_level("WARNING"):
-            _mcp_remember(state, str(vault_path / "notes" / "does-not-exist.md"))
-        records = _records(caplog)
-        assert [r.levelname for r in records] == ["WARNING"]
-        assert records[0].getMessage().startswith("remember rejected: source path not found:")
-        assert not records[0].exc_info
+        asyncio.run(exercise())
+        assert not list(state.ingest_queue), "missing path must not enqueue a job"
+        sources_dir = vault_path / ".marginalia" / "sources"
+        assert not sources_dir.exists() or not list(sources_dir.glob("*.md"))
     finally:
         state.close()
         _close_stores()
