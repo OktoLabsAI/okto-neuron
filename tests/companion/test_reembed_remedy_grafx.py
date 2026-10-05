@@ -278,3 +278,65 @@ def test_incident_reembed_then_plans_resume_unwedges(tmp_path: Path, monkeypatch
         assert _companion(vault)._candidate_ledger().unreceipted_commit_plans() == ()
     finally:
         vault.close()
+
+
+def test_the_servers_own_store_wrapper_forwards_embedding_dim(tmp_path: Path) -> None:
+    """The production wrapper path, not a bare backend: the server resolves a
+    VaultRuntime, leases its pooled handle, and builds the Companion through
+    ``companion_for`` (server/http.py:2786) — and that handle's ``store`` is
+    ``_open_vault``'s ``IndexedStore`` wrapping the GrafxStore
+    (store/vault.py:87-89). ``IndexedStore`` defines no ``embedding_dim`` of
+    its own, so the attribute resolves through its ``__getattr__`` delegation
+    (store/index/indexed.py:139-144) to the backend property — the guard is
+    NOT a no-op through the wrapper the daemon actually serves."""
+    from okto_neuron.server.http import companion_for
+    from okto_neuron.server.state import init_state, reset_state_for_tests
+    from okto_neuron.store.index.indexed import IndexedStore
+
+    root = _init_vault(tmp_path, "serverpath", _DIM_A)
+    vault = Vault.open(root)
+    try:
+        _ingest(vault, "session-1.md", "Turtles")
+        # The server's Companion has no injected provider: run model-free from
+        # here on (the acceptance scenarios' own --disable-llm shape).
+        _, changed = VaultConfig.apply_patch(root, {"llm": {"enabled": False}})
+        assert "llm.enabled" in changed
+        # The wrapper the pool caches and the server leases is an IndexedStore.
+        assert isinstance(vault.store, IndexedStore)
+        assert not hasattr(IndexedStore, "embedding_dim"), (
+            "if IndexedStore ever defines embedding_dim itself, update this proof"
+        )
+    finally:
+        vault.close()
+
+    reset_state_for_tests()
+    monkeyhome = pytest.MonkeyPatch()
+    monkeyhome.setenv("HOME", str(tmp_path))
+    for name in ("OKTO_NEURON_HOME", "OKTO_NEURON_CONFIG", "OKTO_NEURON_VAULT", "MARGINALIA_HOME"):
+        monkeyhome.delenv(name, raising=False)
+    try:
+        state = init_state(None, None)
+        runtime = state.runtime_for(root)
+        lease = runtime.lease_vault()
+        try:
+            served = lease.vault
+            assert isinstance(served.store, IndexedStore)
+            assert served.store.embedding_dim == _DIM_A
+            companion_for(served).remember(_note(root, "session-2.md", "Snakes"))
+        finally:
+            lease.release()
+
+        # Hot-edit the width the way the config API does, re-lease the pooled
+        # handle, and prove the guard fires THROUGH the wrapper.
+        _hot_edit_dim(served, _DIM_B)
+        lease = runtime.lease_vault()
+        try:
+            with pytest.raises(EmbeddingDimMismatch):
+                companion_for(lease.vault).remember(_note(root, "session-3.md", "Frogs"))
+            with pytest.raises(EmbeddingDimMismatch):
+                lease.vault.query("turtles")
+        finally:
+            lease.release()
+    finally:
+        monkeyhome.undo()
+        reset_state_for_tests()
