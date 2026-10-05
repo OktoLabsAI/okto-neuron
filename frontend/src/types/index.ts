@@ -753,6 +753,14 @@ export interface IngestQueueItem {
   name: string
   path: string
   status: IngestItemStatus
+  // P1 async remember: one-line preview of a RAW-TEXT source (MCP remember
+  // enqueues durable copies named note-<hash>.md); empty for path sources,
+  // where the filename already identifies the item.
+  preview?: string | null
+  // P1: the caller's sensitivity ask travels with the item; document_id is
+  // set once the worker's remember returns it.
+  sensitivity?: string | null
+  document_id?: string | null
   committed: number
   queued: number
   error: string | null

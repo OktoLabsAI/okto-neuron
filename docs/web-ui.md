@@ -1268,3 +1268,31 @@ revert the embedding config) instead of wedging mid-apply.
   the abandon row records the receipts that stay applied).
 - The blocking `IngestError` itself names the plan's run id and the exact resume/abandon commands,
   so the wedge is self-describing at the point of failure.
+
+## Addendum · 2026-10-05 — async MCP `remember` + `ingest_status`; queue honors sensitivity; LAN LLMs are local
+
+**Async remember.** MCP `remember` no longer blocks for the whole ingest: it validates
+(loopback write gate, vault resolution, maintenance/draining, integrity fence, raw-text
+materialization — including the out-of-tree refusal and a loud `bad_path` for a missing
+path), then **enqueues** the durable source into the vault's ingest queue and returns
+immediately with `{job_id, status:"queued", vault (name only), source_name,
+poll:"ingest_status"}`. The queue's drain worker performs the remember under the writer
+lock; the inline progress-notification bridge and the idle-call heartbeat are gone with
+the inline call — progress is queue telemetry now.
+
+**`ingest_status(job_id, vault=None)`.** Polls a job: `status`
+(queued|processing|done|error|cancelled), an explicit `ok` (true only when done AND not
+zero-yield/failed-quality), `stage` + `blocks_done`/`blocks_total`, `committed`/`queued`
+counts, `document_id`, `error`/`provider_error`, and the serving vault NAME. Unknown
+ids fail loudly as `not_found`.
+
+**Sensitivity survives the queue.** `sensitivity` travels with the queue item (persisted
+and rehydrated) into the worker's `companion.remember` — `local_only` now actually
+reaches the ingest instead of being dropped. A `local_only` source may only run on a
+local LLM: loopback/`localhost`, RFC1918 (10/8, 172.16/12, 192.168/16), IPv6 ULA
+fc00::/7, or link-local — the operator's LAN ollama/litellm box qualifies; hostnames do
+not (a DNS name can point anywhere).
+
+**Raw-text previews.** Queue items enqueued from raw text carry a one-line ~80-char
+`preview` of the note; the Logs view shows it instead of the bare `note-<hash>.md`
+filename (path still on hover).

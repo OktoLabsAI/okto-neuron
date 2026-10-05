@@ -406,8 +406,11 @@ export function IngestLogsView() {
                       >
                         <div className="flex min-w-0 items-center gap-2">
                           <StatusIcon status={item.status} />
-                          <span className="min-w-0 flex-1 truncate text-sm text-surface-200" title={item.path}>
-                            {item.name}
+                          <span
+                            className="min-w-0 flex-1 truncate text-sm text-surface-200"
+                            title={item.preview ? `${item.preview}\n(${item.path})` : item.path}
+                          >
+                            {item.preview || item.name}
                           </span>
                           <Badge tone={statusTone(item.status)}>{STATUS_LABELS[item.status]}</Badge>
                           <IngestOutcomeBadge item={item} />

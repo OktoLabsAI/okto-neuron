@@ -100,6 +100,21 @@ class IngestItem:
     name: str
     path: str  # absolute path the worker will remember()
     status: str = "queued"  # queued | processing | done | error | cancelled
+    # P1: the caller's sensitivity ask travels WITH the item (persisted,
+    # rehydrated) so the drain worker can honor it — the queue used to drop
+    # it, silently ingesting local_only sources through remote LLMs.
+    sensitivity: str = "default"  # local_only | default
+    # P1: the ingested document's id once the worker's remember returns it
+    # (persisted; empty while queued/processing or on failure).
+    document_id: str = ""
+    # P1: the worker's remember reported the vault's LLM disabled (model-free
+    # ingest); surfaced by ingest_status so the old inline contract's
+    # llm_disabled flag survives the async switch.
+    llm_disabled: bool = False
+    # P1: one-line, ~80-char preview of RAW-TEXT sources (MCP remember) so the
+    # queue UI can show what the note-<hash>.md durable copy actually contains.
+    # Path-sourced items leave it empty; the filename already identifies them.
+    preview: str = ""
     committed: int = 0
     queued: int = 0
     error: str | None = None
@@ -900,6 +915,44 @@ def _register_copied(
             accepted_srcs.add(src_abs)
     stats["refreshed"] = refreshed
     return items
+
+
+def enqueue_materialized(
+    state: "ServerState",
+    path: Path | str,
+    *,
+    sensitivity: str = "default",
+    name: str | None = None,
+    preview: str = "",
+) -> IngestItem:
+    """Register an ALREADY-DURABLE source as a queue item — no second copy.
+
+    For callers that materialized raw text into ``.marginalia/sources``
+    themselves (MCP ``remember``, P1): the file is durable in the vault, so
+    the queue must not copy it again the way :func:`enqueue_paths` does.
+    Same dedup rule as ``_register_copied``: an identical path already
+    ``queued`` returns the existing item (re-remembering identical raw text
+    is one job, not two); a non-default sensitivity updates the pending item,
+    since the newest ask governs the run that has not started yet.
+    """
+    abs_path = str(Path(path).resolve())
+    existing = next(
+        (i for i in state.ingest_queue if i.path == abs_path and i.status == "queued"),
+        None,
+    )
+    if existing is not None:
+        if sensitivity != "default":
+            existing.sensitivity = sensitivity
+        return existing
+    item = IngestItem(
+        id=_next_id(state, abs_path),
+        name=name or Path(abs_path).name,
+        path=abs_path,
+        sensitivity=sensitivity,
+        preview=preview,
+    )
+    state.ingest_queue.append(item)
+    return item
 
 
 def enqueue_uploads(
@@ -1708,6 +1761,7 @@ async def _drain(
                         result = await job_io(
                             companion.remember,
                             item.path,
+                            sensitivity=item.sensitivity,
                             on_progress=on_progress,
                             on_event=on_event,
                             should_cancel=_should_cancel,
@@ -1730,6 +1784,8 @@ async def _drain(
                 item.provider_error = getattr(result, "provider_error", None)
                 raw_outcome = getattr(result, "outcome", None)
                 item.outcome = dict(raw_outcome) if isinstance(raw_outcome, dict) else {}
+                item.document_id = str(getattr(result, "document_id", "") or "")
+                item.llm_disabled = bool(getattr(result, "llm_disabled", False))
                 item.claims = int(getattr(result, "claims_minted", 0)) + sum(
                     1 for outcome in getattr(result, "outcomes", ()) if outcome.type == "Claim"
                 )

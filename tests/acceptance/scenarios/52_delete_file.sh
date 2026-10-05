@@ -51,17 +51,32 @@ def data(result):
     return value if isinstance(value, dict) else {}
 
 
+async def await_job(client, queued):
+    """P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud)."""
+    status = {}
+    for _ in range(600):
+        status = data(await client.call_tool("ingest_status", {"job_id": queued.get("job_id")}))
+        if status.get("status") in {"done", "error", "cancelled"}:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise SystemExit(f"FAIL ingest_status timeout: {status}")
+    if status.get("status") != "done" or status.get("ok") is not True:
+        raise SystemExit(f"FAIL ingest not ok: {status}")
+    return status
+
+
 async def main():
     keep_path = VAULT / "notes" / "keep.md"
     drop_path = VAULT / "notes" / "drop.md"
     async with Client(URL, auth=TOKEN) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         print(f"tools={tools}")
-        if tools != ["ask", "explore", "init_vault", "list_vaults", "remember"]:
+        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]:
             print("FAIL unexpected_tool_surface")
 
-        keep = data(await client.call_tool("remember", {"source": str(keep_path)}))
-        drop = data(await client.call_tool("remember", {"source": str(drop_path)}))
+        keep = await await_job(client, data(await client.call_tool("remember", {"source": str(keep_path)})))
+        drop = await await_job(client, data(await client.call_tool("remember", {"source": str(drop_path)})))
         drop_path.unlink()
 
         missing_path_error = False

@@ -453,8 +453,22 @@ def test_mcp_remember_holds_runtime_lease_and_writer_lock(tmp_path: Path, monkey
 
     async def exercise() -> None:
         async with Client(server) as client:
+            # Async contract (P1): remember enqueues and returns immediately;
+            # the lease + writer-lock hold now happens in the drain worker
+            # (which runs the fake companion), so drain INSIDE this loop.
             result = await client.call_tool("remember", {"source": "lease-bound raw note"})
-        assert (result.structured_content or {}).get("document_id") == "leased"
+            queued = result.structured_content or {}
+            assert queued.get("status") == "queued", queued
+            job_id = queued["job_id"]
+            for _ in range(500):
+                item = next((i for i in state.ingest_queue if i.id == job_id), None)
+                if item is not None and item.status in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            status = (
+                await client.call_tool("ingest_status", {"job_id": job_id})
+            ).structured_content or {}
+            assert status.get("document_id") == "leased", status
 
     try:
         asyncio.run(exercise())

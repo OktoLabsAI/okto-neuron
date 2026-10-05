@@ -48,14 +48,29 @@ def data(result):
     return value if isinstance(value, dict) else {}
 
 
+async def await_job(client, queued):
+    """P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud)."""
+    status = {}
+    for _ in range(600):
+        status = data(await client.call_tool("ingest_status", {"job_id": queued.get("job_id")}))
+        if status.get("status") in {"done", "error", "cancelled"}:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise SystemExit(f"FAIL ingest_status timeout: {status}")
+    if status.get("status") != "done" or status.get("ok") is not True:
+        raise SystemExit(f"FAIL ingest not ok: {status}")
+    return status
+
+
 async def main():
     old_path = VAULT / "notes" / "movable.md"
     new_path = VAULT / "notes" / "projects" / "moved.md"
     async with Client(URL, auth=TOKEN) as client:
-        first = data(await client.call_tool("remember", {"source": str(old_path)}))
+        first = await await_job(client, data(await client.call_tool("remember", {"source": str(old_path)})))
         new_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(old_path, new_path)
-        second = data(await client.call_tool("remember", {"source": str(new_path)}))
+        second = await await_job(client, data(await client.call_tool("remember", {"source": str(new_path)})))
         explored = data(
             await client.call_tool("explore", {"topic": "blueparrot_chartreuse_xyz", "k": 20})
         )

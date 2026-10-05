@@ -100,7 +100,7 @@ class _Companion:
     def __init__(self, remembered: list[str]) -> None:
         self._remembered = remembered
 
-    def remember(self, path, *, on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
+    def remember(self, path, *, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
         self._remembered.append(path)
         return SimpleNamespace(
             committed=1,

@@ -37,7 +37,6 @@ from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _gc_tuning
 from okto_neuron.server import _integrity as graph_integrity
-from okto_neuron.server._lock_holder import held_lock
 from okto_neuron.server._preload import preload_server_modules
 from okto_neuron.server._prewarm import start_ledger_prewarm
 from okto_neuron.server._store_io import (
@@ -1314,127 +1313,38 @@ def _mcp_kg_add_allowed() -> bool:
     return request_is_loopback(request)
 
 
-def _mcp_progress_bridge() -> Callable[[str, int, int], None] | None:
-    """Build a ``Companion.remember`` ``on_progress`` that emits MCP progress.
-
-    WHY: a long ``remember`` used to return nothing for minutes, and clients
-    abort an idle tool call (Claude Code: "sent no response or progress for
-    300s"). The daemon finished the work but the ONLY trustworthy success
-    signal — ``units.succeeded == blocks_total`` — lives in the payload that
-    the abort discarded. Emitting a notification per block keeps the client's
-    idle timer alive so the real payload survives.
-
-    THREADING: ``remember`` runs under ``asyncio.to_thread``, so ``on_progress``
-    fires on a worker thread while ``Context.report_progress`` is a coroutine
-    that must run on the event loop. The loop and the ``Context`` are captured
-    HERE, on the loop, because ``get_context()`` reads context-local state a
-    worker thread does not have. The callback then hands the coroutine to
-    ``run_coroutine_threadsafe`` and DISCARDS the future: the worker never
-    joins it, so ingest speed never depends on notification delivery, and a
-    delivery failure can never fail the ingest (it is swallowed inside the
-    coroutine and logged at debug — the ingest is the product, the
-    notification is telemetry).
-
-    COALESCING: ``_emit`` fires once per stage boundary AND once per block, and
-    several alternate paths in the per-block extraction loop can emit the same
-    ``(stage, blocks_done)`` pair two or three times for one block. Deduping on
-    that exact pair yields one notification per block completion plus one per
-    stage change, with no throttle that could drop the very notification the
-    idle timer needs.
-
-    Returns ``None`` when there is no MCP context at all (in-memory/REST
-    callers), so the caller passes ``on_progress=None`` rather than a callback
-    that cannot do anything. ``report_progress`` itself no-ops when the client
-    sent no ``progressToken``.
-    """
-    try:
-        from fastmcp.server.dependencies import get_context  # type: ignore
-
-        ctx = get_context()
-        loop = asyncio.get_running_loop()
-    except (RuntimeError, ImportError):  # no MCP context / no running loop
-        return None
-    if ctx is None:
-        return None
-
-    last: list[tuple[str, int] | None] = [None]
-
-    async def _send(progress: float, total: float | None, message: str) -> None:
-        try:
-            await ctx.report_progress(progress, total, message)
-        except Exception:  # noqa: BLE001 - telemetry must never break ingest
-            _LOG.debug("mcp progress notification failed", exc_info=True)
-
-    def _on_progress(stage: str, blocks_done: int, blocks_total: int) -> None:
-        key = (stage, blocks_done)
-        if last[0] == key:
-            return
-        last[0] = key
-        # blocks_total is 0 during "parsing" (the block count is not known
-        # yet); send total=None so a client computing a percentage does not
-        # divide by zero.
-        total = float(blocks_total) if blocks_total > 0 else None
-        message = f"{stage} {blocks_done}/{blocks_total}" if total else stage
-        coro = _send(float(blocks_done), total, message)
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except Exception:  # noqa: BLE001 - e.g. the loop is already closed
-            # Close the never-awaited coroutine so a shutdown drain does not
-            # also emit a RuntimeWarning on top of the swallowed failure.
-            coro.close()
-            _LOG.debug("mcp progress dispatch failed", exc_info=True)
-
-    return _on_progress
-
-
-# Client idle timeout for HTTP MCP tool calls is 300 s (Claude Code); one long
-# LLM call can leave the per-block bridge silent for longer. A timer heartbeat
-# independent of block events keeps the client's idle timer alive.
-_MCP_HEARTBEAT_INTERVAL_S = 20.0
-
-
-@contextlib.asynccontextmanager
-async def _mcp_heartbeat():
-    """Send an MCP progress notification every interval while the body runs.
-
-    Started with the tool call and cancelled in ``finally`` (no notification
-    after completion). It never raises into the tool: no MCP context yields a
-    no-op, and ``report_progress`` itself no-ops without a ``progressToken``.
-    Progress is elapsed seconds; ``total`` is None (duration is unknown).
-    """
-    try:
-        from fastmcp.server.dependencies import get_context  # type: ignore
-
-        ctx = get_context()
-    except (RuntimeError, ImportError):
-        ctx = None
-    if ctx is None:
-        yield
-        return
-    started = time.monotonic()
-
-    async def _beat() -> None:
-        while True:
-            await asyncio.sleep(_MCP_HEARTBEAT_INTERVAL_S)
-            elapsed = time.monotonic() - started
-            try:
-                await ctx.report_progress(elapsed, None, f"remember in progress ({elapsed:.0f}s)")
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - telemetry must never break ingest
-                _LOG.debug("mcp heartbeat notification failed", exc_info=True)
-
-    task = asyncio.create_task(_beat())
-    try:
-        yield
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
-
-
 _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
 _BARE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
+
+
+def _raw_text_preview(source: str, limit: int = 80) -> str:
+    """One-line, ``limit``-char preview of a RAW-TEXT remember source.
+
+    Empty for path-shaped sources (the queue already shows their filename);
+    for raw text, the first line flattened to a single line and truncated on
+    a character boundary. Pure string work — no filesystem access."""
+    if "\n" not in source:
+        try:
+            exists = Path(source).expanduser().exists()
+        except (OSError, ValueError, RuntimeError):
+            exists = False
+        has_space = " " in source
+        suffix = Path(source).suffix
+        is_path_shaped = (
+            exists
+            or "/" in source
+            or "\\" in source
+            or _DRIVE_LETTER_RE.match(source) is not None
+            or (source.startswith("~") and not has_space)
+            or (not has_space and "/" not in source and _BARE_SUFFIX_RE.match(suffix) is not None)
+        )
+        if is_path_shaped:
+            return ""
+    first_line = source.lstrip().splitlines()[0] if source.strip() else ""
+    first_line = " ".join(first_line.split())
+    if len(first_line) <= limit:
+        return first_line
+    return first_line[: limit - 1].rstrip() + "\u2026"
 
 
 def _materialize_raw_text_source(vault: Vault, source: str) -> str:
@@ -2017,50 +1927,48 @@ def _build_mcp_server(state: ServerState):
         sensitivity: Literal["local_only", "default"] = "default",
         vault: str | None = None,
     ) -> dict[str, object]:
-        """Ingest a source and autonomously curate it into the graph.
+        """Validate, materialize, and ENQUEUE a source for async ingest.
 
-        WRITE op — serialized by the selected vault runtime's writer lock.
-        ``source`` is EITHER a file path OR raw text. Raw text is detected
-        conservatively: multi-line strings are always raw text; a single-line
-        string counts as raw text only when it is NOT path-shaped (path-shaped =
-        an existing file/dir, contains a slash or backslash, a Windows drive
-        prefix, a space-free ``~`` prefix, or a space-free name with a short
-        file suffix like ``note.pdf``). A path-shaped source is read IN PLACE
-        and never copied: it must be an existing file inside the vault root or a
-        configured folder-watch root (``folder_watch.roots`` in the vault
-        config); a missing path fails loudly as a path error, and a file outside
-        those roots is refused with ``forbidden: ...`` naming the allowed roots
-        and how to proceed (copy it under one, add its folder to
-        ``folder_watch.roots``, or pass its text as raw text). Detected raw text
-        is the only form that is copied: it is first materialized to a durable
-        ``.marginalia/sources/`` file in the vault (same convention as REST /add
-        and /api/v1/ingest) and that copy is then ingested, so the vault keeps
-        its own text and does not reference any original file. ``sensitivity`` must be exactly ``local_only`` or ``default``
-        (enforced by the tool schema — no other value is accepted); ``local_only``
-        keeps the source off any remote LLM path.
+        ASYNC (P1): this returns immediately — ``{"job_id", "status":
+        "queued", "vault" (name, never a path), "source_name", "poll":
+        "ingest_status"}`` — after validation and raw-text materialization;
+        the vault's ingest-queue worker performs the remember under the
+        writer lock. Poll ``ingest_status(job_id)`` for stage/blocks progress
+        and the terminal committed/queued counts.
 
-        ``vault`` optionally names the registered vault to write to (a NAME from
-        ``list_vaults`` — never a path); omit it to use this connection's vault.
-        Before choosing, check the project directory for a ``.okto-neuron-vault``
-        file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
+        WRITE op — loopback-only. ``source`` is EITHER a file path OR raw
+        text. Raw text is detected conservatively: multi-line strings are
+        always raw text; a single-line string counts as raw text only when it
+        is NOT path-shaped (path-shaped = an existing file/dir, contains a
+        slash or backslash, a Windows drive prefix, a space-free ``~``
+        prefix, or a space-free name with a short file suffix like
+        ``note.pdf``). A path-shaped source is read IN PLACE and never copied:
+        it must be an existing file inside the vault root or a configured
+        folder-watch root (``folder_watch.roots`` in the vault config); a
+        missing path fails loudly as a path error, and a file outside those
+        roots is refused with ``forbidden: ...`` naming the allowed roots and
+        how to proceed (copy it under one, add its folder to
+        ``folder_watch.roots``, or pass its text as raw text). Detected raw
+        text is the only form that is copied: it is materialized to a durable
+        ``.marginalia/sources/`` file (same convention as REST /add and
+        /api/v1/ingest) and THAT copy is enqueued, so the vault keeps its own
+        text. ``sensitivity`` must be exactly ``local_only`` or ``default``
+        (enforced by the tool schema); it travels with the queue item and the
+        worker honors it: ``local_only`` keeps the source off any remote LLM
+        path — the ingest FAILS unless the vault's LLM is local, meaning its
+        api_base has no host (stub), or its host is ``localhost``/loopback, a
+        private RFC1918 address (10/8, 172.16/12, 192.168/16), an IPv6
+        unique-local (fc00::/7) or link-local address. Hostnames are NOT
+        local (a DNS name can point anywhere).
+
+        ``vault`` optionally names the registered vault to write to (a NAME
+        from ``list_vaults`` — never a path); omit it to use this connection's
+        vault. Before choosing, check the project directory for a
+        ``.okto-neuron-vault`` file, or a pre-0.3.0 ``.marginalia-vault``
+        (``{"vault": "<name>"}``), and pass the name it pins.
         """
-        # The heartbeat covers the whole call (lock wait included); the inline
-        # counters record it in the vault's ingest summary (status "inline").
-        call = iq.InlineCall()
-        try:
-            async with _mcp_heartbeat():
-                result = await _remember_inline(source, sensitivity, vault, call)
-        except BaseException:
-            call.finish(ok=False)
-            raise
-        call.finish(ok=not result.get("provider_error"))
-        return result
-
-    async def _remember_inline(
-        source: str, sensitivity: str, vault: str | None, call: iq.InlineCall
-    ) -> dict[str, object]:
-        # WRITE op — loopback-only, even under --allow-remote (writes never widen).
-        # Matches REST /remember and the init_vault gate below.
+        # WRITE op — loopback-only, even under --allow-remote (writes never
+        # widen). Matches REST /remember and the init_vault gate below.
         if not _mcp_kg_add_allowed():
             raise RuntimeError(
                 "forbidden: remember is restricted to loopback callers; "
@@ -2076,73 +1984,151 @@ def _build_mcp_server(state: ServerState):
             if runtime.shutting_down:
                 raise RuntimeError("shutting_down: server is shutting down")
             raise RuntimeError("maintenance: vault maintenance is in progress; writes are paused")
-        call.start(runtime)
-        with lease as selected_vault:
-            async with held_lock(runtime.writer_lock, "mcp-remember"):
-                try:
-                    await store_io(graph_integrity.require_write_allowed, runtime, selected_vault)
-                    ingest_source = await store_io(
-                        _materialize_raw_text_source, selected_vault, source
+        from okto_neuron.server.http import _companion as _queue_companion
+
+        try:
+            with lease as selected_vault:
+                # Fail fast on the integrity fence; the worker re-checks per
+                # item under the writer lock, but a fenced vault should refuse
+                # the enqueue, not accept work it will reject.
+                await store_io(
+                    graph_integrity.require_write_allowed, runtime, selected_vault
+                )
+                ingest_source = await store_io(
+                    _materialize_raw_text_source, selected_vault, source
+                )
+                # Fail fast on an out-of-tree PATH source exactly the way the
+                # inline flow did (field report: the refusal must name the
+                # roots and the remedies AT CALL TIME) — the worker would
+                # otherwise only fail the job after the caller has moved on.
+                # Raw-text sources are already under .marginalia/sources and
+                # pass trivially; missing paths pass through (the ingest
+                # reader fails closed on them, as before).
+                from okto_neuron.companion import (
+                    _source_is_ingestable_path,
+                    _source_outside_roots_message,
+                )
+                from okto_neuron.config import VaultConfig
+
+                # The config read is YAML I/O: off-loop (event-loop guard).
+                watch_roots = list(
+                    await store_io(
+                        lambda: VaultConfig.load(
+                            Path(selected_vault.path)
+                        ).folder_watch.roots
                     )
-                    # Off-load the blocking extraction so the event loop stays
-                    # responsive while this vault's lock serializes writes.
-                    result = await job_io(
-                        functools.partial(
-                            companion_for(selected_vault).remember,
-                            ingest_source,
-                            sensitivity=sens,
-                            on_progress=_mcp_progress_bridge(),
+                )
+                if not _source_is_ingestable_path(
+                    ingest_source, selected_vault.path, watch_roots
+                ):
+                    raise SourceOutsideVaultError(
+                        _source_outside_roots_message(
+                            ingest_source, selected_vault.path, watch_roots
                         )
                     )
-                    runtime.note_ingest()
-                except graph_integrity.IntegrityFenceError as exc:
-                    raise RuntimeError(str(exc)) from exc
-                except SourceOutsideVaultError as exc:
-                    # Normalized the same way REST's /remember does (403
-                    # forbidden) instead of leaking the raw exception type.
-                    log_remember_failure(exc, source, _LOG)
-                    raise RuntimeError(f"forbidden: {exc}") from exc
-                except IngestError as exc:
-                    # Normalized the same way REST's /remember does
-                    # (ladybug_write_failed) instead of leaking the raw
-                    # exception type. The client only sees the message, so the
-                    # failure is logged here by the rule REST /remember uses.
-                    log_remember_failure(exc, source, _LOG)
+                # A PATH-shaped source that does not exist fails loudly as a
+                # path error at call time (the docstring's contract) instead
+                # of enqueueing a job that only fails in the worker.
+                if ingest_source == source and not Path(str(ingest_source)).expanduser().is_file():
                     raise RuntimeError(
-                        f"ladybug_write_failed: ladybug write failed: {exc}"
-                    ) from exc
-                except Exception as exc:
-                    # Everything else keeps the client error it always had; the
-                    # server log gets what REST /remember logs for the same
-                    # failure (a store GraphBackendError or exhausted-retry
-                    # error as a failed graph write, an unexpected exception
-                    # with its traceback, a caller's bad source path as a
-                    # warning).
-                    log_remember_failure(exc, source, _LOG)
-                    raise
-        from okto_neuron.server import _curation
-
-        remember_outcome = await store_io(
-            _curation.attach_verified_reconciliation_outcome,
-            runtime,
-            dict(getattr(result, "outcome", {}) or {}),
-            trigger="verified_file_commit",
-        )
+                        f"bad_path: source does not exist: {ingest_source}"
+                    )
+                item = iq.enqueue_materialized(
+                    runtime,
+                    ingest_source,
+                    sensitivity=sens,
+                    preview=_raw_text_preview(source),
+                )
+                iq.ensure_worker(runtime, _queue_companion)
+                await store_io(iq.persist, runtime)
+        except graph_integrity.IntegrityFenceError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except SourceOutsideVaultError as exc:
+            # Normalized the same way REST's /remember does (403 forbidden)
+            # instead of leaking the raw exception type.
+            log_remember_failure(exc, source, _LOG)
+            raise RuntimeError(f"forbidden: {exc}") from exc
+        except IngestError as exc:
+            # Materialization-time ingest errors keep the client wording the
+            # inline path always used.
+            log_remember_failure(exc, source, _LOG)
+            raise RuntimeError(
+                f"ladybug_write_failed: ladybug write failed: {exc}"
+            ) from exc
+        vault_name = await store_io(_serving_vault_name, runtime)
         return {
-            "document_id": result.document_id,
-            "committed": result.committed,
-            "queued": result.queued,
-            "blocks_total": result.blocks_total,
-            "nodes_extracted": result.nodes_extracted,
-            "edges_extracted": result.edges_extracted,
-            "claims_minted": result.claims_minted,
-            "provider_error": result.provider_error,
-            "provider_failures": result.provider_failures,
-            "empty_after_retry_blocks": result.empty_after_retry_blocks,
-            "llm_disabled": result.llm_disabled,
-            "outcomes": [o.model_dump(mode="json") for o in result.outcomes],
-            "outcome": remember_outcome,
+            "job_id": item.id,
+            "status": "queued",
+            "vault": vault_name,
+            "source_name": item.name,
+            "poll": "ingest_status",
         }
+
+    @mcp.tool()
+    async def ingest_status(
+        job_id: str, vault: str | None = None
+    ) -> dict[str, object]:
+        """Poll an async ``remember`` job (the ``job_id`` it returned).
+
+        ``status`` is ``queued | processing | done | error | cancelled``;
+        ``ok`` is the caller-friendly verdict: ``true`` ONLY for a finished
+        job whose ingest actually yielded — a provider error with zero yield
+        or a failed/integrity-failed outcome quality is ``status=error`` and
+        ``ok=false`` with the reason in ``error``/``provider_error``.
+        ``stage``/``blocks_done``/``blocks_total`` carry the within-file
+        progress (stage: queued | parsing | extracting | embedding | dedup |
+        committing | done | error), ``committed``/``queued`` the terminal
+        curation counts, ``document_id`` the ingested document once known.
+        ``vault`` is the serving vault's NAME (never a path). A ``job_id``
+        that never existed (or belongs to another vault) fails loudly as
+        ``not_found``. A ``local_only`` sensitivity job can only succeed on a
+        vault whose LLM is local (loopback, RFC1918, IPv6 ULA fc00::/7, or
+        link-local api_base host — see ``remember``).
+        """
+        runtime, lease = await acquire_off_loop(_lease, vault, release=_release_pair)
+        with lease:
+            detail = await iq.item_detail_async(runtime, job_id)
+            # The registry scan in _serving_vault_name reads YAML: off-loop
+            # (the event-loop guard pins this tool to never block the loop).
+            vault_name = await store_io(_serving_vault_name, runtime)
+        if detail is None:
+            raise RuntimeError(
+                f"not_found: no ingest job {job_id!r} on this vault; "
+                "job ids come from remember's queued result"
+            )
+        queued_item = detail["item"]
+        outcome = queued_item.get("outcome") if isinstance(queued_item.get("outcome"), dict) else {}
+        quality = str(outcome.get("quality") or "").strip()
+        zero_yield = bool(
+            queued_item.get("provider_error")
+            and int(queued_item.get("committed") or 0) == 0
+            and int(queued_item.get("queued") or 0) == 0
+            and int(queued_item.get("claims") or 0) == 0
+        )
+        # Mirrors the drain worker's own terminal rule: done AND actually
+        # yielded. Zero-yield/failed-quality items are status=error already;
+        # the explicit recomputation keeps legacy sidecar items honest too.
+        ok = queued_item.get("status") == "done" and not zero_yield and quality not in {
+            "failed",
+            "integrity_failed",
+        }
+        return {
+            "job_id": queued_item.get("id"),
+            "status": queued_item.get("status"),
+            "ok": ok,
+            "stage": queued_item.get("stage"),
+            "blocks_done": int(queued_item.get("blocks_done") or 0),
+            "blocks_total": int(queued_item.get("blocks_total") or 0),
+            "committed": int(queued_item.get("committed") or 0),
+            "queued": int(queued_item.get("queued") or 0),
+            "document_id": (str(queued_item.get("document_id") or "") or None),
+            "llm_disabled": bool(queued_item.get("llm_disabled") or False),
+            "error": queued_item.get("error"),
+            "provider_error": queued_item.get("provider_error"),
+            "vault": vault_name,
+            "source_name": queued_item.get("name"),
+        }
+
 
     @mcp.tool()
     async def list_vaults() -> dict[str, object]:

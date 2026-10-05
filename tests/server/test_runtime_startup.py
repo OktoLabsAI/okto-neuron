@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,12 +168,13 @@ def test_legacy_pure_query_serializer_remains_import_compatible() -> None:
 
 
 @pytest.mark.asyncio
-async def test_serve_mcp_surface_is_the_five_memory_tools() -> None:
-    """The live `serve` MCP surface is exactly ask / explore / remember / init_vault / list_vaults.
+async def test_serve_mcp_surface_is_the_memory_tools() -> None:
+    """The live `serve` MCP surface is exactly ask / explore / remember /
+    init_vault / list_vaults / ingest_status.
 
     Deliberately small graph-native surface: subgraph-grounded ask, ego-graph
-    drill-down, write, vault creation, and name-only vault discovery (ADR 0014).
-    The legacy
+    drill-down, async write (remember) + its job poller (ingest_status, P1),
+    vault creation, and name-only vault discovery (ADR 0014). The legacy
     kg_add/kg_query_natural/kg_get_provenance plus flat recall and the review pair
     were retired to avoid tool-selection ambiguity for agents.
     """
@@ -180,7 +182,7 @@ async def test_serve_mcp_surface_is_the_five_memory_tools() -> None:
     server = runtime._build_mcp_server(state)
     names = {tool.name for tool in await server.list_tools()}  # type: ignore[attr-defined]
 
-    assert names == {"ask", "explore", "remember", "init_vault", "list_vaults"}
+    assert names == {"ask", "explore", "remember", "init_vault", "list_vaults", "ingest_status"}
 
 
 @pytest.mark.asyncio
@@ -678,16 +680,30 @@ async def test_mcp_remember_relays_bedrock_missing_dependency_error(
     server = runtime._build_mcp_server(state)
     try:
         async with Client(server) as client:
-            # Fix 1 (issue #4 — loud total failure): this note is a single
-            # Block, so the one attempted extraction failing with a provider
-            # error means EVERY attempted block failed. remember() now raises
-            # LLMUnavailableError instead of returning a success-shaped
-            # payload with provider_error quietly set — the MCP tool call
-            # surfaces that as a ToolError, not a structured "ok" result.
-            with pytest.raises(Exception) as excinfo:
-                await client.call_tool("remember", {"source": str(note)})
+            # Async contract (P1): remember ENQUEUES and returns immediately;
+            # the boto3 dependency check happens when the queue worker runs the
+            # extraction, so the loud total failure (Fix 1, issue #4 — a
+            # LLMUnavailableError with a zero yield) surfaces as the JOB's
+            # error via ingest_status (status=error, ok=false), not as a
+            # call-time ToolError.
+            result = await client.call_tool("remember", {"source": str(note)})
+            queued = result.structured_content or {}
+            assert queued.get("status") == "queued", queued
+            assert queued.get("poll") == "ingest_status"
+            job_id = queued["job_id"]
+            # Let the drain worker finish INSIDE this loop (bounded).
+            for _ in range(500):
+                item = next((i for i in state.ingest_queue if i.id == job_id), None)
+                if item is not None and item.status in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            status = (
+                await client.call_tool("ingest_status", {"job_id": job_id})
+            ).structured_content or {}
 
-        error = str(excinfo.value)
+        assert status.get("status") == "error", status
+        assert status.get("ok") is False, status
+        error = f"{status.get('error')} {status.get('provider_error')}"
         assert "bedrock" in error.lower()
         assert "boto3" in error
         assert "okto-neuron[litellm,bedrock]" in error
@@ -704,7 +720,11 @@ async def test_mcp_remember_materializes_raw_text_source(
     materialized under ``.marginalia/sources/`` before ingest, instead of the
     docstring's claimed-but-unimplemented raw-text mode silently doing
     nothing. ``companion_for`` is faked so this stays LLM-free; the fake
-    asserts it received a real, existing file path — not the raw string."""
+    asserts it received a real, existing file path — not the raw string.
+
+    Async contract (P1): remember returns the queued job (named after the
+    materialized source); the drain worker performs the remember; the
+    document is asserted via ingest_status."""
     from fastmcp import Client
 
     from okto_neuron import Vault
@@ -735,15 +755,29 @@ async def test_mcp_remember_materializes_raw_text_source(
     try:
         async with Client(server) as client:
             result = await client.call_tool("remember", {"source": raw_text})
+            queued = result.structured_content or {}
+            assert queued.get("status") == "queued", queued
+            assert queued.get("poll") == "ingest_status"
+            job_id = queued["job_id"]
+            # Let the drain worker finish INSIDE this loop (bounded).
+            for _ in range(500):
+                item = next((i for i in state.ingest_queue if i.id == job_id), None)
+                if item is not None and item.status in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            status = (
+                await client.call_tool("ingest_status", {"job_id": job_id})
+            ).structured_content or {}
 
-        data = result.structured_content or {}
-        assert data.get("document_id") == "doc-raw-text"
-        assert data.get("outcome") == {"quality": "partial"}
+        assert status.get("status") == "done", status
+        assert status.get("ok") is True, status
+        assert status.get("document_id") == "doc-raw-text"
         assert captured["is_file"] is True
         assert captured["content"] == raw_text
         sources_dir = Path(vault.path) / ".marginalia" / "sources"
         md_files = list(sources_dir.glob("*.md"))
         assert md_files, "expected a materialized .md file under .marginalia/sources/"
+        assert queued.get("source_name") == Path(md_files[0]).name
     finally:
         state.close()
 
@@ -859,7 +893,10 @@ async def test_mcp_remember_spaced_and_tilde_prefixed_text_materializes_raw(
     """Regression guard for Defect B (single-line spaced sentences stay raw
     text) and Defect 16 (a source starting with ``~`` must never crash with
     ``RuntimeError`` from ``Path.expanduser()`` — it materializes as raw text
-    instead, whether single- or multi-line)."""
+    instead, whether single- or multi-line).
+
+    Async contract (P1): remember enqueues the materialized copy and the
+    document is asserted via ingest_status after the in-loop drain."""
     from fastmcp import Client
 
     from okto_neuron import Vault
@@ -884,9 +921,23 @@ async def test_mcp_remember_spaced_and_tilde_prefixed_text_materializes_raw(
     try:
         async with Client(server) as client:
             result = await client.call_tool("remember", {"source": raw_text})
+            queued = result.structured_content or {}
+            assert queued.get("status") == "queued", queued
+            assert queued.get("poll") == "ingest_status"
+            job_id = queued["job_id"]
+            # Let the drain worker finish INSIDE this loop (bounded).
+            for _ in range(500):
+                item = next((i for i in state.ingest_queue if i.id == job_id), None)
+                if item is not None and item.status in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            status = (
+                await client.call_tool("ingest_status", {"job_id": job_id})
+            ).structured_content or {}
 
-        data = result.structured_content or {}
-        assert data.get("document_id") == "doc-raw-text"
+        assert status.get("status") == "done", status
+        assert status.get("ok") is True, status
+        assert status.get("document_id") == "doc-raw-text"
         assert captured["is_file"] is True
         assert captured["content"] == raw_text
     finally:

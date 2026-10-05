@@ -350,6 +350,7 @@ def test_worker_stops_active_file_and_cancels_late_queue_items(tmp_path: Path) -
             self,
             path,
             *,
+            sensitivity="default",
             on_progress=None,
             on_event=None,
             should_cancel=None,
@@ -410,6 +411,7 @@ def test_server_shutdown_pauses_active_file_without_discarding_queue(tmp_path: P
             self,
             path,
             *,
+            sensitivity="default",
             on_progress=None,
             on_event=None,
             should_cancel=None,
@@ -478,7 +480,7 @@ def test_ensure_worker_drains_rehydrated_queued_item(tmp_path: Path) -> None:
     not sit idle until the next manual enqueue."""
 
     class _StubCompanion:
-        def remember(self, path, *, on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
+        def remember(self, path, *, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
             return SimpleNamespace(committed=1, queued=0)
 
     async def _run() -> str:
@@ -505,7 +507,7 @@ def test_drain_checkpoints_the_store_after_a_document_completes(tmp_path: Path) 
     inside ``writer_lock``, so no second writer can interleave."""
 
     class _StubCompanion:
-        def remember(self, path, *, on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
+        def remember(self, path, *, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
             return SimpleNamespace(committed=1, queued=0)
 
     checkpoint_calls: list[bool] = []
@@ -539,7 +541,7 @@ def test_drain_survives_a_checkpoint_failure(tmp_path: Path) -> None:
     successful ingest to ``error`` — the semantic write already committed."""
 
     class _StubCompanion:
-        def remember(self, path, *, on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
+        def remember(self, path, *, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
             return SimpleNamespace(committed=1, queued=0)
 
     class _BrokenStore:
@@ -573,7 +575,7 @@ def test_worker_records_provider_error_from_remember_result(tmp_path: Path) -> N
     )
 
     class _StubCompanion:
-        def remember(self, path, *, on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
+        def remember(self, path, *, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):  # type: ignore[no-untyped-def]
             return SimpleNamespace(
                 committed=0,
                 queued=0,

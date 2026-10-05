@@ -80,13 +80,28 @@ def stored_block_ids():
         return {row["id"] for row in json.load(response).get("nodes", [])}
 
 
+async def await_job(client, queued):
+    """P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud)."""
+    status = {}
+    for _ in range(600):
+        status = data(await client.call_tool("ingest_status", {"job_id": queued.get("job_id")}))
+        if status.get("status") in {"done", "error", "cancelled"}:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise SystemExit(f"FAIL ingest_status timeout: {status}")
+    if status.get("status") != "done" or status.get("ok") is not True:
+        raise SystemExit(f"FAIL ingest not ok: {status}")
+    return status
+
+
 async def main():
     before_blocks = block_ids()
     if len(before_blocks) != 2:
         print(f"FAIL expected_two_blocks actual={len(before_blocks)}")
 
     async with Client(URL, auth=TOKEN) as client:
-        first = data(await client.call_tool("remember", {"source": str(SOURCE)}))
+        first = await await_job(client, data(await client.call_tool("remember", {"source": str(SOURCE)})))
         alpha_before = data(await client.call_tool("explore", {"topic": "alpha paragraph"}))
         stored_before = stored_block_ids()
 
@@ -96,7 +111,7 @@ async def main():
             encoding="utf-8",
         )
         after_blocks = block_ids()
-        second = data(await client.call_tool("remember", {"source": str(SOURCE)}))
+        second = await await_job(client, data(await client.call_tool("remember", {"source": str(SOURCE)})))
         alpha_after = data(await client.call_tool("explore", {"topic": "alpha paragraph"}))
         rag_after = data(await client.call_tool("explore", {"topic": "RAG retrieval pipelines"}))
         stored_after = stored_block_ids()

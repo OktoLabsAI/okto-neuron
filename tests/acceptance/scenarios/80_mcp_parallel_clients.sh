@@ -52,12 +52,25 @@ def data(result):
 async def remember_one(index):
     async with Client(URL, auth=TOKEN) as client:
         try:
-            result = data(
+            queued = data(
                 await client.call_tool(
                     "remember", {"source": str(VAULT / "notes" / f"m{index}.md")}
                 )
             )
-            return ("ok", index, result.get("document_id"))
+            # P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud).
+            status = {}
+            for _ in range(600):
+                status = data(
+                    await client.call_tool("ingest_status", {"job_id": queued.get("job_id")})
+                )
+                if status.get("status") in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                raise SystemExit(f"FAIL ingest_status timeout: {status}")
+            if status.get("status") != "done" or status.get("ok") is not True:
+                raise SystemExit(f"FAIL ingest not ok: {status}")
+            return ("ok", index, status.get("document_id"))
         except Exception as exc:
             return ("err", index, f"{type(exc).__name__}: {str(exc)[:200]}")
 
@@ -72,7 +85,7 @@ async def main():
     async with Client(URL, auth=TOKEN) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         print(f"tools={tools}")
-        if tools != ["ask", "explore", "init_vault", "list_vaults", "remember"]:
+        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]:
             print("FAIL unexpected_tool_surface")
         for status, index, document_id in results:
             if status != "ok":
