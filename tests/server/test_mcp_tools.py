@@ -496,9 +496,16 @@ def test_remember_tool_description_is_truthful_about_paths_and_raw_text(tmp_path
     assert ".marginalia/sources/" in text and "raw text" in text.lower()
 
 
-def test_remember_normalizes_source_outside_vault_error(
+def test_remember_worker_error_surfaces_through_ingest_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    """P1: remember is async — a companion failure no longer raises at call
+    time; the job lands status=error with the companion's message, and
+    ingest_status surfaces it with ok=false. The outside-root REFUSAL itself
+    is still fail-fast at call time (see the roots test above); this covers
+    the worker-side failure lane."""
+    import asyncio
+
     from fastmcp import Client
 
     from okto_neuron.companion import SourceOutsideVaultError
@@ -508,7 +515,7 @@ def test_remember_normalizes_source_outside_vault_error(
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def remember(self, _source, *, sensitivity, on_progress=None, **_kw):
+        def remember(self, _source, *, sensitivity="default", on_progress=None, **_kw):
             raise SourceOutsideVaultError("escaped the vault root")
 
     monkeypatch.setattr(http_module, "companion_for", lambda _vault: FakeCompanion())
@@ -516,20 +523,33 @@ def test_remember_normalizes_source_outside_vault_error(
 
     async def exercise():
         async with Client(server) as client:
-            with pytest.raises(Exception) as exc_info:
-                await client.call_tool("remember", {"source": "raw note"})
-            return exc_info
+            queued = await client.call_tool("remember", {"source": "raw note"})
+            payload = queued.data if isinstance(queued.data, dict) else queued.data[0]
+            for _ in range(500):
+                status = await client.call_tool(
+                    "ingest_status", {"job_id": payload["job_id"]}
+                )
+                body = status.data if isinstance(status.data, dict) else status.data[0]
+                if body["status"] in {"done", "error", "cancelled"}:
+                    return payload, body
+                await asyncio.sleep(0.01)
+            raise AssertionError("worker never reached a terminal state")
 
     try:
-        import asyncio
-
-        exc_info = asyncio.run(exercise())
-        assert "forbidden:" in str(exc_info.value)
+        payload, body = asyncio.run(exercise())
     finally:
         state.close()
+    assert payload["status"] == "queued"
+    assert body["status"] == "error"
+    assert body["ok"] is False
+    assert "escaped the vault root" in (body["error"] or "")
 
 
-def test_remember_normalizes_ingest_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_remember_ingest_error_text_surfaces_through_ingest_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import asyncio
+
     from fastmcp import Client
 
     from okto_neuron.errors import IngestError
@@ -539,7 +559,7 @@ def test_remember_normalizes_ingest_error(tmp_path: Path, monkeypatch: pytest.Mo
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def remember(self, _source, *, sensitivity, on_progress=None, **_kw):
+        def remember(self, _source, *, sensitivity="default", on_progress=None, **_kw):
             raise IngestError("ladybug write blew up")
 
     monkeypatch.setattr(http_module, "companion_for", lambda _vault: FakeCompanion())
@@ -547,17 +567,25 @@ def test_remember_normalizes_ingest_error(tmp_path: Path, monkeypatch: pytest.Mo
 
     async def exercise():
         async with Client(server) as client:
-            with pytest.raises(Exception) as exc_info:
-                await client.call_tool("remember", {"source": "raw note"})
-            return exc_info
+            queued = await client.call_tool("remember", {"source": "raw note"})
+            payload = queued.data if isinstance(queued.data, dict) else queued.data[0]
+            for _ in range(500):
+                status = await client.call_tool(
+                    "ingest_status", {"job_id": payload["job_id"]}
+                )
+                body = status.data if isinstance(status.data, dict) else status.data[0]
+                if body["status"] in {"done", "error", "cancelled"}:
+                    return body
+                await asyncio.sleep(0.01)
+            raise AssertionError("worker never reached a terminal state")
 
     try:
-        import asyncio
-
-        exc_info = asyncio.run(exercise())
-        assert "ladybug_write_failed:" in str(exc_info.value)
+        body = asyncio.run(exercise())
     finally:
         state.close()
+    assert body["status"] == "error"
+    assert body["ok"] is False
+    assert "ladybug write blew up" in (body["error"] or "")
 
 
 # --------------------------------------------------------------------------
@@ -565,6 +593,137 @@ def test_remember_normalizes_ingest_error(tmp_path: Path, monkeypatch: pytest.Mo
 # ``version=`` on the FastMCP constructor makes the framework substitute its
 # own package version into the initialize handshake.
 # --------------------------------------------------------------------------
+
+
+def test_ingest_status_reports_done_with_ok_true_and_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """P1: the happy path — remember returns immediately with a job_id, the
+    worker finishes, and ingest_status reports done/ok=true with the queue's
+    own stage+blocks telemetry, the curation counts, and the document_id."""
+    import asyncio
+
+    from fastmcp import Client
+
+    from okto_neuron.companion import RememberResult
+    from okto_neuron.server import http as http_module
+
+    vault, path = _new_vault(tmp_path, "status-ok")
+    state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
+
+    class FakeCompanion:
+        def remember(self, _source, *, sensitivity="default", on_progress=None, **_kw):
+            if on_progress is not None:
+                on_progress("extracting", 1, 2)
+                on_progress("committing", 2, 2)
+            return RememberResult(
+                document_id="doc-42", committed=2, queued=1, blocks_total=2
+            )
+
+    monkeypatch.setattr(http_module, "companion_for", lambda _vault: FakeCompanion())
+    server = runtime._build_mcp_server(state)
+
+    async def exercise():
+        async with Client(server) as client:
+            t0 = asyncio.get_running_loop().time()
+            queued = await client.call_tool("remember", {"source": "raw note\nsecond line"})
+            call_seconds = asyncio.get_running_loop().time() - t0
+            payload = queued.data if isinstance(queued.data, dict) else queued.data[0]
+            body = None
+            for _ in range(500):
+                status = await client.call_tool("ingest_status", {"job_id": payload["job_id"]})
+                body = status.data if isinstance(status.data, dict) else status.data[0]
+                if body["status"] in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            return call_seconds, payload, body
+
+    try:
+        call_seconds, payload, body = asyncio.run(exercise())
+    finally:
+        state.close()
+    assert call_seconds < 1.0, "remember must return immediately (async)"
+    assert payload["status"] == "queued" and payload["poll"] == "ingest_status"
+    assert payload["vault"] == "status-ok", "vault is a NAME, never a path"
+    assert body["status"] == "done" and body["ok"] is True
+    assert body["stage"] == "done"
+    assert body["blocks_done"] == 2 and body["blocks_total"] == 2
+    assert body["committed"] == 2 and body["queued"] == 1
+    assert body["document_id"] == "doc-42"
+    assert body["error"] is None and body["provider_error"] is None
+    assert body["vault"] == "status-ok"
+
+
+def test_ingest_status_zero_yield_provider_error_is_ok_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The drain's zero-yield rule (provider error with nothing committed)
+    must surface as status=error, ok=false, with the provider error text."""
+    import asyncio
+
+    from fastmcp import Client
+
+    from okto_neuron.companion import RememberResult
+    from okto_neuron.server import http as http_module
+
+    vault, path = _new_vault(tmp_path, "status-zero")
+    state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
+
+    class FakeCompanion:
+        def remember(self, _source, *, sensitivity="default", on_progress=None, **_kw):
+            return RememberResult(
+                document_id="doc-z",
+                committed=0,
+                queued=0,
+                blocks_total=1,
+                provider_error="LLM endpoint 500",
+            )
+
+    monkeypatch.setattr(http_module, "companion_for", lambda _vault: FakeCompanion())
+    server = runtime._build_mcp_server(state)
+
+    async def exercise():
+        async with Client(server) as client:
+            queued = await client.call_tool("remember", {"source": "raw note"})
+            payload = queued.data if isinstance(queued.data, dict) else queued.data[0]
+            for _ in range(500):
+                status = await client.call_tool("ingest_status", {"job_id": payload["job_id"]})
+                body = status.data if isinstance(status.data, dict) else status.data[0]
+                if body["status"] in {"done", "error", "cancelled"}:
+                    return body
+                await asyncio.sleep(0.01)
+            raise AssertionError("worker never reached a terminal state")
+
+    try:
+        body = asyncio.run(exercise())
+    finally:
+        state.close()
+    assert body["status"] == "error"
+    assert body["ok"] is False
+    assert "LLM endpoint 500" in (body["provider_error"] or "")
+    assert "zero yield" in (body["error"] or "")
+
+
+def test_ingest_status_unknown_job_id_is_not_found(tmp_path: Path):
+    import asyncio
+
+    from fastmcp import Client
+
+    vault, path = _new_vault(tmp_path, "status-missing")
+    state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
+    server = runtime._build_mcp_server(state)
+
+    async def exercise():
+        async with Client(server) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool("ingest_status", {"job_id": "999-deadbeef"})
+            return str(exc_info.value)
+
+    try:
+        message = asyncio.run(exercise())
+    finally:
+        state.close()
+    assert "not_found" in message
 
 
 def test_mcp_server_info_reports_marginalia_version(tmp_path):
@@ -1596,413 +1755,12 @@ def test_lease_fenced_messages_are_unchanged(tmp_path: Path):
         state.close()
 
 
-# --------------------------------------------------------------------------
-# MCP progress notifications for ``remember``.
-#
-# A long ``remember`` used to return NOTHING for minutes and clients abort an
-# idle tool call ("sent no response or progress for 300s"), discarding the only
-# trustworthy success signal (the payload). ``remember`` now bridges
-# ``Companion.remember(on_progress=...)`` — which fires on the ``to_thread``
-# worker — onto ``Context.report_progress`` on the event loop.
-# --------------------------------------------------------------------------
-
-
-def _remember_payload_fields(result):
-    return {
-        "document_id": result.document_id,
-        "committed": result.committed,
-        "queued": result.queued,
-        "blocks_total": result.blocks_total,
-        "nodes_extracted": result.nodes_extracted,
-        "edges_extracted": result.edges_extracted,
-        "claims_minted": result.claims_minted,
-        "provider_error": result.provider_error,
-        "provider_failures": result.provider_failures,
-        "empty_after_retry_blocks": result.empty_after_retry_blocks,
-        "llm_disabled": result.llm_disabled,
-    }
-
-
-def _progress_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, emit):
-    """Wire a FakeCompanion whose ``remember`` drives ``on_progress`` via ``emit``."""
-    from okto_neuron.companion import RememberResult
-    from okto_neuron.server import http as http_module
-
-    vault, path = _new_vault(tmp_path, name)
-    state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
-    result = RememberResult(
-        document_id="doc-1", committed=2, queued=1, blocks_total=3, nodes_extracted=4
-    )
-
-    class FakeCompanion:
-        def remember(self, _source, *, sensitivity, on_progress=None, **_kw):
-            emit(on_progress)
-            return result
-
-    monkeypatch.setattr(http_module, "companion_for", lambda _vault: FakeCompanion())
-    return state, runtime._build_mcp_server(state), result
-
-
-def _three_block_ingest(on_progress):
-    """Mimic the real ``_emit`` firing pattern: stage boundaries + per block.
-
-    The extraction loop has alternate paths that emit the SAME
-    ``(stage, blocks_done)`` pair more than once for one block — duplicated
-    here deliberately so the coalescing rule is under test.
-    """
-    assert on_progress is not None
-    on_progress("parsing", 0, 0)
-    on_progress("extracting", 0, 3)
-    for block in (1, 2, 3):
-        on_progress("extracting", block, 3)
-        on_progress("extracting", block, 3)  # duplicate alternate path
-    on_progress("embedding", 3, 3)
-    on_progress("committing", 3, 3)
-
-
-def _run_remember_collecting_progress(server, seen):
-    import asyncio
-
-    from fastmcp import Client
-
-    async def handler(progress: float, total: float | None, message: str | None) -> None:
-        seen.append((progress, total, message))
-
-    async def exercise():
-        async with Client(server) as client:
-            result = await client.call_tool(
-                "remember", {"source": "a note\nacross lines"}, progress_handler=handler
-            )
-            # Notifications are fire-and-forget; let the client's receive loop
-            # drain them before asserting on the strict per-block sequence.
-            await asyncio.sleep(0.05)
-            return result
-
-    return asyncio.run(exercise())
-
-
-def test_remember_emits_progress_notification_per_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    state, server, expected = _progress_fixture(
-        tmp_path, monkeypatch, "progress-blocks", _three_block_ingest
-    )
-    seen: list[tuple[float, float | None, str | None]] = []
-    try:
-        call = _run_remember_collecting_progress(server, seen)
-    finally:
-        state.close()
-
-    # One notification per block completion...
-    blocks = [s for s in seen if s[2] and s[2].startswith("extracting ") and s[0] > 0]
-    assert [s[0] for s in blocks] == [1.0, 2.0, 3.0]
-    assert all(s[1] == 3.0 for s in blocks)
-    # ...duplicated (stage, blocks_done) pairs coalesced away.
-    assert len(seen) == len({(s[0], s[2]) for s in seen})
-    # parsing has no block count yet: total must be None, never 0.
-    parsing = [s for s in seen if s[2] == "parsing"]
-    assert parsing and parsing[0][1] is None
-    # ...and every stage boundary is represented.
-    assert {s[2].split()[0] for s in seen if s[2]} == {
-        "parsing",
-        "extracting",
-        "embedding",
-        "committing",
-    }
-
-    # The payload is the whole point: it must be UNCHANGED.
-    payload = call.data
-    assert payload["document_id"] == expected.document_id
-    for field, value in _remember_payload_fields(expected).items():
-        assert payload[field] == value
-    assert payload["outcomes"] == []
-    assert "outcome" in payload
-
-
-def _curation_ingest(on_progress):
-    """A 3-block ingest whose dedup/curation phases tick sub-stage ordinals.
-
-    Mirrors the measured live run: the blocks finish quickly, then dedup and
-    curation dominate the runtime. The keep-alive reports an item ordinal with
-    an explicitly undeclared total (0), which the bridge renders as the bare
-    stage name and sends with total=None.
-    """
-    assert on_progress is not None
-    on_progress("parsing", 0, 0)
-    on_progress("extracting", 0, 3)
-    for block in (1, 2, 3):
-        on_progress("extracting", block, 3)
-    on_progress("embedding", 3, 3)
-    on_progress("dedup", 3, 3)
-    for ordinal in (1, 6, 11, 16):
-        on_progress("dedup", ordinal, 0)
-    on_progress("committing", 3, 3)
-    for ordinal in (1, 6, 11):
-        on_progress("committing", ordinal, 0)
-
-
-def test_remember_emits_progress_through_dedup_and_curation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """The phase that dominates runtime must not be a single notification.
-
-    Pins that the sub-stage ordinals survive the bridge's (stage, done)
-    coalescing as SEPARATE notifications, and that the payload is unchanged.
-    """
-    state, server, expected = _progress_fixture(
-        tmp_path, monkeypatch, "progress-curation", _curation_ingest
-    )
-    seen: list[tuple[float, float | None, str | None]] = []
-    try:
-        call = _run_remember_collecting_progress(server, seen)
-    finally:
-        state.close()
-
-    dedup = [s for s in seen if s[2] == "dedup"]
-    committing = [s for s in seen if s[2] == "committing"]
-    # Advancing ordinals, each its own notification (the old behaviour was one).
-    assert [s[0] for s in dedup] == [1.0, 6.0, 11.0, 16.0]
-    assert [s[0] for s in committing] == [1.0, 6.0, 11.0]
-    # An undeclared total is sent as None, never 0 (no divide-by-zero, no
-    # bogus 100%).
-    assert all(s[1] is None for s in dedup + committing)
-    # Nothing was coalesced away.
-    assert len(seen) == len({(s[0], s[2]) for s in seen})
-
-    payload = call.data
-    assert payload["document_id"] == expected.document_id
-    for field, value in _remember_payload_fields(expected).items():
-        assert payload[field] == value
-
-
-def test_remember_survives_failing_progress_delivery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """A notification that cannot be delivered must never fail the ingest."""
-    state, server, expected = _progress_fixture(
-        tmp_path, monkeypatch, "progress-raises", _three_block_ingest
-    )
-
-    async def _boom(*_a, **_kw):
-        raise RuntimeError("transport gone")
-
-    import fastmcp.server.context as fastmcp_context
-
-    monkeypatch.setattr(fastmcp_context.Context, "report_progress", _boom)
-    seen: list[tuple[float, float | None, str | None]] = []
-    try:
-        call = _run_remember_collecting_progress(server, seen)
-    finally:
-        state.close()
-
-    assert seen == []
-    assert call.data["document_id"] == expected.document_id
-    assert call.data["blocks_total"] == expected.blocks_total
-
-
-def test_remember_bridge_returns_none_outside_mcp_request(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """No MCP context (direct in-process call) => no callback, no failure."""
-    import asyncio
-
-    async def _check():
-        assert runtime._mcp_progress_bridge() is None
-
-    asyncio.run(_check())
-
-    calls: list[object] = []
-    state, server, expected = _progress_fixture(
-        tmp_path, monkeypatch, "progress-nocontext", calls.append
-    )
-
-    async def exercise():
-        from fastmcp import Client
-
-        async with Client(server) as client:
-            return await client.call_tool("remember", {"source": "a note\nacross lines"})
-
-    try:
-        call = asyncio.run(exercise())
-    finally:
-        state.close()
-
-    assert call.data["document_id"] == expected.document_id
-
-
-def test_remember_progress_dispatch_does_not_block_worker_thread(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """The worker must hand the coroutine off and walk away — never join it."""
-    import asyncio as _asyncio
-
-    real = _asyncio.run_coroutine_threadsafe
-    futures: list[object] = []
-
-    class _Unjoinable:
-        def __init__(self, fut):
-            self._fut = fut
-
-        def result(self, timeout=None):  # pragma: no cover - must never run
-            raise AssertionError("worker thread joined the notification future")
-
-        def __getattr__(self, item):
-            return getattr(self._fut, item)
-
-    def _spy(coro, loop):
-        fut = _Unjoinable(real(coro, loop))
-        futures.append(fut)
-        return fut
-
-    monkeypatch.setattr(runtime.asyncio, "run_coroutine_threadsafe", _spy)
-    state, server, expected = _progress_fixture(
-        tmp_path, monkeypatch, "progress-nonblocking", _three_block_ingest
-    )
-    seen: list[tuple[float, float | None, str | None]] = []
-    try:
-        call = _run_remember_collecting_progress(server, seen)
-    finally:
-        state.close()
-
-    assert futures, "no notification was dispatched"
-    assert call.data["document_id"] == expected.document_id
-
-
-# --------------------------------------------------------------------------
-# Timer heartbeat + inline counters for MCP ``remember`` (client idle timeout).
-# --------------------------------------------------------------------------
-
-
-def _silent_ingest(seconds: float):
-    import time
-
-    def emit(on_progress):
-        time.sleep(seconds)  # one long LLM call: no block events at all
-
-    return emit
-
-
-def test_remember_heartbeat_flows_while_block_call_is_silent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(runtime, "_MCP_HEARTBEAT_INTERVAL_S", 0.1)
-    state, server, expected = _progress_fixture(
-        tmp_path, monkeypatch, "hb-silent", _silent_ingest(0.65)
-    )
-    seen: list[tuple[float, float | None, str | None]] = []
-    try:
-        call = _run_remember_collecting_progress(server, seen)
-    finally:
-        state.close()
-
-    beats = [s for s in seen if s[2] and s[2].startswith("remember in progress")]
-    assert 4 <= len(beats) <= 7  # ~0.65 s / 0.1 s, interval honoured
-    assert all(b[1] is None for b in beats)
-    assert [b[0] for b in beats] == sorted(b[0] for b in beats)
-    assert call.data["document_id"] == expected.document_id
-
-
-def test_remember_heartbeat_stops_after_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    import asyncio
-
-    monkeypatch.setattr(runtime, "_MCP_HEARTBEAT_INTERVAL_S", 0.05)
-    state, server, _ = _progress_fixture(tmp_path, monkeypatch, "hb-stop", _silent_ingest(0.2))
-    seen: list[tuple[float, float | None, str | None]] = []
-    try:
-        _run_remember_collecting_progress(server, seen)
-        n = len(seen)
-        asyncio.run(asyncio.sleep(0.3))
-    finally:
-        state.close()
-    assert n >= 2 and len(seen) == n
-
-
-def test_remember_heartbeat_cancelled_on_exception_and_no_token_ok():
-    import asyncio
-
-    async def exercise():
-        # No MCP context: a no-op that neither raises nor leaks a task.
-        before = len(asyncio.all_tasks())
-        with pytest.raises(ValueError):
-            async with runtime._mcp_heartbeat():
-                raise ValueError("boom")
-        assert len(asyncio.all_tasks()) == before
-
-    asyncio.run(exercise())
-
-
-def test_remember_heartbeat_task_cancelled_when_body_raises(monkeypatch: pytest.MonkeyPatch):
-    import asyncio
-
-    import fastmcp.server.dependencies as deps
-
-    sent: list[float] = []
-
-    class _Ctx:
-        async def report_progress(self, progress, total, message):
-            sent.append(progress)
-
-    monkeypatch.setattr(deps, "get_context", lambda: _Ctx())
-    monkeypatch.setattr(runtime, "_MCP_HEARTBEAT_INTERVAL_S", 0.02)
-
-    async def exercise():
-        before = len(asyncio.all_tasks())
-        with pytest.raises(ValueError):
-            async with runtime._mcp_heartbeat():
-                await asyncio.sleep(0.1)
-                raise ValueError("boom")
-        assert len(asyncio.all_tasks()) == before
-        n = len(sent)
-        await asyncio.sleep(0.1)
-        assert len(sent) == n >= 2
-
-    asyncio.run(exercise())
-
-
-def test_remember_inline_counters_visible_while_running_and_after(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    from okto_neuron.server import _ingest_queue as iq
-
-    holder: dict = {}
-
-    def emit(on_progress):
-        holder["during"] = iq.inline_summary(holder["runtime"])
-        holder["queue_during"] = iq.summary(holder["runtime"])
-
-    state, server, _ = _progress_fixture(tmp_path, monkeypatch, "inline-ok", emit)
-    holder["runtime"] = state.runtime_for(state.vault_path)
-    try:
-        _run_remember_collecting_progress(server, [])
-        after = iq.inline_summary(holder["runtime"])
-        queue_after = iq.summary(holder["runtime"])
-    finally:
-        state.close()
-    assert holder["during"] == {"processing": 1, "done": 0, "error": 0}
-    assert after == {"processing": 0, "done": 1, "error": 0}
-    # Normal queue counters are untouched: an inline call is not a queue item.
-    assert holder["queue_during"] == queue_after
-    assert queue_after["total"] == 0 and queue_after["processing"] == 0
-
-
-def test_remember_inline_counters_record_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from okto_neuron.server import _ingest_queue as iq
-
-    def emit(on_progress):
-        raise RuntimeError("provider exploded")
-
-    state, server, _ = _progress_fixture(tmp_path, monkeypatch, "inline-err", emit)
-    rt = state.runtime_for(state.vault_path)
-    try:
-        with pytest.raises(Exception):
-            _run_remember_collecting_progress(server, [])
-        after = iq.inline_summary(rt)
-    finally:
-        state.close()
-    assert after == {"processing": 0, "done": 0, "error": 1}
-
+# P1: the inline-progress-notification, heartbeat, and inline-counter tests
+# that lived here were deleted with the inline remember they pinned —
+# remember is async now (queue item + ingest_status), the notification
+# bridge and heartbeat are gone with it, and MCP ingests are counted as
+# queue items, not inline. Their intent survives in the ingest_status tests
+# above and tests/server/test_ingest_queue_sensitivity.py.
 
 def test_inline_summary_defaults_to_zero_for_legacy_state():
     from okto_neuron.server import _ingest_queue as iq

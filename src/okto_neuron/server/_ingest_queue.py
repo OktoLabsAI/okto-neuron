@@ -104,6 +104,9 @@ class IngestItem:
     # rehydrated) so the drain worker can honor it — the queue used to drop
     # it, silently ingesting local_only sources through remote LLMs.
     sensitivity: str = "default"  # local_only | default
+    # P1: the ingested document's id once the worker's remember returns it
+    # (persisted; empty while queued/processing or on failure).
+    document_id: str = ""
     committed: int = 0
     queued: int = 0
     error: str | None = None
@@ -1771,6 +1774,7 @@ async def _drain(
                 item.provider_error = getattr(result, "provider_error", None)
                 raw_outcome = getattr(result, "outcome", None)
                 item.outcome = dict(raw_outcome) if isinstance(raw_outcome, dict) else {}
+                item.document_id = str(getattr(result, "document_id", "") or "")
                 item.claims = int(getattr(result, "claims_minted", 0)) + sum(
                     1 for outcome in getattr(result, "outcomes", ()) if outcome.type == "Claim"
                 )

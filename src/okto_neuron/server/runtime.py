@@ -1313,125 +1313,6 @@ def _mcp_kg_add_allowed() -> bool:
     return request_is_loopback(request)
 
 
-def _mcp_progress_bridge() -> Callable[[str, int, int], None] | None:
-    """Build a ``Companion.remember`` ``on_progress`` that emits MCP progress.
-
-    WHY: a long ``remember`` used to return nothing for minutes, and clients
-    abort an idle tool call (Claude Code: "sent no response or progress for
-    300s"). The daemon finished the work but the ONLY trustworthy success
-    signal — ``units.succeeded == blocks_total`` — lives in the payload that
-    the abort discarded. Emitting a notification per block keeps the client's
-    idle timer alive so the real payload survives.
-
-    THREADING: ``remember`` runs under ``asyncio.to_thread``, so ``on_progress``
-    fires on a worker thread while ``Context.report_progress`` is a coroutine
-    that must run on the event loop. The loop and the ``Context`` are captured
-    HERE, on the loop, because ``get_context()`` reads context-local state a
-    worker thread does not have. The callback then hands the coroutine to
-    ``run_coroutine_threadsafe`` and DISCARDS the future: the worker never
-    joins it, so ingest speed never depends on notification delivery, and a
-    delivery failure can never fail the ingest (it is swallowed inside the
-    coroutine and logged at debug — the ingest is the product, the
-    notification is telemetry).
-
-    COALESCING: ``_emit`` fires once per stage boundary AND once per block, and
-    several alternate paths in the per-block extraction loop can emit the same
-    ``(stage, blocks_done)`` pair two or three times for one block. Deduping on
-    that exact pair yields one notification per block completion plus one per
-    stage change, with no throttle that could drop the very notification the
-    idle timer needs.
-
-    Returns ``None`` when there is no MCP context at all (in-memory/REST
-    callers), so the caller passes ``on_progress=None`` rather than a callback
-    that cannot do anything. ``report_progress`` itself no-ops when the client
-    sent no ``progressToken``.
-    """
-    try:
-        from fastmcp.server.dependencies import get_context  # type: ignore
-
-        ctx = get_context()
-        loop = asyncio.get_running_loop()
-    except (RuntimeError, ImportError):  # no MCP context / no running loop
-        return None
-    if ctx is None:
-        return None
-
-    last: list[tuple[str, int] | None] = [None]
-
-    async def _send(progress: float, total: float | None, message: str) -> None:
-        try:
-            await ctx.report_progress(progress, total, message)
-        except Exception:  # noqa: BLE001 - telemetry must never break ingest
-            _LOG.debug("mcp progress notification failed", exc_info=True)
-
-    def _on_progress(stage: str, blocks_done: int, blocks_total: int) -> None:
-        key = (stage, blocks_done)
-        if last[0] == key:
-            return
-        last[0] = key
-        # blocks_total is 0 during "parsing" (the block count is not known
-        # yet); send total=None so a client computing a percentage does not
-        # divide by zero.
-        total = float(blocks_total) if blocks_total > 0 else None
-        message = f"{stage} {blocks_done}/{blocks_total}" if total else stage
-        coro = _send(float(blocks_done), total, message)
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except Exception:  # noqa: BLE001 - e.g. the loop is already closed
-            # Close the never-awaited coroutine so a shutdown drain does not
-            # also emit a RuntimeWarning on top of the swallowed failure.
-            coro.close()
-            _LOG.debug("mcp progress dispatch failed", exc_info=True)
-
-    return _on_progress
-
-
-# Client idle timeout for HTTP MCP tool calls is 300 s (Claude Code); one long
-# LLM call can leave the per-block bridge silent for longer. A timer heartbeat
-# independent of block events keeps the client's idle timer alive.
-_MCP_HEARTBEAT_INTERVAL_S = 20.0
-
-
-@contextlib.asynccontextmanager
-async def _mcp_heartbeat():
-    """Send an MCP progress notification every interval while the body runs.
-
-    Started with the tool call and cancelled in ``finally`` (no notification
-    after completion). It never raises into the tool: no MCP context yields a
-    no-op, and ``report_progress`` itself no-ops without a ``progressToken``.
-    Progress is elapsed seconds; ``total`` is None (duration is unknown).
-    """
-    try:
-        from fastmcp.server.dependencies import get_context  # type: ignore
-
-        ctx = get_context()
-    except (RuntimeError, ImportError):
-        ctx = None
-    if ctx is None:
-        yield
-        return
-    started = time.monotonic()
-
-    async def _beat() -> None:
-        while True:
-            await asyncio.sleep(_MCP_HEARTBEAT_INTERVAL_S)
-            elapsed = time.monotonic() - started
-            try:
-                await ctx.report_progress(elapsed, None, f"remember in progress ({elapsed:.0f}s)")
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - telemetry must never break ingest
-                _LOG.debug("mcp heartbeat notification failed", exc_info=True)
-
-    task = asyncio.create_task(_beat())
-    try:
-        yield
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
-
-
 _DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
 _BARE_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,5}$")
 
@@ -2131,6 +2012,65 @@ def _build_mcp_server(state: ServerState):
             "vault": _serving_vault_name(runtime),
             "source_name": item.name,
             "poll": "ingest_status",
+        }
+
+    @mcp.tool()
+    async def ingest_status(
+        job_id: str, vault: str | None = None
+    ) -> dict[str, object]:
+        """Poll an async ``remember`` job (the ``job_id`` it returned).
+
+        ``status`` is ``queued | processing | done | error | cancelled``;
+        ``ok`` is the caller-friendly verdict: ``true`` ONLY for a finished
+        job whose ingest actually yielded — a provider error with zero yield
+        or a failed/integrity-failed outcome quality is ``status=error`` and
+        ``ok=false`` with the reason in ``error``/``provider_error``.
+        ``stage``/``blocks_done``/``blocks_total`` carry the within-file
+        progress (stage: queued | parsing | extracting | embedding | dedup |
+        committing | done | error), ``committed``/``queued`` the terminal
+        curation counts, ``document_id`` the ingested document once known.
+        ``vault`` is the serving vault's NAME (never a path). A ``job_id``
+        that never existed (or belongs to another vault) fails loudly as
+        ``not_found``.
+        """
+        runtime, lease = await acquire_off_loop(_lease, vault, release=_release_pair)
+        with lease:
+            detail = await iq.item_detail_async(runtime, job_id)
+        if detail is None:
+            raise RuntimeError(
+                f"not_found: no ingest job {job_id!r} on this vault; "
+                "job ids come from remember's queued result"
+            )
+        queued_item = detail["item"]
+        outcome = queued_item.get("outcome") if isinstance(queued_item.get("outcome"), dict) else {}
+        quality = str(outcome.get("quality") or "").strip()
+        zero_yield = bool(
+            queued_item.get("provider_error")
+            and int(queued_item.get("committed") or 0) == 0
+            and int(queued_item.get("queued") or 0) == 0
+            and int(queued_item.get("claims") or 0) == 0
+        )
+        # Mirrors the drain worker's own terminal rule: done AND actually
+        # yielded. Zero-yield/failed-quality items are status=error already;
+        # the explicit recomputation keeps legacy sidecar items honest too.
+        ok = queued_item.get("status") == "done" and not zero_yield and quality not in {
+            "failed",
+            "integrity_failed",
+        }
+        return {
+            "job_id": queued_item.get("id"),
+            "status": queued_item.get("status"),
+            "ok": ok,
+            "stage": queued_item.get("stage"),
+            "blocks_done": int(queued_item.get("blocks_done") or 0),
+            "blocks_total": int(queued_item.get("blocks_total") or 0),
+            "committed": int(queued_item.get("committed") or 0),
+            "queued": int(queued_item.get("queued") or 0),
+            "document_id": (str(queued_item.get("document_id") or "") or None),
+            "error": queued_item.get("error"),
+            "provider_error": queued_item.get("provider_error"),
+            "vault": _serving_vault_name(runtime),
+            "source_name": queued_item.get("name"),
         }
 
 
