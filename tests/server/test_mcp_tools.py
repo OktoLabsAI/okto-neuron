@@ -382,6 +382,12 @@ def test_remember_rejects_invalid_sensitivity_value(
 
 
 def test_remember_accepts_exact_local_only_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """P1: remember is ASYNC — it enqueues with the caller's sensitivity and
+    returns immediately; the queue worker passes local_only to
+    companion.remember. The drain is awaited INSIDE the client loop (as the
+    real server would) so the vault never closes under the worker."""
+    import asyncio
+
     from fastmcp import Client
 
     from okto_neuron.companion import RememberResult
@@ -392,7 +398,7 @@ def test_remember_accepts_exact_local_only_value(tmp_path: Path, monkeypatch: py
     observed: dict[str, object] = {}
 
     class FakeCompanion:
-        def remember(self, _source, *, sensitivity, on_progress=None, **_kw):
+        def remember(self, _source, *, sensitivity="default", on_progress=None, **_kw):
             observed["sensitivity"] = sensitivity
             return RememberResult(document_id="d1", committed=1, blocks_total=1)
 
@@ -401,12 +407,30 @@ def test_remember_accepts_exact_local_only_value(tmp_path: Path, monkeypatch: py
 
     async def exercise():
         async with Client(server) as client:
-            await client.call_tool("remember", {"source": "raw note", "sensitivity": "local_only"})
+            result = await client.call_tool(
+                "remember", {"source": "raw note", "sensitivity": "local_only"}
+            )
+            payload = result.data if hasattr(result, "data") else result
+            queued = payload if isinstance(payload, dict) else payload[0]
+            assert queued["status"] == "queued", queued
+            assert queued["poll"] == "ingest_status"
+            assert queued["job_id"]
+            # Let the drain worker finish INSIDE this loop (bounded).
+            for _ in range(500):
+                item = next(
+                    (i for i in state.ingest_queue if i.id == queued["job_id"]), None
+                )
+                if item is not None and item.status in {"done", "error", "cancelled"}:
+                    break
+                await asyncio.sleep(0.01)
+            return queued, item
 
     try:
-        import asyncio
-
-        asyncio.run(exercise())
+        queued, item = asyncio.run(exercise())
+        assert item is not None and item.status == "done", (
+            f"drain never finished: {item and item.status}"
+        )
+        assert item.sensitivity == "local_only"
         assert observed["sensitivity"] == "local_only"
     finally:
         state.close()

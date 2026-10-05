@@ -37,7 +37,6 @@ from okto_neuron.llm._litellm_process import cancel_active_litellm_calls
 from okto_neuron.server import _ingest_queue as iq
 from okto_neuron.server import _gc_tuning
 from okto_neuron.server import _integrity as graph_integrity
-from okto_neuron.server._lock_holder import held_lock
 from okto_neuron.server._preload import preload_server_modules
 from okto_neuron.server._prewarm import start_ledger_prewarm
 from okto_neuron.server._store_io import (
@@ -2017,50 +2016,44 @@ def _build_mcp_server(state: ServerState):
         sensitivity: Literal["local_only", "default"] = "default",
         vault: str | None = None,
     ) -> dict[str, object]:
-        """Ingest a source and autonomously curate it into the graph.
+        """Validate, materialize, and ENQUEUE a source for async ingest.
 
-        WRITE op — serialized by the selected vault runtime's writer lock.
-        ``source`` is EITHER a file path OR raw text. Raw text is detected
-        conservatively: multi-line strings are always raw text; a single-line
-        string counts as raw text only when it is NOT path-shaped (path-shaped =
-        an existing file/dir, contains a slash or backslash, a Windows drive
-        prefix, a space-free ``~`` prefix, or a space-free name with a short
-        file suffix like ``note.pdf``). A path-shaped source is read IN PLACE
-        and never copied: it must be an existing file inside the vault root or a
-        configured folder-watch root (``folder_watch.roots`` in the vault
-        config); a missing path fails loudly as a path error, and a file outside
-        those roots is refused with ``forbidden: ...`` naming the allowed roots
-        and how to proceed (copy it under one, add its folder to
-        ``folder_watch.roots``, or pass its text as raw text). Detected raw text
-        is the only form that is copied: it is first materialized to a durable
-        ``.marginalia/sources/`` file in the vault (same convention as REST /add
-        and /api/v1/ingest) and that copy is then ingested, so the vault keeps
-        its own text and does not reference any original file. ``sensitivity`` must be exactly ``local_only`` or ``default``
-        (enforced by the tool schema — no other value is accepted); ``local_only``
-        keeps the source off any remote LLM path.
+        ASYNC (P1): this returns immediately — ``{"job_id", "status":
+        "queued", "vault" (name, never a path), "source_name", "poll":
+        "ingest_status"}`` — after validation and raw-text materialization;
+        the vault's ingest-queue worker performs the remember under the
+        writer lock. Poll ``ingest_status(job_id)`` for stage/blocks progress
+        and the terminal committed/queued counts.
 
-        ``vault`` optionally names the registered vault to write to (a NAME from
-        ``list_vaults`` — never a path); omit it to use this connection's vault.
-        Before choosing, check the project directory for a ``.okto-neuron-vault``
-        file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
+        WRITE op — loopback-only. ``source`` is EITHER a file path OR raw
+        text. Raw text is detected conservatively: multi-line strings are
+        always raw text; a single-line string counts as raw text only when it
+        is NOT path-shaped (path-shaped = an existing file/dir, contains a
+        slash or backslash, a Windows drive prefix, a space-free ``~``
+        prefix, or a space-free name with a short file suffix like
+        ``note.pdf``). A path-shaped source is read IN PLACE and never copied:
+        it must be an existing file inside the vault root or a configured
+        folder-watch root (``folder_watch.roots`` in the vault config); a
+        missing path fails loudly as a path error, and a file outside those
+        roots is refused with ``forbidden: ...`` naming the allowed roots and
+        how to proceed (copy it under one, add its folder to
+        ``folder_watch.roots``, or pass its text as raw text). Detected raw
+        text is the only form that is copied: it is materialized to a durable
+        ``.marginalia/sources/`` file (same convention as REST /add and
+        /api/v1/ingest) and THAT copy is enqueued, so the vault keeps its own
+        text. ``sensitivity`` must be exactly ``local_only`` or ``default``
+        (enforced by the tool schema); it travels with the queue item and the
+        worker honors it — ``local_only`` keeps the source off any remote LLM
+        path.
+
+        ``vault`` optionally names the registered vault to write to (a NAME
+        from ``list_vaults`` — never a path); omit it to use this connection's
+        vault. Before choosing, check the project directory for a
+        ``.okto-neuron-vault`` file, or a pre-0.3.0 ``.marginalia-vault``
+        (``{"vault": "<name>"}``), and pass the name it pins.
         """
-        # The heartbeat covers the whole call (lock wait included); the inline
-        # counters record it in the vault's ingest summary (status "inline").
-        call = iq.InlineCall()
-        try:
-            async with _mcp_heartbeat():
-                result = await _remember_inline(source, sensitivity, vault, call)
-        except BaseException:
-            call.finish(ok=False)
-            raise
-        call.finish(ok=not result.get("provider_error"))
-        return result
-
-    async def _remember_inline(
-        source: str, sensitivity: str, vault: str | None, call: iq.InlineCall
-    ) -> dict[str, object]:
-        # WRITE op — loopback-only, even under --allow-remote (writes never widen).
-        # Matches REST /remember and the init_vault gate below.
+        # WRITE op — loopback-only, even under --allow-remote (writes never
+        # widen). Matches REST /remember and the init_vault gate below.
         if not _mcp_kg_add_allowed():
             raise RuntimeError(
                 "forbidden: remember is restricted to loopback callers; "
@@ -2076,73 +2069,70 @@ def _build_mcp_server(state: ServerState):
             if runtime.shutting_down:
                 raise RuntimeError("shutting_down: server is shutting down")
             raise RuntimeError("maintenance: vault maintenance is in progress; writes are paused")
-        call.start(runtime)
-        with lease as selected_vault:
-            async with held_lock(runtime.writer_lock, "mcp-remember"):
-                try:
-                    await store_io(graph_integrity.require_write_allowed, runtime, selected_vault)
-                    ingest_source = await store_io(
-                        _materialize_raw_text_source, selected_vault, source
-                    )
-                    # Off-load the blocking extraction so the event loop stays
-                    # responsive while this vault's lock serializes writes.
-                    result = await job_io(
-                        functools.partial(
-                            companion_for(selected_vault).remember,
-                            ingest_source,
-                            sensitivity=sens,
-                            on_progress=_mcp_progress_bridge(),
+        from okto_neuron.server.http import _companion as _queue_companion
+
+        try:
+            with lease as selected_vault:
+                # Fail fast on the integrity fence; the worker re-checks per
+                # item under the writer lock, but a fenced vault should refuse
+                # the enqueue, not accept work it will reject.
+                await store_io(
+                    graph_integrity.require_write_allowed, runtime, selected_vault
+                )
+                ingest_source = await store_io(
+                    _materialize_raw_text_source, selected_vault, source
+                )
+                # Fail fast on an out-of-tree PATH source exactly the way the
+                # inline flow did (field report: the refusal must name the
+                # roots and the remedies AT CALL TIME) — the worker would
+                # otherwise only fail the job after the caller has moved on.
+                # Raw-text sources are already under .marginalia/sources and
+                # pass trivially; missing paths pass through (the ingest
+                # reader fails closed on them, as before).
+                from okto_neuron.companion import (
+                    _source_is_ingestable_path,
+                    _source_outside_roots_message,
+                )
+                from okto_neuron.config import VaultConfig
+
+                watch_roots = list(
+                    VaultConfig.load(Path(selected_vault.path)).folder_watch.roots
+                )
+                if not _source_is_ingestable_path(
+                    ingest_source, selected_vault.path, watch_roots
+                ):
+                    raise SourceOutsideVaultError(
+                        _source_outside_roots_message(
+                            ingest_source, selected_vault.path, watch_roots
                         )
                     )
-                    runtime.note_ingest()
-                except graph_integrity.IntegrityFenceError as exc:
-                    raise RuntimeError(str(exc)) from exc
-                except SourceOutsideVaultError as exc:
-                    # Normalized the same way REST's /remember does (403
-                    # forbidden) instead of leaking the raw exception type.
-                    log_remember_failure(exc, source, _LOG)
-                    raise RuntimeError(f"forbidden: {exc}") from exc
-                except IngestError as exc:
-                    # Normalized the same way REST's /remember does
-                    # (ladybug_write_failed) instead of leaking the raw
-                    # exception type. The client only sees the message, so the
-                    # failure is logged here by the rule REST /remember uses.
-                    log_remember_failure(exc, source, _LOG)
-                    raise RuntimeError(
-                        f"ladybug_write_failed: ladybug write failed: {exc}"
-                    ) from exc
-                except Exception as exc:
-                    # Everything else keeps the client error it always had; the
-                    # server log gets what REST /remember logs for the same
-                    # failure (a store GraphBackendError or exhausted-retry
-                    # error as a failed graph write, an unexpected exception
-                    # with its traceback, a caller's bad source path as a
-                    # warning).
-                    log_remember_failure(exc, source, _LOG)
-                    raise
-        from okto_neuron.server import _curation
-
-        remember_outcome = await store_io(
-            _curation.attach_verified_reconciliation_outcome,
-            runtime,
-            dict(getattr(result, "outcome", {}) or {}),
-            trigger="verified_file_commit",
-        )
+                item = iq.enqueue_materialized(
+                    runtime, ingest_source, sensitivity=sens
+                )
+                iq.ensure_worker(runtime, _queue_companion)
+                await store_io(iq.persist, runtime)
+        except graph_integrity.IntegrityFenceError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except SourceOutsideVaultError as exc:
+            # Normalized the same way REST's /remember does (403 forbidden)
+            # instead of leaking the raw exception type.
+            log_remember_failure(exc, source, _LOG)
+            raise RuntimeError(f"forbidden: {exc}") from exc
+        except IngestError as exc:
+            # Materialization-time ingest errors keep the client wording the
+            # inline path always used.
+            log_remember_failure(exc, source, _LOG)
+            raise RuntimeError(
+                f"ladybug_write_failed: ladybug write failed: {exc}"
+            ) from exc
         return {
-            "document_id": result.document_id,
-            "committed": result.committed,
-            "queued": result.queued,
-            "blocks_total": result.blocks_total,
-            "nodes_extracted": result.nodes_extracted,
-            "edges_extracted": result.edges_extracted,
-            "claims_minted": result.claims_minted,
-            "provider_error": result.provider_error,
-            "provider_failures": result.provider_failures,
-            "empty_after_retry_blocks": result.empty_after_retry_blocks,
-            "llm_disabled": result.llm_disabled,
-            "outcomes": [o.model_dump(mode="json") for o in result.outcomes],
-            "outcome": remember_outcome,
+            "job_id": item.id,
+            "status": "queued",
+            "vault": _serving_vault_name(runtime),
+            "source_name": item.name,
+            "poll": "ingest_status",
         }
+
 
     @mcp.tool()
     async def list_vaults() -> dict[str, object]:

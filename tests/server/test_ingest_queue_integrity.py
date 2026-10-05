@@ -198,7 +198,7 @@ def _drain_result(**overrides) -> SimpleNamespace:
 
 def _run_drain(state: SimpleNamespace, result: SimpleNamespace) -> None:
     class _Companion:
-        def remember(self, path, on_progress=None, on_event=None, should_cancel=None):
+        def remember(self, path, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):
             return result
 
     state.ingest_worker_active = True
@@ -207,7 +207,7 @@ def _run_drain(state: SimpleNamespace, result: SimpleNamespace) -> None:
 
 def _run_drain_exception(state: SimpleNamespace, error: BaseException) -> None:
     class _Companion:
-        def remember(self, path, on_progress=None, on_event=None, should_cancel=None):
+        def remember(self, path, sensitivity="default", on_progress=None, on_event=None, should_cancel=None):
             raise error
 
     state.ingest_worker_active = True
