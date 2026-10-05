@@ -115,11 +115,24 @@ class _Companion:
         )
 
 
-async def _until(predicate, timeout_s: float) -> None:  # type: ignore[no-untyped-def]
+async def _until(predicate, timeout_s: float, what: str = "condition") -> None:  # type: ignore[no-untyped-def]
+    """Poll ``predicate`` until true, bounded by a monotonic deadline.
+
+    The sleep is clamped to the remaining budget so the final wake lands ON
+    the deadline and still gets one last predicate check: a condition that
+    becomes true at (or microseconds past) the deadline must not fail because
+    a fixed 20 ms sleep overshot it (the v0.3.4 tag-gate flake missed by
+    1.1 ms). The assert names what was awaited and how late it ran."""
     deadline = time.monotonic() + timeout_s
-    while not predicate():
-        assert time.monotonic() < deadline, "condition not reached in time"
-        await asyncio.sleep(0.02)
+    while True:
+        if predicate():
+            return
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, (
+            f"{what}: condition not reached in {timeout_s}s "
+            f"(missed by {-remaining * 1000:.1f} ms)"
+        )
+        await asyncio.sleep(min(0.02, remaining))
 
 
 @pytest.mark.asyncio
@@ -142,8 +155,13 @@ async def test_unanswering_model_server_fails_the_job_and_frees_the_writer_lock(
 
     def run_judge(state, job):  # type: ignore[no-untyped-def]
         job.progress("judging")
-        # What run_propose does for every cluster (curation_call_timeout_s, shrunk).
-        with _scoped_call_timeout(2.0):
+        # What run_propose does for every cluster (curation_call_timeout_s,
+        # shrunk). 4s, not 2s: litellm's cold import must fit INSIDE the scoped
+        # window or the deadline fires "before provider execution" and the
+        # silent server is never contacted (the v0.3.4 tag-gate flake). The
+        # property under test — a hung server is killed at the deadline — is
+        # unchanged.
+        with _scoped_call_timeout(4.0):
             LiteLLMProvider(resolved).complete([Message("user", "same entity?")])
         return {"never": "reached"}
 
@@ -153,7 +171,13 @@ async def test_unanswering_model_server_fails_the_job_and_frees_the_writer_lock(
 
     started = time.monotonic()
     job = _jobs.submit(state, "reconcile-propose")
-    await _until(lambda: state.writer_lock.locked(), 15)  # the snapshot job holds it
+    # NOT writer_lock.locked(): the hold is transient (an instantly-failing
+    # judge call releases in microseconds) and a 20 ms poll can step over it.
+    # "running" is sticky enough here (error/done are terminal) and proves the
+    # job started before the ingest is enqueued.
+    await _until(
+        lambda: job.status in {"running", "error", "done"}, 15, "snapshot job to start"
+    )
     state.ingest_queue.append(IngestItem(id="q", name="q.md", path=str(tmp_path / "q.md")))
     iq.ensure_worker(state, lambda _s: _Companion(remembered))
 
@@ -167,8 +191,11 @@ async def test_unanswering_model_server_fails_the_job_and_frees_the_writer_lock(
     await _until(lambda: state.ingest_queue[0].status == "done", 30)
     assert remembered == [str(tmp_path / "q.md")], "the queued ingest did not run"
     assert not state.writer_lock.locked()
-    # Sanity on the error itself: a timeout, not some unrelated failure.
-    assert "timeout" in (job.error or "").lower() or "timed out" in (job.error or "").lower()
+    # Sanity on the error itself: the scoped deadline, not some unrelated
+    # failure ("deadline expired" is the pre-dispatch branch of the same
+    # bound; "timed out" the mid-call one).
+    lowered = (job.error or "").lower()
+    assert "timeout" in lowered or "timed out" in lowered or "deadline" in lowered
 
 
 @pytest.mark.asyncio
@@ -188,7 +215,8 @@ async def test_watchdog_abandons_a_stalled_read_only_job_and_releases_the_lock(
     remembered: list[str] = []
     try:
         job = _jobs.submit(state, "reconcile-propose")
-        await _until(lambda: state.writer_lock.locked(), 10)
+        # See the first test: never poll the transient lock-hold itself.
+        await _until(lambda: job.status in {"running", "error"}, 10, "stalled job to start")
         state.ingest_queue.append(IngestItem(id="q", name="q.md", path=str(tmp_path / "q.md")))
         iq.ensure_worker(state, lambda _s: _Companion(remembered))
 

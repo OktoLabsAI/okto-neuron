@@ -618,7 +618,7 @@ jobs:
     # fixed at the root (`store/staging.py`, `store/neo4j.py`); the
     # `test_neo4j_generation.py` regression cases no longer carry
     # `xfail(strict=False)`.
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     services:
       neo4j:
