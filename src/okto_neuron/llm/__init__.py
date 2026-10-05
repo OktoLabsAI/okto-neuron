@@ -759,6 +759,31 @@ def _current_call_timeout_s() -> float | None:
     return max(float(deadline) - time.monotonic(), 0.0)
 
 
+def _consume_completion_stream(litellm: object, stream: object, on_token) -> object:
+    """Iterate a litellm streaming response into a non-stream-equivalent one.
+
+    ``on_token`` sees each content delta as it arrives (never the assembled
+    text). The chunks are handed to ``litellm.stream_chunk_builder``, which
+    produces the SAME ModelResponse shape a non-stream call returns —
+    choices/message/finish_reason/usage — so every downstream extraction
+    (usage stats, truncation flags, native finish reasons) behaves identically
+    on the stream and non-stream paths.
+    """
+    chunks: list[object] = []
+    for chunk in stream:
+        chunks.append(chunk)
+        try:
+            delta = chunk.choices[0].delta.content
+        except (AttributeError, IndexError):
+            delta = None
+        if delta:
+            try:
+                on_token(delta)
+            except Exception:  # noqa: BLE001 — telemetry must never fail the call
+                logger.debug("on_token callback failed", exc_info=True)
+    return litellm.stream_chunk_builder(chunks)  # type: ignore[attr-defined]
+
+
 def _run_litellm_completion(litellm: object, kwargs: dict) -> object:
     """Run ingest-owned HTTP work in a killable helper, never an orphan thread."""
     call_kwargs = dict(kwargs)
@@ -1593,6 +1618,7 @@ class LiteLLMProvider:
         presence_penalty: float | None = None,
         enable_thinking: bool | None = None,
         response_format: ResponseFormat | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> str:
         assert_completion_allowed()
         _preflight_provider_optional_dependencies(self._provider)
@@ -1962,9 +1988,38 @@ class LiteLLMProvider:
             prompt_chars,
             "\n".join(f"[{m.role}] {m.content}" for m in messages),
         )
+        # P2 streaming: a caller that supplied ``on_token`` wants token-level
+        # progress. The cancellable helper-process path (deadline/cancel
+        # predicate active) does NOT support streaming across the process
+        # boundary, so it deliberately falls back to the non-stream request
+        # — the heartbeat that accompanies streaming callers covers the idle
+        # timeout in that case, and the debug log names the fallback.
+        streaming = on_token is not None and (
+            _current_call_timeout_s() is None
+            and _current_call_cancel_predicate() is None
+        )
+        if on_token is not None and not streaming:
+            logger.debug(
+                "token streaming requested for %s but a task deadline/cancel "
+                "predicate is active; falling back to non-stream",
+                self.model,
+            )
         try:
             try:
-                response = _run_litellm_completion(litellm, kwargs)
+                if streaming:
+                    stream_kwargs = dict(kwargs)
+                    stream_kwargs["stream"] = True
+                    # Ask for usage in the stream's final chunk so the
+                    # assembled response carries the same usage a non-stream
+                    # call would have returned.
+                    stream_kwargs.setdefault(
+                        "stream_options", {"include_usage": True}
+                    )
+                    response = _consume_completion_stream(
+                        litellm, _run_litellm_completion(litellm, stream_kwargs), on_token
+                    )
+                else:
+                    response = _run_litellm_completion(litellm, kwargs)
             except Exception as exc:
                 if response_format is None or not _looks_like_response_format_rejection(exc):
                     raise
