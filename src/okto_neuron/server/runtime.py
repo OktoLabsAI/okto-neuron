@@ -2113,6 +2113,7 @@ def _build_mcp_server(state: ServerState):
             "committed": int(queued_item.get("committed") or 0),
             "queued": int(queued_item.get("queued") or 0),
             "document_id": (str(queued_item.get("document_id") or "") or None),
+            "llm_disabled": bool(queued_item.get("llm_disabled") or False),
             "error": queued_item.get("error"),
             "provider_error": queued_item.get("provider_error"),
             "vault": _serving_vault_name(runtime),

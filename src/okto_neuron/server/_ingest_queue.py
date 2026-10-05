@@ -107,6 +107,10 @@ class IngestItem:
     # P1: the ingested document's id once the worker's remember returns it
     # (persisted; empty while queued/processing or on failure).
     document_id: str = ""
+    # P1: the worker's remember reported the vault's LLM disabled (model-free
+    # ingest); surfaced by ingest_status so the old inline contract's
+    # llm_disabled flag survives the async switch.
+    llm_disabled: bool = False
     # P1: one-line, ~80-char preview of RAW-TEXT sources (MCP remember) so the
     # queue UI can show what the note-<hash>.md durable copy actually contains.
     # Path-sourced items leave it empty; the filename already identifies them.
@@ -1781,6 +1785,7 @@ async def _drain(
                 raw_outcome = getattr(result, "outcome", None)
                 item.outcome = dict(raw_outcome) if isinstance(raw_outcome, dict) else {}
                 item.document_id = str(getattr(result, "document_id", "") or "")
+                item.llm_disabled = bool(getattr(result, "llm_disabled", False))
                 item.claims = int(getattr(result, "claims_minted", 0)) + sum(
                     1 for outcome in getattr(result, "outcomes", ()) if outcome.type == "Claim"
                 )

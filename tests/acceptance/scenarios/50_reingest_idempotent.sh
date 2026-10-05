@@ -48,24 +48,41 @@ def payload(result):
     return data if isinstance(data, dict) else {}
 
 
+async def await_job(client, queued):
+    """P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud)."""
+    status = {}
+    for _ in range(600):
+        status = payload(await client.call_tool("ingest_status", {"job_id": queued.get("job_id")}))
+        if status.get("status") in {"done", "error", "cancelled"}:
+            break
+        await asyncio.sleep(0.1)
+    else:
+        raise SystemExit(f"FAIL ingest_status timeout: {status}")
+    if status.get("status") != "done" or status.get("ok") is not True:
+        raise SystemExit(f"FAIL ingest not ok: {status}")
+    return status
+
+
 async def main():
     async with Client(URL, auth=TOKEN) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         print(f"tools={tools}")
-        if tools != ["ask", "explore", "init_vault", "list_vaults", "remember"]:
+        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]:
             print("FAIL unexpected_tool_surface")
 
-        first = payload(await client.call_tool("remember", {"source": SOURCE}))
+        first = await await_job(client, payload(await client.call_tool("remember", {"source": SOURCE})))
         first_graph = payload(
             await client.call_tool("explore", {"topic": "idempotency", "k": 12})
         )
-        second = payload(await client.call_tool("remember", {"source": SOURCE}))
+        second = await await_job(client, payload(await client.call_tool("remember", {"source": SOURCE})))
         second_graph = payload(
             await client.call_tool("explore", {"topic": "idempotency", "k": 12})
         )
 
         same_document = first.get("document_id") == second.get("document_id")
         same_seeds = first_graph.get("seeds") == second_graph.get("seeds")
+        # P1: remember returns the queued job; llm_disabled lives on the
+        # finished job's status payload (the worker's remember result).
         disabled = first.get("llm_disabled") is True and second.get("llm_disabled") is True
         print(f"same_document={same_document}")
         print(f"same_seeds={same_seeds}")
