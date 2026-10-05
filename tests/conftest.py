@@ -88,14 +88,26 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def assert_home_is_isolated() -> None:
-    """Fail loudly if ``Path.home()`` or the app homes resolve into the real home."""
+    """Fail loudly if ``Path.home()`` or the app homes resolve into the real home.
+
+    The OS temp subtree is exempt: on Windows the pytest temp factory roots
+    at ``%LOCALAPPDATA%\\Temp``, which lives INSIDE the user profile, so a
+    scratch home there is still a scratch home — it never overlays the real
+    account's ``.marginalia``/``.okto-neuron``. On POSIX the temp dir was
+    never under the real home, so the exemption changes nothing.
+    """
+
+    import os
+    import tempfile
+
     real = _real_home()
     home = Path.home()
+    temp_root = Path(os.path.realpath(tempfile.gettempdir()))
     problems = []
-    if _is_under(home, real):
+    if _is_under(home, real) and not _is_under(home, temp_root):
         problems.append(f"Path.home() = {home} is the real user home {real} (or under it)")
     for dirname in _APP_HOME_DIRNAMES:
-        if _is_under(home / dirname, real):
+        if _is_under(home / dirname, real) and not _is_under(home / dirname, temp_root):
             problems.append(f"{home / dirname} resolves under the real home {real}")
     if problems:
         message = "REAL-HOME GUARD: refusing to run tests against live data: " + "; ".join(problems)
