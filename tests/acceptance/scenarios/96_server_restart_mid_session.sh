@@ -41,8 +41,14 @@ def fail(message: str) -> None:
 
 if not isinstance(payload, dict):
     fail("payload is not an object")
-if set(payload) != {"version", "pid", "start_token", "owner_id"}:
+_required_keys = {"version", "pid", "start_token", "owner_id"}
+if not _required_keys <= set(payload) <= _required_keys | {"capabilities"}:
     fail("payload keys do not match the canonical schema")
+if "capabilities" in payload and (
+    not isinstance(payload["capabilities"], list)
+    or not all(isinstance(item, str) for item in payload["capabilities"])
+):
+    fail("capabilities is not a list of strings")
 if type(payload["version"]) is not int:
     fail("version is not an integer")
 if payload["version"] != lifecycle.PID_RECORD_VERSION:

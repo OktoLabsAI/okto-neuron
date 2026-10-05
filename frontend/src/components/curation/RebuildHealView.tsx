@@ -97,7 +97,7 @@ function SemanticGate({ gate }: { gate: SemanticRebuildGate }) {
           {failedChecks.map((check) => (
             <li
               key={check.code}
-              className="rounded border border-rose-900/50 bg-surface-950/40 px-3 py-2"
+              className="rounded-sm border border-rose-900/50 bg-surface-950/40 px-3 py-2"
             >
               <div className="flex flex-wrap items-center gap-2">
                 <code className="text-xs text-rose-200">{check.code}</code>

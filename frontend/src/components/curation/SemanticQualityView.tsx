@@ -88,7 +88,7 @@ function EvidenceValue({ value }: { value: unknown }) {
       {reason && <p className="text-xs leading-relaxed text-surface-500">{reason}</p>}
       <details className="text-xs text-surface-500">
         <summary className="cursor-pointer select-none hover:text-surface-300">View evidence</summary>
-        <pre className="mt-2 max-h-72 overflow-auto rounded bg-surface-950 p-3 font-mono text-[11px] leading-relaxed text-surface-300">
+        <pre className="mt-2 max-h-72 overflow-auto rounded-sm bg-surface-950 p-3 font-mono text-[11px] leading-relaxed text-surface-300">
           {JSON.stringify(value, null, 2)}
         </pre>
       </details>
@@ -147,7 +147,7 @@ function InvariantRow({ check }: { check: SemanticInvariantCheck }) {
           <summary className="cursor-pointer select-none hover:text-surface-300">
             Evidence samples ({check.samples.length})
           </summary>
-          <pre className="mt-2 max-h-64 overflow-auto rounded bg-surface-950 p-3 font-mono text-[11px] text-surface-300">
+          <pre className="mt-2 max-h-64 overflow-auto rounded-sm bg-surface-950 p-3 font-mono text-[11px] text-surface-300">
             {JSON.stringify(check.samples, null, 2)}
           </pre>
         </details>
@@ -334,7 +334,7 @@ function Governance({ governance }: { governance: SemanticGovernanceResponse }) 
             </summary>
             <ul className="mt-2 space-y-2">
               {observed.map((item) => (
-                <li key={item.fingerprint} className="rounded border border-surface-800 p-2">
+                <li key={item.fingerprint} className="rounded-sm border border-surface-800 p-2">
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge
                       tone={
@@ -391,7 +391,7 @@ function Governance({ governance }: { governance: SemanticGovernanceResponse }) 
             <summary className="cursor-pointer select-none hover:text-surface-300">
               View all {registry.counts.total} registered predicates
             </summary>
-            <ul className="mt-2 max-h-[32rem] space-y-2 overflow-auto pr-1">
+            <ul className="mt-2 max-h-128 space-y-2 overflow-auto pr-1">
               {registry.records.map((record) => (
                 <PredicateRecord key={record.label} record={record} />
               ))}
@@ -413,7 +413,7 @@ function Governance({ governance }: { governance: SemanticGovernanceResponse }) 
               <summary className="cursor-pointer select-none hover:text-surface-300">
                 View durable identity decisions
               </summary>
-              <ul className="mt-2 max-h-[32rem] space-y-2 overflow-auto pr-1">
+              <ul className="mt-2 max-h-128 space-y-2 overflow-auto pr-1">
                 {decisions.records.map((decision) => (
                   <IdentityDecision key={decision.decision_id} decision={decision} />
                 ))}

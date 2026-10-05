@@ -695,7 +695,7 @@ export function GraphView() {
                 }
               }}
               placeholder="find node to focus…"
-              className="w-full bg-transparent px-2 py-1.5 text-sm text-surface-100 placeholder:text-surface-600 focus:outline-none"
+              className="w-full bg-transparent px-2 py-1.5 text-sm text-surface-100 placeholder:text-surface-600 focus:outline-hidden"
             />
             {search && (
               <button
@@ -704,7 +704,7 @@ export function GraphView() {
                   setSearch('')
                   setSearchResults([])
                 }}
-                className="rounded p-1 text-surface-500 hover:bg-surface-800 hover:text-surface-200"
+                className="rounded-sm p-1 text-surface-500 hover:bg-surface-800 hover:text-surface-200"
                 title="Clear node search"
               >
                 <X size={13} />
@@ -786,7 +786,7 @@ export function GraphView() {
             return (
               <label
                 key={t.type}
-                className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-surface-800"
+                className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-surface-800"
               >
                 <input
                   type="checkbox"
@@ -816,7 +816,7 @@ export function GraphView() {
           {(stats?.edge_types ?? []).map((t) => (
             <label
               key={t.type}
-              className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-surface-800"
+              className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-surface-800"
             >
               <input
                 type="checkbox"
@@ -845,7 +845,7 @@ export function GraphView() {
             max={5000}
             value={filters.limit}
             onChange={(e) => setFilters({ limit: Math.max(1, Number(e.target.value) || 1) })}
-            className="w-20 rounded border border-surface-700 bg-surface-900 px-2 py-1 text-right text-surface-100 focus:border-accent-600 focus:outline-none"
+            className="w-20 rounded-sm border border-surface-700 bg-surface-900 px-2 py-1 text-right text-surface-100 focus:border-accent-600 focus:outline-hidden"
           />
         </label>
         <label className="mb-3 flex items-center justify-between gap-2 px-1 text-xs text-surface-400">
@@ -855,7 +855,7 @@ export function GraphView() {
             min={0}
             value={filters.minDegree}
             onChange={(e) => setFilters({ minDegree: Math.max(0, Number(e.target.value) || 0) })}
-            className="w-20 rounded border border-surface-700 bg-surface-900 px-2 py-1 text-right text-surface-100 focus:border-accent-600 focus:outline-none"
+            className="w-20 rounded-sm border border-surface-700 bg-surface-900 px-2 py-1 text-right text-surface-100 focus:border-accent-600 focus:outline-hidden"
           />
         </label>
         <button
@@ -978,7 +978,7 @@ export function GraphView() {
                 {pendingNodeTypes.length > 0 ? (
                   <div className="mt-1 flex flex-wrap gap-1.5">
                     {pendingNodeTypes.map(([type, count]) => (
-                      <span key={type} className="rounded border border-amber-700/30 px-1.5 py-0.5 text-amber-50">
+                      <span key={type} className="rounded-sm border border-amber-700/30 px-1.5 py-0.5 text-amber-50">
                         {type} {count}
                       </span>
                     ))}
@@ -995,7 +995,7 @@ export function GraphView() {
                     {pendingPredicates.map(([predicate, count]) => (
                       <span
                         key={predicate}
-                        className="rounded border border-amber-700/30 px-1.5 py-0.5 font-mono text-[11px] text-amber-50"
+                        className="rounded-sm border border-amber-700/30 px-1.5 py-0.5 font-mono text-[11px] text-amber-50"
                       >
                         {predicate} {count}
                       </span>
@@ -1035,7 +1035,7 @@ export function GraphView() {
               </div>
             )}
             {error && (
-              <div className="absolute left-1/2 top-6 w-[28rem] max-w-[80%] -translate-x-1/2">
+              <div className="absolute left-1/2 top-6 w-md max-w-[80%] -translate-x-1/2">
                 <ErrorBox message={error} />
               </div>
             )}
@@ -1125,10 +1125,10 @@ function EdgeDetailPanel({
   const dst: NodeRef = target ?? { id: edge.dst, type: 'Node', name: edge.dst }
 
   return (
-    <aside className="flex w-[28rem] shrink-0 flex-col overflow-y-auto border-l border-surface-800 bg-surface-900/60">
-      <div className="sticky top-0 flex items-center justify-between border-b border-surface-800 bg-surface-900/90 px-4 py-3 backdrop-blur">
+    <aside className="flex w-md shrink-0 flex-col overflow-y-auto border-l border-surface-800 bg-surface-900/60">
+      <div className="sticky top-0 flex items-center justify-between border-b border-surface-800 bg-surface-900/90 px-4 py-3 backdrop-blur-sm">
         <h2 className="text-sm font-semibold">Edge detail</h2>
-        <button onClick={onClose} className="rounded p-1 text-surface-400 hover:bg-surface-800 hover:text-surface-200">
+        <button onClick={onClose} className="rounded-sm p-1 text-surface-400 hover:bg-surface-800 hover:text-surface-200">
           <X size={16} />
         </button>
       </div>

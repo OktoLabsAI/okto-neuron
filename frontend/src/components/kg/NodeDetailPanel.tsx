@@ -33,10 +33,10 @@ export function NodeDetailPanel({
   }, [nodeId])
 
   return (
-    <aside className="flex w-[28rem] shrink-0 flex-col overflow-y-auto border-l border-surface-800 bg-surface-900/60">
-      <div className="sticky top-0 flex items-center justify-between border-b border-surface-800 bg-surface-900/90 px-4 py-3 backdrop-blur">
+    <aside className="flex w-md shrink-0 flex-col overflow-y-auto border-l border-surface-800 bg-surface-900/60">
+      <div className="sticky top-0 flex items-center justify-between border-b border-surface-800 bg-surface-900/90 px-4 py-3 backdrop-blur-sm">
         <h2 className="text-sm font-semibold">Node detail</h2>
-        <button onClick={onClose} className="rounded p-1 text-surface-400 hover:bg-surface-800 hover:text-surface-200">
+        <button onClick={onClose} className="rounded-sm p-1 text-surface-400 hover:bg-surface-800 hover:text-surface-200">
           <X size={16} />
         </button>
       </div>

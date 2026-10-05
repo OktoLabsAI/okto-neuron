@@ -50,11 +50,34 @@ _NEURON_PATH_VARS = (
 _APP_HOME_DIRNAMES = (".marginalia", ".okto-neuron")
 
 
-def _real_home() -> Path:
-    import os
-    import pwd
+_REAL_HOME_CACHE: Path | None = None
+"""The real account home, resolved once before any isolation fixture runs.
 
-    return Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+``pytest_configure`` (and import-time callers) always precede the per-test
+HOME/USERPROFILE patching, so the first call captures the real home. Later
+calls — from inside isolated tests — reuse it: on Windows the fallback reads
+``USERPROFILE`` from the environment, which the isolation fixtures repoint
+at the scratch directory.
+"""
+
+
+def _real_home() -> Path:
+    global _REAL_HOME_CACHE
+    import os
+
+    if _REAL_HOME_CACHE is not None:
+        return _REAL_HOME_CACHE
+    try:
+        import pwd
+    except ImportError:
+        # Windows has no pwd module; USERPROFILE is the account's real home
+        # (expanduser("~") reads it, possibly via HOMEDRIVE/HOMEPATH fallbacks).
+        _REAL_HOME_CACHE = Path(
+            os.path.realpath(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
+        )
+        return _REAL_HOME_CACHE
+    _REAL_HOME_CACHE = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+    return _REAL_HOME_CACHE
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -65,14 +88,26 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def assert_home_is_isolated() -> None:
-    """Fail loudly if ``Path.home()`` or the app homes resolve into the real home."""
+    """Fail loudly if ``Path.home()`` or the app homes resolve into the real home.
+
+    The OS temp subtree is exempt: on Windows the pytest temp factory roots
+    at ``%LOCALAPPDATA%\\Temp``, which lives INSIDE the user profile, so a
+    scratch home there is still a scratch home — it never overlays the real
+    account's ``.marginalia``/``.okto-neuron``. On POSIX the temp dir was
+    never under the real home, so the exemption changes nothing.
+    """
+
+    import os
+    import tempfile
+
     real = _real_home()
     home = Path.home()
+    temp_root = Path(os.path.realpath(tempfile.gettempdir()))
     problems = []
-    if _is_under(home, real):
+    if _is_under(home, real) and not _is_under(home, temp_root):
         problems.append(f"Path.home() = {home} is the real user home {real} (or under it)")
     for dirname in _APP_HOME_DIRNAMES:
-        if _is_under(home / dirname, real):
+        if _is_under(home / dirname, real) and not _is_under(home / dirname, temp_root):
             problems.append(f"{home / dirname} resolves under the real home {real}")
     if problems:
         message = "REAL-HOME GUARD: refusing to run tests against live data: " + "; ".join(problems)
@@ -122,11 +157,33 @@ def pytest_configure(config: pytest.Config) -> None:
     sys.addaudithook(_write_guard_audit)
 
 
+def _isolate_home_env(patch: pytest.MonkeyPatch, scratch: str) -> None:
+    """Point every home-resolving variable at one scratch directory.
+
+    ``HOME`` covers POSIX. On Windows ``Path.home()``/``os.path.expanduser``
+    ignore ``HOME`` and resolve via ``USERPROFILE`` (falling back to
+    ``HOMEDRIVE``+``HOMEPATH``), so those move too — otherwise the real-home
+    guard correctly refuses a run whose ``HOME`` is isolated but whose
+    ``Path.home()`` still lands on the real account home (the Windows CI
+    failure mode). POSIX behavior is unchanged: the Windows variables are
+    only touched on ``nt``.
+    """
+
+    import os
+
+    patch.setenv("HOME", scratch)
+    if os.name == "nt":
+        patch.setenv("USERPROFILE", scratch)
+        drive, rest = os.path.splitdrive(scratch)
+        patch.setenv("HOMEDRIVE", drive or "C:")
+        patch.setenv("HOMEPATH", rest or "\\")
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _session_isolated_home(tmp_path_factory: pytest.TempPathFactory):
     """Session-wide scratch HOME, then assert it is not the real one."""
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("HOME", str(tmp_path_factory.mktemp("session_home")))
+        _isolate_home_env(mp, str(tmp_path_factory.mktemp("session_home")))
         for name in _NEURON_PATH_VARS:
             mp.delenv(name, raising=False)
         assert_home_is_isolated()
@@ -138,7 +195,7 @@ def _isolated_home_and_neuron_env(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Per-test scratch HOME and no path variables; re-assert before the test body."""
-    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    _isolate_home_env(monkeypatch, str(tmp_path_factory.mktemp("home")))
     for name in _NEURON_PATH_VARS:
         monkeypatch.delenv(name, raising=False)
     assert_home_is_isolated()

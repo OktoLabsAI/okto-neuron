@@ -191,11 +191,21 @@ if status != 200 or "results" not in recall:
     print(f"FAIL /recall status={status} body={recall}")
     ok = False
 
-status, stats = get_json("/api/v1/graph/stats")
+# graph/stats is projection-served (server/_projection.py): the first read on
+# a vault without a projection answers 202 {"status":"building"} and only
+# starts the build, so poll (bounded) until the projection is ready.
+status, stats = 0, {}
+deadline = time.time() + 60
+while True:
+    status, stats = get_json("/api/v1/graph/stats")
+    if status == 200:
+        break
+    if time.time() >= deadline:
+        print(f"FAIL graph/stats not ready after 60s status={status} body={stats}")
+        ok = False
+        break
+    time.sleep(0.5)
 Path_write(stats_out, stats)
-if status != 200:
-    print(f"FAIL graph/stats status={status}")
-    ok = False
 
 # curation rebuild -> 202 + job, poll status, then rollback -> 202 + job.
 status, rebuild = post_json("/api/v1/curation/rebuild", {})

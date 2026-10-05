@@ -538,7 +538,7 @@ export function CompanionReviewView() {
                     type="checkbox"
                     checked={selected.has(id)}
                     onChange={() => toggleSelected(id)}
-                    className="mt-1 h-4 w-4 rounded border-surface-700 bg-surface-950"
+                    className="mt-1 h-4 w-4 rounded-sm border-surface-700 bg-surface-950"
                   />
                 )}
                 <div className="min-w-0 flex-1">
@@ -554,7 +554,7 @@ export function CompanionReviewView() {
                       <span className="text-xs text-surface-500">{String(it.reason)}</span>
                     ) : null}
                   </div>
-                  <p className="mt-1 break-words text-sm text-surface-200">
+                  <p className="mt-1 wrap-break-word text-sm text-surface-200">
                     {String(it.title ?? id)}
                   </p>
                   <p className="break-all font-mono text-xs text-surface-600">{id}</p>

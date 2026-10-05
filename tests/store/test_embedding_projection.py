@@ -7,7 +7,6 @@ read through the helpers that feed ``add_node`` keeps its stored embedding.
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 import pytest

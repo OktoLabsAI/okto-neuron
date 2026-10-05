@@ -71,7 +71,7 @@ export function DriftView() {
           value={corpusRoot}
           onChange={(e) => setCorpusRoot(e.target.value)}
           placeholder="/absolute/path/to/vault"
-          className="min-w-[20rem] flex-1 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none"
+          className="min-w-[20rem] flex-1 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden"
         />
         <button
           onClick={run}

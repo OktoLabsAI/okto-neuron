@@ -352,7 +352,7 @@ export function IngestLogsView() {
                       value={query}
                       onChange={(event) => setQuery(event.target.value)}
                       placeholder="Search files"
-                      className="h-9 w-full rounded-lg border border-surface-700 bg-surface-950 pl-8 pr-3 text-xs text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+                      className="h-9 w-full rounded-lg border border-surface-700 bg-surface-950 pl-8 pr-3 text-xs text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
                     />
                   </div>
                   <Filter size={15} className="text-surface-500" />
@@ -361,7 +361,7 @@ export function IngestLogsView() {
                   <select
                     value={statusFilter}
                     onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
-                    className="h-9 min-w-0 rounded-lg border border-surface-700 bg-surface-950 px-2 text-xs text-surface-200 outline-none focus:border-accent-600"
+                    className="h-9 min-w-0 rounded-lg border border-surface-700 bg-surface-950 px-2 text-xs text-surface-200 outline-hidden focus:border-accent-600"
                   >
                     {STATUS_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -470,7 +470,7 @@ export function IngestLogsView() {
                 <select
                   value={eventKindFilter}
                   onChange={(event) => setEventKindFilter(event.target.value)}
-                  className="h-9 min-w-0 rounded-lg border border-surface-700 bg-surface-950 px-2 text-xs text-surface-200 outline-none focus:border-accent-600"
+                  className="h-9 min-w-0 rounded-lg border border-surface-700 bg-surface-950 px-2 text-xs text-surface-200 outline-hidden focus:border-accent-600"
                 >
                   {eventKinds.map((kind) => (
                     <option key={kind} value={kind}>
@@ -776,7 +776,7 @@ function LedgerInspector() {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search ledger runs"
-            className="h-9 w-full rounded-lg border border-surface-700 bg-surface-950 pl-8 pr-3 text-xs text-surface-100 outline-none placeholder:text-surface-600 focus:border-accent-600"
+            className="h-9 w-full rounded-lg border border-surface-700 bg-surface-950 pl-8 pr-3 text-xs text-surface-100 outline-hidden placeholder:text-surface-600 focus:border-accent-600"
           />
         </div>
         <button
@@ -1007,7 +1007,7 @@ function PendingKgPreview({ preview }: { preview: LedgerPendingCommitPreview }) 
               {predicateEntries.map(([predicate, count]) => (
                 <span
                   key={predicate}
-                  className="rounded border border-surface-700 px-1.5 py-0.5 font-mono text-[11px] text-surface-300"
+                  className="rounded-sm border border-surface-700 px-1.5 py-0.5 font-mono text-[11px] text-surface-300"
                 >
                   {predicate} {count}
                 </span>
