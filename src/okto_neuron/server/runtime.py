@@ -2021,6 +2021,13 @@ def _build_mcp_server(state: ServerState):
                             ingest_source, selected_vault.path, watch_roots
                         )
                     )
+                # A PATH-shaped source that does not exist fails loudly as a
+                # path error at call time (the docstring's contract) instead
+                # of enqueueing a job that only fails in the worker.
+                if ingest_source == source and not Path(str(ingest_source)).expanduser().is_file():
+                    raise RuntimeError(
+                        f"bad_path: source does not exist: {ingest_source}"
+                    )
                 item = iq.enqueue_materialized(
                     runtime,
                     ingest_source,

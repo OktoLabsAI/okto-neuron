@@ -38,7 +38,7 @@ from fastmcp import Client
 URL = sys.argv[1]
 SOURCE = sys.argv[2]
 TOKEN = os.environ["OKTO_NEURON_AUTH_TOKEN"]
-EXPECTED_TOOLS = ["ask", "explore", "init_vault", "list_vaults", "remember"]
+EXPECTED_TOOLS = ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]
 
 
 def data(result):
@@ -66,6 +66,20 @@ async def main():
             print("FAIL unexpected_tool_surface")
 
         remembered = data(await client.call_tool("remember", {"source": SOURCE}))
+        # P1: remember is ASYNC — enqueue, then poll ingest_status to done/ok.
+        document_id = None
+        for _ in range(600):
+            status = data(
+                await client.call_tool("ingest_status", {"job_id": remembered.get("job_id")})
+            )
+            if status.get("status") in {"done", "error", "cancelled"}:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise SystemExit(f"FAIL ingest_status timeout: {status}")
+        if status.get("status") != "done" or status.get("ok") is not True:
+            raise SystemExit(f"FAIL ingest not ok: {status}")
+        document_id = status.get("document_id")
         errors = 0
         for label, tool, arguments in CASES:
             try:
@@ -77,7 +91,7 @@ async def main():
                 print(f"{label}: ERR {type(exc).__name__}: {message}")
 
         graph = data(await client.call_tool("explore", {"topic": "badargsprobe", "k": 3}))
-        good_call = remembered.get("document_id") in graph.get("seeds", [])
+        good_call = document_id in graph.get("seeds", [])
         final_tools = sorted(tool.name for tool in await client.list_tools())
         print(f"bad_error_count={errors}/{len(CASES)}")
         print(f"good_call={good_call}")

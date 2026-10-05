@@ -91,10 +91,22 @@ async def main():
     async with Client(MCP_URL, auth=TOKEN) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         print(f"tools={tools}")
-        if tools != ["ask", "explore", "init_vault", "list_vaults", "remember"]:
+        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]:
             print("FAIL unexpected_tool_surface")
         remembered = data(await client.call_tool("remember", {"source": str(SOURCE)}))
-        document_id = remembered.get("document_id")
+        # P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud).
+        for _ in range(600):
+            status = data(
+                await client.call_tool("ingest_status", {"job_id": remembered.get("job_id")})
+            )
+            if status.get("status") in {"done", "error", "cancelled"}:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise SystemExit(f"FAIL ingest_status timeout: {status}")
+        if status.get("status") != "done" or status.get("ok") is not True:
+            raise SystemExit(f"FAIL ingest not ok: {status}")
+        document_id = status.get("document_id")
         for sentinel in SENTINELS:
             graph = data(await client.call_tool("explore", {"topic": sentinel, "k": 12}))
             if document_id in graph.get("seeds", []):
