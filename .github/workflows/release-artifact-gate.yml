@@ -431,6 +431,14 @@ jobs:
           npx --prefix frontend playwright install --with-deps chromium
           npm --prefix frontend run test:release-browser
 
+      - name: Upload the release wheel artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: okto-neuron-wheel
+          path: ${{ env.WHEEL }}
+          retention-days: 90
+
   windows-managed-credentials:
     name: windows-managed-credentials
     runs-on: windows-latest
