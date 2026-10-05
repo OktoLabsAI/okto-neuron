@@ -163,6 +163,12 @@ class LadybugStore:
         VaultConnection._get_handle(self.vault_path, self._graph_handle)
 
     @property
+    def embedding_dim(self) -> int | None:
+        """The width of the vectors this graph stores (``GraphStore`` member),
+        from the open handle's schema metadata (``None`` until known)."""
+        return getattr(self._graph_handle, "embedding_dim", None)
+
+    @property
     def is_closed(self) -> bool:
         return self._closed
 

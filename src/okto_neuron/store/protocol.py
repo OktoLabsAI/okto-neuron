@@ -116,6 +116,23 @@ class GraphStore(Protocol):
     def close(self) -> None: ...
 
     @property
+    def embedding_dim(self) -> int | None:
+        """The width of the vectors this graph stores, or ``None`` when the
+        backend has no fixed stored width (in-memory) or cannot know it.
+
+        Read-only, resolved at open from the backend's own schema metadata.
+        The vault's dimension guard (``Vault._ensure_embedding_compatible``)
+        compares this against the configured embedding width so a hot config
+        change that no longer matches the on-disk graph fails loud BEFORE
+        query/ingest — instead of sealing a semantic plan whose vectors are
+        the wrong width and wedging the vault mid-apply. Backends that store
+        a fixed-width vector column (Ladybug, Grafx, Neo4j) return the
+        stored int; the in-memory store has no such identity and returns
+        ``None`` (the guard then skips, as before).
+        """
+        ...
+
+    @property
     def is_closed(self) -> bool:
         """True once ``close()`` has run on this store, False before.
 

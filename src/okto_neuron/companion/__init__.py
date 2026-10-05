@@ -2971,7 +2971,12 @@ class Companion:
             raise IngestError(
                 source,
                 vault_path=self._vault.path,
-                message="multiple unreceipted semantic plans require operator recovery",
+                message=(
+                    f"multiple unreceipted semantic plans ({len(pending_plans)}) require "
+                    "operator recovery: run `okto-neuron kg plans list`, then resume or "
+                    "abandon each with `okto-neuron kg plans resume <run>` / "
+                    "`okto-neuron kg plans abandon <run> --reason <why>`"
+                ),
             )
         if len(matching_plans) > 1:
             raise IngestError(
@@ -2980,7 +2985,8 @@ class Companion:
                 message="multiple unreceipted plans target the same document",
             )
         if pending_plans and not matching_plans:
-            owner = pending_plans[0].context
+            blocking = pending_plans[0]
+            owner = blocking.context
             owner_description = (
                 f"manual review {owner.get('candidate_id')}"
                 if owner.get("intent") == "manual_review_resolution"
@@ -2991,7 +2997,10 @@ class Companion:
                 vault_path=self._vault.path,
                 message=(
                     "a different sealed semantic plan must be resumed before new "
-                    f"ingest work: {owner_description}"
+                    f"ingest work: {owner_description} (run {blocking.run_id}); run "
+                    f"`okto-neuron kg plans resume {blocking.run_id}` to finish it, or "
+                    f"`okto-neuron kg plans abandon {blocking.run_id} --reason <why>` "
+                    "to discard it"
                 ),
             )
         if matching_plans:

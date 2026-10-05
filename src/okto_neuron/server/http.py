@@ -1120,6 +1120,23 @@ def _grafx_buffer_budget(state: ServerState | VaultRuntime, vault_path: Path) ->
     return value if isinstance(value, int) else None
 
 
+def _pending_sealed_plans_count(vault_path: Path) -> int | None:
+    """Sealed-but-unreceipted plan count for the status payload.
+
+    ``None`` means the ledger exists but cannot be validated (the count is
+    unknown, not zero); a vault with no ledger file at all is simply 0.
+    """
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    ledger = CandidateLedger(Path(vault_path) / ".marginalia")
+    if not ledger.path.is_file():
+        return 0
+    try:
+        return len(ledger.unreceipted_commit_plans())
+    except ValueError:
+        return None
+
+
 def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
     """Store op: discover runtimes, read integrity verdicts and backend pins."""
     now = time.time()
@@ -1254,6 +1271,25 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
             reasons.append(
                 f"review_queue_migration_required: {refused_path.name}: {refusal['remedy']}"
             )
+    # 7. Ingest wedge (P0): a sealed plan without a commit receipt blocks every
+    #    later remember on that vault until an operator resumes or abandons it.
+    pending_sealed_counts = {
+        runtime.vault_path: _pending_sealed_plans_count(runtime.vault_path)
+        for runtime in runtimes
+    }
+    pending_sealed_total = sum(
+        count for count in pending_sealed_counts.values() if count is not None
+    )
+    if pending_sealed_total:
+        wedged = ", ".join(
+            f"{path.name}: {count}"
+            for path, count in sorted(pending_sealed_counts.items())
+            if count
+        )
+        reasons.append(
+            f"pending_sealed_plans: {wedged} sealed plan(s) without a commit receipt "
+            "block every later ingest; run `okto-neuron kg plans list` to recover"
+        )
     vault_summaries = [
         {
             "path": str(runtime.vault_path),
@@ -1264,6 +1300,7 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
             "curation": _jobs.summary(runtime),
             "maintenance": bool(runtime.maintenance_tasks),
             "integrity": integrity,
+            "pending_sealed_plans": pending_sealed_counts[runtime.vault_path],
             # A v1 vault is refused (no open, no writes) until explicitly migrated.
             "review_queue": queue_refusals[runtime.vault_path]
             or {"state": "ok", "code": None, "remedy": None},
@@ -1306,6 +1343,7 @@ def _status_payload(state: ServerState | VaultRuntime) -> dict[str, Any]:
         "folder_watch_last_poll_age": folder_watch_last_poll_age,
         "folder_watch_restart_count": getattr(state, "folder_watch_restart_count", 0),
         "queue_error_count": queue_error_count,
+        "pending_sealed_plans": pending_sealed_total,
         "ingest": ingest_summary,
         "integrity": (
             {
@@ -6123,6 +6161,39 @@ async def api_ingest_batch(request: Request) -> JSONResponse:
     return JSONResponse(snap)
 
 
+async def api_ledger_pending_plans(request: Request) -> JSONResponse:
+    """Sealed-but-unreceipted commit plans for the selected vault (read-only).
+
+    Operator recovery surface for the ingest wedge: each row is one plan that
+    blocks every later ``remember`` until it is resumed or abandoned (see
+    ``kg plans``). Same ledger read the status payload counts.
+    """
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    state = get_state()
+    if state.shutting_down:
+        return _draining_response()
+    vault_path = state.vault_path
+
+    def _load() -> tuple[list[dict[str, Any]] | None, str | None]:
+        ledger = CandidateLedger(Path(vault_path) / ".marginalia")
+        if not ledger.path.is_file():
+            return [], None
+        try:
+            return [dict(summary) for summary in ledger.pending_plan_summaries()], None
+        except ValueError as exc:
+            return None, str(exc)
+
+    plans, error = await store_io(_load)
+    if error is not None:
+        return _err(409, "invalid_candidate_ledger", error)
+    assert plans is not None
+    return JSONResponse(
+        {"plans": plans, "count": len(plans)},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def api_ingest_queue(request: Request) -> JSONResponse:
     """Live queue status for the UI poll (read-only)."""
     state = get_state()
@@ -7992,6 +8063,7 @@ def _routes() -> list[Route]:
             methods=["POST"],
         ),
         Route("/api/v1/ingest-cancel", api_ingest_cancel, methods=["POST"]),
+        Route("/api/v1/ledger/pending-plans", api_ledger_pending_plans, methods=["GET"]),
         Route("/api/v1/ledger/runs", api_ledger_runs, methods=["GET"]),
         Route("/api/v1/ledger/runs/{run_id}", api_ledger_run_detail, methods=["GET"]),
         Route("/api/v1/ledger/summary", api_ledger_summary, methods=["GET"]),

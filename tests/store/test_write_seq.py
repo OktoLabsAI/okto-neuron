@@ -24,6 +24,7 @@ _READ_ONLY = frozenset(
     {
         "get_node", "get_nodes", "list_nodes", "list_edges", "generation", "health",
         "recovery_status", "detect_drift", "is_closed", "checkpoint", "close",
+        "embedding_dim",
     }
 )
 _MUTATING = frozenset({"add_node", "add_edge"})

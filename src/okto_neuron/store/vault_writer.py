@@ -45,6 +45,7 @@ _API_EQUIVALENT: dict[str, str] = {
     "reconcile review reject": "POST /api/v1/reconcile/review/reject",
     "init --wipe": "POST /api/v1/reset",
     "onboard": "PATCH /api/v1/config",
+    "plans resume": "POST /api/v1/ingest (with the plan's source)",
 }
 
 

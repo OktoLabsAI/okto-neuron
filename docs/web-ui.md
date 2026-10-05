@@ -1236,3 +1236,35 @@ recorded in a separate per-vault counter instead: `GET /api/v1/status` carries
 `provider_error` or raises counts as `error`, otherwise `done`). The queue counters (`total`,
 `queued`, `processing`, `done`, `error`, `cancelled`) and `/api/v1/ingest-queue` are unchanged;
 inline calls are not queue items. The counters are in memory and reset on daemon restart.
+
+## Addendum · 2026-10-05 — the ingest wedge: read-only pending-plan surface, `kg plans` recovery, and the embedding-dimension guard that prevents it
+
+**The incident.** A vault's embedding config can be hot-edited (PATCH `/api/v1/config`) while the
+daemon serves it. When the configured width stopped matching the stored graph's width, the vault's
+dimension guard was a silent no-op on grafx (it read the stored width only from Ladybug's
+`_graph_handle`), so the next `remember` sealed a semantic plan, failed mid-apply on the driver's
+vector-width validation, and left a sealed-but-unreceipted commit plan in
+`.marginalia/candidate-ledger.jsonl` that blocked **every later ingest** with "a different sealed
+semantic plan must be resumed before new ingest work" — and no surface could resume or abandon it.
+
+**Prevention (the guard).** `Vault._ensure_embedding_compatible` now reads the stored width from
+the public `GraphStore.embedding_dim` property that every backend implements (grafx and neo4j from
+their schema metadata, ladybug from its open handle; in-memory returns `None` and skips). The
+guard runs before any plan is sealed on ingest, and every query/ask/explore path embeds through
+the same guarded `Vault.embedder` property, so a width mismatch fails with
+`EmbeddingDimMismatch` — naming both remedies (re-embed via `kg reembed` / the Re-embed action, or
+revert the embedding config) instead of wedging mid-apply.
+
+**Recovery (the new surface).** For a vault already carrying a pending sealed plan:
+
+- `GET /api/v1/ledger/pending-plans` (read-only, vault-scoped) lists each one: run id, source,
+  document, intent, receipts vs operations, and seal time. `GET /api/v1/status` carries
+  `pending_sealed_plans` (top level and per vault row) and adds a `pending_sealed_plans:` degraded
+  reason while any exist — the hook for a future UI banner.
+- The CLI settles them: `okto-neuron kg plans list`, `kg plans resume <run>` (re-runs the
+  apply-resume lane for the plan's source — no re-extraction, no LLM calls), and
+  `kg plans abandon <run> --reason <why>` (refuses, exit 2, while operation receipts exist and
+  prints exactly which graph operations were already applied; `--force-partial` accepts them and
+  the abandon row records the receipts that stay applied).
+- The blocking `IngestError` itself names the plan's run id and the exact resume/abandon commands,
+  so the wedge is self-describing at the point of failure.

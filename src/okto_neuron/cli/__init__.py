@@ -864,6 +864,64 @@ def kg_reindex_command(ctx: click.Context, vault: Path | None, force: bool) -> N
     ctx.exit(_run_kg_command("kg_reindex", vault, force=force))
 
 
+@kg_group.group("plans")
+def kg_plans_group() -> None:
+    """Operator recovery for sealed-but-unreceipted ingest plans (P0).
+
+    A sealed commit plan without a commit receipt blocks every later ``remember``
+    on the vault (an interrupted apply leaves the vault wedged). List, resume
+    (finish the remaining operations) or abandon (discard the plan) each one.
+    """
+
+
+@kg_plans_group.command("list")
+@click.argument("vault", required=False, type=click.Path(path_type=Path))
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+@click.pass_context
+def kg_plans_list_command(ctx: click.Context, vault: Path | None, as_json: bool) -> None:
+    """List pending sealed plans (read-only). Mirrors GET /api/v1/ledger/pending-plans."""
+    ctx.exit(_run_kg_command("kg_plans_list", vault, as_json=as_json))
+
+
+@kg_plans_group.command("resume")
+@click.argument("run_id")
+@click.argument("vault", required=False, type=click.Path(path_type=Path))
+@click.pass_context
+def kg_plans_resume_command(ctx: click.Context, run_id: str, vault: Path | None) -> None:
+    """Finish one sealed plan by re-running the resume lane for its source.
+
+    Replays the plan's remaining graph operations without re-extraction or
+    LLM calls. While the daemon serves the vault this is refused (exit 5):
+    POST /api/v1/ingest with the plan's source runs the same resume lane.
+    """
+    ctx.exit(_run_kg_command("kg_plans_resume", run_id, vault))
+
+
+@kg_plans_group.command("abandon")
+@click.argument("run_id")
+@click.argument("vault", required=False, type=click.Path(path_type=Path))
+@click.option("--reason", required=True, help="Why the plan is discarded (recorded durably).")
+@click.option(
+    "--force-partial",
+    is_flag=True,
+    default=False,
+    help=(
+        "Accept leaving already-applied operations in the graph. Without it, a "
+        "plan with operation receipts is refused and the receipts are printed."
+    ),
+)
+@click.pass_context
+def kg_plans_abandon_command(
+    ctx: click.Context, run_id: str, vault: Path | None, reason: str, force_partial: bool
+) -> None:
+    """Durably close one sealed plan so new ingest work can proceed."""
+    ctx.exit(
+        _run_kg_command(
+            "kg_plans_abandon", run_id, vault, reason=reason, force_partial=force_partial
+        )
+    )
+
+
 @kg_group.group("reconcile")
 def kg_reconcile_group() -> None:
     """Retroactive entity reconciliation (v0.0.5, ADR 0008).

@@ -197,9 +197,24 @@ class Vault:
         return getattr(self.store, "index", None)
 
     def _ensure_embedding_compatible(self, embedder: object) -> None:
-        """Fail before query/ingest when hot config no longer matches the graph."""
-        handle = getattr(self.store, "_graph_handle", None)
-        stored_dim = getattr(handle, "embedding_dim", None)
+        """Fail before query/ingest when hot config no longer matches the graph.
+
+        The stored width comes from the store's public ``embedding_dim``
+        property (a ``GraphStore`` member every backend implements — Grafx
+        and Neo4j adopt it from their schema-metadata node, Ladybug from its
+        open handle, in-memory returns ``None``). The legacy ``_graph_handle``
+        read survives only as a fallback for stores predating the property
+        (test doubles). Reading the private handle was what made this guard a
+        silent no-op on Grafx (the default backend): no ``_graph_handle``
+        exists there, so a hot dimension edit sailed through to ``remember``,
+        sealed a semantic plan, and failed mid-apply against the fixed-width
+        vector column — leaving a half-applied plan that wedged every later
+        ingest (P0 ingest-wedge).
+        """
+        stored_dim = getattr(self.store, "embedding_dim", None)
+        if stored_dim is None:
+            handle = getattr(self.store, "_graph_handle", None)
+            stored_dim = getattr(handle, "embedding_dim", None)
         configured_dim = getattr(embedder, "dim", None)
         if not isinstance(stored_dim, int) or not isinstance(configured_dim, int):
             return
@@ -208,8 +223,10 @@ class Vault:
 
         from okto_neuron.errors import EmbeddingDimMismatch
 
+        graph_path = getattr(self.store, "graph_path", None) or self.path / "graph.lbug"
+
         raise EmbeddingDimMismatch(
-            self.path / "graph.lbug",
+            graph_path,
             stored_dim=stored_dim,
             configured_dim=configured_dim,
             vault_path=self.path,

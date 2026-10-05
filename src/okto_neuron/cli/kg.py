@@ -16,7 +16,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import click
@@ -80,6 +80,7 @@ from okto_neuron.store.staging import (
 from okto_neuron.vault_registry import resolve_vault_reference
 
 if TYPE_CHECKING:
+    from okto_neuron.consolidate.ledger import CandidateLedger, CommitPlanSnapshot
     from okto_neuron.store.ladybug import LadybugStore as LadybugStoreType
     from okto_neuron.store.staging import StagingPort
 
@@ -3374,6 +3375,198 @@ def kg_review_queue_migrate(
     return 0
 
 
+# --- kg plans: operator recovery for sealed-but-unreceipted plans (P0) -------
+
+
+def _plans_ledger(vault_path: Path) -> "CandidateLedger":
+    """The vault's candidate ledger, refusing a vault that has none."""
+    from okto_neuron.consolidate.ledger import CandidateLedger
+
+    ledger = CandidateLedger(vault_path / ".marginalia")
+    if not ledger.path.is_file():
+        raise click.ClickException(f"candidate ledger not found: {ledger.path}")
+    return ledger
+
+
+def _pending_plans(ledger: "CandidateLedger") -> list["CommitPlanSnapshot"]:
+    """Unreceipted plans, with the ledger's own refusal surfaced as a CLI error."""
+    try:
+        return list(ledger.unreceipted_commit_plans())
+    except ValueError as exc:
+        raise click.ClickException(
+            f"cannot read sealed plans from an invalid candidate ledger: {exc}"
+        ) from exc
+
+
+def _plan_by_run(plans: list["CommitPlanSnapshot"], run_id: str) -> "CommitPlanSnapshot":
+    for plan in plans:
+        if plan.run_id == run_id:
+            return plan
+    raise click.ClickException(
+        f"no unreceipted sealed plan with run id {run_id!r}; "
+        "run `okto-neuron kg plans list` to see the pending plans"
+    )
+
+
+def _print_receipts(plan: "CommitPlanSnapshot", receipts: dict[str, dict[str, Any]]) -> None:
+    """Name exactly which planned graph operations were already applied."""
+    for operation in sorted(plan.operations, key=lambda op: str(op["operation_id"])):
+        operation_id = str(operation["operation_id"])
+        receipt = receipts.get(operation_id)
+        if receipt is None:
+            continue
+        click.echo(
+            f"  {operation_id}  {operation['operation']}  "
+            f"[{receipt.get('status')}] already applied to the graph"
+        )
+
+
+def kg_plans_list(vault: Path | None = None, *, as_json: bool = False) -> int:
+    """List sealed-but-unreceipted semantic plans (read-only, no lease).
+
+    Each listed plan blocks every later ``remember`` on the vault until it is
+    resumed (``kg plans resume <run>``) or abandoned (``kg plans abandon <run>
+    --reason <why>``). Mirrors ``GET /api/v1/ledger/pending-plans``.
+    """
+    vault_path = _resolve_rebuild_vault(vault)
+    ledger = _plans_ledger(vault_path)
+    summaries = ledger.pending_plan_summaries()
+    if as_json:
+        click.echo(json.dumps({"vault": str(vault_path), "plans": list(summaries)}, indent=2))
+        return 0
+    if not summaries:
+        click.echo(f"no pending sealed plans ({vault_path})")
+        return 0
+    click.echo(f"pending sealed plans ({vault_path}):")
+    for summary in summaries:
+        click.echo(
+            f"  run {summary['run_id']}\n"
+            f"    source:      {summary['source'] or '(none)'}\n"
+            f"    document:    {summary['document_id'] or '(none)'} "
+            f"(intent: {summary['intent']})\n"
+            f"    receipts:    {summary['receipts']}/{summary['operations']} operations "
+            f"applied\n"
+            f"    sealed at:   {summary['sealed_at'] or '(unknown)'}"
+        )
+        if summary["receipts"]:
+            click.echo(
+                "    note: partially applied; abandoning needs --force-partial, "
+                "resuming finishes the remaining operations"
+            )
+    click.echo(
+        "resume with `okto-neuron kg plans resume <run>`; abandon with "
+        "`okto-neuron kg plans abandon <run> --reason <why>`"
+    )
+    return 0
+
+
+def kg_plans_resume(run_id: str, vault: Path | None = None) -> int:
+    """Finish one sealed plan by re-running the existing resume lane.
+
+    Re-``remember``s the plan's pinned source: ``Companion.remember`` detects
+    the sealed plan for that source and replays its remaining operations
+    without re-extraction or LLM calls (ADR 0039 apply-resume lane).
+    """
+    from okto_neuron.companion import Companion
+    from okto_neuron.vault import Vault
+
+    vault_path = _resolve_rebuild_vault(vault)
+    ledger = _plans_ledger(vault_path)
+    plans = _pending_plans(ledger)
+    plan = _plan_by_run(plans, run_id)
+    others = [other for other in plans if other.plan_id != plan.plan_id]
+    if others:
+        blocking = ", ".join(sorted(other.run_id for other in others))
+        raise click.ClickException(
+            "this vault has more than one pending sealed plan, so no resume can "
+            f"run: abandon the others first (pending runs: {blocking})"
+        )
+    source = str(plan.context.get("source") or "")
+    source_path = Path(source) if source else None
+    if source_path is None or not source_path.is_file():
+        raise click.ClickException(
+            f"the sealed plan's source no longer exists ({source or 'none'}); abandon "
+            f"the plan instead: okto-neuron kg plans abandon {plan.run_id} --reason <why>"
+        )
+    with vault_writer(vault_path, "plans resume"):
+        vault_obj = Vault.open(vault_path)
+        try:
+            result = Companion(vault_obj).remember(source_path)
+        finally:
+            vault_obj.close()
+    click.echo(
+        f"resumed run {plan.run_id}: document {result.document_id} "
+        f"(committed={result.committed} queued={result.queued} "
+        f"dead_lettered={result.dead_lettered})"
+    )
+    return 0
+
+
+def kg_plans_abandon(
+    run_id: str,
+    vault: Path | None = None,
+    *,
+    reason: str,
+    force_partial: bool = False,
+) -> int:
+    """Durably close one sealed plan so new ingest work can proceed.
+
+    Refuses (exit 2) while the plan has operation receipts -- those graph
+    writes already happened -- unless ``--force-partial`` accepts them, in
+    which case the abandon row names every receipt that stays applied.
+    """
+    vault_path = _resolve_rebuild_vault(vault)
+    ledger = _plans_ledger(vault_path)
+    plans = _pending_plans(ledger)
+    plan = _plan_by_run(plans, run_id)
+    try:
+        receipts = ledger.operation_receipts(plan)
+    except ValueError as exc:
+        raise click.ClickException(f"cannot read the plan's receipts: {exc}") from exc
+    if receipts and not force_partial:
+        click.echo(
+            f"refusing to abandon run {plan.run_id}: {len(receipts)} of "
+            f"{len(plan.operations)} planned operation(s) were already applied to "
+            "the graph and would be left applied with no plan record:"
+        )
+        _print_receipts(plan, receipts)
+        click.echo(
+            "resume it instead (`okto-neuron kg plans resume "
+            f"{plan.run_id}`), or re-run with --force-partial to accept"
+        )
+        return 2
+    with vault_writer(vault_path, "plans abandon"):
+        try:
+            ledger.record_plan_abandoned(
+                plan.run_id,
+                plan_id=plan.plan_id,
+                plan_hash=plan.plan_hash,
+                reason=reason,
+                evidence={"operator": "kg plans abandon"},
+                force_partial=force_partial,
+            )
+        except ValueError as exc:
+            raise click.ClickException(f"cannot abandon the sealed plan: {exc}") from exc
+        ledger.finish_run(
+            plan.run_id,
+            state="abandoned",
+            summary={
+                "reason": reason,
+                "abandoned_by": "kg plans abandon",
+                "force_partial": force_partial,
+            },
+        )
+    click.echo(f"abandoned run {plan.run_id} (reason: {reason})")
+    if receipts:
+        click.echo(
+            f"{len(receipts)} operation(s) stay applied in the graph and are named "
+            "in the abandon record:"
+        )
+        _print_receipts(plan, receipts)
+    click.echo("new ingest work can proceed")
+    return 0
+
+
 __all__ = [
     "kg_init",
     "kg_rebuild",
@@ -3385,6 +3578,9 @@ __all__ = [
     "kg_reconcile_review_reject",
     "kg_review_queue_migrate",
     "kg_reconcile_heal",
+    "kg_plans_list",
+    "kg_plans_resume",
+    "kg_plans_abandon",
     "kg_snapshot_dump",
     "kg_snapshot_verify",
     "kg_snapshot_load",
