@@ -152,7 +152,7 @@ function EventCard({ event }: { event: IngestEvent }) {
   return (
     <details className="rounded-lg border border-surface-800 bg-surface-950/50" open={event.kind === 'llm_request' || event.kind === 'llm_response'}>
       <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-xs">
-        <span className="rounded border border-surface-700 px-1.5 py-0.5 font-mono text-[10px] uppercase text-accent-300">
+        <span className="rounded-sm border border-surface-700 px-1.5 py-0.5 font-mono text-[10px] uppercase text-accent-300">
           {event.kind}
         </span>
         <span className="min-w-0 flex-1 truncate text-surface-200">{event.summary}</span>
@@ -447,7 +447,7 @@ export function BulkImport() {
               onChange={(e) => setPath(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && void scanFolder()}
               placeholder="/absolute/path/to/folder"
-              className="flex-1 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none"
+              className="flex-1 rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 font-mono text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden"
             />
             <button
               onClick={() => void scanFolder()}
@@ -696,7 +696,7 @@ export function BulkImport() {
                               : it.status}
                       </span>
                       {it.event_count ? (
-                        <span className="shrink-0 rounded border border-surface-700 px-1.5 py-0.5 text-[10px] text-surface-500">
+                        <span className="shrink-0 rounded-sm border border-surface-700 px-1.5 py-0.5 text-[10px] text-surface-500">
                           {it.event_count} events
                         </span>
                       ) : null}

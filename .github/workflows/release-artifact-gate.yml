@@ -332,7 +332,12 @@ jobs:
 
           payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
           expected_pid = int(sys.argv[2])
-          assert set(payload) == {"version", "pid", "start_token", "owner_id"}
+          _required_keys = {"version", "pid", "start_token", "owner_id"}
+          assert _required_keys <= set(payload) <= _required_keys | {"capabilities"}
+          if "capabilities" in payload:
+              assert isinstance(payload["capabilities"], list) and all(
+                  isinstance(item, str) for item in payload["capabilities"]
+              )
           assert payload["version"] == lifecycle.PID_RECORD_VERSION
           assert payload["pid"] == expected_pid
           current_token = lifecycle._process_start_token(expected_pid)

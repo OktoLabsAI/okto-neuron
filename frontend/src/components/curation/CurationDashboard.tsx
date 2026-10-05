@@ -215,7 +215,7 @@ function SchedulerPanel({ sched }: { sched: SchedulerStatus }) {
           {sched.recent.slice(0, 8).map((j) => (
             <div
               key={j.id}
-              className="flex items-center justify-between rounded border border-surface-800 bg-surface-950 px-2 py-1 text-xs"
+              className="flex items-center justify-between rounded-sm border border-surface-800 bg-surface-950 px-2 py-1 text-xs"
             >
               <span className="font-mono text-surface-400">{j.kind}</span>
               <span className="text-surface-500">{fmtTime(j.finished_at ?? j.created_at)}</span>

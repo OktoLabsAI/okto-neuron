@@ -67,7 +67,7 @@ export function NeighborhoodGraph({
         nodesConnectable={false}
       >
         <Background color="#1e293b" gap={18} />
-        <Controls showInteractive={false} className="!bg-surface-800 !text-surface-200" />
+        <Controls showInteractive={false} className="bg-surface-800! !text-surface-200" />
       </ReactFlow>
     </div>
   )

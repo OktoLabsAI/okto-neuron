@@ -49,7 +49,7 @@ export function ProvenanceChip({
   byteEnd: number
 }) {
   return (
-    <code className="inline-flex items-center gap-1 rounded bg-surface-900 px-2 py-1 font-mono text-xs text-accent-400 ring-1 ring-surface-700">
+    <code className="inline-flex items-center gap-1 rounded-sm bg-surface-900 px-2 py-1 font-mono text-xs text-accent-400 ring-1 ring-surface-700">
       {path}
       <span className="text-surface-500">
         [{byteStart}:{byteEnd}]
@@ -61,7 +61,7 @@ export function ProvenanceChip({
 // ── form primitives ────────────────────────────────────────────────────────────
 
 const _inputBase =
-  'rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none'
+  'rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden'
 
 export function Select({
   value,

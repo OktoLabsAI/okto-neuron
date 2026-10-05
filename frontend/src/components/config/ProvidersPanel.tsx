@@ -17,7 +17,7 @@ import {
 import type { NamedCredential, ProviderProfile, ProviderType } from '@/types'
 
 const inputCls =
-  'w-full rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-none'
+  'w-full rounded-lg border border-surface-700 bg-surface-900 px-3 py-2 text-sm text-surface-100 placeholder:text-surface-600 focus:border-accent-600 focus:outline-hidden'
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -355,7 +355,7 @@ export function ProvidersPanel({
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2 text-sm text-surface-100">
                   {provider.name}
-                  {provider.uses.map((use) => <span key={use} className="rounded border border-surface-700 px-1.5 py-0.5 text-[10px] text-surface-400">{use}</span>)}
+                  {provider.uses.map((use) => <span key={use} className="rounded-sm border border-surface-700 px-1.5 py-0.5 text-[10px] text-surface-400">{use}</span>)}
                   <span className="text-[10px] text-surface-500">{provider.parameter_mode}</span>
                   <span className="text-[10px] text-surface-500">
                     {provider.allow_remote ? 'remote allowed' : 'loopback only'}
