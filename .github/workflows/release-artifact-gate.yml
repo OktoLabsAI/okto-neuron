@@ -664,7 +664,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "gate6_start=$(date +%s)" >> "$GITHUB_ENV"
-          uv run --extra neo4j python -m pytest \
+          uv run --extra neo4j --extra litellm python -m pytest \
             tests/store tests/curation tests/cli tests/config \
             tests/test_server_http.py tests/test_server_api_v1.py \
             tests/reconcile tests/server tests/test_dependency_contract.py \
