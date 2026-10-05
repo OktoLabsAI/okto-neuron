@@ -19137,6 +19137,35 @@ recorded in a separate per-vault counter instead: <code>GET /api/v1/status</code
 <code>provider_error</code> or raises counts as <code>error</code>, otherwise <code>done</code>). The queue counters (<code>total</code>,
 <code>queued</code>, <code>processing</code>, <code>done</code>, <code>error</code>, <code>cancelled</code>) and <code>/api/v1/ingest-queue</code> are unchanged;
 inline calls are not queue items. The counters are in memory and reset on daemon restart.</p>
+<h2 id="docs__web-ui--addendum--2026-10-05--the-ingest-wedge-read-only-pending-plan-surface-kg-plans-recovery-and-the-embedding-dimension-guard-that-prevents-it">Addendum · 2026-10-05 — the ingest wedge: read-only pending-plan surface, <code>kg plans</code> recovery, and the embedding-dimension guard that prevents it</h2>
+<p><strong>The incident.</strong> A vault's embedding config can be hot-edited (PATCH <code>/api/v1/config</code>) while the
+daemon serves it. When the configured width stopped matching the stored graph's width, the vault's
+dimension guard was a silent no-op on grafx (it read the stored width only from Ladybug's
+<code>_graph_handle</code>), so the next <code>remember</code> sealed a semantic plan, failed mid-apply on the driver's
+vector-width validation, and left a sealed-but-unreceipted commit plan in
+<code>.marginalia/candidate-ledger.jsonl</code> that blocked <strong>every later ingest</strong> with &quot;a different sealed
+semantic plan must be resumed before new ingest work&quot; — and no surface could resume or abandon it.</p>
+<p><strong>Prevention (the guard).</strong> <code>Vault._ensure_embedding_compatible</code> now reads the stored width from
+the public <code>GraphStore.embedding_dim</code> property that every backend implements (grafx and neo4j from
+their schema metadata, ladybug from its open handle; in-memory returns <code>None</code> and skips). The
+guard runs before any plan is sealed on ingest, and every query/ask/explore path embeds through
+the same guarded <code>Vault.embedder</code> property, so a width mismatch fails with
+<code>EmbeddingDimMismatch</code> — naming both remedies (re-embed via <code>kg reembed</code> / the Re-embed action, or
+revert the embedding config) instead of wedging mid-apply.</p>
+<p><strong>Recovery (the new surface).</strong> For a vault already carrying a pending sealed plan:</p>
+<ul>
+<li><code>GET /api/v1/ledger/pending-plans</code> (read-only, vault-scoped) lists each one: run id, source,
+document, intent, receipts vs operations, and seal time. <code>GET /api/v1/status</code> carries
+<code>pending_sealed_plans</code> (top level and per vault row) and adds a <code>pending_sealed_plans:</code> degraded
+reason while any exist — the hook for a future UI banner.</li>
+<li>The CLI settles them: <code>okto-neuron kg plans list</code>, <code>kg plans resume &lt;run&gt;</code> (re-runs the
+apply-resume lane for the plan's source — no re-extraction, no LLM calls), and
+<code>kg plans abandon &lt;run&gt; --reason &lt;why&gt;</code> (refuses, exit 2, while operation receipts exist and
+prints exactly which graph operations were already applied; <code>--force-partial</code> accepts them and
+the abandon row records the receipts that stay applied).</li>
+<li>The blocking <code>IngestError</code> itself names the plan's run id and the exact resume/abandon commands,
+so the wedge is self-describing at the point of failure.</li>
+</ul>
 </div></div></div><div class="doc" id="frontend__README"><div class="doc-head" onclick="toggleDoc(this.parentNode)"><span class="chev">▶</span><div class="meta"><div class="dt">Web UI developer guide</div><div class="ds">The concise frontend layout, seven-view map, development workflow, and explicit mock-mode contract.</div></div><a class="src" href="../../frontend/README.md" onclick="event.stopPropagation()">frontend/README.md</a></div><div class="doc-body"><div class="md"><h1 id="frontend__README--okto-neuron-web-ui">Okto Neuron Web UI</h1>
 <p>Built SPA (React 18 + Vite + TS + Tailwind 3 + Zustand 5, graph viz via <code>@xyflow/react</code>),
 served by Okto Neuron's Starlette server. Talks to the backend strictly via the
