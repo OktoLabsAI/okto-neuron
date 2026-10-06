@@ -17,6 +17,7 @@ import contextlib
 import errno
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -1586,6 +1587,59 @@ def _vault_llm_model_hint(vault_path: Path) -> str | None:
     return None
 
 
+_MCP_INSTRUCTIONS = """
+Okto Neuron is a local-first knowledge-graph memory for agents. Ingest sources
+(remember), retrieve grounded facts (recall / explore), or get a synthesized
+answer (ask). Every fact carries provenance (source path + byte span).
+
+WHICH TOOL WHEN
+- recall: lookups and fact checks; use when you will iterate or quote.
+  Cheap, no LLM: hybrid vector+BM25+title search with provenance.
+- explore: walk entities and relations from a node (structured graph, no LLM).
+- ask: ONE-SHOT synthesized prose only (slow, LLM). Check
+  retrieval.synthesis_status; cite the sources it lists.
+- remember: async. It returns {job_id}; poll ingest_status(job_id) until
+  status=done and ok=true. ingest_status also carries stage/progress.
+- list_vaults: vault NAMES (never paths) when several are registered.
+
+VAULTS: omit the vault argument to use this connection's vault; check the
+project directory for .okto-neuron-vault ({"vault": "<name>"}) and pass that
+name.
+
+SENSITIVITY: remember(sensitivity="local_only") keeps a source off any remote
+LLM. It only works when the vault's LLM is local (api_base host is loopback,
+RFC1918, IPv6 ULA fc00::/7, or link-local; "localhost" counts, hostnames
+do not).
+
+ERRORS
+- EmbeddingDimMismatch: the vault's embedding config disagrees with the graph;
+  an operator must run `okto-neuron kg reembed` (or revert the config).
+- "a different sealed semantic plan must be resumed": an interrupted ingest
+  wedged the vault; an operator runs `okto-neuron kg plans list` then
+  resume/abandon.
+- not_found: no such vault/job id; check list_vaults / remember's job_id.
+
+CITE SOURCES: quote the vault-relative path and byte span from provenance,
+not just the fact.
+"""
+
+
+def _hit_span_text(hit, cap: int = 2000) -> str:
+    """The hit's provenance byte span, read from disk and capped.
+
+    Best-effort: an unreadable or missing source yields an empty string, not
+    an error — the hit's metadata is still useful without the text."""
+    try:
+        path = Path(hit.provenance.path)
+        start = max(0, int(hit.provenance.byte_start))
+        end = max(start, int(hit.provenance.byte_end))
+        with path.open("rb") as fh:
+            fh.seek(start)
+            return fh.read(min(end - start, cap)).decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
 def _build_mcp_server(state: ServerState):
     """Build FastMCP tools over client-scoped, leased vault runtimes.
 
@@ -1600,7 +1654,7 @@ def _build_mcp_server(state: ServerState):
             cause=exc,
         ) from exc
 
-    mcp = FastMCP(CLI_NAME, version=OKTO_NEURON_VERSION)
+    mcp = FastMCP(CLI_NAME, version=OKTO_NEURON_VERSION, instructions=_MCP_INSTRUCTIONS)
 
     # ── agent memory surface ─────────────────────────────────────────────────
     # A deliberately small graph-native surface: ASK a grounded question over the
@@ -2029,6 +2083,87 @@ def _build_mcp_server(state: ServerState):
             min_claim_confidence,
             max_degree_per_seed,
         )
+
+    @mcp.tool()
+    async def recall(
+        query: str,
+        k: int = 10,
+        vault: str | None = None,
+        include_text: bool = False,
+    ) -> dict[str, object]:
+        """Retrieve the ``k` most relevant notes for ``query`` — no LLM.
+
+        This is the cheap lookup lane: hybrid vector + BM25 + title search
+        over the vault's notes, each hit carrying its provenance (source
+        path, byte span, document). Use it for fact checks and whenever you
+        will iterate or quote; use ``explore`` to walk entities/relations,
+        and ``ask`` only when you need one synthesized prose answer.
+
+        Returns ``{hits, retrieval}``. Each hit: ``id``, ``type``, ``title``,
+        ``score``, ``source`` (``path`` vault-RELATIVE, ``byte_start``,
+        ``byte_end``, ``document_id``; ``ingested_at`` when knowable), and —
+        only when ``include_text=true`` — ``text`` (the matched span, capped).
+
+        ``vault`` optionally names the registered vault to read (a NAME from
+        ``list_vaults`` — never a path); omit it to use this connection's
+        vault. Always validated, exactly like ``ask``/``explore``.
+        """
+        if state.shutting_down:
+            raise RuntimeError("shutting_down: server is shutting down")
+        ignored: list[str] = []
+        runtime, lease = await acquire_off_loop(_lease, vault, ignored, release=_release_pair)
+        return await _run_leased(
+            store_io,
+            lease,
+            functools.partial(
+                _recall_impl,
+                runtime=runtime,
+                lease=lease,
+                ignored=ignored,
+                query=query,
+                k=k,
+                include_text=include_text,
+            ),
+        )
+
+    def _recall_impl(
+        runtime: VaultRuntime,
+        lease: VaultLease[Vault],
+        ignored: list[str],
+        query: str,
+        k: int,
+        include_text: bool,
+    ) -> dict[str, object]:
+        with lease as selected_vault:
+            hits = selected_vault.query(query, k=min(int(k), MAX_QUERY_K))
+            vault_root = Path(selected_vault.path)
+            payload_hits: list[dict[str, object]] = []
+            for hit in hits:
+                prov = hit.provenance
+                source: dict[str, object] = {
+                    "byte_start": prov.byte_start,
+                    "byte_end": prov.byte_end,
+                    "document_id": prov.document_id,
+                }
+                relative = _companion_vault_relative(prov.path, vault_root)
+                if relative:
+                    source["path"] = relative
+                entry: dict[str, object] = {
+                    "id": str(hit.node.id),
+                    "type": str(hit.node.type),
+                    "title": str(getattr(hit.node, "title", "") or ""),
+                    "score": float(hit.score),
+                    "source": source,
+                }
+                if include_text:
+                    entry["text"] = _hit_span_text(hit, cap=2000)
+                payload_hits.append(entry)
+        return {
+            "hits": payload_hits,
+            "retrieval": {"vault": _serving_vault_name(runtime), **(
+                {"vault_override_ignored": ignored[0]} if ignored else {}
+            )},
+        }
 
     def _explore_impl(
         runtime: VaultRuntime,
@@ -2472,6 +2607,90 @@ def _build_mcp_server(state: ServerState):
         if hint:
             created["hint"] = hint
         return created
+
+    # ── prompts: reusable agent recipes over the tool surface ──────────────
+
+    @mcp.prompt()
+    def research(topic: str) -> str:
+        """Research a topic from the vault, citing sources.
+
+        Cheap-to-expensive: recall first, explore the entities you find, and
+        only ask for a synthesized answer if the parts still need tying
+        together."""
+        return (
+            f"Research '{topic}' from the Okto Neuron vault.\n"
+            "1. recall(query=<the topic>, include_text=true) — collect the "
+            "grounded facts and their source paths + byte spans.\n"
+            "2. explore(topic=<the topic>) — walk the entities/relations "
+            "around those facts for structure.\n"
+            "3. Only if a synthesized summary is needed: ask(question=<the "
+            "topic>) and check retrieval.synthesis_status.\n"
+            "Cite every fact with its vault-relative source path and byte "
+            "span. Say when the vault has nothing on the topic."
+        )
+
+    @mcp.prompt()
+    def record_decision(summary: str) -> str:
+        """Record a decision into the vault and confirm it ingested."""
+        return (
+            "Record this decision with the Okto Neuron MCP:\n"
+            "<<<" + summary + ">>>\n"
+            "1. remember(source=<the summary as raw text>) — note the job_id "
+            "it returns.\n"
+            "2. Poll ingest_status(job_id) until status=done.\n"
+            "3. Confirm ok=true; report the document_id and the ingest "
+            "outcome. If ok=false, report error/provider_error verbatim."
+        )
+
+    # ── resources: read-only vault state ───────────────────────────────────
+
+    @mcp.resource(
+        "neuron://vaults/{name}/status",
+        name="vault status",
+        description=(
+            "Per-vault operational status: node counts, embedding dimension, "
+            "pending sealed plans, the ingest queue summary, and whether the "
+            "vault's LLM is local (loopback/RFC1918/ULA/link-local rule)."
+        ),
+    )
+    async def vault_status(name: str) -> str:
+        from okto_neuron.server.http import _pending_sealed_plans_count
+        from okto_neuron.server._ingest_queue import summary as _queue_summary
+
+        runtime = _resolve(name)
+        vault_path = Path(runtime.vault_path)
+        payload: dict[str, object] = {
+            "vault": _serving_vault_name(runtime),
+            "pending_sealed_plans": _pending_sealed_plans_count(vault_path),
+            "queue": _queue_summary(runtime),
+        }
+        lease = runtime.lease_vault()
+        try:
+            vault = lease.vault
+            payload["embedding_dim"] = getattr(vault.store, "embedding_dim", None)
+            counts = await store_io(
+                lambda: {
+                    "total_nodes": len(list(vault.store.list_nodes(include_embedding=False))),
+                    "total_edges": len(list(vault.store.list_edges())),
+                }
+            )
+            payload.update(counts)
+            # LLM locality per the RFC1918 rule (companion._is_local_provider).
+            try:
+                from okto_neuron.companion import _is_local_provider
+                from okto_neuron.config import VaultConfig
+                from okto_neuron.llm import get_provider
+
+                cfg = await store_io(VaultConfig.load, vault_path)
+                resolved = cfg.llm.resolved("ask")
+                payload["llm_is_local"] = _is_local_provider(
+                    await store_io(get_provider, resolved)
+                )
+            except Exception:  # noqa: BLE001 — locality is advisory, never fatal
+                payload["llm_is_local"] = None
+        finally:
+            lease.release()
+        return json.dumps(payload, indent=2, sort_keys=True, default=str)
 
     return mcp
 

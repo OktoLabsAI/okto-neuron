@@ -38,7 +38,7 @@ from fastmcp import Client
 URL = sys.argv[1]
 SOURCE = sys.argv[2]
 TOKEN = os.environ["OKTO_NEURON_AUTH_TOKEN"]
-EXPECTED_TOOLS = ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]
+EXPECTED_TOOLS = ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "recall", "remember"]
 
 
 def data(result):

@@ -1059,6 +1059,7 @@ async def main():
             "ingest_status",
             "init_vault",
             "list_vaults",
+            "recall",
             "remember",
         ], tools
         print(",".join(tools))
@@ -1075,7 +1076,7 @@ asyncio.run(main())
         )
         assert (
             mcp_result.stdout.strip()
-            == "ask,explore,ingest_status,init_vault,list_vaults,remember"
+            == "ask,explore,ingest_status,init_vault,list_vaults,recall,remember"
         )
     finally:
         if process.poll() is None:
