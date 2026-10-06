@@ -72,7 +72,7 @@ async def main():
     async with Client(URL, auth=TOKEN) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         print(f"tools={tools}")
-        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]:
+        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "recall", "remember"]:
             print("FAIL unexpected_tool_surface")
 
         keep = await await_job(client, data(await client.call_tool("remember", {"source": str(keep_path)})))
