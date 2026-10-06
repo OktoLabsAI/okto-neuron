@@ -1296,3 +1296,20 @@ not (a DNS name can point anywhere).
 **Raw-text previews.** Queue items enqueued from raw text carry a one-line ~80-char
 `preview` of the note; the Logs view shows it instead of the bare `note-<hash>.md`
 filename (path still on hover).
+
+## Addendum · 2026-10-05 — MCP `ask` streams synthesis progress (heartbeat, stages, token counts)
+
+A long `ask` used to return nothing for minutes; clients with idle timeouts aborted the call
+and discarded the answer. `ask` now reports progress throughout: a heartbeat notification
+every 15 s while the call runs, stage notifications (`retrieving` → `synthesizing` → `done`),
+and throttled token counts during synthesis (`synthesizing: N tokens`, at most one per 250 ms
+— never the answer text). Progress values are strictly monotonically increasing per request.
+
+Under the hood, `LiteLLMProvider.complete` gained an optional token-streaming lane
+(`on_token`): with a callback the request runs `stream=True` with
+`stream_options={"include_usage": True}` and the chunks are assembled with
+`litellm.stream_chunk_builder`, so text, finish reasons (including truncation and native
+unmapped reasons), and usage are identical to the non-stream path. Without a callback the
+request is byte-for-byte today's. Deadline/cancel-scoped calls (the cancellable helper
+process) deliberately fall back to non-stream — chunk callbacks do not cross that process
+boundary, and the heartbeat covers the idle timeout there.
