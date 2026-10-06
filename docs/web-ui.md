@@ -1313,3 +1313,19 @@ unmapped reasons), and usage are identical to the non-stream path. Without a cal
 request is byte-for-byte today's. Deadline/cancel-scoped calls (the cancellable helper
 process) deliberately fall back to non-stream — chunk callbacks do not cross that process
 boundary, and the heartbeat covers the idle timeout there.
+
+## Addendum · 2026-10-05 — MCP guidance: instructions, recall tool, prompts, status resource
+
+The MCP server now teaches agents how to use it. `FastMCP(instructions=…)` carries a
+concise operator guide (which tool when — recall for cheap lookups with provenance, explore
+to walk the graph, ask only for one-shot synthesized prose, remember is async → poll
+ingest_status; vault selection; the local_only RFC1918/ULA/link-local rule; error guidance
+for the embedding-dim and sealed-plan wedges; cite-the-source discipline). A new
+**`recall(query, k, vault, include_text)`** tool is the no-LLM lookup lane: hybrid
+vector+BM25+title search returning hits with vault-relative source paths, byte spans and
+document ids (optional capped span text). Two **prompts** — `research(topic)` (recall →
+explore → ask only if synthesis is needed) and `record_decision(summary)` (remember → poll
+ingest_status → confirm ok) — and a **`neuron://vaults/{name}/status`** template resource
+(counts, embedding dim, pending sealed plans, queue summary, llm_is_local per the
+RFC1918 rule) complete the surface. ask/explore docstrings are trimmed to guidance plus
+compact knob tables; no behavior changed.
