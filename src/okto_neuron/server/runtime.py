@@ -1774,85 +1774,32 @@ def _build_mcp_server(state: ServerState):
     ) -> dict[str, object]:
         """Answer a question grounded in the knowledge graph, with citations.
 
-        ``ask`` is one-shot — it synthesises a single answer with no chance to
-        re-query — so it seeds *wide*: ``k`` (notes retrieved) defaults to 20,
-        capped at ``MAX_QUERY_K``. Raise it for broad or multi-part questions;
-        lower it to cut cost on narrow lookups. (If you can issue follow-up
-        queries yourself, prefer ``explore``, which seeds tighter and returns
-        structured graph to walk.) ``hops`` widens the graph neighbourhood
-        around each seed (1 = direct neighbours; raise when an answer needs
-        more connected context) — but it only takes effect when subgraph
-        retrieval is active for this vault (``llm.ask.enable_subgraph``,
-        default off; the default block-dump retrieval mode ignores ``hops``
-        entirely). Returns ``{status, text, citations, subgraph_evidence_ids,
-        retrieval}``; ``status`` is ``"ok"`` only for a clean answer and
-        ``"degraded"`` for anything else (see ``synthesis_status`` below); the ``retrieval`` block echoes the effective ``seed_k``
-        and ``mode``, plus ``enable_subgraph`` (whether this call actually
-        used subgraph retrieval) and ``hops`` (the value applied, or ``null``
-        when ``hops`` had no effect), so you can see what your knobs did. It also
-        carries ``vault`` — the NAME of the vault that actually served the call —
-        and, when your ``vault`` argument lost to the connection's ``?vault=``
-        selector, ``vault_override_ignored`` with the CANONICAL registered name
-        of the vault that was discarded (not your literal argument: casing and
-        surrounding whitespace are normalised to the registry's spelling).
-        ``citations`` is always just the retrieval seeds. When subgraph
-        retrieval is active, ``text`` is grounded in a wider 1-hop+ ego-graph
-        and may cite ``claim:<id>``/node ids from that wider graph that never
-        appear in ``citations`` — ``subgraph_evidence_ids`` carries the full
-        set of ids rendered into that ego-graph context so those anchors
-        resolve. It is empty outside subgraph mode, where ``citations``
-        already is the complete grounding set.
+        ``ask`` is ONE-SHOT: it synthesises a single answer with no chance to
+        re-query, so it seeds wide (``k`` default 20, capped at MAX_QUERY_K).
+        Raise ``k`` for broad/multi-part questions; lower it for narrow
+        lookups; if you can issue follow-ups yourself, prefer ``explore`` or
+        ``recall``. Returns ``{status, text, citations,
+        subgraph_evidence_ids, retrieval}``; ``status`` is ``"ok"`` only for
+        a clean answer — check ``retrieval.synthesis_status`` (``"no_llm"``,
+        ``"provider_error"``, ``"empty"``, ``"truncated"``,
+        ``"abnormal_stop"``). ``retrieval`` echoes ``seed_k``, ``mode``,
+        ``hops``-when-it-applied, ``vault`` (the NAME that served the call),
+        and ``vault_override_ignored`` when your ``vault`` argument lost to
+        the connection's ``?vault=``.
 
-        ALWAYS check ``retrieval["synthesis_status"]``: an empty ``text`` with
-        ``synthesis_status == "provider_error"`` (summary in
-        ``retrieval["provider_error"]``) means the answering MODEL was
-        unreachable, NOT that the graph lacks the answer — retry or fix the LLM
-        config rather than concluding the vault is empty. ``"no_llm"`` means no
-        usable LLM is configured for the vault, so no model was called
-        (``retrieval["no_llm_reason"]`` says what to set); the citations are
-        still the retrieval hits. ``"empty"`` means the
-        model replied with nothing; ``"ok"`` means synthesis succeeded.
-        ``"truncated"`` means the provider hit the token budget (finish_reason
-        ``length``) so ``text`` is cut off mid-answer, and ``"abnormal_stop"``
-        means it stopped for some other non-``stop`` reason — in both cases
-        ``retrieval["finish_reason"]`` (plus ``retrieval["native_finish_reason"]``
-        when the provider's raw value differs) says exactly which.
-
-        ``vault`` optionally names the registered vault to read (a NAME from
-        ``list_vaults`` — never a path); omit it to use this connection's vault.
-        It is ALWAYS validated: a path-shaped or unknown name fails the call even
-        when this connection's ``?vault=`` selector takes precedence over it.
-        Before choosing, check the project directory for a ``.okto-neuron-vault``
-        file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
-
-        Retrieval-policy knobs (parity with the web UI's query controls). EVERY
-        one defaults to ``None`` = inherit the vault/config default for this
-        call; a ``None`` never overwrites a configured value. ``k`` and
-        ``seed_k`` are both capped at ``MAX_QUERY_K`` = 100.
-
-        - ``enable_subgraph``: use graph (ego-graph) retrieval instead of the
-          default source-block dump. Default ``None`` (inherit; normally OFF).
-        - ``source_block_policy``: when to splice raw source blocks into context
-          — ``never`` / ``on_coverage_miss`` / ``always`` / ``blend``.
-        - ``seed_k``: how many retrieval seeds to fetch (overrides ``k``).
-        - ``hops``: ego-graph radius, clamped to 1..5; takes effect ONLY when
-          subgraph retrieval is active (block-dump mode ignores it entirely).
-        - ``max_degree_per_seed``: max neighbours expanded per seed node.
-        - ``neighbour_budget_tokens``: token budget for the neighbour context.
-        - ``source_block_budget_tokens``: token budget for spliced source blocks.
-        - ``coverage_threshold``: 0.0-1.0 graph-coverage bar below which source
-          blocks are spliced in.
-        - ``min_claim_confidence``: 0.0-1.0 floor on claim confidence.
-        - ``max_nodes`` / ``max_relationships`` / ``max_claims``: hard caps on
-          what the assembled subgraph renders.
-        - ``relationship_types``: restrict edges to these predicate names.
-        - ``include_sources``: when true, add a ``sources`` list with per-hit
-          provenance (vault-RELATIVE path, ``block_id``, byte span,
-          ``content_hash``, plus ``superseded``/``valid_until`` when stale).
-          Default false, so the existing payload is unchanged.
-
-        An out-of-range knob (e.g. ``coverage_threshold=1.5``) fails the call
-        with a readable ``invalid retrieval policy: ...`` error.
+        Retrieval knobs (EVERY one ``None`` = inherit the vault default):
+        ``k``/``seed_k`` (cap MAX_QUERY_K=100) | ``hops`` 1..5, only when
+        subgraph retrieval is active | ``enable_subgraph`` graph-mode
+        retrieval (default inherit, normally OFF) |
+        ``source_block_policy`` never/on_coverage_miss/always/blend |
+        ``seed_k`` overrides ``k`` for subgraph seeding |
+        ``max_degree_per_seed`` | ``neighbour_budget_tokens`` |
+        ``source_block_budget_tokens`` | ``coverage_threshold`` 0.0-1.0 |
+        ``min_claim_confidence`` 0.0-1.0 | ``max_nodes``/``max_relationships``/
+        ``max_claims`` render caps | ``relationship_types`` edge filter |
+        ``include_sources`` adds per-hit provenance (vault-RELATIVE path,
+        block_id, byte span, content_hash, superseded/valid_until when
+        stale; default false).
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
@@ -2027,40 +1974,26 @@ def _build_mcp_server(state: ServerState):
     ) -> dict[str, object]:
         """Drill into the graph around a topic, then walk outward by node id.
 
-        ``explore`` is the agentic retrieval path — you get back structured graph,
-        not prose, and you re-query to widen. So it seeds *tight*: ``k`` (seed
-        notes) defaults to 12, capped at ``MAX_QUERY_K``, keeping each pass cheap
-        and high-precision; you widen by calling ``explore`` again on a returned
-        node's ``id`` rather than by inflating ``k``. (For a single one-shot
-        answer with no follow-up, use
-        ``ask``, which seeds wider.) Give a ``topic`` (free text) to seed by
-        semantic search, OR a ``node_id`` (from a prior ``explore``/``ask`` result)
-        to expand directly from that node. ``hops`` widens the neighbourhood per
-        call. Returns the structured ego-graph — ``nodes`` (each with an ``id``),
-        ``relationships``, and ``claims`` — NOT prose. A ``retrieval`` block
-        reports how the call actually retrieved: ``mode`` (``topic`` or
-        ``node``), the effective ``seed_k`` (``null`` in ``node`` mode, where
-        ``k`` is unused), ``hops``, ``max_degree_per_seed``,
-        ``min_claim_confidence``, ``relationship_types`` (``[]`` = unrestricted)
-        and ``vault`` (the NAME of the vault that served the call), plus
+        The agentic retrieval path: structured graph, not prose. Seed tight
+        (``k`` default 12) and re-query on a returned node's ``id`` to widen
+        instead of inflating ``k``. For a one-shot synthesized answer use
+        ``ask``. Give ``topic`` (free text) or ``node_id`` (from a prior
+        explore/ask). Returns ``nodes`` / ``relationships`` / ``claims`` plus a
+        ``retrieval`` block (``mode``, ``seed_k``, ``hops``, ``vault`` NAME,
         ``vault_override_ignored`` when your ``vault`` argument lost to the
-        connection's ``?vault=`` selector — the CANONICAL registered name of the
-        discarded vault, not your literal argument. There is no
-        ``synthesis_status``:
-        ``explore`` makes no LLM call.
+        connection's ``?vault=``). No LLM call, no ``synthesis_status``.
 
-        ``relationship_types`` restricts edges to those predicate names;
-        ``min_claim_confidence`` (0.0-1.0) floors claim confidence;
-        ``max_degree_per_seed`` caps neighbours expanded per seed. All three
-        default to ``None`` = inherit this vault's ``llm.ask`` config.
-        Each returned relationship/claim carries the source ``block_id``.
+        Knobs (each ``None`` = inherit the vault's ``llm.ask`` config):
+        ``hops`` 1..5 ego-graph radius (node mode only) | ``k`` seed notes,
+        capped at MAX_QUERY_K | ``relationship_types`` restrict edge
+        predicates ([] = unrestricted) | ``min_claim_confidence`` 0.0-1.0
+        floor | ``max_degree_per_seed`` cap neighbours per seed. Returned
+        relationships/claims carry the source ``block_id``.
 
         ``vault`` optionally names the registered vault to read (a NAME from
-        ``list_vaults`` — never a path); omit it to use this connection's vault.
-        It is ALWAYS validated: a path-shaped or unknown name fails the call even
-        when this connection's ``?vault=`` selector takes precedence over it.
-        Before choosing, check the project directory for a ``.okto-neuron-vault``
-        file, or a pre-0.3.0 ``.marginalia-vault`` (``{"vault": "<name>"}``), and pass the name it pins.
+        ``list_vaults`` — never a path); omit it to use this connection's
+        vault. Always validated; check the project directory for
+        ``.okto-neuron-vault`` (``{"vault": "<name>"}``) and pass the name.
         """
         if state.shutting_down:
             raise RuntimeError("shutting_down: server is shutting down")
