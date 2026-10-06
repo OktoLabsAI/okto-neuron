@@ -112,7 +112,7 @@ def test_ask_caps_k_at_max_query_k(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     observed: dict[str, object] = {}
 
     class FakeCompanion:
-        def ask(self, question, *, k, retrieval_policy=None):
+        def ask(self, question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             observed["k"] = k
             return Answer(
                 text="ok", citations=("claim:1",), retrieval={"mode": "block", "seed_k": k}
@@ -182,7 +182,7 @@ def test_ask_retrieval_block_reports_hops_noop_in_block_mode(
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             # Default (non-subgraph) retrieval never puts "hops" in the trace.
             return Answer(text="ok", citations=(), retrieval={"mode": "block", "seed_k": k})
 
@@ -219,7 +219,7 @@ def test_ask_retrieval_block_reports_effective_hops_in_subgraph_mode(
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(
                 text="ok",
                 citations=(),
@@ -267,7 +267,7 @@ def test_ask_surfaces_subgraph_evidence_ids_in_mcp_response(
     ids = ("claim:seed-1", "claim:neighbour-2")
 
     class FakeCompanion:
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(
                 text="ok",
                 # citations are only the retrieval seeds ...
@@ -318,7 +318,7 @@ def test_ask_block_mode_reports_empty_subgraph_evidence_ids(
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(
                 text="ok",
                 citations=("claim:seed-1",),
@@ -812,7 +812,7 @@ def test_per_call_vault_argument_selects_another_vault_for_reads(
         def __init__(self, vault):
             self._vault = vault
 
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             seen["ask"] = Path(self._vault.path).resolve(strict=False)
             return Answer(text="ok", citations=(), retrieval={"mode": "block", "seed_k": k})
 
@@ -907,7 +907,7 @@ def test_unknown_per_call_vault_fails_loudly_and_connection_still_works(
         def __init__(self, vault):
             self._vault = vault
 
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(text="ok", citations=(), retrieval={"mode": "block", "seed_k": k})
 
     monkeypatch.setattr(http_module, "companion_for", FakeCompanion)
@@ -973,7 +973,7 @@ def _policy_capture_state(tmp_path: Path, name: str, monkeypatch, *, mode: str =
     seen: dict[str, object] = {}
 
     class FakeCompanion:
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             seen["policy"] = retrieval_policy
             return Answer(text="ok", citations=(), retrieval={"mode": mode, "seed_k": k})
 
@@ -1112,7 +1112,7 @@ def _hit_state(tmp_path: Path, name: str, monkeypatch, *, source: Path | None = 
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def ask(self, _question, *, k, retrieval_policy=None):
+        def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(
                 text="ok",
                 citations=("a" * 64,),
@@ -1322,7 +1322,7 @@ def test_ask_tool_payload_carries_synthesis_status(
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def ask(self, question, *, k, retrieval_policy=None):
+        def ask(self, question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(
                 text="",
                 citations=("claim:1",),
@@ -1404,7 +1404,7 @@ def test_ask_tool_payload_carries_truncated_status(
     state = ServerState(vault=vault, vault_path=path, multi_vault_runtime_enabled=True)
 
     class FakeCompanion:
-        def ask(self, question, *, k, retrieval_policy=None):
+        def ask(self, question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
             return Answer(
                 text="Alice founded Acme in",
                 citations=("claim:1",),
@@ -1459,7 +1459,7 @@ class _FakeCompanion:
     def __init__(self, vault):
         self._vault = vault
 
-    def ask(self, _question, *, k, retrieval_policy=None):
+    def ask(self, _question, *, k, retrieval_policy=None, on_stage=None, on_token=None):
         from okto_neuron.companion import Answer
 
         _FakeCompanion.seen["ask"] = Path(self._vault.path).resolve(strict=False)
