@@ -91,7 +91,7 @@ async def main():
     async with Client(MCP_URL, auth=TOKEN) as client:
         tools = sorted(tool.name for tool in await client.list_tools())
         print(f"tools={tools}")
-        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "remember"]:
+        if tools != ["ask", "explore", "ingest_status", "init_vault", "list_vaults", "recall", "remember"]:
             print("FAIL unexpected_tool_surface")
         remembered = data(await client.call_tool("remember", {"source": str(SOURCE)}))
         # P1: remember is ASYNC — poll ingest_status to done/ok (bounded, loud).

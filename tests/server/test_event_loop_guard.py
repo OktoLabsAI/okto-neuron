@@ -417,6 +417,12 @@ _MCP_TOOL_ARGS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
     ),
     "list_vaults": ({}, {}),
     "init_vault": ({"name": "guard-mcp-warm"}, {"name": "guard-mcp"}),
+    "recall": (
+        # P3: the no-LLM lookup lane (hybrid vector+BM25+title). A real query
+        # with include_text exercises hit provenance + capped span text.
+        {"query": "the loop guard", "k": 3, "include_text": True},
+        {"query": "a second loop guard probe", "k": 3, "include_text": True},
+    ),
 }
 
 

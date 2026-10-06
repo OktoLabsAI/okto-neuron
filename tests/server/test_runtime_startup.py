@@ -169,20 +169,23 @@ def test_legacy_pure_query_serializer_remains_import_compatible() -> None:
 
 @pytest.mark.asyncio
 async def test_serve_mcp_surface_is_the_memory_tools() -> None:
-    """The live `serve` MCP surface is exactly ask / explore / remember /
+    """The live `serve` MCP surface is exactly ask / explore / recall / remember /
     init_vault / list_vaults / ingest_status.
 
     Deliberately small graph-native surface: subgraph-grounded ask, ego-graph
-    drill-down, async write (remember) + its job poller (ingest_status, P1),
-    vault creation, and name-only vault discovery (ADR 0014). The legacy
-    kg_add/kg_query_natural/kg_get_provenance plus flat recall and the review pair
-    were retired to avoid tool-selection ambiguity for agents.
+    drill-down, the no-LLM provenance lookup (recall, P3), async write (remember)
+    + its job poller (ingest_status, P1), vault creation, and name-only vault
+    discovery (ADR 0014). The legacy kg_add/kg_query_natural/kg_get_provenance
+    and the review pair were retired to avoid tool-selection ambiguity for
+    agents.
     """
     state = ServerState(vault=None, vault_path=None)
     server = runtime._build_mcp_server(state)
     names = {tool.name for tool in await server.list_tools()}  # type: ignore[attr-defined]
 
-    assert names == {"ask", "explore", "remember", "init_vault", "list_vaults", "ingest_status"}
+    assert names == {
+        "ask", "explore", "recall", "remember", "init_vault", "list_vaults", "ingest_status",
+    }
 
 
 @pytest.mark.asyncio
