@@ -323,6 +323,8 @@ so graph bootstrap width and query/ingest embedder cannot diverge.
   `okto-neuron[sentence-transformers]`), while external providers require
   `okto-neuron[litellm]`; a missing provider dependency fails explicitly and never substitutes
   the deterministic test embedder.
+  The embedding provider list includes `hostinger_router` and `empiriolabs`. Both use the
+  advanced environment-reference credential flow.
   Single-key embedding providers use the same managed credential pattern as LLM defaults:
   Config sends `kind: "embedding"` to `PUT /api/v1/credentials/provider`, stores only the
   generated environment reference in `embedding.api_key_env`, clears the password field, and

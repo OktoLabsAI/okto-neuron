@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   wheel:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       OKTO_NEURON_NO_OPEN: "1"
     steps:

@@ -18270,6 +18270,8 @@ their published extras (<code>okto-neuron[embeddings]</code> or
 <code>okto-neuron[sentence-transformers]</code>), while external providers require
 <code>okto-neuron[litellm]</code>; a missing provider dependency fails explicitly and never substitutes
 the deterministic test embedder.
+The embedding provider list includes <code>hostinger_router</code> and <code>empiriolabs</code>. Both use the
+advanced environment-reference credential flow.
 Single-key embedding providers use the same managed credential pattern as LLM defaults:
 Config sends <code>kind: &quot;embedding&quot;</code> to <code>PUT /api/v1/credentials/provider</code>, stores only the
 generated environment reference in <code>embedding.api_key_env</code>, clears the password field, and
